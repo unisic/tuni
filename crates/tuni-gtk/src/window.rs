@@ -56,6 +56,14 @@ const PANEL_MAX: i32 = 560;
 /// read of what is already in the page cache costs nothing anyone can measure.
 const PANEL_POLL_SECONDS: u32 = 2;
 
+/// What a Find command found to act on. The bar over a terminal belongs to the
+/// window and is handed the terminal it is pointing at; a file pane carries its
+/// own search inside GtkSourceView.
+enum Search {
+    Terminal(TuniFind, TuniTerminal),
+    Editor(TuniEditor),
+}
+
 /// What the palette lists before the projects and terminals: the window's own
 /// actions, by the name a person would search for, with the keys that do the
 /// same thing so the palette teaches them. The shortcuts repeat `ACCELS` in
@@ -73,6 +81,7 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         Some("Ctrl+Shift+N"),
         "win.new-project",
     ),
+    ("New Window", "window-new-symbolic", None, "win.new-window"),
     (
         "Split Right",
         "view-right-pane-symbolic",
@@ -123,10 +132,35 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
     ),
     ("Close Tab", "window-close-symbolic", None, "win.tab-close"),
     (
-        "Find in Terminal",
+        "Find",
         "edit-find-symbolic",
         Some("Ctrl+Shift+F"),
         "win.find",
+    ),
+    ("Find Next", "go-down-symbolic", Some("F3"), "win.find-next"),
+    (
+        "Find Previous",
+        "go-up-symbolic",
+        Some("Shift+F3"),
+        "win.find-previous",
+    ),
+    (
+        "Find and Replace",
+        "edit-find-replace-symbolic",
+        Some("Ctrl+Shift+H"),
+        "win.find-replace",
+    ),
+    (
+        "Use Selection for Find",
+        "edit-select-all-symbolic",
+        None,
+        "win.use-selection-for-find",
+    ),
+    (
+        "Clear Terminal",
+        "edit-clear-all-symbolic",
+        Some("Ctrl+Shift+K"),
+        "win.clear-terminal",
     ),
     (
         "Save File",
@@ -141,11 +175,12 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "win.toggle-sidebar",
     ),
     (
-        "Toggle Files Panel",
-        "folder-symbolic",
+        "Toggle Panel",
+        "sidebar-show-right-symbolic",
         Some("Ctrl+Shift+B"),
         "win.toggle-panel",
     ),
+    ("Show Files", "folder-symbolic", None, "win.show-files"),
     (
         "Show Git",
         "media-record-symbolic",
@@ -201,6 +236,11 @@ mod imp {
         /// question is asked once rather than every time the answer is acted
         /// on.
         pub closing: Cell<bool>,
+        /// Whether this window is the one the saved session belongs to. The
+        /// window the application opens with is; a second window opened beside
+        /// it is not, so closing either one cannot overwrite the other's work
+        /// with its own.
+        pub session_owner: Cell<bool>,
 
         pub split: RefCell<Option<adw::OverlaySplitView>>,
         pub sidebar: RefCell<Option<gtk::ListBox>>,
@@ -305,6 +345,35 @@ impl TuniWindow {
             .build();
         window.imp().settings.replace(settings);
         window
+    }
+
+    /// Says this window owns the saved session: it is the one restored at
+    /// startup, and the only one that writes the session file back.
+    pub fn own_session(&self) {
+        self.imp().session_owner.set(true);
+    }
+
+    /// Opens another window on the same application, with the settings this one
+    /// is running under.
+    ///
+    /// It starts on an empty project rather than on a copy of this window's:
+    /// two windows showing the same shells is not something a PTY can do, and
+    /// the second window is for the work that does not fit beside the first.
+    /// Only the window that opened with the session saves one, so whichever
+    /// closes last cannot overwrite the other.
+    fn open_window(&self) {
+        let Some(app) = self.application().and_downcast::<adw::Application>() else {
+            return;
+        };
+        let window = Self::new(&app, self.imp().settings.borrow().clone());
+        window.present();
+        glib::idle_add_local_once(glib::clone!(
+            #[weak]
+            window,
+            move || {
+                window.open_project();
+            }
+        ));
     }
 
     // --- construction ------------------------------------------------------
@@ -673,16 +742,45 @@ impl TuniWindow {
                     editor.save();
                 }
             }),
-            // Only over a terminal: a file pane has GtkSourceView's own search,
-            // and a diff is a rendering of a command's output rather than
-            // something to search through.
-            entry("find", None, |window, _| {
-                if let (Some(find), Some(terminal)) =
-                    (window.imp().find.borrow().clone(), window.active_terminal())
-                {
-                    find.open(&terminal);
+            // Searches whatever the focused pane holds: the bar over a terminal,
+            // GtkSourceView's own over a file. A diff is a rendering of a
+            // command's output rather than something to search through, so it
+            // answers to none of these.
+            entry("find", None, |window, _| match window.find_target() {
+                Some(Search::Terminal(find, terminal)) => find.open(&terminal),
+                Some(Search::Editor(editor)) => editor.open_find(),
+                None => {}
+            }),
+            entry("find-next", None, |window, _| window.find_step(true)),
+            entry("find-previous", None, |window, _| window.find_step(false)),
+            // Only a file can be replaced in: terminal output and diffs are
+            // readings of something that already happened.
+            entry("find-replace", None, |window, _| {
+                if let Some(editor) = window.active_editor() {
+                    editor.open_replace();
                 }
             }),
+            entry("use-selection-for-find", None, |window, _| {
+                match window.find_target() {
+                    Some(Search::Terminal(find, terminal)) => {
+                        if let Some(needle) = terminal.selection() {
+                            find.look_up(&terminal, &needle);
+                        }
+                    }
+                    Some(Search::Editor(editor)) => {
+                        if let Some(needle) = editor.selection() {
+                            editor.find_text(&needle);
+                        }
+                    }
+                    None => {}
+                }
+            }),
+            entry("clear-terminal", None, |window, _| {
+                if let Some(terminal) = window.active_terminal() {
+                    terminal.clear();
+                }
+            }),
+            entry("new-window", None, |window, _| window.open_window()),
             entry("palette", None, |window, _| window.show_palette()),
             // Jumps to a pane wherever it is: its project, then its tab, then
             // the pane itself. What the palette's second section runs.
@@ -712,28 +810,19 @@ impl TuniWindow {
                     window.focus_pane();
                 }
             }),
-            // One key that both opens the panel and puts it on the repository:
-            // asking for git while the panel is showing the files is asking for
-            // the panel to change page, not to close.
+            // One key per page that both opens the panel and puts it on that
+            // page: asking for git while the panel is showing the files is
+            // asking for the panel to change page, not to close. Asking for the
+            // page already showing is the one that closes it, which is how kero
+            // spends the same three keys.
+            entry("show-files", None, |window, _| {
+                window.show_panel(crate::panel::FILES);
+            }),
             entry("show-git", None, |window, _| {
-                let imp = window.imp();
-                if let Some(panel) = imp.panel_view.borrow().as_ref() {
-                    panel.set_page(crate::panel::GIT);
-                }
-                if let Some(panel) = imp.panel.borrow().as_ref() {
-                    panel.set_show_sidebar(true);
-                }
-                window.sync_files();
+                window.show_panel(crate::panel::GIT);
             }),
             entry("show-info", None, |window, _| {
-                let imp = window.imp();
-                if let Some(panel) = imp.panel_view.borrow().as_ref() {
-                    panel.set_page(crate::panel::INFO);
-                }
-                if let Some(panel) = imp.panel.borrow().as_ref() {
-                    panel.set_show_sidebar(true);
-                }
-                window.sync_files();
+                window.show_panel(crate::panel::INFO);
             }),
             entry("tab-rename", None, |window, _| window.rename_tab()),
             entry("tab-automatic-title", None, |window, _| {
@@ -948,7 +1037,7 @@ impl TuniWindow {
     /// Runs while the window is closing, so it does the least it can: a
     /// snapshot of the model, one pass over the live terminals, two files.
     fn save_session(&self) {
-        if !session_enabled() {
+        if !session_enabled() || !self.imp().session_owner.get() {
             return;
         }
         let imp = self.imp();
@@ -2267,6 +2356,67 @@ impl TuniWindow {
         self.imp().terminals.borrow().get(&pane).cloned()
     }
 
+    /// Opens the panel on a page, or closes it if that page is already the one
+    /// showing.
+    fn show_panel(&self, page: &str) {
+        let imp = self.imp();
+        let showing = imp
+            .panel
+            .borrow()
+            .as_ref()
+            .is_some_and(adw::OverlaySplitView::shows_sidebar);
+        let already = imp
+            .panel_view
+            .borrow()
+            .as_ref()
+            .is_some_and(|panel| panel.page() == page);
+
+        if showing && already {
+            if let Some(panel) = imp.panel.borrow().as_ref() {
+                panel.set_show_sidebar(false);
+            }
+            self.focus_pane();
+            return;
+        }
+
+        if let Some(panel) = imp.panel_view.borrow().as_ref() {
+            panel.set_page(page);
+        }
+        if let Some(panel) = imp.panel.borrow().as_ref() {
+            panel.set_show_sidebar(true);
+        }
+        self.sync_files();
+    }
+
+    /// What a Find command acts on: the pane with the keyboard decides, and a
+    /// diff pane decides on nothing.
+    fn find_target(&self) -> Option<Search> {
+        if let Some(editor) = self.active_editor() {
+            return Some(Search::Editor(editor));
+        }
+        let find = self.imp().find.borrow().clone()?;
+        Some(Search::Terminal(find, self.active_terminal()?))
+    }
+
+    /// Walks to the next match in the focused pane, or the previous one.
+    ///
+    /// Over a terminal whose bar is down this opens it first, on the term it
+    /// was last searching for — asking for the next match is asking to carry on
+    /// with a search, and the bar is where that search lives.
+    fn find_step(&self, forward: bool) {
+        match self.find_target() {
+            Some(Search::Terminal(find, terminal)) => {
+                if find.targets(&terminal) {
+                    find.step_match(forward);
+                } else {
+                    find.open(&terminal);
+                }
+            }
+            Some(Search::Editor(editor)) => editor.step_match(forward),
+            None => {}
+        }
+    }
+
     /// Hands the keyboard to whatever the focused pane holds.
     fn focus_pane(&self) {
         let Some(pane) = self.focused_pane() else {
@@ -3041,6 +3191,7 @@ fn main_menu() -> gio::Menu {
     let opening = gio::Menu::new();
     opening.append(Some("New Tab"), Some("win.new-tab"));
     opening.append(Some("New Project"), Some("win.new-project"));
+    opening.append(Some("New Window"), Some("win.new-window"));
 
     let panes = gio::Menu::new();
     panes.append(Some("Split Right"), Some("win.split-right"));
@@ -3050,9 +3201,18 @@ fn main_menu() -> gio::Menu {
 
     let panels = gio::Menu::new();
     panels.append(Some("Projects"), Some("win.toggle-sidebar"));
-    panels.append(Some("Files"), Some("win.toggle-panel"));
+    panels.append(Some("Files"), Some("win.show-files"));
     panels.append(Some("Git"), Some("win.show-git"));
     panels.append(Some("Info"), Some("win.show-info"));
+
+    let searching = gio::Menu::new();
+    searching.append(Some("Find"), Some("win.find"));
+    searching.append(Some("Find and Replace"), Some("win.find-replace"));
+    searching.append(
+        Some("Use Selection for Find"),
+        Some("win.use-selection-for-find"),
+    );
+    searching.append(Some("Clear Terminal"), Some("win.clear-terminal"));
 
     let file = gio::Menu::new();
     file.append(Some("Save File"), Some("win.save-file"));
@@ -3063,6 +3223,7 @@ fn main_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append_section(None, &opening);
     menu.append_section(None, &panes);
+    menu.append_section(None, &searching);
     menu.append_section(None, &file);
     menu.append_section(None, &panels);
     menu.append_section(None, &application);

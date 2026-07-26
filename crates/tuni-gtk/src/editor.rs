@@ -588,8 +588,6 @@ impl TuniEditor {
         });
     }
 
-    /// Hands the keyboard to the text, so a pane focused by a shortcut can be
-    /// typed into.
     /// Opens the find bar with a query already in it, as Ctrl+F and typing
     /// would. The entry drives the search itself, so the matches arrive the
     /// same way they do for a reader.
@@ -598,6 +596,31 @@ impl TuniEditor {
         if let Some(entry) = self.imp().query.borrow().as_ref() {
             entry.set_text(query);
         }
+    }
+
+    /// Opens the find bar, for the window's Find command reaching a file pane.
+    pub fn open_find(&self) {
+        self.open_search(false);
+    }
+
+    /// Opens the find bar with the replacement row showing.
+    pub fn open_replace(&self) {
+        self.open_search(true);
+    }
+
+    /// Walks to the next match, or the previous one.
+    pub fn step_match(&self, forward: bool) {
+        self.find(forward, true);
+    }
+
+    /// The selected text, if there is a selection and it is on one line — a
+    /// paragraph dragged by accident is not a search term.
+    #[must_use]
+    pub fn selection(&self) -> Option<String> {
+        let buffer = self.imp().buffer.borrow().clone()?;
+        let (start, end) = buffer.selection_bounds()?;
+        let text = buffer.text(&start, &end, false).to_string();
+        (!text.is_empty() && !text.contains('\n')).then_some(text)
     }
 
     /// What the find bar is saying about the matches: "3 of 12", "No matches",
@@ -620,6 +643,8 @@ impl TuniEditor {
         }
     }
 
+    /// Hands the keyboard to the text, so a pane focused by a shortcut can be
+    /// typed into.
     pub fn focus_text(&self) {
         if let Some(view) = self.imp().view.borrow().as_ref() {
             view.grab_focus();

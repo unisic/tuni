@@ -80,7 +80,11 @@ lands in the diff on its own.
 Three ways to get somewhere. `Ctrl+Shift+F` opens a find bar over the terminal:
 every match on screen and in the scrollback is highlighted as you type, the
 tally counts them, and Enter walks forward while Shift+Enter walks back,
-scrolling each match into view. `Ctrl+Shift+P` opens the command palette —
+scrolling each match into view. It follows the keyboard rather than the mouse —
+press it while a file pane has the focus and it is that file being searched, in
+GtkSourceView's own bar — and `F3` steps whichever of the two is open. Text
+already selected can be handed to the bar as the term, which is the quickest
+way to look for something a command just printed. `Ctrl+Shift+P` opens the command palette —
 everything the window can do, by name, with the keys that do the same thing
 beside it, and under that every terminal in the workspace, so a shell in another
 project is one query away rather than a hunt through tabs. Holding `Ctrl` and
@@ -92,7 +96,9 @@ Closing the window writes that arrangement down, and opening it again puts it
 back: the projects, their tabs, the columns and panes inside each one with the
 room they had, the names that were typed, and a fresh shell in each pane's last
 working directory. What those shells had printed is not restored unless it is
-asked for. A settings window under `Ctrl+,` edits the font, the two themes, the
+asked for. A second window can be opened for a scratch project on another
+screen; it starts empty and never writes the session, so the arrangement that
+comes back is the one the first window was left in. A settings window under `Ctrl+,` edits the font, the two themes, the
 scrollback, whether a file pane wraps its long lines, and that last decision,
 writing each change to `~/.config/tuni/config.toml` as it is made. There is no
 OK button; a line of terminal beside the font rows is drawn in whatever has
@@ -120,12 +126,15 @@ rather than leaving the chooser reading "None".
 | `Ctrl+Shift+1` … `Ctrl+Shift+9` | Jump to a project |
 | `F9` | Show or hide the sidebar |
 | `Ctrl+Shift+B` | Show or hide the panel |
-| `Ctrl+Shift+G` | Open the panel on the repository |
+| `Ctrl+Shift+G` | Open the panel on the repository, or close it when it is already there |
 | `Ctrl+Shift+I` | Open the panel on the session: processes and ports |
 | `Ctrl+,` | Preferences |
 | `Ctrl+S` | Save the file in the focused pane |
 | `Ctrl+Shift+P` | The command palette |
-| `Ctrl+Shift+F` | Find in the terminal; Enter and `Shift+Enter` walk the matches, `Escape` closes |
+| `Ctrl+Shift+F` | Find in the pane that has the keyboard; Enter and `Shift+Enter` walk the matches, `Escape` closes |
+| `F3` / `Shift+F3` | Next match, previous match |
+| `Ctrl+Shift+H` | Find and replace in the file pane that has the keyboard |
+| `Ctrl+Shift+K` | Clear the terminal: the screen, the scrollback behind it, and a fresh prompt |
 | `Ctrl+F` / `Ctrl+H` | Find, find and replace — in a file pane only |
 | `Ctrl+G` / `Ctrl+Shift+G` | Next match, previous match — in a file pane only |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection, paste |
@@ -138,6 +147,10 @@ rather than leaving the chooser reading "None".
 | `Shift+Page Up` / `Shift+Page Down` | Scroll the viewport by a page |
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
+
+New Window, Show Files and Use Selection for Find have no key of their own —
+they are in the menu and in the palette, which is where anything without a
+shortcut can be reached by name.
 
 A pane nobody is looking at can still say something. The bell marks its tab as
 wanting attention, and when the window is not the focused one it arrives as a

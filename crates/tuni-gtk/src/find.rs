@@ -257,6 +257,34 @@ impl TuniFind {
         }
     }
 
+    /// Whether the bar is up and searching this terminal, which is what tells
+    /// "find next" whether there is a search to step through at all.
+    #[must_use]
+    pub(crate) fn targets(&self, terminal: &TuniTerminal) -> bool {
+        self.is_visible()
+            && self
+                .imp()
+                .target
+                .borrow()
+                .as_ref()
+                .is_some_and(|current| current == terminal)
+    }
+
+    /// Searches for a term chosen elsewhere — the terminal's selection — rather
+    /// than for one typed into the entry. The entry still drives the search, so
+    /// the matches and the tally arrive the way they do for a reader.
+    pub(crate) fn look_up(&self, terminal: &TuniTerminal, needle: &str) {
+        self.open(terminal);
+        if let Some(entry) = self.imp().entry.borrow().as_ref() {
+            entry.set_text(needle);
+            entry.set_position(-1);
+        }
+        // `SearchEntry` waits out a keystroke or two before it reports a change,
+        // which is right for typing and wrong for a term that arrived whole:
+        // the matches are wanted now, not a beat after the bar appears.
+        self.look_for(needle);
+    }
+
     /// Types into the entry on the harness's behalf, so a capture drives the
     /// same path a person's keystrokes do.
     pub(crate) fn search_text(&self, needle: &str) {

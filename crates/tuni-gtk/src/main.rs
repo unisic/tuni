@@ -65,9 +65,19 @@ const ACCELS: &[(&str, &[&str])] = &[
     // ports.
     ("win.show-info", &["<Ctrl><Shift>i"]),
     ("win.settings", &["<Ctrl>comma"]),
-    // Find in the terminal. `Ctrl+F` belongs to the shell — it is emacs-mode
-    // forward-char, and readline would never see it again.
+    // Find in whatever the focused pane holds. `Ctrl+F` belongs to the shell —
+    // it is emacs-mode forward-char, and readline would never see it again.
     ("win.find", &["<Ctrl><Shift>f"]),
+    // What every desktop application on this platform steps through matches
+    // with, and free of the shell entirely.
+    ("win.find-next", &["F3"]),
+    ("win.find-previous", &["<Shift>F3"]),
+    // `Ctrl+H` is backspace to a terminal; the shifted key is the one an editor
+    // here would have taken.
+    ("win.find-replace", &["<Ctrl><Shift>h"]),
+    // kero's ⌘K. `Ctrl+K` is kill-line in a shell, so this goes one modifier
+    // over, where `clear` is not a command that has to reach the shell at all.
+    ("win.clear-terminal", &["<Ctrl><Shift>k"]),
     // kero's palette is ⌘K; `Ctrl+K` is kill-line in a shell, so the palette
     // takes the key every editor on this desktop puts it on.
     ("win.palette", &["<Ctrl><Shift>p"]),
@@ -122,6 +132,9 @@ fn build_window(app: &adw::Application) {
     let settings = settings();
     window::apply_appearance(settings.appearance);
     let window = TuniWindow::new(app, settings);
+    // The window the application opens with is the one the saved session
+    // belongs to. Windows opened beside it neither restore it nor write it.
+    window.own_session();
     window.present();
 
     // The first project's shell learns its size from the first allocation, so
@@ -170,9 +183,10 @@ fn settings() -> tuni_core::settings::Settings {
 /// into the shell first, and `TUNI_CAPTURE_DELAY_MS` is how long to wait for
 /// that command to finish before the shot is taken.
 ///
-/// `TUNI_CAPTURE_WIDGET=window` shoots the whole window, chrome included;
-/// anything else shoots the terminal alone, which is what the rendering
-/// captures want.
+/// `TUNI_CAPTURE_WIDGET=window` shoots the whole window, chrome included, and
+/// `=active` the window in front, which is how a second window shows up in a
+/// capture at all; anything else shoots the terminal alone, which is what the
+/// rendering captures want.
 ///
 /// The rest of the family below drives one part of the window each:
 /// `TUNI_CAPTURE_ACTIONS`, `TUNI_CAPTURE_OPEN`, `TUNI_CAPTURE_DIFF`,
@@ -575,14 +589,23 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
         );
     }
 
-    let whole_window = std::env::var("TUNI_CAPTURE_WIDGET").is_ok_and(|value| value == "window");
+    let widget = std::env::var("TUNI_CAPTURE_WIDGET").unwrap_or_default();
+    let whole_window = widget == "window";
+    // "active" shoots whichever window is in front rather than this one, which
+    // is the only way to see a window opened by an action during the capture.
+    let front = widget == "active";
     glib::timeout_add_local_once(
         std::time::Duration::from_millis(delay),
         glib::clone!(
             #[weak]
             window,
             move || {
-                let target: gtk::Widget = if whole_window {
+                let target: gtk::Widget = if front {
+                    window
+                        .application()
+                        .and_then(|app| app.active_window())
+                        .map_or_else(|| window.clone().upcast(), gtk::Window::upcast)
+                } else if whole_window {
                     window.clone().upcast()
                 } else {
                     match window.active_terminal() {
@@ -593,10 +616,18 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                 if let Err(error) = capture(&target, &path) {
                     eprintln!("capture failed: {error}");
                 }
+                // Held before the close below, which takes the window off the
+                // application and would leave nothing to ask for it afterwards.
+                let app = window.application();
                 window.force_close();
                 // A dialog on top of the window keeps it alive, and the
-                // capture is over either way.
-                if let Some(app) = window.application() {
+                // capture is over either way. Every window goes, not only this
+                // one: a capture that opened a second window has a second
+                // window to close, and a loop with a window left runs on.
+                if let Some(app) = app {
+                    for open in app.windows() {
+                        open.destroy();
+                    }
                     app.quit();
                 }
             }

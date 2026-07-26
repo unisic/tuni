@@ -899,6 +899,35 @@ impl TuniTerminal {
         self.imp().session.replace(None);
     }
 
+    /// Throw away what is on screen and the scrollback behind it, then ask the
+    /// program in front for its prompt again.
+    ///
+    /// The erase is fed to our own parser rather than typed at the shell, so it
+    /// works while something is running and does not depend on `clear` being
+    /// installed. `Ctrl+L` afterwards is what makes a shell — or a full-screen
+    /// program, which reads it as "redraw" — put its prompt back on the blank
+    /// screen instead of leaving the eye nothing to look at.
+    pub fn clear(&self) {
+        if self.imp().session.borrow().is_none() {
+            return;
+        }
+        // Home, erase the screen, erase the scrollback: what `clear` sends on a
+        // terminal whose terminfo carries `E3`.
+        self.feed(b"\x1b[H\x1b[2J\x1b[3J");
+        self.send_text("\x0c");
+    }
+
+    /// The selected text, if there is a selection. What a search for the
+    /// selection looks for.
+    #[must_use]
+    pub fn selection(&self) -> Option<String> {
+        let mut guard = self.imp().session.borrow_mut();
+        guard
+            .as_mut()
+            .and_then(|session| session.term.selection_text().ok().flatten())
+            .filter(|text| !text.is_empty())
+    }
+
     /// What this terminal is holding, as the VT bytes that reproduce it, for
     /// the session file. `None` for a terminal that never ran or never
     /// printed anything.
