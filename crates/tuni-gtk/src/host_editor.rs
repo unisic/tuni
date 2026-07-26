@@ -11,10 +11,15 @@
 //! `Include`, `Match`, first-value-wins and comments people rely on; a terminal
 //! that reformats it loses trust once and for good.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use adw::prelude::*;
 use gtk::glib;
 
-use tuni_core::ssh::{Host, Meta, Source};
+use tuni_core::ssh::{Forward, Host, Meta, Source};
+
+use crate::forward_editor;
 
 /// What the dialog hands back: the host as a file will hold it, and the part of
 /// it ssh syntax cannot say.
@@ -119,6 +124,50 @@ pub fn present<F>(
     options.add(&tags);
     options.add(&jump);
     page.add(&options);
+
+    // Held apart from the rows, because a forward is added and removed rather
+    // than typed, and Save is what puts the list in the file.
+    let forwards = Rc::new(RefCell::new(host.forwards.clone()));
+    let forwards_group = adw::PreferencesGroup::builder()
+        .title("Port Forwarding")
+        .description("Brought up by ssh with the connection, every time")
+        .build();
+    let forward_rows = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .build();
+    forward_rows.add_css_class("boxed-list");
+    let add_forward = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Add a forward")
+        .valign(gtk::Align::Center)
+        .build();
+    add_forward.add_css_class("flat");
+    forwards_group.set_header_suffix(Some(&add_forward));
+    forwards_group.add(&forward_rows);
+    page.add(&forwards_group);
+    draw(&forward_rows, &forwards);
+    add_forward.connect_clicked(glib::clone!(
+        #[strong]
+        forwards,
+        #[weak]
+        forward_rows,
+        move |button| {
+            forward_editor::present(
+                button,
+                None,
+                glib::clone!(
+                    #[strong]
+                    forwards,
+                    #[weak]
+                    forward_rows,
+                    move |forward| {
+                        forwards.borrow_mut().push(forward);
+                        draw(&forward_rows, &forwards);
+                    }
+                ),
+            );
+        }
+    ));
 
     let extra_group = adw::PreferencesGroup::builder()
         .title("Extra ssh options")
@@ -231,10 +280,7 @@ pub fn present<F>(
                     .filter(|_| jump.selected() != 0)
                     .cloned()
                     .unwrap_or_default(),
-                // Kept from the host that was opened: this dialog has no
-                // forwarding rows yet, and a rewrite must not drop what the
-                // file already says.
-                forwards: host.forwards.clone(),
+                forwards: forwards.borrow().clone(),
                 extra: lines(&buffer.text(&buffer.start_iter(), &buffer.end_iter(), false)),
                 source: Source::Tuni,
                 origin: None,
@@ -256,6 +302,70 @@ pub fn present<F>(
 
     dialog.present(Some(parent));
     name.grab_focus();
+}
+
+/// Draws the forwards a host declares, whole. A handful of rows, each carrying
+/// the position it edits, so a change is a redraw rather than a patch.
+fn draw(rows: &gtk::ListBox, forwards: &Rc<RefCell<Vec<Forward>>>) {
+    while let Some(row) = rows.first_child() {
+        rows.remove(&row);
+    }
+    if forwards.borrow().is_empty() {
+        let empty = adw::ActionRow::builder().title("No forwards").build();
+        empty.set_sensitive(false);
+        rows.append(&empty);
+        return;
+    }
+
+    for (index, forward) in forwards.borrow().iter().enumerate() {
+        let (title, written) = forward_editor::describe(forward);
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .subtitle(written)
+            .activatable(true)
+            .build();
+        let remove = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Remove this forward")
+            .valign(gtk::Align::Center)
+            .build();
+        remove.add_css_class("flat");
+        remove.connect_clicked(glib::clone!(
+            #[strong]
+            forwards,
+            #[weak]
+            rows,
+            move |_| {
+                forwards.borrow_mut().remove(index);
+                draw(&rows, &forwards);
+            }
+        ));
+        row.add_suffix(&remove);
+        row.connect_activated(glib::clone!(
+            #[strong]
+            forwards,
+            #[weak]
+            rows,
+            move |row| {
+                let editing = forwards.borrow()[index].clone();
+                forward_editor::present(
+                    row,
+                    Some(editing),
+                    glib::clone!(
+                        #[strong]
+                        forwards,
+                        #[weak]
+                        rows,
+                        move |forward| {
+                            forwards.borrow_mut()[index] = forward;
+                            draw(&rows, &forwards);
+                        }
+                    ),
+                );
+            }
+        ));
+        rows.append(&row);
+    }
 }
 
 /// Opens the file chooser on `~/.ssh`, where the keys are, and writes what

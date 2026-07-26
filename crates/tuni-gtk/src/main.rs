@@ -8,6 +8,7 @@ mod diff;
 mod editor;
 mod files;
 mod find;
+mod forward_editor;
 mod git;
 mod grid;
 mod host_editor;

@@ -542,12 +542,26 @@ impl Forward {
         }
     }
 
-    /// What is listened on, as the side of a spec before the target.
-    fn listen(&self) -> String {
+    /// What is listened on, as the side of a spec before the target, which is
+    /// also the word a configuration file puts after the keyword.
+    #[must_use]
+    pub fn listen(&self) -> String {
         if self.bind.is_empty() {
             self.listen_port.to_string()
         } else {
             format!("{}:{}", literal(&self.bind), self.listen_port)
+        }
+    }
+
+    /// What answers at the other end, as a word of its own. Empty for a dynamic
+    /// forward, which has no one far end: whatever connects says where it wants
+    /// to go.
+    #[must_use]
+    pub fn target(&self) -> String {
+        if self.direction == Direction::Dynamic {
+            String::new()
+        } else {
+            format!("{}:{}", literal(&self.host), self.port)
         }
     }
 
@@ -1024,8 +1038,8 @@ fn render(hosts: &[Host]) -> Result<String, String> {
                 quote(value).ok_or_else(|| format!("{value} cannot be the value of {keyword}"))
             };
             let mut text = format!("    {keyword} {}", word(&forward.listen())?);
-            if forward.direction != Direction::Dynamic {
-                let target = format!("{}:{}", literal(&forward.host), forward.port);
+            let target = forward.target();
+            if !target.is_empty() {
                 text.push(' ');
                 text.push_str(&word(&target)?);
             }
