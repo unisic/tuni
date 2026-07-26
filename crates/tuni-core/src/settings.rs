@@ -60,6 +60,10 @@ pub struct Settings {
     /// which is a decision about someone's `~` that no application should make
     /// on their behalf.
     pub restore_history: bool,
+    /// Whether a file pane wraps a long line to its width rather than scrolling
+    /// sideways. Off, as it is in kero and in every editor's own default: a
+    /// wrapped line and a real line stop being the same thing.
+    pub wrap_lines: bool,
 }
 
 /// How many lines of a pane's scrollback are kept for the replay. kero's own
@@ -133,6 +137,9 @@ impl Settings {
         if let Some(on) = table.boolean("terminal.restore-history") {
             settings.restore_history = on;
         }
+        if let Some(on) = table.boolean("editor.wrap-lines") {
+            settings.wrap_lines = on;
+        }
         settings
     }
 
@@ -191,6 +198,9 @@ impl Settings {
         }
         if self.restore_history != default.restore_history {
             let _ = writeln!(out, "terminal.restore-history = {}", self.restore_history);
+        }
+        if self.wrap_lines != default.wrap_lines {
+            let _ = writeln!(out, "editor.wrap-lines = {}", self.wrap_lines);
         }
         out
     }
@@ -448,6 +458,7 @@ mod tests {
             },
             appearance: Appearance::Dark,
             restore_history: true,
+            wrap_lines: true,
         };
         let read = Settings::parse(&settings.to_toml());
 
@@ -459,6 +470,7 @@ mod tests {
         assert_eq!(read.terminal.scrollback_lines, 50_000);
         assert_eq!(read.appearance, Appearance::Dark);
         assert!(read.restore_history);
+        assert!(read.wrap_lines);
     }
 
     #[test]

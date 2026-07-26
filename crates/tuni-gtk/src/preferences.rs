@@ -250,6 +250,21 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
         }
     ));
     behavior.add(&scrollback);
+
+    let wrap = adw::SwitchRow::builder()
+        .title("Wrap Lines in Files")
+        .subtitle("A line longer than the pane folds onto the next one instead of scrolling")
+        .active(settings.wrap_lines)
+        .build();
+    wrap.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.wrap_lines = on);
+        }
+    ));
+    behavior.add(&wrap);
     page.add(&behavior);
 
     // --- the session

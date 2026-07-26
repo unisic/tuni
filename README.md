@@ -93,8 +93,8 @@ back: the projects, their tabs, the columns and panes inside each one with the
 room they had, the names that were typed, and a fresh shell in each pane's last
 working directory. What those shells had printed is not restored unless it is
 asked for. A settings window under `Ctrl+,` edits the font, the two themes, the
-scrollback, and that last decision, writing each change to
-`~/.config/tuni/config.toml` as it is made.
+scrollback, whether a file pane wraps its long lines, and that last decision,
+writing each change to `~/.config/tuni/config.toml` as it is made.
 
 | Shortcut | Action |
 | --- | --- |
@@ -411,6 +411,7 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `cursor-blink` | `true` | And then only if the desktop blinks its own cursor, and only while the program running has no opinion |
 | `terminal.scrollback-lines` | `10000` | Lines kept above the screen |
 | `terminal.restore-history` | `false` | Whether a restored pane replays what it had printed |
+| `editor.wrap-lines` | `false` | Whether a file pane folds a long line rather than scrolling sideways |
 
 The session itself lives under `~/.local/share/tuni`. A file pane comes back
 holding the file it held, with the cursor where it was left; unsaved edits are

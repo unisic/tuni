@@ -828,6 +828,9 @@ impl TuniWindow {
         for diff in imp.diffs.borrow().values() {
             diff.set_theme(&theme);
         }
+        for editor in imp.editors.borrow().values() {
+            editor.set_wrap(settings.wrap_lines);
+        }
         crate::editor::apply_font(&settings.terminal);
         crate::diff::apply_colors(&theme);
         apply_chrome(&theme);
@@ -1337,6 +1340,7 @@ impl TuniWindow {
         editor.set_hexpand(true);
         editor.set_vexpand(true);
         editor.set_dark(adw::StyleManager::default().is_dark());
+        editor.set_wrap(imp.settings.borrow().wrap_lines);
         editor.open(path);
         if let Some(cursor) = imp.pending_cursors.borrow_mut().remove(&pane) {
             editor.set_cursor(cursor);

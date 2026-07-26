@@ -626,6 +626,17 @@ impl TuniEditor {
         }
     }
 
+    /// Whether a line too long for the pane wraps or scrolls sideways.
+    pub fn set_wrap(&self, wrap: bool) {
+        if let Some(view) = self.imp().view.borrow().as_ref() {
+            view.set_wrap_mode(if wrap {
+                gtk::WrapMode::WordChar
+            } else {
+                gtk::WrapMode::None
+            });
+        }
+    }
+
     /// Follows the desktop between light and dark. The scheme is the one
     /// GtkSourceView ships to match Adwaita, so the text sits in the same
     /// palette as the window around it.
