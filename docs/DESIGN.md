@@ -157,7 +157,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+Shift+A` | Select everything, scrollback included |
 | Drag, double click, triple click | Select by character, word, line |
 | `Alt`+drag | Block selection |
-| `Shift`+click | Select even while an application is tracking the mouse |
+| `Shift`+click | Select even while an application is following the pointer |
 | `Ctrl`+click | Open the hyperlink under the pointer |
 | `Shift+Page Up` / `Shift+Page Down` | Scroll the viewport by a page |
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
@@ -388,6 +388,18 @@ a key types with nothing held down travels with the event as well, so `Ctrl`+`С
 on a Cyrillic layout arrives as `Ctrl+C`, and the modifiers the keymap already
 folded into the character are the ones GDK says it consumed rather than a guess
 at Shift.
+
+An application that asks for the mouse gets it, and Shift is how the person at
+the keyboard takes it back. That is the convention, and it is a poor deal when
+the application asked for less than it is being given. Button-event and
+any-event tracking follow the pointer, so a drag inside one is the thing it
+asked for and selecting there needs Shift. The older click-only modes hear
+about buttons and nothing else, and a drag handed to a program that cannot be
+told the pointer moved is a drag nobody receives while a selection nobody made
+is lost. So there the press waits: leaving the cell makes it a selection, and
+lifting inside the cell makes it a click, which the application then gets
+whole. Claude Code and a good many other full-screen programs enable exactly
+those modes, and in them the mouse works as it does anywhere else.
 
 A hyperlink is whatever the program holding the PTY says it is, which over ssh
 is not the person at the keyboard. So `Ctrl` has to be held before one lights up

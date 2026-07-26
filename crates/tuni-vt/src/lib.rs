@@ -619,6 +619,17 @@ impl Terminal {
         self.inner.is_mouse_tracking().unwrap_or(false)
     }
 
+    /// Whether the application hears about the pointer moving, rather than only
+    /// about the buttons.
+    ///
+    /// Button-event and any-event tracking are the two modes a drag reaches. In
+    /// the older click-only modes a program never learns the pointer moved at
+    /// all, so a drag it would be given is a drag nobody receives.
+    pub fn tracks_mouse_motion(&self) -> bool {
+        self.inner.mode(Mode::BUTTON_MOUSE).unwrap_or(false)
+            || self.inner.mode(Mode::ANY_MOUSE).unwrap_or(false)
+    }
+
     /// Encode a key event into the bytes to write to the PTY. Returns an empty
     /// slice for keys that produce no output, such as a bare modifier.
     pub fn encode_key(&mut self, input: &KeyInput<'_>) -> Result<&[u8]> {

@@ -46,7 +46,7 @@ const PROGRESS_STALE: Duration = Duration::from_secs(15);
 
 /// What the pointer is doing between press and release. A drag either paints a
 /// selection or is reported to the application; never both.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default)]
 enum Pointer {
     #[default]
     Idle,
@@ -56,6 +56,14 @@ enum Pointer {
     /// where Ghostty opens it and where a press that slid off can still be
     /// taken back.
     Link,
+    /// Pressed where an application listens for clicks but not for motion. The
+    /// press waits: leaving the cell makes it a selection, lifting inside the
+    /// cell makes it the click the application was listening for.
+    Held {
+        x: f64,
+        y: f64,
+        time: u32,
+    },
 }
 
 /// The overlay scrollbar's thumb, in widget pixels.
@@ -1692,6 +1700,15 @@ impl TuniTerminal {
             .is_some_and(|session| session.term.is_mouse_tracking())
     }
 
+    /// Whether a drag is something the application can hear at all.
+    fn tracks_motion(&self) -> bool {
+        self.imp()
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| session.term.tracks_mouse_motion())
+    }
+
     fn report_mouse(
         &self,
         action: MouseAction,
@@ -1837,16 +1854,25 @@ impl TuniTerminal {
     }
 
     fn on_pointer_press(&self, gesture: &gtk::GestureClick, x: f64, y: f64) {
+        self.pointer_press(
+            gesture.current_button(),
+            keymap::mods_from_state(gesture.current_event_state()),
+            x,
+            y,
+            gesture.current_event_time(),
+        );
+    }
+
+    /// A button going down. Taken apart from the gesture that carries it so the
+    /// debug capture harness can press where a pointer would.
+    pub(crate) fn pointer_press(&self, button: u32, mods: Mods, x: f64, y: f64, time: u32) {
         self.grab_focus_self();
 
         let imp = self.imp();
         imp.buttons_down
             .set(imp.buttons_down.get().saturating_add(1));
         imp.pointer_pos.set((x, y));
-
-        let mods = keymap::mods_from_state(gesture.current_event_state());
         imp.mods.set(mods);
-        let button = gesture.current_button();
 
         if button == gdk::BUTTON_PRIMARY
             && self.scrollbar_hit(x)
@@ -1873,6 +1899,17 @@ impl TuniTerminal {
         }
 
         if self.reports_mouse(mods) {
+            // Ghostty hands every press to an application that tracks the
+            // mouse, which leaves Shift as the only way to select in one. That
+            // is the right answer while the application follows the pointer,
+            // and a poor one while it only listens for clicks: the drag it is
+            // being given is a drag it will never be told about. So a press of
+            // the selecting button waits, and becomes whichever of the two the
+            // pointer turns out to be doing.
+            if button == gdk::BUTTON_PRIMARY && !self.tracks_motion() {
+                imp.pointer.set(Pointer::Held { x, y, time });
+                return;
+            }
             imp.pointer.set(Pointer::Reporting);
             self.report_mouse(MouseAction::Press, mouse_button(button), mods, x, y);
             return;
@@ -1886,16 +1923,14 @@ impl TuniTerminal {
             }
             gdk::BUTTON_PRIMARY => {
                 imp.pointer.set(Pointer::Selecting);
-                let time = Duration::from_millis(u64::from(gesture.current_event_time()));
-                self.selection_press(x, y, time);
+                self.selection_press(x, y, Duration::from_millis(u64::from(time)));
             }
             _ => {}
         }
     }
 
-    /// Anchor a selection at a surface position. Public to the crate so the
-    /// debug capture harness can drive the same path a real click takes.
-    pub(crate) fn selection_press(&self, x: f64, y: f64, time: Duration) {
+    /// Anchor a selection at a surface position.
+    fn selection_press(&self, x: f64, y: f64, time: Duration) {
         let geometry = self.geometry();
         let mut guard = self.imp().session.borrow_mut();
         if let Some(session) = guard.as_mut() {
@@ -1905,7 +1940,7 @@ impl TuniTerminal {
         self.queue_draw();
     }
 
-    pub(crate) fn selection_drag(&self, x: f64, y: f64, rectangle: bool) {
+    fn selection_drag(&self, x: f64, y: f64, rectangle: bool) {
         let geometry = self.geometry();
         let mut guard = self.imp().session.borrow_mut();
         if let Some(session) = guard.as_mut() {
@@ -1916,7 +1951,7 @@ impl TuniTerminal {
     }
 
     /// End the gesture and return what is selected.
-    pub(crate) fn selection_finish(&self) -> Option<String> {
+    fn selection_finish(&self) -> Option<String> {
         let mut guard = self.imp().session.borrow_mut();
         let text = guard.as_mut().and_then(|session| {
             let _ = session.term.select_release();
@@ -1927,6 +1962,16 @@ impl TuniTerminal {
     }
 
     fn on_pointer_release(&self, gesture: &gtk::GestureClick, x: f64, y: f64) {
+        self.pointer_release(
+            gesture.current_button(),
+            keymap::mods_from_state(gesture.current_event_state()),
+            x,
+            y,
+        );
+    }
+
+    /// A button coming back up, and the end of whatever the press started.
+    pub(crate) fn pointer_release(&self, button: u32, mods: Mods, x: f64, y: f64) {
         let imp = self.imp();
         imp.buttons_down
             .set(imp.buttons_down.get().saturating_sub(1));
@@ -1938,7 +1983,6 @@ impl TuniTerminal {
             return;
         }
 
-        let mods = keymap::mods_from_state(gesture.current_event_state());
         imp.mods.set(mods);
         match imp.pointer.replace(Pointer::Idle) {
             Pointer::Link => {
@@ -1962,13 +2006,18 @@ impl TuniTerminal {
                 }
             }
             Pointer::Reporting => {
-                self.report_mouse(
-                    MouseAction::Release,
-                    mouse_button(gesture.current_button()),
-                    mods,
-                    x,
-                    y,
-                );
+                self.report_mouse(MouseAction::Release, mouse_button(button), mods, x, y);
+            }
+            Pointer::Held {
+                x: press_x,
+                y: press_y,
+                ..
+            } => {
+                // The pointer stayed in its cell, so the press was a click
+                // after all and the application gets both halves of it now.
+                let button = mouse_button(button);
+                self.report_mouse(MouseAction::Press, button, mods, press_x, press_y);
+                self.report_mouse(MouseAction::Release, button, mods, x, y);
             }
             Pointer::Selecting => {
                 // Selecting fills the primary selection, so a middle click in
@@ -1985,9 +2034,17 @@ impl TuniTerminal {
     }
 
     fn on_pointer_motion(&self, controller: &gtk::EventControllerMotion, x: f64, y: f64) {
+        self.pointer_motion(
+            keymap::mods_from_state(controller.current_event_state()),
+            x,
+            y,
+        );
+    }
+
+    /// The pointer moving, whether or not a button is down.
+    pub(crate) fn pointer_motion(&self, mods: Mods, x: f64, y: f64) {
         let imp = self.imp();
         imp.pointer_pos.set((x, y));
-        let mods = keymap::mods_from_state(controller.current_event_state());
         imp.mods.set(mods);
 
         if imp.bar_drag.get().is_some() {
@@ -2004,6 +2061,18 @@ impl TuniTerminal {
         match imp.pointer.get() {
             // Alt turns the drag into a block selection, as in Ghostty.
             Pointer::Selecting => self.selection_drag(x, y, mods.contains(Mods::ALT)),
+            Pointer::Held {
+                x: press_x,
+                y: press_y,
+                time,
+            } => {
+                let geometry = self.geometry();
+                if geometry.cell_at(press_x, press_y) != geometry.cell_at(x, y) {
+                    imp.pointer.set(Pointer::Selecting);
+                    self.selection_press(press_x, press_y, Duration::from_millis(u64::from(time)));
+                    self.selection_drag(x, y, mods.contains(Mods::ALT));
+                }
+            }
             _ => {
                 self.refresh_links(mods);
                 if self.reports_mouse(mods) {

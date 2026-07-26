@@ -647,9 +647,13 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                 terminal,
                 move || match parse_select(&spec) {
                     Some((x1, y1, x2, y2)) => {
-                        terminal.selection_press(x1, y1, std::time::Duration::ZERO);
-                        terminal.selection_drag(x2, y2, false);
-                        println!("selection: {:?}", terminal.selection_finish());
+                        // Press, drag, release, with nothing held down: the
+                        // gates a real drag meets are the point of the test.
+                        let mods = tuni_vt::Mods::empty();
+                        terminal.pointer_press(gtk::gdk::BUTTON_PRIMARY, mods, x1, y1, 0);
+                        terminal.pointer_motion(mods, x2, y2);
+                        terminal.pointer_release(gtk::gdk::BUTTON_PRIMARY, mods, x2, y2);
+                        println!("selection: {:?}", terminal.selection());
                     }
                     None => eprintln!("TUNI_CAPTURE_SELECT wants x1,y1,x2,y2"),
                 }
