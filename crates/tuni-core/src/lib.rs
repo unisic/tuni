@@ -1,10 +1,11 @@
 //! Portable workspace models — no GTK, no libghostty.
 //!
-//! Etap 0 only needs the terminal's own configuration and its colors. Projects,
-//! pane layout, session persistence, the file tree, and git status land here in
-//! Etapy 2–6.
+//! The terminal's own configuration and colors, and the projects and tabs
+//! around them. Pane layout, session persistence, the file tree, and git status
+//! land here next.
 
 pub mod theme;
+pub mod workspace;
 
 /// Point sizes a font may be zoomed to. Below the first the grid stops being
 /// legible; above the second a single cell no longer fits a sane window.

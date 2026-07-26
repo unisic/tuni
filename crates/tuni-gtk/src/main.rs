@@ -1,18 +1,37 @@
-//! Etap 0 shell: one window, one terminal, nothing else.
+//! The application: one window, and the keyboard shortcuts that reach it.
 //!
-//! Projects, tabs, and the pane layout arrive in Etapy 2–3. Keeping this file
-//! deliberately thin means the widget carries the whole feasibility question,
-//! which is what the spike is meant to answer.
+//! Everything the window does lives in `window.rs`; this file is the process.
 
 mod keymap;
 mod terminal;
+mod window;
 
 use adw::prelude::*;
 use gtk::glib;
 
 use terminal::TuniTerminal;
+use window::TuniWindow;
 
 const APP_ID: &str = "dev.unisic.Tuni";
+
+/// What the keyboard does, as data rather than as scattered constants — Etap 4
+/// reads the same table out of a configuration file.
+///
+/// A terminal cannot spend plain `Ctrl` on the application: `Ctrl+C` and
+/// `Ctrl+D` belong to the shell. So the application's own actions sit on
+/// `Ctrl+Shift`, which is the convention every Linux terminal follows, and tab
+/// selection on `Alt`+digit, which is what a tabbed terminal does. `Ctrl+Tab`
+/// is the exception, because nothing in a shell wants it.
+const ACCELS: &[(&str, &[&str])] = &[
+    ("win.new-tab", &["<Ctrl><Shift>t"]),
+    ("win.close-tab", &["<Ctrl><Shift>w"]),
+    ("win.next-tab", &["<Ctrl>Tab", "<Ctrl>Page_Down"]),
+    ("win.previous-tab", &["<Ctrl><Shift>Tab", "<Ctrl>Page_Up"]),
+    ("win.new-project", &["<Ctrl><Shift>n"]),
+    ("win.next-project", &["<Ctrl><Alt>Down"]),
+    ("win.previous-project", &["<Ctrl><Alt>Up"]),
+    ("win.toggle-sidebar", &["F9", "<Ctrl><Shift>b"]),
+];
 
 fn main() -> glib::ExitCode {
     // Not unique: a terminal launched from a shell must inherit *that* shell's
@@ -22,91 +41,33 @@ fn main() -> glib::ExitCode {
         .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
+    app.connect_startup(|app| {
+        for (action, accels) in ACCELS {
+            app.set_accels_for_action(action, accels);
+        }
+        for number in 1..=9 {
+            app.set_accels_for_action(
+                &format!("win.select-tab({number})"),
+                &[&format!("<Alt>{number}")],
+            );
+        }
+    });
     app.connect_activate(build_window);
     app.run()
 }
 
 fn build_window(app: &adw::Application) {
-    let terminal = TuniTerminal::new();
-    terminal.set_hexpand(true);
-    terminal.set_vexpand(true);
-    terminal.set_config(&config());
-
-    let header = adw::HeaderBar::new();
-    let title = adw::WindowTitle::new("tuni", "");
-    header.set_title_widget(Some(&title));
-
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content.append(&header);
-    content.append(&terminal);
-
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .default_width(960)
-        .default_height(640)
-        .content(&content)
-        .build();
-
-    // The window title tracks OSC 0/2 through the widget's `title` property.
-    terminal.connect_notify_local(
-        Some("title"),
-        glib::clone!(
-            #[weak]
-            title,
-            move |terminal: &TuniTerminal, _| {
-                if let Some(text) = terminal.title() {
-                    title.set_title(&text);
-                }
-            }
-        ),
-    );
-
-    // And the subtitle tracks OSC 7, so the window says where the shell is.
-    terminal.connect_notify_local(
-        Some("cwd"),
-        glib::clone!(
-            #[weak]
-            title,
-            move |terminal: &TuniTerminal, _| {
-                if let Some(cwd) = terminal.cwd() {
-                    title.set_subtitle(&shorten(&cwd));
-                }
-            }
-        ),
-    );
-
-    // The theme is the desktop's business, not one terminal's: the style
-    // manager says light or dark, the config names a theme for each, and the
-    // window paints its chrome to match whatever the terminal ended up with.
-    let style = adw::StyleManager::default();
-    let recolor = glib::clone!(
-        #[weak]
-        terminal,
-        move |style: &adw::StyleManager| {
-            let theme = config().theme(style.is_dark());
-            terminal.set_theme(&theme);
-            apply_chrome(&theme);
-        }
-    );
-    style.connect_dark_notify(recolor.clone());
-    recolor(&style);
-
+    let window = TuniWindow::new(app, config());
     window.present();
 
-    // Spawn after presenting, so the first allocation has already sized the
-    // grid and the shell never sees a bogus 80x24 winsize.
+    // The first project's shell learns its size from the first allocation, so
+    // it opens after the window is on screen rather than before.
     glib::idle_add_local_once(glib::clone!(
-        #[weak]
-        terminal,
         #[weak]
         window,
         move || {
-            if let Err(error) = terminal.start(std::env::current_dir().ok()) {
-                let dialog = adw::AlertDialog::new(Some("Cannot start shell"), Some(&error));
-                dialog.add_response("close", "Close");
-                dialog.present(Some(&window));
-            } else {
-                let _ = terminal.grab_focus();
+            window.open_project();
+            if let Some(terminal) = window.active_terminal() {
                 maybe_capture(&window, &terminal);
             }
         }
@@ -135,86 +96,17 @@ fn config() -> tuni_core::TerminalConfig {
     config
 }
 
-/// Paint the window chrome from the terminal's theme.
-///
-/// libadwaita builds its whole stylesheet out of named colors, so overriding
-/// those recolors the header bar, dialogs, and popovers consistently — far more
-/// robust than styling widgets one by one, and it keeps working as libadwaita
-/// adds widgets. One provider, reloaded, so switching themes does not stack
-/// stylesheets on the display.
-fn apply_chrome(theme: &tuni_core::theme::Theme) {
-    thread_local! {
-        static PROVIDER: gtk::CssProvider = gtk::CssProvider::new();
-    }
-
-    let accent = theme.accent();
-    let css = format!(
-        "@define-color window_bg_color {bg};\n\
-         @define-color window_fg_color {fg};\n\
-         @define-color view_bg_color {bg};\n\
-         @define-color view_fg_color {fg};\n\
-         @define-color headerbar_bg_color {header};\n\
-         @define-color headerbar_fg_color {fg};\n\
-         @define-color headerbar_border_color {border};\n\
-         @define-color headerbar_backdrop_color {bg};\n\
-         @define-color sidebar_bg_color {sidebar};\n\
-         @define-color sidebar_fg_color {fg};\n\
-         @define-color sidebar_border_color {border};\n\
-         @define-color sidebar_backdrop_color {bg};\n\
-         @define-color popover_bg_color {raised};\n\
-         @define-color popover_fg_color {fg};\n\
-         @define-color dialog_bg_color {raised};\n\
-         @define-color dialog_fg_color {fg};\n\
-         @define-color card_bg_color {raised};\n\
-         @define-color card_fg_color {fg};\n\
-         @define-color accent_color {accent};\n\
-         @define-color accent_bg_color {accent};\n\
-         @define-color accent_fg_color {on_accent};\n",
-        bg = theme.background.to_hex(),
-        fg = theme.foreground.to_hex(),
-        header = theme.surface(0.06).to_hex(),
-        sidebar = theme.surface(0.03).to_hex(),
-        raised = theme.surface(0.10).to_hex(),
-        border = theme.surface(0.20).to_hex(),
-        accent = accent.to_hex(),
-        on_accent = accent.contrasting().to_hex(),
-    );
-
-    let Some(display) = gtk::gdk::Display::default() else {
-        return;
-    };
-    PROVIDER.with(|provider| {
-        provider.load_from_string(&css);
-        gtk::style_context_add_provider_for_display(
-            &display,
-            provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    });
-}
-
-/// A path as a person would write it: `/home/me/src` is `~/src`.
-fn shorten(path: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    match path.strip_prefix(&home) {
-        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
-            format!("~{rest}")
-        }
-        _ => path.to_owned(),
-    }
-}
-
-/// Debug capture: render the terminal to a PNG and quit.
+/// Debug capture: render the window to a PNG and quit.
 ///
 /// Driven by environment variables so it costs nothing in a normal run.
 /// `TUNI_CAPTURE_PNG` is the output path, `TUNI_CAPTURE_INPUT` is text typed
 /// into the shell first, and `TUNI_CAPTURE_DELAY_MS` is how long to wait for
 /// that command to finish before the shot is taken.
 ///
-/// The terminal only: `GtkWidgetPaintable` renders our own widget but draws
-/// nothing for the window or its content box, so the header bar cannot be
-/// captured this way.
-fn maybe_capture(window: &adw::ApplicationWindow, terminal: &TuniTerminal) {
+/// `TUNI_CAPTURE_WIDGET=window` shoots the whole window, chrome included;
+/// anything else shoots the terminal alone, which is what the rendering
+/// captures want.
+fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
     let Ok(path) = std::env::var("TUNI_CAPTURE_PNG") else {
         return;
     };
@@ -232,6 +124,38 @@ fn maybe_capture(window: &adw::ApplicationWindow, terminal: &TuniTerminal) {
                 move || terminal.send_text(&input)
             ),
         );
+    }
+
+    // Actions typed the way the keyboard would reach them: "win.new-tab" or
+    // "win.new-project", one per comma, each a step later, so a capture can
+    // show a window that has more than one of anything.
+    if let Ok(actions) = std::env::var("TUNI_CAPTURE_ACTIONS") {
+        for (step, action) in actions.split(',').map(str::trim).enumerate() {
+            let action = action.to_owned();
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(500 + 250 * step as u64),
+                glib::clone!(
+                    #[weak]
+                    window,
+                    move || {
+                        let (name, target) = match action.split_once('(') {
+                            Some((name, rest)) => (
+                                name.to_owned(),
+                                rest.trim_end_matches(')').parse::<i32>().ok(),
+                            ),
+                            None => (action.clone(), None),
+                        };
+                        let name = name.strip_prefix("win.").unwrap_or(&name);
+                        gtk::prelude::WidgetExt::activate_action(
+                            &window,
+                            &format!("win.{name}"),
+                            target.map(|value| value.to_variant()).as_ref(),
+                        )
+                        .unwrap_or_else(|_| eprintln!("no such action: {name}"));
+                    }
+                ),
+            );
+        }
     }
 
     // A scripted zoom, in whole steps, driving the same path Ctrl+plus does.
@@ -305,15 +229,22 @@ fn maybe_capture(window: &adw::ApplicationWindow, terminal: &TuniTerminal) {
         );
     }
 
+    let whole_window = std::env::var("TUNI_CAPTURE_WIDGET").is_ok_and(|value| value == "window");
     glib::timeout_add_local_once(
         std::time::Duration::from_millis(delay),
         glib::clone!(
             #[weak]
-            terminal,
-            #[weak]
             window,
             move || {
-                if let Err(error) = capture(terminal.upcast_ref(), &path) {
+                let target: gtk::Widget = if whole_window {
+                    window.clone().upcast()
+                } else {
+                    match window.active_terminal() {
+                        Some(terminal) => terminal.upcast(),
+                        None => window.clone().upcast(),
+                    }
+                };
+                if let Err(error) = capture(&target, &path) {
                     eprintln!("capture failed: {error}");
                 }
                 window.close();

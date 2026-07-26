@@ -248,6 +248,21 @@ mod imp {
             }
         }
 
+        fn signals() -> &'static [glib::subclass::Signal] {
+            static SIGNALS: std::sync::OnceLock<Vec<glib::subclass::Signal>> =
+                std::sync::OnceLock::new();
+            SIGNALS.get_or_init(|| {
+                vec![
+                    // The shell is gone. Whoever placed this widget decides what
+                    // that means — the tab strip closes the tab.
+                    glib::subclass::Signal::builder("exited").build(),
+                    // The application rang. A tab that is not on screen shows it
+                    // as an attention mark rather than as a sound.
+                    glib::subclass::Signal::builder("bell").build(),
+                ]
+            })
+        }
+
         fn constructed(&self) {
             self.parent_constructed();
             let obj = self.obj();
@@ -732,6 +747,7 @@ impl TuniTerminal {
                         PtyEvent::Exited => {
                             this.imp().session.replace(None);
                             this.queue_draw();
+                            this.emit_by_name::<()>("exited", &[]);
                             break;
                         }
                     }
@@ -740,6 +756,16 @@ impl TuniTerminal {
         ));
 
         Ok(())
+    }
+
+    /// Hang up: drop the PTY, which closes the master and sends the shell its
+    /// SIGHUP — the same death a closed terminal window deals.
+    ///
+    /// Dropping the widget does this too, but a closed tab may outlive its own
+    /// close for as long as an animation holds a reference, and the shell
+    /// should not.
+    pub fn shutdown(&self) {
+        self.imp().session.replace(None);
     }
 
     fn feed(&self, bytes: &[u8]) {
@@ -784,6 +810,7 @@ impl TuniTerminal {
         }
         if effects.bell {
             self.error_bell();
+            self.emit_by_name::<()>("bell", &[]);
         }
         for request in &effects.clipboard_writes {
             if std::env::var_os("TUNI_DEBUG_CLIPBOARD").is_some() {
