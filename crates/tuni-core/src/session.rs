@@ -7,6 +7,12 @@
 //! starts fresh shells in those directories — a shell is a process, and a
 //! process cannot be saved to disk.
 //!
+//! A connection is not a shell. Opening one again means authenticating again,
+//! and authenticating can ask for a password or a key touch, so a pane that
+//! was on another machine comes back naming its host rather than dialling it.
+//! It dials by itself only when a shared connection to that host is already
+//! open, because then there is nothing left to ask.
+//!
 //! Everything that is not shape is optional, and a field that fails to read
 //! falls back rather than failing the whole file. A snapshot is a convenience;
 //! refusing to open a window because one number in it went missing would make
@@ -51,6 +57,11 @@ pub struct PaneSnapshot {
     /// readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<bool>,
+    /// The host an ssh pane was connected to, by the name `ssh` was given.
+    /// Absent on every other pane, which is what keeps a session written
+    /// before there was ssh readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<String>,
 }
 
 /// What the window knows about a pane that the model does not: the scrollback
@@ -293,6 +304,10 @@ fn snap_tab(tab: &Tab, state: &impl Fn(Id) -> PaneState) -> TabSnapshot {
                                 Content::Diff { staged, .. } => Some(staged),
                                 _ => None,
                             },
+                            ssh: match &pane.content {
+                                Content::Ssh { alias } => Some(alias.clone()),
+                                _ => None,
+                            },
                         }
                     })
                     .collect(),
@@ -317,10 +332,11 @@ fn restore_tab(
                 .panes
                 .iter()
                 .map(|saved| {
-                    let mut pane = match (&saved.file, saved.diff) {
-                        (Some(path), Some(staged)) => Pane::diff(PathBuf::from(path), staged),
-                        (Some(path), None) => Pane::file(PathBuf::from(path)),
-                        (None, _) => Pane::new(),
+                    let mut pane = match (&saved.ssh, &saved.file, saved.diff) {
+                        (Some(alias), _, _) => Pane::ssh(alias.clone()),
+                        (None, Some(path), Some(staged)) => Pane::diff(PathBuf::from(path), staged),
+                        (None, Some(path), None) => Pane::file(PathBuf::from(path)),
+                        (None, None, _) => Pane::new(),
                     };
                     if saved.directory.is_some() {
                         pane.directory.clone_from(&saved.directory);
@@ -569,6 +585,55 @@ mod tests {
         assert_eq!(pane.path(), Some(Path::new("/src/main.rs")));
         assert_eq!(pane.directory.as_deref(), Some("/src"));
         assert_eq!(restored.cursors.get(&pane.id()), Some(&42));
+    }
+
+    #[test]
+    fn an_ssh_pane_comes_back_pointing_at_its_host() {
+        let mut saved = workspace(&[1]);
+        let project = saved.projects()[0].id();
+        let tab = saved.projects()[0].tabs()[0].id();
+        saved
+            .project_mut(project)
+            .and_then(|project| project.tab_mut(tab))
+            .expect("just built")
+            .layout_mut()
+            .split(Pane::ssh("prod-db".to_owned()), Edge::Right);
+
+        let text = serde_json::to_string(&Snapshot::of(&saved, |_| PaneState::default()))
+            .expect("plain data");
+        let read: Snapshot = serde_json::from_str(&text).expect("what we just wrote");
+        let restored = read.restore().workspace;
+
+        let pane = restored.projects()[0].tabs()[0]
+            .layout()
+            .panes()
+            .find(|pane| matches!(pane.content, Content::Ssh { .. }))
+            .expect("the connection is still a connection");
+        assert_eq!(
+            pane.content,
+            Content::Ssh {
+                alias: "prod-db".to_owned()
+            }
+        );
+        // The tab reads the host name from the moment the window opens, before
+        // anything has been dialled and before a remote prompt has said
+        // anything about itself.
+        assert_eq!(pane.title.as_deref(), Some("prod-db"));
+    }
+
+    #[test]
+    fn a_session_written_before_there_was_ssh_still_opens() {
+        let read: Snapshot = serde_json::from_str(
+            r#"{"projects":[{"tabs":[{"columns":[{"panes":[
+                {"file":"/src/main.rs"},{"directory":"/src"}
+            ]}]}]}]}"#,
+        )
+        .expect("a pane with no ssh key is a pane that predates ssh");
+        let restored = read.restore().workspace;
+
+        let panes = restored.projects()[0].tabs()[0].layout().columns()[0].panes();
+        assert_eq!(panes[0].path(), Some(Path::new("/src/main.rs")));
+        assert_eq!(panes[1].content, Content::Terminal);
     }
 
     #[test]

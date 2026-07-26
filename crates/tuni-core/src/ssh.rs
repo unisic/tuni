@@ -180,6 +180,34 @@ impl Control {
         options
     }
 
+    /// Whether a shared connection to `destination` is already open and
+    /// answering.
+    ///
+    /// This is the question that decides whether tuni may connect to something
+    /// nobody asked it to connect to. A master that answers has been through
+    /// whatever the far end wanted, be that a password, a code or a key touch,
+    /// so attaching to it asks nobody anything. Anything else is a login, and a
+    /// window putting eight panes back must not start eight logins.
+    ///
+    /// A socket left behind by a killed master answers nothing and reads as
+    /// down here, which is the safe way round: the worst it costs is a
+    /// connection the user has to ask for.
+    ///
+    /// Two subprocesses, so the caller belongs off the main thread.
+    #[must_use]
+    pub fn is_live(&self, destination: &str) -> bool {
+        let mut args = Vec::new();
+        for option in self.options(destination) {
+            args.push("-o".to_owned());
+            args.push(option);
+        }
+        args.push("-O".to_owned());
+        args.push("check".to_owned());
+        args.push("--".to_owned());
+        args.push(destination.to_owned());
+        run(&args).code == 0
+    }
+
     /// Whether the socket directory is there, making it if it is not. No
     /// directory means no sharing, which costs an authentication per pane and
     /// breaks nothing.
@@ -1208,5 +1236,14 @@ mod tests {
         assert_eq!(host.hostname, "tuni-no-such-alias");
         assert_eq!(host.port, 22);
         assert!(!host.user.is_empty());
+    }
+
+    #[test]
+    fn a_connection_nobody_opened_is_not_live() {
+        // The whole restore rule hangs on this answering `false` rather than
+        // hanging or dialling: `ssh -O check` talks to a socket that is not
+        // there and gives up at once, without touching the network.
+        assert!(!Control::new(true).is_live("tuni-no-such-alias"));
+        assert!(!Control::new(false).is_live("tuni-no-such-alias"));
     }
 }

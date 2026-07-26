@@ -37,6 +37,7 @@ use crate::notify;
 use crate::palette;
 use crate::panel::TuniPanel;
 use crate::preferences;
+use crate::remote::TuniRemote;
 use crate::switcher::{Card, TuniSwitcher};
 use crate::terminal::{Launch, TuniTerminal};
 
@@ -230,7 +231,7 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
 mod imp {
     use super::{
         Cell, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniFind, TuniGrid, TuniPanel,
-        TuniSwitcher, TuniTerminal, Workspace, glib,
+        TuniRemote, TuniSwitcher, TuniTerminal, Workspace, glib,
     };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
@@ -245,6 +246,10 @@ mod imp {
         pub editors: RefCell<HashMap<Id, TuniEditor>>,
         /// One diff per pane showing what changed in a file, by pane id.
         pub diffs: RefCell<HashMap<Id, TuniDiff>>,
+        /// The bar an ssh pane wears above its terminal, by pane id. The
+        /// terminal underneath is in `terminals` like any other, since it is
+        /// one: only what the grid draws differs.
+        pub remotes: RefCell<HashMap<Id, TuniRemote>>,
         /// One layout of panes per tab, by tab id.
         pub grids: RefCell<HashMap<Id, TuniGrid>>,
         /// The strip entry each tab was given, by tab id.
@@ -1266,7 +1271,7 @@ impl TuniWindow {
         for (project, tabs, chosen) in plan {
             self.attach_project(project);
             for (position, tab) in tabs.iter().enumerate() {
-                self.attach_tab(project, *tab, position as i32);
+                self.attach_tab(project, *tab, position as i32, false);
             }
             // Inserting pages moved the selection along with them; put it back
             // where the session left it.
@@ -1468,7 +1473,7 @@ impl TuniWindow {
             project.insert_tab(position.max(0) as usize, tab);
         }
 
-        let Some(page) = self.attach_tab(project, tab_id, position) else {
+        let Some(page) = self.attach_tab(project, tab_id, position, true) else {
             return;
         };
         view.set_selected_page(&page);
@@ -1481,7 +1486,18 @@ impl TuniWindow {
     /// One tab is one page holding one [`TuniGrid`]; a fresh tab has a single
     /// pane in it and a restored one has however many it was saved with, which
     /// is the only difference between opening a tab and restoring one.
-    fn attach_tab(&self, project: Id, tab: Id, position: i32) -> Option<adw::TabPage> {
+    ///
+    /// `requested` says whether somebody asked for this tab just now, as
+    /// against a window putting back what it had. It decides one thing: a
+    /// connection nobody asked for waits to be asked, because dialling one can
+    /// want a password.
+    fn attach_tab(
+        &self,
+        project: Id,
+        tab: Id,
+        position: i32,
+        requested: bool,
+    ) -> Option<adw::TabPage> {
         let imp = self.imp();
         let view = imp.views.borrow().get(&project).cloned()?;
 
@@ -1519,12 +1535,16 @@ impl TuniWindow {
                     .map(PathBuf::from)
                     .filter(|path| path.is_dir())
                     .or_else(|| fallback.clone());
-                Some((self.new_terminal(project, tab, pane), pane, content, cwd))
+                let terminal = self.new_terminal(project, tab, pane);
+                if is_remote(&content) {
+                    self.new_remote(project, tab, pane, &terminal);
+                }
+                Some((terminal, pane, content, cwd))
             })
             .collect();
         self.rebuild_grid(project, tab);
         for (terminal, pane, content, cwd) in started {
-            self.start_session(&terminal, pane, &content, cwd);
+            self.start_session(&terminal, pane, &content, cwd, requested);
         }
         Some(page)
     }
@@ -1580,6 +1600,39 @@ impl TuniWindow {
         imp.terminals.borrow_mut().insert(pane, terminal.clone());
         self.watch_terminal(&terminal, project, tab, pane);
         terminal
+    }
+
+    /// The bar an ssh pane wears above its terminal, wired to the one thing it
+    /// offers.
+    fn new_remote(&self, project: Id, tab: Id, pane: Id, terminal: &TuniTerminal) -> TuniRemote {
+        let remote = TuniRemote::new(terminal);
+        remote.connect_open(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            terminal,
+            move || {
+                let content = this.pane_content(project, tab, pane);
+                if let Some(content) = content {
+                    this.start_session(&terminal, pane, &content, None, true);
+                }
+            }
+        ));
+        self.imp().remotes.borrow_mut().insert(pane, remote.clone());
+        remote
+    }
+
+    /// What a pane holds, read out of the model.
+    fn pane_content(&self, project: Id, tab: Id, pane: Id) -> Option<Content> {
+        self.imp()
+            .workspace
+            .borrow()
+            .project(project)?
+            .tab(tab)?
+            .layout()
+            .panes()
+            .find(|entry| entry.id() == pane)
+            .map(|entry| entry.content.clone())
     }
 
     /// An editor for one pane, opened on a file and remembered.
@@ -1685,7 +1738,7 @@ impl TuniWindow {
             project.insert_tab(position.max(0) as usize, tab);
         }
 
-        let Some(page) = self.attach_tab(project, tab_id, position) else {
+        let Some(page) = self.attach_tab(project, tab_id, position, true) else {
             return;
         };
         view.set_selected_page(&page);
@@ -1815,23 +1868,23 @@ impl TuniWindow {
         self.focus_pane();
     }
 
-    /// Starts a shell once its widget has been allocated.
-    ///
-    /// The shell learns its window size from that first allocation, so starting
-    /// it any earlier opens it at 80x24 and corrects it under its own feet.
-    ///
-    /// A restored pane replays what it had printed once the shell is up, so the
-    /// old output sits above the new prompt rather than racing it.
     /// Starts what a pane holds: a shell straight away, or a connection once
     /// `ssh` has been asked what its command line should be. That question is
     /// a subprocess, so it is not asked on this thread and the pane sits empty
     /// until the answer comes back.
+    ///
+    /// `requested` is the reconnect rule, which is to dial exactly when doing
+    /// so cannot ask anybody anything. Somebody who pressed Connect is there
+    /// to answer a prompt. A window putting its panes back is not, so it
+    /// dials only where a shared connection is already open and there is
+    /// nothing left to authenticate; the rest come back as an offer.
     fn start_session(
         &self,
         terminal: &TuniTerminal,
         pane: Id,
         content: &Content,
         cwd: Option<PathBuf>,
+        requested: bool,
     ) {
         let Content::Ssh { alias } = content else {
             self.start_terminal(
@@ -1845,6 +1898,7 @@ impl TuniWindow {
             return;
         };
         let alias = alias.clone();
+        let name = alias.clone();
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -1852,13 +1906,25 @@ impl TuniWindow {
             terminal,
             async move {
                 let Ok(argv) = gio::spawn_blocking(move || {
+                    let control = tuni_core::ssh::Control::new(true);
                     let host = tuni_core::ssh::host(&alias);
-                    tuni_core::ssh::command(&host, &tuni_core::ssh::Control::new(true))
+                    (requested || control.is_live(&host.target()))
+                        .then(|| tuni_core::ssh::command(&host, &control))
                 })
                 .await
                 else {
                     return;
                 };
+                let remote = this.imp().remotes.borrow().get(&pane).cloned();
+                let Some(argv) = argv else {
+                    if let Some(remote) = remote {
+                        remote.set_idle(&format!("Not connected to {name}"), "Connect");
+                    }
+                    return;
+                };
+                if let Some(remote) = remote {
+                    remote.set_running();
+                }
                 this.start_terminal(
                     &terminal,
                     pane,
@@ -1872,6 +1938,13 @@ impl TuniWindow {
         ));
     }
 
+    /// Starts a shell once its widget has been allocated.
+    ///
+    /// The shell learns its window size from that first allocation, so starting
+    /// it any earlier opens it at 80x24 and corrects it under its own feet.
+    ///
+    /// A restored pane replays what it had printed once the shell is up, so the
+    /// old output sits above the new prompt rather than racing it.
     fn start_terminal(&self, terminal: &TuniTerminal, pane: Id, launch: Launch) {
         glib::idle_add_local_once(glib::clone!(
             #[weak(rename_to = this)]
@@ -1995,6 +2068,14 @@ impl TuniWindow {
                 .borrow()
                 .iter()
                 .map(|(id, diff)| (*id, diff.clone().upcast())),
+        );
+        // Last, so a connection's bar replaces the bare terminal already
+        // entered for it above.
+        widgets.extend(
+            imp.remotes
+                .borrow()
+                .iter()
+                .map(|(id, remote)| (*id, remote.clone().upcast())),
         );
         widgets
     }
@@ -2125,16 +2206,13 @@ impl TuniWindow {
     /// refused key or a dropped link leaves an explanation on the screen, and
     /// closing the pane throws the explanation away with it.
     fn session_ended(&self, project: Id, tab: Id, pane: Id) {
-        let remote = self
-            .imp()
-            .workspace
-            .borrow()
-            .project(project)
-            .and_then(|project| project.tab(tab))
-            .and_then(|tab| tab.layout().panes().find(|entry| entry.id() == pane))
-            .is_some_and(|entry| is_remote(&entry.content));
-        if !remote {
+        let Some(Content::Ssh { alias }) = self.pane_content(project, tab, pane) else {
             self.close_pane(project, tab, pane);
+            return;
+        };
+        let remote = self.imp().remotes.borrow().get(&pane).cloned();
+        if let Some(remote) = remote {
+            remote.set_idle(&format!("Disconnected from {alias}"), "Reconnect");
         }
     }
 
@@ -2197,6 +2275,7 @@ impl TuniWindow {
             crate::debug::watch(&terminal, "TuniTerminal", pane.raw());
         }
         imp.editors.borrow_mut().remove(&pane);
+        imp.remotes.borrow_mut().remove(&pane);
     }
 
     /// Closes one pane, and the tab with it when it was the last one.

@@ -17,6 +17,7 @@ mod notify;
 mod palette;
 mod panel;
 mod preferences;
+mod remote;
 mod sprites;
 mod switcher;
 mod terminal;
