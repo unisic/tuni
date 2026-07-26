@@ -19,3 +19,4 @@ tuni-vt.workspace = true
 adw = { package = "libadwaita", version = "0.8", features = ["v1_6"] }
 gtk = { package = "gtk4", version = "0.10", features = ["v4_12"] }
 unicode-width = "0.2"
+sourceview5 = { version = "0.10", features = ["v5_10"] }

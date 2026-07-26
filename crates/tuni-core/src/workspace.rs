@@ -69,6 +69,17 @@ impl Tab {
         }
     }
 
+    /// A tab whose one pane is not the shell a new tab would hold — what
+    /// opening a file in a tab of its own builds.
+    #[must_use]
+    pub fn with_pane(pane: Pane) -> Self {
+        Self {
+            id: Id::next(),
+            custom_name: None,
+            layout: Layout::new(pane),
+        }
+    }
+
     #[must_use]
     pub fn id(&self) -> Id {
         self.id

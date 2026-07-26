@@ -11,6 +11,8 @@
 //! it has in proportion to them, so a window resize needs no model change at
 //! all, and a saved layout restores into a window of any size.
 
+use std::path::{Path, PathBuf};
+
 use crate::workspace::Id;
 
 /// The smallest share of an axis a single tile may be shrunk to. Below this a
@@ -48,13 +50,27 @@ impl Edge {
     }
 }
 
-/// One tile: a terminal, and what the shell inside it last said about itself.
+/// What a tile is showing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Content {
+    /// A shell. Every pane was one of these before there was anything else.
+    #[default]
+    Terminal,
+    /// A file, open for editing.
+    File(PathBuf),
+}
+
+/// One tile: what it holds, and what that last said about itself.
 #[derive(Clone, Debug)]
 pub struct Pane {
     id: Id,
-    /// What the shell last said through OSC 0/2.
+    pub content: Content,
+    /// What the shell last said through OSC 0/2. A file pane has no shell, so
+    /// the window titles it from the file instead.
     pub title: Option<String>,
-    /// Where the shell last said it is, through OSC 7.
+    /// Where the shell last said it is, through OSC 7 — or, for a file, the
+    /// directory it sits in, so the panels beside it still have somewhere to
+    /// point.
     pub directory: Option<String>,
     /// Share of its column's height.
     pub weight: f64,
@@ -65,15 +81,56 @@ impl Pane {
     pub fn new() -> Self {
         Self {
             id: Id::next(),
+            content: Content::Terminal,
             title: None,
             directory: None,
             weight: 1.0,
         }
     }
 
+    /// A pane holding a file. It is named by the file, since there is no
+    /// shell in it to say what it is doing.
+    #[must_use]
+    pub fn file(path: PathBuf) -> Self {
+        let directory = path
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned());
+        let title = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        Self {
+            content: Content::File(path),
+            title,
+            directory,
+            ..Self::new()
+        }
+    }
+
     #[must_use]
     pub fn id(&self) -> Id {
         self.id
+    }
+
+    /// The file this pane is showing, if it is showing one.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        match &self.content {
+            Content::Terminal => None,
+            Content::File(path) => Some(path),
+        }
+    }
+
+    /// Points a file pane at another path, after the file was renamed under it.
+    /// The bytes have not moved, so nothing is re-read; what is already open
+    /// simply saves to the new name.
+    pub fn set_path(&mut self, path: PathBuf) {
+        if matches!(self.content, Content::File(_)) {
+            *self = Self {
+                id: self.id,
+                weight: self.weight,
+                ..Self::file(path)
+            };
+        }
     }
 }
 

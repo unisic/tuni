@@ -23,7 +23,6 @@ use gtk::{gdk, graphene};
 use tuni_core::panes::{Edge, Layout};
 use tuni_core::workspace::Id;
 
-use crate::terminal::TuniTerminal;
 use crate::tiles::{GAP, TuniTiles};
 
 /// The box a dragged pane is scaled to fit inside, keeping its own proportions
@@ -35,7 +34,8 @@ const THUMBNAIL: (f64, f64) = (220.0, 160.0);
 struct PaneWidgets {
     id: Id,
     container: gtk::Box,
-    /// Holds the terminal, which belongs to the window rather than to us.
+    /// Holds the pane's own widget — a terminal or an editor — which belongs
+    /// to the window rather than to us.
     overlay: gtk::Overlay,
 }
 
@@ -109,10 +109,11 @@ impl TuniGrid {
         }
     }
 
-    /// Builds the layout as widgets, taking the terminals from `terminals`.
-    pub fn rebuild(&self, layout: &Layout, terminals: &HashMap<Id, TuniTerminal>) {
-        // Hand every terminal back before the old tree goes, so none of them is
-        // carried off by a widget being disposed. Taken out of the cell first:
+    /// Builds the layout as widgets, taking each pane's own widget from
+    /// `panes`.
+    pub fn rebuild(&self, layout: &Layout, panes: &HashMap<Id, gtk::Widget>) {
+        // Hand every pane's widget back before the old tree goes, so none of
+        // them is carried off by a widget being disposed. Taken out first:
         // unparenting moves the keyboard, and whoever hears about that is
         // entitled to look at this list.
         let old: Vec<PaneWidgets> = self.imp().panes.borrow_mut().drain(..).collect();
@@ -132,7 +133,7 @@ impl TuniGrid {
             } else {
                 layout.columns()[0].panes()[0].id()
             };
-            let pane = self.build_pane(id, terminals, split, false);
+            let pane = self.build_pane(id, panes, split, false);
             self.set_child(Some(&pane));
             self.refresh_focus();
             return;
@@ -142,7 +143,7 @@ impl TuniGrid {
         for (index, column) in layout.columns().iter().enumerate() {
             let stack = TuniTiles::new(gtk::Orientation::Vertical);
             for pane in column.panes() {
-                let widget = self.build_pane(pane.id(), terminals, true, true);
+                let widget = self.build_pane(pane.id(), panes, true, true);
                 stack.append(&widget, pane.weight);
             }
             stack.connect_resized(glib::clone!(
@@ -186,12 +187,13 @@ impl TuniGrid {
         }
     }
 
-    /// One tile: the terminal, a ring around it while the tab is split, a grip
-    /// to carry it by, and the hint shown when something is dropped on it.
+    /// One tile: what the pane holds, a ring around it while the tab is split,
+    /// a grip to carry it by, and the hint shown when something is dropped on
+    /// it.
     fn build_pane(
         &self,
         id: Id,
-        terminals: &HashMap<Id, TuniTerminal>,
+        panes: &HashMap<Id, gtk::Widget>,
         ring: bool,
         movable: bool,
     ) -> gtk::Box {
@@ -203,8 +205,8 @@ impl TuniGrid {
         let overlay = gtk::Overlay::new();
         overlay.set_hexpand(true);
         overlay.set_vexpand(true);
-        if let Some(terminal) = terminals.get(&id) {
-            overlay.set_child(Some(terminal));
+        if let Some(widget) = panes.get(&id) {
+            overlay.set_child(Some(widget));
         }
         overlay.add_overlay(&preview);
 

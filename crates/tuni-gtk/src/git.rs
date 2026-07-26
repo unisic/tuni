@@ -34,6 +34,8 @@ mod imp {
     /// Told how many files have changed, so whatever holds the panel can put
     /// the number where it is visible without the panel showing.
     pub type Handler = Rc<dyn Fn(usize)>;
+    /// The window's, called with the file a row names.
+    pub type Opener = Rc<dyn Fn(std::path::PathBuf)>;
 
     #[derive(Default)]
     pub struct TuniGit {
@@ -66,6 +68,7 @@ mod imp {
         pub placeholder: RefCell<Option<adw::StatusPage>>,
         pub actions: RefCell<Option<gio::SimpleActionGroup>>,
         pub changed: RefCell<Option<Handler>>,
+        pub open: RefCell<Option<Opener>>,
     }
 
     #[glib::object_subclass]
@@ -435,6 +438,12 @@ impl TuniGit {
         self.imp().changed.replace(Some(Rc::new(callback)));
     }
 
+    /// Called with the file a row names when the row is opened. Where it is
+    /// shown is the window's decision, not the panel's.
+    pub fn connect_open<F: Fn(std::path::PathBuf) + 'static>(&self, callback: F) {
+        self.imp().open.replace(Some(Rc::new(callback)));
+    }
+
     fn announce(&self, count: usize) {
         let callback = self.imp().changed.borrow().clone();
         if let Some(callback) = callback {
@@ -704,18 +713,22 @@ impl TuniGit {
         button
     }
 
-    /// Opens the file the row names. The diff viewer takes this over when
-    /// there is one.
+    /// Opens the file the row names, in a pane. The diff viewer takes this
+    /// over when there is one.
     fn open(&self, entry: &Entry) {
         let Some(status) = self.status() else {
             return;
         };
         let path = status.root.join(&entry.path);
+        // A deleted file has a row and no bytes behind it; there is nothing to
+        // open until the diff viewer can show what was in it.
         if !path.exists() {
             return;
         }
-        let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&path)));
-        launcher.launch(self.window().as_ref(), gio::Cancellable::NONE, |_| ());
+        let handler = self.imp().open.borrow().clone();
+        if let Some(handler) = handler {
+            handler(path);
+        }
     }
 
     // --- acting on the repository ------------------------------------------
@@ -953,10 +966,6 @@ impl TuniGit {
         } else {
             "Stage something first"
         }));
-    }
-
-    fn window(&self) -> Option<gtk::Window> {
-        self.root().and_downcast::<gtk::Window>()
     }
 }
 

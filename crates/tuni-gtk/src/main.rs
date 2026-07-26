@@ -2,6 +2,7 @@
 //!
 //! Everything the window does lives in `window.rs`; this file is the process.
 
+mod editor;
 mod files;
 mod git;
 mod grid;
@@ -149,6 +150,11 @@ fn settings() -> tuni_core::settings::Settings {
 /// `TUNI_CAPTURE_WIDGET=window` shoots the whole window, chrome included;
 /// anything else shoots the terminal alone, which is what the rendering
 /// captures want.
+///
+/// The rest of the family below drives one part of the window each:
+/// `TUNI_CAPTURE_ACTIONS`, `TUNI_CAPTURE_OPEN`, `TUNI_CAPTURE_FIND`,
+/// `TUNI_CAPTURE_EDIT`, `TUNI_CAPTURE_ZOOM`, `TUNI_CAPTURE_SCROLL`,
+/// `TUNI_CAPTURE_HOVER`, and `TUNI_CAPTURE_SELECT`.
 fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
     let Ok(path) = std::env::var("TUNI_CAPTURE_PNG") else {
         return;
@@ -171,7 +177,9 @@ fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
 
     // Actions typed the way the keyboard would reach them: "win.new-tab" or
     // "win.new-project", one per comma, each a step later, so a capture can
-    // show a window that has more than one of anything.
+    // show a window that has more than one of anything. An "editor." action
+    // goes to the file that is open, since that group lives on the pane rather
+    // than on the window.
     if let Ok(actions) = std::env::var("TUNI_CAPTURE_ACTIONS") {
         for (step, action) in actions.split(',').map(str::trim).enumerate() {
             let action = action.to_owned();
@@ -188,17 +196,112 @@ fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
                             ),
                             None => (action.clone(), None),
                         };
-                        let name = name.strip_prefix("win.").unwrap_or(&name);
-                        gtk::prelude::WidgetExt::activate_action(
-                            &window,
-                            &format!("win.{name}"),
-                            target.map(|value| value.to_variant()).as_ref(),
-                        )
-                        .unwrap_or_else(|_| eprintln!("no such action: {name}"));
+                        let target = target.map(|value| value.to_variant());
+                        let (widget, name) = match name.strip_prefix("editor.") {
+                            Some(rest) => match window.active_editor() {
+                                Some(editor) => {
+                                    (editor.upcast::<gtk::Widget>(), format!("editor.{rest}"))
+                                }
+                                None => return eprintln!("no file is open: {name}"),
+                            },
+                            None => {
+                                let name = name.strip_prefix("win.").unwrap_or(&name);
+                                (window.clone().upcast(), format!("win.{name}"))
+                            }
+                        };
+                        gtk::prelude::WidgetExt::activate_action(&widget, &name, target.as_ref())
+                            .unwrap_or_else(|_| eprintln!("no such action: {name}"));
                     }
                 ),
             );
         }
+    }
+
+    // A file put in a pane, the way activating it in the Files panel does.
+    // `path` alone opens it in a tab of its own; `path|side` splits the tab it
+    // is asked from.
+    if let Ok(spec) = std::env::var("TUNI_CAPTURE_OPEN") {
+        for (step, spec) in spec.split(',').map(str::trim).enumerate() {
+            let (path, side) = match spec.split_once('|') {
+                Some((path, edge)) => (path.to_owned(), edge.trim() == "side"),
+                None => (spec.to_owned(), false),
+            };
+            glib::timeout_add_local_once(
+                // Before the scripted actions, so an "editor." action has a
+                // file to reach.
+                std::time::Duration::from_millis(350 + 100 * step as u64),
+                glib::clone!(
+                    #[weak]
+                    window,
+                    move || {
+                        let path = std::path::Path::new(&path);
+                        if side {
+                            window.open_file_to_side(path);
+                        } else {
+                            window.open_file(path);
+                        }
+                    }
+                ),
+            );
+        }
+    }
+
+    // A scripted find: the bar opens with the text in it and the count is
+    // printed, which is the check that the search reached the file.
+    if let Ok(query) = std::env::var("TUNI_CAPTURE_FIND") {
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(900),
+            glib::clone!(
+                #[weak]
+                window,
+                move || {
+                    let Some(editor) = window.active_editor() else {
+                        eprintln!("TUNI_CAPTURE_FIND: no file is open");
+                        return;
+                    };
+                    editor.find_text(&query);
+                    // The entry waits a moment before it searches, the way it
+                    // does for someone still typing.
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(500),
+                        move || println!("matches: {}", editor.match_text()),
+                    );
+                }
+            ),
+        );
+    }
+
+    // Text typed into the file that is open, and optionally the save after it:
+    // "text" or "text|save". Runs the same buffer the keyboard writes into, so
+    // the shot shows the unsaved mark and the disk shows what the save wrote.
+    if let Ok(spec) = std::env::var("TUNI_CAPTURE_EDIT") {
+        let (text, save) = match spec.split_once('|') {
+            Some((text, tail)) => (text.to_owned(), tail.trim() == "save"),
+            None => (spec, false),
+        };
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(900),
+            glib::clone!(
+                #[weak]
+                window,
+                move || {
+                    let Some(editor) = window.active_editor() else {
+                        eprintln!("TUNI_CAPTURE_EDIT: no file is open");
+                        return;
+                    };
+                    editor.insert(&text);
+                    if save {
+                        glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(300),
+                            move || {
+                                editor.save();
+                                println!("dirty after save: {}", editor.is_dirty());
+                            },
+                        );
+                    }
+                }
+            ),
+        );
     }
 
     // A scripted zoom, in whole steps, driving the same path Ctrl+plus does.
@@ -290,7 +393,7 @@ fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
                 if let Err(error) = capture(&target, &path) {
                     eprintln!("capture failed: {error}");
                 }
-                window.close();
+                window.force_close();
             }
         ),
     );

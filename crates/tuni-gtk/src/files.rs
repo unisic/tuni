@@ -88,6 +88,10 @@ mod imp {
     pub enum Message {
         /// Type a `cd` into the terminal that has the keyboard.
         Cd(std::path::PathBuf),
+        /// Open a file in a tab of its own.
+        Open(std::path::PathBuf),
+        /// Open a file beside the pane being worked in.
+        OpenToSide(std::path::PathBuf),
     }
 
     #[derive(Default)]
@@ -340,6 +344,11 @@ impl TuniFiles {
                     files.activate(&item);
                 }
             }),
+            entry("open-to-side", self, |files| {
+                if let Some(item) = files.target() {
+                    files.send(Message::OpenToSide(item.path));
+                }
+            }),
             entry("reveal", self, |files| {
                 if let Some(item) = files.target() {
                     files.reveal(&item.path);
@@ -416,15 +425,16 @@ impl TuniFiles {
         }
     }
 
-    /// A directory opens; anything else is handed to whatever the desktop
-    /// opens it with. The editor takes files over when there is one.
+    /// A directory opens or closes; a file goes to the editor, which is the
+    /// window's to place. Something the editor will not show — a picture, a
+    /// binary — is still opened in a pane, and the pane is where the offer to
+    /// hand it to the desktop lives.
     fn activate(&self, item: &Item) {
         if item.is_directory {
             self.toggle(&item.path);
             return;
         }
-        let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&item.path)));
-        launcher.launch(self.window().as_ref(), gio::Cancellable::NONE, |_result| ());
+        self.send(Message::Open(item.path.clone()));
     }
 
     fn reload(&self) {
@@ -690,6 +700,7 @@ fn row_menu(item: &Item) -> gio::Menu {
         open.append(Some("cd Here"), Some("files.cd"));
     } else {
         open.append(Some("Open"), Some("files.open"));
+        open.append(Some("Open to the Side"), Some("files.open-to-side"));
     }
     open.append(Some("Show in Files"), Some("files.reveal"));
     open.append(Some("Copy Path"), Some("files.copy-path"));

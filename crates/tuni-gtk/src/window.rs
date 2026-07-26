@@ -15,7 +15,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -24,11 +24,12 @@ use gtk::gio;
 use gtk::glib;
 
 use tuni_core::panes::{Edge, Layout, Pane};
-use tuni_core::session::{History, Snapshot};
+use tuni_core::session::{History, PaneState, Snapshot};
 use tuni_core::settings::{Appearance, HISTORY_LINE_LIMIT, Settings};
 use tuni_core::theme::Theme;
 use tuni_core::workspace::{Id, Tab, Workspace};
 
+use crate::editor::TuniEditor;
 use crate::grid::{Message, TuniGrid};
 use crate::panel::TuniPanel;
 use crate::preferences;
@@ -52,7 +53,8 @@ const PANEL_POLL_SECONDS: u32 = 2;
 
 mod imp {
     use super::{
-        Cell, HashMap, Id, RefCell, Settings, TuniGrid, TuniPanel, TuniTerminal, Workspace, glib,
+        Cell, HashMap, Id, RefCell, Settings, TuniEditor, TuniGrid, TuniPanel, TuniTerminal,
+        Workspace, glib,
     };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
@@ -62,6 +64,9 @@ mod imp {
         pub workspace: RefCell<Workspace>,
         /// One terminal per pane, by pane id.
         pub terminals: RefCell<HashMap<Id, TuniTerminal>>,
+        /// One editor per pane holding a file, by pane id. A pane is in one map
+        /// or the other, never in both.
+        pub editors: RefCell<HashMap<Id, TuniEditor>>,
         /// One layout of panes per tab, by tab id.
         pub grids: RefCell<HashMap<Id, TuniGrid>>,
         /// The strip entry each tab was given, by tab id.
@@ -72,6 +77,13 @@ mod imp {
         /// Scrollback waiting for the shell it belongs to, by pane id. Emptied
         /// one pane at a time as the restored shells start.
         pub pending_history: RefCell<HashMap<Id, String>>,
+        /// Where the cursor was in each restored file pane, by pane id, until
+        /// its editor exists to be told.
+        pub pending_cursors: RefCell<HashMap<Id, usize>>,
+        /// Set once the window has been allowed to close, so the unsaved-work
+        /// question is asked once rather than every time the answer is acted
+        /// on.
+        pub closing: Cell<bool>,
 
         pub split: RefCell<Option<adw::OverlaySplitView>>,
         pub sidebar: RefCell<Option<gtk::ListBox>>,
@@ -128,6 +140,11 @@ mod imp {
 
     impl WindowImpl for TuniWindow {
         fn close_request(&self) -> glib::Propagation {
+            // A file with unsaved work in it is the one thing worth stopping a
+            // close for; everything else here can be rebuilt from the session.
+            if !self.closing.get() && self.obj().ask_about_unsaved() {
+                return glib::Propagation::Stop;
+            }
             // Written before the shells are hung up: the scrollback is read out
             // of the live terminals, and a terminal that has been shut down has
             // nothing left to read.
@@ -169,6 +186,7 @@ impl TuniWindow {
     fn build_ui(&self) {
         let imp = self.imp();
         load_css();
+        crate::editor::apply_font(&imp.settings.borrow().terminal);
 
         let sidebar = gtk::ListBox::new();
         sidebar.set_selection_mode(gtk::SelectionMode::Single);
@@ -287,6 +305,13 @@ impl TuniWindow {
                 #[weak(rename_to = this)]
                 self,
                 move |message| this.files_message(&message)
+            ));
+        }
+        if let Some(git) = panel_view.git() {
+            git.connect_open(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |path| this.open_file(&path)
             ));
         }
         let panel = adw::OverlaySplitView::builder()
@@ -500,6 +525,14 @@ impl TuniWindow {
                     project.custom_directory = None;
                 }
             }),
+            // The editor has `Ctrl+S` of its own, which a terminal may not:
+            // `Ctrl+S` to a shell is flow control, and stopping the output of
+            // the pane beside the file being saved is not what was asked for.
+            entry("save-file", None, |window, _| {
+                if let Some(editor) = window.active_editor() {
+                    editor.save();
+                }
+            }),
             entry("settings", None, |window, _| window.show_preferences()),
             entry("toggle-sidebar", None, |window, _| {
                 if let Some(split) = window.imp().split.borrow().as_ref() {
@@ -518,7 +551,7 @@ impl TuniWindow {
                 // Closing it hands the keyboard back to the terminal, which is
                 // where it was before the panel took it.
                 if !showing {
-                    window.focus_terminal();
+                    window.focus_pane();
                 }
             }),
             // One key that both opens the panel and puts it on the repository:
@@ -580,6 +613,9 @@ impl TuniWindow {
                 for terminal in this.imp().terminals.borrow().values() {
                     terminal.set_theme(&theme);
                 }
+                for editor in this.imp().editors.borrow().values() {
+                    editor.set_dark(style.is_dark());
+                }
                 apply_chrome(&theme);
             }
         );
@@ -618,6 +654,7 @@ impl TuniWindow {
             terminal.set_config(&settings.terminal);
             terminal.set_theme(&theme);
         }
+        crate::editor::apply_font(&settings.terminal);
         apply_chrome(&theme);
 
         // Turning history off should not leave the last session's output on
@@ -700,6 +737,8 @@ impl TuniWindow {
                 terminal.send_text(&format!("cd {}\n", tuni_core::files::shell_quote(path)));
                 terminal.grab_focus();
             }
+            crate::files::Message::Open(path) => self.open_file(path),
+            crate::files::Message::OpenToSide(path) => self.open_file_to_side(path),
         }
     }
 
@@ -716,21 +755,28 @@ impl TuniWindow {
         let imp = self.imp();
         let keep_history = imp.settings.borrow().restore_history;
         let terminals = imp.terminals.borrow();
+        let editors = imp.editors.borrow();
         let history = RefCell::new(History::default());
 
         let snapshot = {
             let workspace = imp.workspace.borrow();
-            let mut snapshot = Snapshot::of(&workspace, |pane| {
-                if !keep_history {
-                    return None;
-                }
-                let text = terminals.get(&pane)?.history(HISTORY_LINE_LIMIT)?;
-                // Unique within one saved session, which is all a key has to
-                // be: the file is rewritten whole, so nothing older survives to
-                // collide with.
-                let key = format!("pane-{}", pane.raw());
-                history.borrow_mut().insert(key.clone(), text);
-                Some(key)
+            let mut snapshot = Snapshot::of(&workspace, |pane| PaneState {
+                history: keep_history
+                    .then(|| {
+                        let text = terminals.get(&pane)?.history(HISTORY_LINE_LIMIT)?;
+                        // Unique within one saved session, which is all a key has
+                        // to be: the file is rewritten whole, so nothing older
+                        // survives to collide with.
+                        let key = format!("pane-{}", pane.raw());
+                        history.borrow_mut().insert(key.clone(), text);
+                        Some(key)
+                    })
+                    .flatten(),
+                // Where the work was left in a file pane. The text itself is
+                // not saved: what is on disk is the file, and a restored window
+                // that quietly held edits nothing wrote would be a worse
+                // promise than reopening the file as it is.
+                cursor: editors.get(&pane).and_then(TuniEditor::cursor),
             });
             snapshot.sidebar = imp
                 .split
@@ -765,6 +811,9 @@ impl TuniWindow {
         }
         let imp = self.imp();
 
+        if !restored.cursors.is_empty() {
+            imp.pending_cursors.replace(restored.cursors.clone());
+        }
         if imp.settings.borrow().restore_history && !restored.histories.is_empty() {
             let history = History::load();
             if !history.is_empty() {
@@ -857,6 +906,15 @@ impl TuniWindow {
                 this.imp().menu_page.replace(page.cloned());
             }
         ));
+        // A tab with unsaved work in it asks before it goes; the strip waits
+        // for the answer rather than closing and being told afterwards.
+        view.connect_close_page(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |view, page| this.confirm_tab_close(view, page)
+        ));
         view.connect_page_detached(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -897,6 +955,7 @@ impl TuniWindow {
                 if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane.id()) {
                     terminal.shutdown();
                 }
+                imp.editors.borrow_mut().remove(&pane.id());
             }
             imp.grids.borrow_mut().remove(&tab.id());
             imp.pages.borrow_mut().remove(&tab.id());
@@ -943,7 +1002,7 @@ impl TuniWindow {
 
         self.refresh();
         self.sync_files();
-        self.focus_terminal();
+        self.focus_pane();
     }
 
     // --- tabs --------------------------------------------------------------
@@ -990,10 +1049,16 @@ impl TuniWindow {
         let (name, panes) = {
             let workspace = imp.workspace.borrow();
             let entry = workspace.project(project)?.tab(tab)?;
-            let panes: Vec<(Id, Option<String>)> = entry
+            let panes: Vec<(Id, Option<String>, Option<PathBuf>)> = entry
                 .layout()
                 .panes()
-                .map(|pane| (pane.id(), pane.directory.clone()))
+                .map(|pane| {
+                    (
+                        pane.id(),
+                        pane.directory.clone(),
+                        pane.path().map(Path::to_path_buf),
+                    )
+                })
                 .collect();
             (entry.name().to_owned(), panes)
         };
@@ -1004,16 +1069,20 @@ impl TuniWindow {
         page.set_live_thumbnail(true);
         imp.pages.borrow_mut().insert(tab, page.clone());
 
-        // Every terminal exists before any of them is drawn, so the grid is
-        // laid out once rather than once per pane.
+        // Every pane's widget exists before any of them is drawn, so the grid
+        // is laid out once rather than once per pane.
         let started: Vec<(TuniTerminal, Id, Option<PathBuf>)> = panes
             .into_iter()
-            .map(|(pane, directory)| {
+            .filter_map(|(pane, directory, file)| {
+                if let Some(file) = file {
+                    self.new_editor(project, tab, pane, &file);
+                    return None;
+                }
                 let cwd = directory
                     .map(PathBuf::from)
                     .filter(|path| path.is_dir())
                     .or_else(|| fallback.clone());
-                (self.new_terminal(project, tab, pane), pane, cwd)
+                Some((self.new_terminal(project, tab, pane), pane, cwd))
             })
             .collect();
         self.rebuild_grid(project, tab);
@@ -1023,7 +1092,7 @@ impl TuniWindow {
         Some(page)
     }
 
-    /// Opens a pane beside the focused one, in the same tab.
+    /// Opens a shell beside the focused pane, in the same tab.
     fn split(&self, edge: Edge) {
         let Some((project, tab)) = self.selected_tab() else {
             return;
@@ -1031,22 +1100,29 @@ impl TuniWindow {
         let cwd = self.directory_for_new_shell(project);
         let pane = Pane::new();
         let pane_id = pane.id();
-        {
-            let imp = self.imp();
-            let mut workspace = imp.workspace.borrow_mut();
-            let Some(entry) = workspace
-                .project_mut(project)
-                .and_then(|project| project.tab_mut(tab))
-            else {
-                return;
-            };
-            entry.layout_mut().split(pane, edge);
+        if !self.insert_pane(project, tab, pane, edge) {
+            return;
         }
 
         let terminal = self.new_terminal(project, tab, pane_id);
         self.rebuild_grid(project, tab);
         self.refresh();
         self.start_terminal(&terminal, pane_id, cwd);
+    }
+
+    /// Puts a pane the caller built into a tab's layout. `false` when the tab
+    /// is gone, which is the caller's cue not to build a widget for it.
+    fn insert_pane(&self, project: Id, tab: Id, pane: Pane, edge: Edge) -> bool {
+        let imp = self.imp();
+        let mut workspace = imp.workspace.borrow_mut();
+        let Some(entry) = workspace
+            .project_mut(project)
+            .and_then(|project| project.tab_mut(tab))
+        else {
+            return false;
+        };
+        entry.layout_mut().split(pane, edge);
+        true
     }
 
     /// A terminal for one pane, themed and remembered.
@@ -1060,6 +1136,161 @@ impl TuniWindow {
         imp.terminals.borrow_mut().insert(pane, terminal.clone());
         self.watch_terminal(&terminal, project, tab, pane);
         terminal
+    }
+
+    /// An editor for one pane, opened on a file and remembered.
+    fn new_editor(&self, project: Id, tab: Id, pane: Id, path: &Path) -> TuniEditor {
+        let imp = self.imp();
+        let editor = TuniEditor::new();
+        editor.set_hexpand(true);
+        editor.set_vexpand(true);
+        editor.set_dark(adw::StyleManager::default().is_dark());
+        editor.open(path);
+        if let Some(cursor) = imp.pending_cursors.borrow_mut().remove(&pane) {
+            editor.set_cursor(cursor);
+        }
+        // The tab marks itself while the file is unsaved, so the mark has to
+        // arrive as the file becomes dirty rather than at the next redraw.
+        editor.connect_changed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move || this.refresh_names()
+        ));
+        editor.connect_focused(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move || this.pane_focused(project, tab, pane)
+        ));
+        imp.editors.borrow_mut().insert(pane, editor.clone());
+        editor
+    }
+
+    // --- files in panes ----------------------------------------------------
+
+    /// Opens a file in a tab of its own, next to the selected one.
+    ///
+    /// A file already open somewhere in this project is shown where it is
+    /// rather than opened twice — the same rule kero has, and the reason a
+    /// second click on a file in the panel goes back to the work in progress
+    /// instead of throwing it away.
+    pub fn open_file(&self, path: &Path) {
+        if self.show_open_file(path) {
+            return;
+        }
+        let Some(project) = self.imp().workspace.borrow().selected_id() else {
+            return;
+        };
+        let imp = self.imp();
+        let Some(view) = imp.views.borrow().get(&project).cloned() else {
+            return;
+        };
+
+        let tab = Tab::with_pane(Pane::file(path.to_path_buf()));
+        let tab_id = tab.id();
+        let position = view
+            .selected_page()
+            .map_or_else(|| view.n_pages(), |page| view.page_position(&page) + 1);
+        if let Some(project) = imp.workspace.borrow_mut().project_mut(project) {
+            project.insert_tab(position.max(0) as usize, tab);
+        }
+
+        let Some(page) = self.attach_tab(project, tab_id, position) else {
+            return;
+        };
+        view.set_selected_page(&page);
+        self.refresh();
+        self.focus_pane();
+    }
+
+    /// Opens a file beside the focused pane, in the tab already on screen.
+    pub fn open_file_to_side(&self, path: &Path) {
+        let Some((project, tab)) = self.selected_tab() else {
+            self.open_file(path);
+            return;
+        };
+        if self.show_open_file_in(tab, path) {
+            return;
+        }
+        let pane = Pane::file(path.to_path_buf());
+        let pane_id = pane.id();
+        if !self.insert_pane(project, tab, pane, Edge::Right) {
+            return;
+        }
+        self.new_editor(project, tab, pane_id, path);
+        self.rebuild_grid(project, tab);
+        self.refresh();
+        self.focus_pane();
+    }
+
+    /// Brings a file already open in this project back on screen. `false` when
+    /// it is not open anywhere.
+    fn show_open_file(&self, path: &Path) -> bool {
+        let imp = self.imp();
+        let found = {
+            let workspace = imp.workspace.borrow();
+            let Some(project) = workspace.selected_project() else {
+                return false;
+            };
+            project.tabs().iter().find_map(|tab| {
+                tab.layout()
+                    .panes()
+                    .find(|pane| pane.path() == Some(path))
+                    .map(|pane| (tab.id(), pane.id()))
+            })
+        };
+        let Some((tab, pane)) = found else {
+            return false;
+        };
+        if let Some(page) = imp.pages.borrow().get(&tab).cloned()
+            && let Some(view) = self.selected_view()
+        {
+            view.set_selected_page(&page);
+        }
+        self.focus_pane_at(tab, pane);
+        true
+    }
+
+    /// The same, for one tab: what splitting to the side checks before it
+    /// splits.
+    fn show_open_file_in(&self, tab: Id, path: &Path) -> bool {
+        let found = {
+            let workspace = self.imp().workspace.borrow();
+            workspace
+                .selected_project()
+                .and_then(|project| project.tab(tab))
+                .and_then(|tab| {
+                    tab.layout()
+                        .panes()
+                        .find(|pane| pane.path() == Some(path))
+                        .map(tuni_core::panes::Pane::id)
+                })
+        };
+        let Some(pane) = found else {
+            return false;
+        };
+        self.focus_pane_at(tab, pane);
+        true
+    }
+
+    /// Moves the focus to one pane of a tab, in the model and on screen.
+    fn focus_pane_at(&self, tab: Id, pane: Id) {
+        let imp = self.imp();
+        {
+            let mut workspace = imp.workspace.borrow_mut();
+            let Some(layout) = workspace
+                .selected_project_mut()
+                .and_then(|project| project.tab_mut(tab))
+                .map(Tab::layout_mut)
+            else {
+                return;
+            };
+            layout.focus(pane);
+        }
+        if let Some(grid) = imp.grids.borrow().get(&tab) {
+            grid.set_focused(pane);
+        }
+        self.refresh();
+        self.focus_pane();
     }
 
     /// Starts a shell once its widget has been allocated.
@@ -1088,7 +1319,7 @@ impl TuniWindow {
                 }
                 // The keyboard goes where the model says it should, not to
                 // whichever shell happened to start last.
-                this.focus_terminal();
+                this.focus_pane();
             }
         ));
     }
@@ -1144,7 +1375,7 @@ impl TuniWindow {
         }
         self.refresh();
         if reshaped {
-            self.focus_terminal();
+            self.focus_pane();
         }
     }
 
@@ -1166,9 +1397,28 @@ impl TuniWindow {
         };
         // A copy of the map rather than a borrow of it: rebuilding moves the
         // keyboard between widgets, and a shell that hangs up while that
-        // happens goes straight for this map.
-        let terminals = imp.terminals.borrow().clone();
-        grid.rebuild(&layout, &terminals);
+        // happens goes straight for these maps.
+        grid.rebuild(&layout, &self.pane_widgets());
+    }
+
+    /// What every pane holds, by pane id: a terminal, or the editor that took
+    /// its place. The grid draws whatever it is given and knows the difference
+    /// between the two no better than the layout does.
+    fn pane_widgets(&self) -> HashMap<Id, gtk::Widget> {
+        let imp = self.imp();
+        let mut widgets: HashMap<Id, gtk::Widget> = imp
+            .terminals
+            .borrow()
+            .iter()
+            .map(|(id, terminal)| (*id, terminal.clone().upcast()))
+            .collect();
+        widgets.extend(
+            imp.editors
+                .borrow()
+                .iter()
+                .map(|(id, editor)| (*id, editor.clone().upcast())),
+        );
+        widgets
     }
 
     /// Follows one terminal: its title names the tab and the project, its
@@ -1298,6 +1548,7 @@ impl TuniWindow {
         if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane) {
             terminal.shutdown();
         }
+        imp.editors.borrow_mut().remove(&pane);
         let alive = {
             let mut workspace = imp.workspace.borrow_mut();
             let Some(layout) = workspace
@@ -1319,7 +1570,7 @@ impl TuniWindow {
         }
         self.rebuild_grid(project, tab);
         self.refresh();
-        self.focus_terminal();
+        self.focus_pane();
     }
 
     fn close_focused_pane(&self) {
@@ -1329,7 +1580,134 @@ impl TuniWindow {
         let Some(pane) = self.focused_pane() else {
             return;
         };
-        self.close_pane(project, tab, pane);
+        let editor = self.imp().editors.borrow().get(&pane).cloned();
+        match editor.filter(TuniEditor::is_dirty) {
+            Some(editor) => self.ask_before_discarding(&[editor], move |window, go_ahead| {
+                if go_ahead {
+                    window.close_pane(project, tab, pane);
+                }
+            }),
+            None => self.close_pane(project, tab, pane),
+        }
+    }
+
+    // --- unsaved work ------------------------------------------------------
+
+    /// Every file open in the window with edits that are not on disk.
+    fn dirty_editors(&self) -> Vec<TuniEditor> {
+        self.imp()
+            .editors
+            .borrow()
+            .values()
+            .filter(|editor| editor.is_dirty())
+            .cloned()
+            .collect()
+    }
+
+    /// The files with unsaved edits inside one tab.
+    fn dirty_editors_in(&self, tab: Id) -> Vec<TuniEditor> {
+        let imp = self.imp();
+        let workspace = imp.workspace.borrow();
+        let Some(entry) = workspace
+            .projects()
+            .iter()
+            .find_map(|project| project.tab(tab))
+        else {
+            return Vec::new();
+        };
+        let editors = imp.editors.borrow();
+        entry
+            .layout()
+            .panes()
+            .filter_map(|pane| editors.get(&pane.id()))
+            .filter(|editor| editor.is_dirty())
+            .cloned()
+            .collect()
+    }
+
+    /// Asks before anything with unsaved work in it goes away, and does what
+    /// the answer says. Save writes the files and carries on; Discard carries
+    /// on without writing; Cancel does neither.
+    /// Asks, then hands the answer on: `true` to go ahead without the edits,
+    /// `false` to leave everything as it was. Both are answered, always — what
+    /// asked may be holding something open until it hears back.
+    fn ask_before_discarding<F>(&self, dirty: &[TuniEditor], answer: F)
+    where
+        F: Fn(&Self, bool) + 'static,
+    {
+        let dialog = adw::AlertDialog::new(Some("Save Changes?"), Some(&unsaved_message(dirty)));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("discard", "Discard");
+        dialog.add_response("save", "Save");
+        dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+
+        let dirty = dirty.to_vec();
+        dialog.connect_response(
+            None,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_, response| {
+                    let go_ahead = match response {
+                        "save" => {
+                            for editor in &dirty {
+                                editor.save();
+                            }
+                            // A file that could not be written says so in its
+                            // own banner and stays open; going ahead here would
+                            // throw away exactly what the question was about.
+                            !dirty.iter().any(TuniEditor::is_dirty)
+                        }
+                        "discard" => true,
+                        _ => false,
+                    };
+                    answer(&this, go_ahead);
+                }
+            ),
+        );
+        dialog.present(Some(self));
+    }
+
+    /// The window is closing with unsaved work in it. `true` when the close
+    /// should stop and wait for the answer.
+    fn ask_about_unsaved(&self) -> bool {
+        let dirty = self.dirty_editors();
+        if dirty.is_empty() {
+            return false;
+        }
+        self.ask_before_discarding(&dirty, |window, go_ahead| {
+            if go_ahead {
+                window.imp().closing.set(true);
+                window.close();
+            }
+        });
+        true
+    }
+
+    /// Answers the strip's question about closing a tab: straight through
+    /// unless a file in it has edits nothing has written.
+    fn confirm_tab_close(&self, view: &adw::TabView, page: &adw::TabPage) -> glib::Propagation {
+        let Some(tab) = self.tab_of(&page.child()) else {
+            return glib::Propagation::Proceed;
+        };
+        let dirty = self.dirty_editors_in(tab);
+        if dirty.is_empty() {
+            return glib::Propagation::Proceed;
+        }
+
+        let view = view.clone();
+        let page = page.clone();
+        // The strip is holding the page open until it is told; every path out
+        // of the question has to tell it, including the one that changes
+        // nothing — a tab never answered for stays half-closed and refuses to
+        // close again.
+        self.ask_before_discarding(&dirty, move |_, go_ahead| {
+            view.close_page_finish(&page, go_ahead);
+        });
+        glib::Propagation::Stop
     }
 
     /// The strip has removed a tab: drop it from the model and hang up every
@@ -1360,6 +1738,7 @@ impl TuniWindow {
             if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane.id()) {
                 terminal.shutdown();
             }
+            imp.editors.borrow_mut().remove(&pane.id());
         }
         imp.grids.borrow_mut().remove(&tab.id());
         imp.pages.borrow_mut().remove(&tab.id());
@@ -1396,7 +1775,7 @@ impl TuniWindow {
             grid.set_focused(focused);
         }
         self.refresh();
-        self.focus_terminal();
+        self.focus_pane();
     }
 
     fn focus_toward(&self, edge: Edge) {
@@ -1423,7 +1802,7 @@ impl TuniWindow {
         // Weights live in the widgets as well as in the model, so a size change
         // is the one thing that has to be drawn again rather than nudged.
         self.rebuild_grid(project, tab);
-        self.focus_terminal();
+        self.focus_pane();
     }
 
     fn resize(&self, edge: Edge) {
@@ -1447,7 +1826,7 @@ impl TuniWindow {
             layout.toggle_zoom();
         }
         self.rebuild_grid(project, tab);
-        self.focus_terminal();
+        self.focus_pane();
     }
 
     /// The strip has changed which tab is on screen.
@@ -1467,7 +1846,7 @@ impl TuniWindow {
         }
         self.refresh();
         self.sync_files();
-        self.focus_terminal();
+        self.focus_pane();
     }
 
     fn shift_tab(&self, offset: i32) {
@@ -1577,10 +1956,33 @@ impl TuniWindow {
         self.imp().terminals.borrow().get(&pane).cloned()
     }
 
-    fn focus_terminal(&self) {
-        if let Some(terminal) = self.active_terminal() {
+    /// Hands the keyboard to whatever the focused pane holds.
+    fn focus_pane(&self) {
+        let Some(pane) = self.focused_pane() else {
+            return;
+        };
+        let imp = self.imp();
+        if let Some(editor) = imp.editors.borrow().get(&pane) {
+            editor.focus_text();
+            return;
+        }
+        if let Some(terminal) = imp.terminals.borrow().get(&pane) {
             terminal.grab_focus();
         }
+    }
+
+    /// The editor in the focused pane, if that is what the pane holds.
+    /// Quits without asking about files with unsaved edits. A scripted close
+    /// has already made that decision, and there is nobody there to answer the
+    /// question.
+    pub(crate) fn force_close(&self) {
+        self.imp().closing.set(true);
+        self.close();
+    }
+
+    pub(crate) fn active_editor(&self) -> Option<TuniEditor> {
+        let pane = self.focused_pane()?;
+        self.imp().editors.borrow().get(&pane).cloned()
     }
 
     // --- rendering the model -----------------------------------------------
@@ -1644,7 +2046,20 @@ impl TuniWindow {
                 let Some(page) = pages.get(&tab.id()) else {
                     continue;
                 };
-                page.set_title(tab.name());
+                // A file with unsaved edits marks its tab, so a tab in the
+                // strip behind the one being worked in still says so.
+                let dirty = {
+                    let editors = imp.editors.borrow();
+                    tab.layout()
+                        .panes()
+                        .filter_map(|pane| editors.get(&pane.id()))
+                        .any(TuniEditor::is_dirty)
+                };
+                if dirty {
+                    page.set_title(&format!("• {}", tab.name()));
+                } else {
+                    page.set_title(tab.name());
+                }
                 page.set_tooltip(&tab.directory().map(shorten).unwrap_or_default());
             }
         }
@@ -1987,12 +2402,16 @@ fn main_menu() -> gio::Menu {
     panels.append(Some("Files"), Some("win.toggle-panel"));
     panels.append(Some("Git"), Some("win.show-git"));
 
+    let file = gio::Menu::new();
+    file.append(Some("Save File"), Some("win.save-file"));
+
     let application = gio::Menu::new();
     application.append(Some("Preferences"), Some("win.settings"));
 
     let menu = gio::Menu::new();
     menu.append_section(None, &opening);
     menu.append_section(None, &panes);
+    menu.append_section(None, &file);
     menu.append_section(None, &panels);
     menu.append_section(None, &application);
     menu
@@ -2129,8 +2548,23 @@ pub fn apply_chrome(theme: &Theme) {
     });
 }
 
+/// What the question about unsaved work says. One file is named; several are
+/// counted, since a list of them would be a dialog rather than a sentence.
+fn unsaved_message(dirty: &[TuniEditor]) -> String {
+    match dirty {
+        [editor] => format!(
+            "“{}” has changes that have not been written to disk.",
+            editor.name()
+        ),
+        editors => format!(
+            "{} files have changes that have not been written to disk.",
+            editors.len()
+        ),
+    }
+}
+
 /// A path as a person would write it: `/home/me/src` is `~/src`.
-fn shorten(path: &str) -> String {
+pub(crate) fn shorten(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     match path.strip_prefix(&home) {
         Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {

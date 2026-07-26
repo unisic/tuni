@@ -4,6 +4,7 @@
 //! them, the pane layout inside a tab, what all of it is restored from, and the
 //! directory tree and repository state beside it.
 
+pub mod editor;
 pub mod files;
 pub mod git;
 pub mod panes;

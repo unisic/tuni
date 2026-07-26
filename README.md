@@ -29,10 +29,10 @@ purpose.
 
 On the other side, a panel under `Ctrl+Shift+B` shows the directory the focused
 shell is working in, or the project's own if one is pinned, and follows it as
-the focus moves. Its Files page opens directories in place and files in whatever
-the desktop opens them with, and a right click renames, creates, copies a path,
-shows a file in the desktop's file manager, moves one to the trash, or types a
-`cd` into the terminal that has the keyboard.
+the focus moves. Its Files page opens directories in place and files in a pane of
+their own, and a right click opens one beside what is already there, renames,
+creates, copies a path, shows a file in the desktop's file manager, moves one to
+the trash, or types a `cd` into the terminal that has the keyboard.
 
 Its Git page, under `Ctrl+Shift+G`, is the repository that directory belongs to:
 the branch and how far it is from its upstream, what is in conflict, what is
@@ -45,6 +45,15 @@ to undo it by. Discarding asks first, and what git would delete outright goes to
 the desktop's trash instead. The state of a file is spelled out, never carried
 by color alone: the two porcelain letters are on the row, and what they mean is
 in its tooltip.
+
+A pane holds a file as readily as it holds a shell. Opening one from either page
+puts it where a terminal would have gone — syntax highlighting for whatever
+GtkSourceView recognizes, line numbers, undo, find and replace, and `Ctrl+S`.
+A file with unsaved edits carries a dot in its header and on its tab, and
+nothing that would throw those edits away — closing the pane, the tab, or the
+window — happens without asking first. A picture opens in the pane too, and
+anything that is neither, or is past the 5 MiB the editor will read, says so and
+offers to hand the file to the desktop.
 
 Closing the window writes that arrangement down, and opening it again puts it
 back: the projects, their tabs, the columns and panes inside each one with the
@@ -75,6 +84,9 @@ scrollback, and that last decision, writing each change to
 | `Ctrl+Shift+B` | Show or hide the panel |
 | `Ctrl+Shift+G` | Open the panel on the repository |
 | `Ctrl+,` | Preferences |
+| `Ctrl+S` | Save the file in the focused pane |
+| `Ctrl+F` / `Ctrl+H` | Find, find and replace — in a file pane only |
+| `Ctrl+G` / `Ctrl+Shift+G` | Next match, previous match — in a file pane only |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection, paste |
 | Middle click | Paste the primary selection |
 | `Ctrl+Shift+A` | Select everything, scrollback included |
@@ -86,8 +98,8 @@ scrollback, and that last decision, writing each change to
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
 
-From here the work runs to full parity: the editor, the diff viewer — which is
-where staging a single hunk belongs — the command palette, and packaging.
+From here the work runs to full parity: the diff viewer — which is where staging
+a single hunk belongs — the command palette, and packaging.
 
 Consuming a 200 MiB stream, measured with `scripts/throughput.sh` on this
 machine:
@@ -189,6 +201,23 @@ commit is possible, which paths a discard has to restore and which it has to
 delete — lives in `tuni-core` with tests against a real repository, and the
 widget only draws the answer.
 
+The editor's keys belong to the pane rather than to the window, and that is the
+whole reason it can share a window with terminals: `Ctrl+S` is flow control to a
+shell and `Ctrl+F` is a page forward in `less`, so binding either one globally
+would break the pane next door. They are a shortcut controller on the editor
+widget, scoped locally, which means they exist exactly while a file has the
+keyboard. Saving writes a neighbouring file and renames it onto the target,
+which is atomic on every filesystem Linux ships: an interrupted save costs the
+new text, never the old. Two things follow from renaming rather than truncating
+and both are handled — a symlink is resolved first, so it is still a symlink
+afterwards, and the old file's permissions are copied onto the new one, so a
+script stays executable. What the session remembers is the cursor offset and
+nothing else. Unsaved text is not written to a cache to be recovered later; what
+is on disk is the file, and the question before closing is asked while there is
+still someone there to answer it. A file is text if it decodes as UTF-8 and
+binary if it does not, which is a decision the bytes make rather than the
+extension.
+
 Ghostty's theme catalog is vendored under `data/themes` and baked into the
 binary at build time, so a fresh checkout runs with all 574 and a packaged
 build needs no data directory beside the executable. The same theme drives the
@@ -252,7 +281,9 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `terminal.scrollback-lines` | `10000` | Lines kept above the screen |
 | `terminal.restore-history` | `false` | Whether a restored pane replays what it had printed |
 
-The session itself lives under `~/.local/share/tuni`.
+The session itself lives under `~/.local/share/tuni`. A file pane comes back
+holding the file it held, with the cursor where it was left; unsaved edits are
+not part of that, since a file is what is on disk.
 
 ## Building
 
