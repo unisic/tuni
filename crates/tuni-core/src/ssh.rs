@@ -453,6 +453,26 @@ pub fn command(host: &Host, control: &Control) -> Vec<String> {
     argv
 }
 
+/// The command line that opens `host`'s sftp subsystem.
+///
+/// `ssh -s` rather than the `sftp` program: over a live master this is another
+/// channel on the connection the panes are already using, and what arrives on
+/// stdout is the protocol rather than a program's idea of a listing.
+///
+/// `BatchMode=yes` because a file listing has nowhere to put a question. A host
+/// nothing is connected to yet fails here and is connected to in a pane, which
+/// is the only place a password is ever typed.
+#[must_use]
+pub fn sftp_command(host: &Host, control: &Control) -> Vec<String> {
+    let mut argv = command(host, control);
+    argv.splice(
+        1..1,
+        ["-o".to_owned(), "BatchMode=yes".to_owned(), "-s".to_owned()],
+    );
+    argv.push("sftp".to_owned());
+    argv
+}
+
 /// Where a host came from, which is what decides whether it may be changed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Source {

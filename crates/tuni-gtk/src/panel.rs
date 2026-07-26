@@ -15,14 +15,16 @@ use gtk::glib;
 use crate::files::TuniFiles;
 use crate::git::TuniGit;
 use crate::info::TuniInfo;
+use crate::sftp::TuniSftp;
 
 /// The names the pages are addressed by, in the switcher and in `session.json`.
 pub const FILES: &str = "files";
+pub const SFTP: &str = "sftp";
 pub const GIT: &str = "git";
 pub const INFO: &str = "info";
 
 mod imp {
-    use super::{RefCell, TuniFiles, TuniGit, TuniInfo, glib};
+    use super::{RefCell, TuniFiles, TuniGit, TuniInfo, TuniSftp, glib};
     use adw::subclass::prelude::*;
 
     #[derive(Default)]
@@ -32,6 +34,10 @@ mod imp {
         pub files: RefCell<Option<TuniFiles>>,
         pub git: RefCell<Option<TuniGit>>,
         pub git_page: RefCell<Option<adw::ViewStackPage>>,
+        pub sftp: RefCell<Option<TuniSftp>>,
+        /// Held so the page can be taken off the switcher: there is nothing to
+        /// browse until a pane is connected to something.
+        pub sftp_page: RefCell<Option<adw::ViewStackPage>>,
     }
 
     #[glib::object_subclass]
@@ -76,6 +82,7 @@ impl TuniPanel {
         let info = TuniInfo::new();
         let files = TuniFiles::new();
         let git = TuniGit::new();
+        let sftp = TuniSftp::new();
 
         // Files first, since it is the page the panel opens on and the one a
         // pane is opened from; Info last, as kero orders the same three.
@@ -86,6 +93,12 @@ impl TuniPanel {
         // page is, and it is an icon the theme actually has.
         let git_page =
             stack.add_titled_with_icon(&git, Some(GIT), "Git", "view-list-bullet-symbolic");
+        // Beside Files, since it is the same page about another machine, and
+        // hidden until there is a machine: a switcher with a page nothing can
+        // fill is a dead tab.
+        let sftp_page =
+            stack.add_titled_with_icon(&sftp, Some(SFTP), "Remote", "folder-remote-symbolic");
+        sftp_page.set_visible(false);
         stack.add_titled_with_icon(&info, Some(INFO), "Info", "dialog-information-symbolic");
 
         // How many files have changed, on the tab, so the number is readable
@@ -119,6 +132,8 @@ impl TuniPanel {
         imp.files.replace(Some(files));
         imp.git.replace(Some(git));
         imp.git_page.replace(Some(git_page));
+        imp.sftp.replace(Some(sftp));
+        imp.sftp_page.replace(Some(sftp_page));
     }
 
     #[must_use]
@@ -134,6 +149,11 @@ impl TuniPanel {
     #[must_use]
     pub fn git(&self) -> Option<TuniGit> {
         self.imp().git.borrow().clone()
+    }
+
+    #[must_use]
+    pub fn sftp(&self) -> Option<TuniSftp> {
+        self.imp().sftp.borrow().clone()
     }
 
     /// Points every page at a directory.
@@ -165,6 +185,18 @@ impl TuniPanel {
         }
         if let Some(git) = self.git() {
             git.sync(directory);
+        }
+        if let Some(sftp) = self.sftp() {
+            sftp.sync(host);
+        }
+        if let Some(page) = self.imp().sftp_page.borrow().as_ref() {
+            page.set_visible(host.is_some());
+            // A hidden page keeps drawing if it is the one showing, so the
+            // panel goes back to the files on this machine with the pane that
+            // was on another.
+            if host.is_none() && self.page() == SFTP {
+                self.set_page(FILES);
+            }
         }
     }
 

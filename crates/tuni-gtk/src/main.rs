@@ -22,6 +22,7 @@ mod palette;
 mod panel;
 mod preferences;
 mod remote;
+mod sftp;
 mod snippets;
 mod sprites;
 mod switcher;

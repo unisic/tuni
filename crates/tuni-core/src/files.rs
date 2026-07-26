@@ -44,11 +44,32 @@ pub struct Failure {
 }
 
 impl Failure {
-    fn new(message: impl Into<String>, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             detail: detail.into(),
         }
+    }
+}
+
+/// Where a tree's rows come from: this machine, or the far end of a connection.
+///
+/// A tree is rebuilt on the main thread, so `read` may not block on anything
+/// slower than a disk. [`Disk`] reads the directory; a reader over a connection
+/// answers out of what it has already been handed and asks for the rest in the
+/// background.
+pub trait Directory {
+    fn read(&mut self, path: &Path) -> Vec<Item>;
+}
+
+/// The files on this machine, which is where the tree read from before there
+/// was anywhere else to read from.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Disk;
+
+impl Directory for Disk {
+    fn read(&mut self, path: &Path) -> Vec<Item> {
+        read_directory(path)
     }
 }
 
@@ -93,37 +114,37 @@ impl Tree {
     /// Points the tree at `root` and re-reads whatever is open. Answers whether
     /// the rows changed, so a caller polling on a timer can leave the list view
     /// alone when nothing moved — which is nearly always.
-    pub fn sync(&mut self, root: &Path) -> bool {
+    pub fn sync(&mut self, root: &Path, source: &mut dyn Directory) -> bool {
         if root != self.root {
             self.root = root.to_path_buf();
             // The open directories belonged to the tree that was here before.
             self.expanded.clear();
         }
-        self.rebuild()
+        self.rebuild(source)
     }
 
     /// Opens a directory if it was closed, closes it if it was open.
-    pub fn toggle(&mut self, path: &Path) -> bool {
+    pub fn toggle(&mut self, path: &Path, source: &mut dyn Directory) -> bool {
         if !self.expanded.remove(path) {
             self.expanded.insert(path.to_path_buf());
         }
-        self.rebuild()
+        self.rebuild(source)
     }
 
-    pub fn expand(&mut self, path: &Path) -> bool {
+    pub fn expand(&mut self, path: &Path, source: &mut dyn Directory) -> bool {
         self.expanded.insert(path.to_path_buf());
-        self.rebuild()
+        self.rebuild(source)
     }
 
     /// Forgets a path and everything under it, after it stopped existing.
-    pub fn forget(&mut self, path: &Path) -> bool {
+    pub fn forget(&mut self, path: &Path, source: &mut dyn Directory) -> bool {
         self.expanded.retain(|open| !open.starts_with(path));
-        self.rebuild()
+        self.rebuild(source)
     }
 
     /// Follows a rename, so a directory that was open stays open under its new
     /// name — and so do the directories opened inside it.
-    pub fn remap(&mut self, from: &Path, to: &Path) -> bool {
+    pub fn remap(&mut self, from: &Path, to: &Path, source: &mut dyn Directory) -> bool {
         self.expanded = self
             .expanded
             .drain()
@@ -132,11 +153,11 @@ impl Tree {
                 Err(_) => open,
             })
             .collect();
-        self.rebuild()
+        self.rebuild(source)
     }
 
     /// Reads the open directories again. Answers whether anything changed.
-    pub fn rebuild(&mut self) -> bool {
+    pub fn rebuild(&mut self, source: &mut dyn Directory) -> bool {
         let mut items = Vec::new();
         if self.root.as_os_str().is_empty() {
             let changed = !self.items.is_empty();
@@ -144,7 +165,7 @@ impl Tree {
             return changed;
         }
         let root = self.root.clone();
-        self.append_children(&root, 0, &mut items);
+        self.append_children(&root, 0, source, &mut items);
         if items == self.items {
             return false;
         }
@@ -152,16 +173,22 @@ impl Tree {
         true
     }
 
-    fn append_children(&self, directory: &Path, depth: usize, out: &mut Vec<Item>) {
+    fn append_children(
+        &self,
+        directory: &Path,
+        depth: usize,
+        source: &mut dyn Directory,
+        out: &mut Vec<Item>,
+    ) {
         if depth >= MAX_DEPTH {
             return;
         }
-        for child in read_directory(directory) {
+        for child in source.read(directory) {
             let expanded = child.is_directory && self.expanded.contains(&child.path);
             let path = child.path.clone();
             out.push(Item { depth, ..child });
             if expanded {
-                self.append_children(&path, depth + 1, out);
+                self.append_children(&path, depth + 1, source, out);
             }
         }
     }
@@ -405,7 +432,7 @@ mod tests {
         sandbox.file("README.md");
 
         let mut tree = Tree::new();
-        tree.sync(sandbox.path());
+        tree.sync(sandbox.path(), &mut Disk);
         assert_eq!(
             names(&tree),
             [("src".to_owned(), 0), ("README.md".to_owned(), 0)]
@@ -419,15 +446,15 @@ mod tests {
         sandbox.file("src/main.rs");
 
         let mut tree = Tree::new();
-        tree.sync(sandbox.path());
-        assert!(tree.toggle(&src), "the rows changed");
+        tree.sync(sandbox.path(), &mut Disk);
+        assert!(tree.toggle(&src, &mut Disk), "the rows changed");
         assert!(tree.is_expanded(&src));
         assert_eq!(
             names(&tree),
             [("src".to_owned(), 0), ("main.rs".to_owned(), 1)]
         );
 
-        assert!(tree.toggle(&src));
+        assert!(tree.toggle(&src, &mut Disk));
         assert_eq!(names(&tree), [("src".to_owned(), 0)]);
     }
 
@@ -440,7 +467,7 @@ mod tests {
         sandbox.directory("zebra");
 
         let mut tree = Tree::new();
-        tree.sync(sandbox.path());
+        tree.sync(sandbox.path(), &mut Disk);
         let listed: Vec<String> = tree.items().iter().map(|item| item.name.clone()).collect();
         assert_eq!(listed, ["zebra", "Apple.txt", "item2.txt", "item10.txt"]);
     }
@@ -452,7 +479,7 @@ mod tests {
         sandbox.file(".gitignore");
 
         let mut tree = Tree::new();
-        tree.sync(sandbox.path());
+        tree.sync(sandbox.path(), &mut Disk);
         let listed: Vec<String> = tree.items().iter().map(|item| item.name.clone()).collect();
         assert_eq!(listed, [".gitignore"], "other dotfiles stay");
     }
@@ -463,11 +490,11 @@ mod tests {
         sandbox.file("one");
 
         let mut tree = Tree::new();
-        assert!(tree.sync(sandbox.path()));
-        assert!(!tree.rebuild(), "nothing moved");
+        assert!(tree.sync(sandbox.path(), &mut Disk));
+        assert!(!tree.rebuild(&mut Disk), "nothing moved");
 
         sandbox.file("two");
-        assert!(tree.rebuild(), "a file appeared");
+        assert!(tree.rebuild(&mut Disk), "a file appeared");
     }
 
     #[test]
@@ -479,11 +506,11 @@ mod tests {
         second.file("other");
 
         let mut tree = Tree::new();
-        tree.sync(first.path());
-        tree.toggle(&src);
+        tree.sync(first.path(), &mut Disk);
+        tree.toggle(&src, &mut Disk);
         assert!(tree.is_expanded(&src));
 
-        tree.sync(second.path());
+        tree.sync(second.path(), &mut Disk);
         assert!(!tree.is_expanded(&src));
         assert_eq!(names(&tree), [("other".to_owned(), 0)]);
     }
@@ -496,12 +523,12 @@ mod tests {
         sandbox.file("src/inner/deep.rs");
 
         let mut tree = Tree::new();
-        tree.sync(sandbox.path());
-        tree.toggle(&src);
-        tree.toggle(&inner);
+        tree.sync(sandbox.path(), &mut Disk);
+        tree.toggle(&src, &mut Disk);
+        tree.toggle(&inner, &mut Disk);
 
         let moved = rename(&src, "lib").expect("renamed").expect("moved");
-        tree.remap(&src, &moved);
+        tree.remap(&src, &moved, &mut Disk);
 
         assert!(tree.is_expanded(&moved));
         assert!(tree.is_expanded(&moved.join("inner")));

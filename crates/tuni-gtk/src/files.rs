@@ -20,13 +20,13 @@ use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
 
-use tuni_core::files::{Failure, Item, Tree};
+use tuni_core::files::{Disk, Failure, Item, Tree};
 
 /// Pixels of indent per level of depth.
 const INDENT: i32 = 12;
 
 /// One row of the list, wrapped so a `GListModel` can hold it.
-mod row {
+pub(crate) mod row {
     use std::cell::{Cell, RefCell};
 
     use gtk::glib;
@@ -490,7 +490,7 @@ impl TuniFiles {
         }
         self.imp().given.replace(root.to_path_buf());
         self.show_location(false);
-        let changed = self.imp().tree.borrow_mut().sync(root);
+        let changed = self.imp().tree.borrow_mut().sync(root, &mut Disk);
         if changed {
             self.reload();
         }
@@ -499,7 +499,7 @@ impl TuniFiles {
 
     /// Steps the tree somewhere of the user's own choosing.
     fn browse(&self, directory: &Path) {
-        if self.imp().tree.borrow_mut().sync(directory) {
+        if self.imp().tree.borrow_mut().sync(directory, &mut Disk) {
             self.reload();
         }
         self.refresh_header();
@@ -547,13 +547,13 @@ impl TuniFiles {
     /// Re-reads what is open. Draws nothing when nothing moved, which is the
     /// usual answer.
     pub fn poll(&self) {
-        if self.imp().tree.borrow_mut().rebuild() {
+        if self.imp().tree.borrow_mut().rebuild(&mut Disk) {
             self.reload();
         }
     }
 
     fn toggle(&self, path: &Path) {
-        if self.imp().tree.borrow_mut().toggle(path) {
+        if self.imp().tree.borrow_mut().toggle(path, &mut Disk) {
             self.reload();
         }
     }
@@ -647,7 +647,7 @@ impl TuniFiles {
                 move |name: String| {
                     match tuni_core::files::rename(&path, &name) {
                         Ok(Some(moved)) => {
-                            this.imp().tree.borrow_mut().remap(&path, &moved);
+                            this.imp().tree.borrow_mut().remap(&path, &moved, &mut Disk);
                             this.reload();
                         }
                         Ok(None) => {}
@@ -674,7 +674,7 @@ impl TuniFiles {
                         Ok(Some(_)) => {
                             // Opened, so the thing that was just made is
                             // visible rather than hidden in a closed folder.
-                            this.imp().tree.borrow_mut().expand(&directory);
+                            this.imp().tree.borrow_mut().expand(&directory, &mut Disk);
                             this.reload();
                         }
                         Ok(None) => {}
@@ -691,7 +691,7 @@ impl TuniFiles {
         let file = gio::File::for_path(&item.path);
         match file.trash(gio::Cancellable::NONE) {
             Ok(()) => {
-                self.imp().tree.borrow_mut().forget(&item.path);
+                self.imp().tree.borrow_mut().forget(&item.path, &mut Disk);
                 self.reload();
             }
             Err(error) => self.report(&Failure {
@@ -745,7 +745,7 @@ impl TuniFiles {
 }
 
 /// Draws one row: the indent, the chevron, the icon, and the name.
-fn bind_row(object: &glib::Object) {
+pub(crate) fn bind_row(object: &glib::Object) {
     let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
         return;
     };

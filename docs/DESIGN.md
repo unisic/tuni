@@ -127,7 +127,9 @@ host declared in `~/.ssh/config` is read, listed and connected to but never
 rewritten, and editing one opens that file at the line that declares it, in an
 editor pane. A session that ends leaves its last screen where it is with a
 Reconnect button over it, rather than closing the pane, since a connection that
-dropped has usually just said why.
+dropped has usually just said why. The panel grows a fourth page while a pane is
+on a host: the files at the other end, in the same tree the Files page draws,
+opened over the connection that is already there.
 
 Three ways to get somewhere. `Ctrl+Shift+F` opens a find bar over the terminal:
 every match on screen and in the scrollback is highlighted as you type, the
@@ -521,6 +523,42 @@ worth reading before it goes anywhere. Deleting a key, changing a passphrase and
 managing the agent are all missing on purpose: `ssh-agent` and the desktop's
 keyring do that job already, and a wrong button in this window would be a
 security bug rather than a bad row.
+
+The files on the far machine are a fourth panel page, on the switcher while the
+pane holding the keyboard is on a host and off it the moment that pane is not.
+What fills it is a small client speaking version 3 of the SFTP protocol over
+`ssh -s <host> sftp`, which on a live master is one more channel on the
+connection the panes already have, so nothing authenticates twice, and
+`BatchMode=yes` makes sure a file listing is never the thing that asks for a
+password. The rows come from the tree the Files page already has: `Tree` reads
+through a `Directory`, which is the disk on one page and, on the other, what has
+so far come back. That indirection is the whole of the rule that nothing remote
+touches the main loop. A directory nobody has asked about yet reads as empty and
+a request goes out on a worker thread, the rows appear when the answer lands, and
+an answer about a host that is no longer the one on screen is dropped by a
+counter rather than cancelled, since it costs nothing to throw away. A remote
+directory announces nothing when it changes either, so this page stays out of the
+panel's two-second poll and reads on navigation and when asked. A symlink pays
+for a second round trip to learn whether it points at a directory, which is the
+trade the local tree makes for the same reason and for the same one entry in a
+hundred.
+
+sshfs would have been free: mount the host, and every page in this window works
+on it unchanged, the editor and the git panel included. It is the worst idea
+available. The panel polls on the main thread, so each tick becomes a round trip
+per open directory, and when the link drops FUSE reads block uninterruptibly,
+which means the main loop is gone, `SIGTERM` does not help, and the way out is a
+`fusermount -u` typed into a terminal that is inside the frozen window. Upstream
+archived it, and it does not work in a Flatpak. `ssh host ls` needs a shell at
+the far end, so it fails on the sftp-only accounts and appliances a file browser
+is most wanted for. The `sftp` program driven by `-b -` was the realistic
+alternative and it loses on names: its listing cannot represent a file whose name
+holds a newline, `ls` glob-expands its argument with no way to stop it, so a
+directory called `report[2024]` is unreachable and one called `*` lists its
+parent, and a single failed command ends the batch. The protocol underneath has
+no quoting layer, no globber and no locale. Names are bytes, attributes are
+integers, and a failure is a status code on one request rather than the end of
+the session.
 
 An SSH library was the obvious alternative and it is ruled out by the same
 constraint everything else here follows. `russh` and `libssh2` bring their own
