@@ -20,6 +20,7 @@
 //! way it always is: the master gives up on its own `ServerAlive` count, the
 //! pipe closes, and the next read ends short.
 
+use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -36,6 +37,9 @@ const MAX_PACKET: u32 = 4 * 1024 * 1024;
 
 // Requests.
 const INIT: u8 = 1;
+const OPEN: u8 = 3;
+const READ: u8 = 5;
+const WRITE: u8 = 6;
 const OPENDIR: u8 = 11;
 const READDIR: u8 = 12;
 const REALPATH: u8 = 16;
@@ -47,8 +51,22 @@ const CLOSE: u8 = 4;
 const REPLY_VERSION: u8 = 2;
 const REPLY_STATUS: u8 = 101;
 const REPLY_HANDLE: u8 = 102;
+const REPLY_DATA: u8 = 103;
 const REPLY_NAME: u8 = 104;
 const REPLY_ATTRS: u8 = 105;
+
+// What a file is opened for. Reading and writing are the only two, and the
+// three that come with writing are what "upload this file" means: make it if it
+// is not there, and start from nothing if it is.
+const READABLE: u32 = 0x0000_0001;
+const WRITABLE: u32 = 0x0000_0002;
+const CREATE: u32 = 0x0000_0008;
+const TRUNCATE: u32 = 0x0000_0010;
+
+/// How much of a file moves in one request, which is what OpenSSH's own client
+/// asks for. Nothing here pipelines, so this is also the round trip: a file
+/// crosses a 50 ms link at about 640 KB/s and a distant host feels it.
+const CHUNK: usize = 32 * 1024;
 
 // The status codes worth telling apart. The rest are one failure.
 const OK: u32 = 0;
@@ -130,7 +148,7 @@ impl Session {
         let id = self.request(REALPATH, &encode_string(path))?;
         let (kind, body) = self.reply(id)?;
         if kind != REPLY_NAME {
-            self.blame(kind, &body, path);
+            self.blame(kind, &body, "read", path);
             return None;
         }
         let mut reader = Reader::new(&body);
@@ -154,14 +172,14 @@ impl Session {
             if kind == REPLY_STATUS {
                 let mut reader = Reader::new(&body);
                 if reader.u32() != Some(EOF) {
-                    self.blame(kind, &body, path);
+                    self.blame(kind, &body, "read", path);
                     self.close(&handle);
                     return None;
                 }
                 break;
             }
             if kind != REPLY_NAME {
-                self.blame(kind, &body, path);
+                self.blame(kind, &body, "read", path);
                 self.close(&handle);
                 return None;
             }
@@ -194,6 +212,69 @@ impl Session {
         self.attributes(LSTAT, path)
     }
 
+    /// Copies a remote file to `local`, calling `progress` with how much has
+    /// arrived and how much there is.
+    ///
+    /// The caller decides what `local` is named. Nothing here renames anything,
+    /// so a caller that wants a half-written file to be unopenable writes to a
+    /// name nobody looks for and moves it afterwards.
+    pub fn get(
+        &mut self,
+        remote: &str,
+        local: &Path,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Option<()> {
+        let total = self.stat(remote).map_or(0, |entry| entry.size);
+        let handle = self.open_file(remote, READABLE, None)?;
+        let file = match File::create(local) {
+            Ok(file) => file,
+            Err(error) => {
+                self.failure = Some(Failure::new(
+                    format!("Couldn't write {}.", local.display()),
+                    error.to_string(),
+                ));
+                self.close(&handle);
+                return None;
+            }
+        };
+        let done = self.download(&handle, file, remote, total, progress);
+        self.close(&handle);
+        done
+    }
+
+    /// Copies a local file to `remote`, calling `progress` with how much has
+    /// gone and how much there is.
+    ///
+    /// The file arrives with the permission bits it has here, which is what the
+    /// `sftp` program does too: a script that is executable on this machine is
+    /// executable on the other one.
+    pub fn put(
+        &mut self,
+        local: &Path,
+        remote: &str,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Option<()> {
+        let file = match File::open(local) {
+            Ok(file) => file,
+            Err(error) => {
+                self.failure = Some(Failure::new(
+                    format!("Couldn't read {}.", local.display()),
+                    error.to_string(),
+                ));
+                return None;
+            }
+        };
+        let data = file.metadata().ok();
+        let total = data.as_ref().map_or(0, std::fs::Metadata::len);
+        let mode = data.map_or(0o644, |data| {
+            std::os::unix::fs::PermissionsExt::mode(&data.permissions()) & 0o777
+        });
+        let handle = self.open_file(remote, WRITABLE | CREATE | TRUNCATE, Some(mode))?;
+        let done = self.upload(&handle, file, local, remote, total, progress);
+        self.close(&handle);
+        done
+    }
+
     /// Why the last call failed, in the two parts a dialog wants.
     #[must_use]
     pub fn failure(&self) -> Option<&Failure> {
@@ -204,7 +285,7 @@ impl Session {
         let id = self.request(kind, &encode_string(path))?;
         let (reply, body) = self.reply(id)?;
         if reply != REPLY_ATTRS {
-            self.blame(reply, &body, path);
+            self.blame(reply, &body, "read", path);
             return None;
         }
         let mut entry = Reader::new(&body).attributes()?;
@@ -245,10 +326,128 @@ impl Session {
         let id = self.request(OPENDIR, &encode_string(path))?;
         let (kind, body) = self.reply(id)?;
         if kind != REPLY_HANDLE {
-            self.blame(kind, &body, path);
+            self.blame(kind, &body, "read", path);
             return None;
         }
         Reader::new(&body).string()
+    }
+
+    /// Opens one file and answers with the handle the far end gave it.
+    fn open_file(&mut self, path: &str, flags: u32, mode: Option<u32>) -> Option<Vec<u8>> {
+        let mut request = encode_string(path);
+        request.extend_from_slice(&flags.to_be_bytes());
+        match mode {
+            Some(mode) => {
+                request.extend_from_slice(&PERMISSIONS.to_be_bytes());
+                request.extend_from_slice(&mode.to_be_bytes());
+            }
+            // No attributes, which is what opening something that already
+            // exists asks for: leave it as whoever made it left it.
+            None => request.extend_from_slice(&0_u32.to_be_bytes()),
+        }
+        let id = self.request(OPEN, &request)?;
+        let (kind, body) = self.reply(id)?;
+        if kind != REPLY_HANDLE {
+            let verb = if flags & WRITABLE == 0 {
+                "read"
+            } else {
+                "write"
+            };
+            self.blame(kind, &body, verb, path);
+            return None;
+        }
+        Reader::new(&body).string()
+    }
+
+    /// The body of a download, split out so the handle is closed on every way
+    /// out of it.
+    fn download(
+        &mut self,
+        handle: &[u8],
+        mut file: File,
+        remote: &str,
+        total: u64,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Option<()> {
+        let mut at = 0_u64;
+        progress(0, total);
+        loop {
+            let mut request = encode_string_bytes(handle);
+            request.extend_from_slice(&at.to_be_bytes());
+            request.extend_from_slice(&(CHUNK as u32).to_be_bytes());
+            let id = self.request(READ, &request)?;
+            let (kind, body) = self.reply(id)?;
+            if kind == REPLY_STATUS {
+                // The end of a file is a status packet, the way the end of a
+                // listing is.
+                if Reader::new(&body).u32() != Some(EOF) {
+                    self.blame(kind, &body, "read", remote);
+                    return None;
+                }
+                break;
+            }
+            if kind != REPLY_DATA {
+                self.blame(kind, &body, "read", remote);
+                return None;
+            }
+            let chunk = Reader::new(&body).string()?;
+            // A server may answer with less than was asked for and that means
+            // nothing; only the status packet above says the file has ended.
+            if chunk.is_empty() {
+                break;
+            }
+            if let Err(error) = file.write_all(&chunk) {
+                self.wrote(&error.to_string());
+                return None;
+            }
+            at += chunk.len() as u64;
+            progress(at, total.max(at));
+        }
+        if let Err(error) = file.flush() {
+            self.wrote(&error.to_string());
+            return None;
+        }
+        Some(())
+    }
+
+    /// The body of an upload, closed over the same way.
+    fn upload(
+        &mut self,
+        handle: &[u8],
+        mut file: File,
+        local: &Path,
+        remote: &str,
+        total: u64,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Option<()> {
+        let mut buffer = vec![0_u8; CHUNK];
+        let mut at = 0_u64;
+        progress(0, total);
+        loop {
+            let read = match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) => {
+                    self.failure = Some(Failure::new(
+                        format!("Couldn't read {}.", local.display()),
+                        error.to_string(),
+                    ));
+                    return None;
+                }
+            };
+            let mut request = encode_string_bytes(handle);
+            request.extend_from_slice(&at.to_be_bytes());
+            request.extend_from_slice(&encode_string_bytes(&buffer[..read]));
+            let id = self.request(WRITE, &request)?;
+            let (kind, body) = self.reply(id)?;
+            if kind != REPLY_STATUS || Reader::new(&body).u32() != Some(OK) {
+                self.blame(kind, &body, "write", remote);
+                return None;
+            }
+            at += read as u64;
+            progress(at, total.max(at));
+        }
+        Some(())
     }
 
     fn close(&mut self, handle: &[u8]) {
@@ -318,11 +517,12 @@ impl Session {
     }
 
     /// Turns a status packet into something worth showing, and anything else
-    /// into the fact that it was not what was asked for.
-    fn blame(&mut self, kind: u8, body: &[u8], path: &str) {
+    /// into the fact that it was not what was asked for. `verb` is what was
+    /// being done, since a refused upload is not a failed read.
+    fn blame(&mut self, kind: u8, body: &[u8], verb: &str, path: &str) {
         if kind != REPLY_STATUS {
             self.failure = Some(Failure::new(
-                format!("Couldn't read {path}."),
+                format!("Couldn't {verb} {path}."),
                 "The far end answered with something else.",
             ));
             return;
@@ -336,15 +536,20 @@ impl Session {
         let detail = match code {
             NO_SUCH_FILE => "There is nothing there.".to_owned(),
             PERMISSION_DENIED => {
-                "The account this connection logged in as may not read it.".to_owned()
+                format!("The account this connection logged in as may not {verb} it.")
             }
             _ => message.unwrap_or_else(|| "The far end refused.".to_owned()),
         };
-        self.failure = Some(Failure::new(format!("Couldn't read {path}."), detail));
+        self.failure = Some(Failure::new(format!("Couldn't {verb} {path}."), detail));
     }
 
     fn lost(&mut self, detail: &str) {
         self.failure = Some(Failure::new("The connection ended.", detail));
+    }
+
+    /// A transfer that the far end was fine with and this machine was not.
+    fn wrote(&mut self, detail: &str) {
+        self.failure = Some(Failure::new("Couldn't write the file here.", detail));
     }
 }
 
@@ -556,6 +761,98 @@ mod tests {
         let failure = session.failure().expect("a reason");
         assert!(failure.message.contains("/nowhere"), "{failure:?}");
         assert_eq!(failure.detail, "There is nothing there.");
+    }
+
+    #[test]
+    fn a_download_lands_as_the_bytes_the_far_end_sent() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-get-{}", std::process::id()));
+        let _ = std::fs::remove_file(&local);
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let mut attributes = (SIZE | PERMISSIONS).to_be_bytes().to_vec();
+        attributes.extend_from_slice(&5_u64.to_be_bytes());
+        attributes.extend_from_slice(&0o100_644_u32.to_be_bytes());
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_ATTRS, body(1, &attributes)),
+            (REPLY_HANDLE, body(2, &encode_string("h"))),
+            (REPLY_DATA, body(3, &encode_string("hello"))),
+            (REPLY_STATUS, body(4, &EOF.to_be_bytes())),
+            (REPLY_STATUS, body(5, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+
+        let mut seen = Vec::new();
+        let done = session.get("/home/dean/notes.txt", &local, &mut |at, total| {
+            seen.push((at, total));
+        });
+        assert_eq!(done, Some(()));
+        assert_eq!(std::fs::read(&local).expect("the file"), b"hello");
+        assert_eq!(seen, vec![(0, 5), (5, 5)]);
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        assert_eq!(asked[2].0, OPEN);
+        assert_eq!(asked[3].0, READ);
+        let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn an_upload_sends_the_file_from_its_start() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-put-{}", std::process::id()));
+        std::fs::write(&local, b"hello").expect("a file to send");
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_HANDLE, body(1, &encode_string("h"))),
+            (REPLY_STATUS, body(2, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(3, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+        assert_eq!(
+            session.put(&local, "/tmp/notes.txt", &mut |_, _| {}),
+            Some(())
+        );
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        assert_eq!(asked[1].0, OPEN);
+        assert_eq!(asked[2].0, WRITE);
+
+        let mut reader = Reader::new(&asked[2].1);
+        reader.u32().expect("the request id");
+        assert_eq!(reader.string().as_deref(), Some(&b"h"[..]));
+        assert_eq!(reader.u64(), Some(0));
+        assert_eq!(reader.string().as_deref(), Some(&b"hello"[..]));
+        let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn a_file_the_account_may_not_write_says_which_way_round_it_failed() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-denied-{}", std::process::id()));
+        std::fs::write(&local, b"hello").expect("a file to send");
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let mut status = PERMISSION_DENIED.to_be_bytes().to_vec();
+        status.extend_from_slice(&encode_string("Permission denied"));
+        let (mut session, _far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_STATUS, body(1, &status)),
+        ]);
+        assert!(session.handshake());
+        assert!(session.put(&local, "/etc/passwd", &mut |_, _| {}).is_none());
+
+        let failure = session.failure().expect("a reason");
+        assert_eq!(failure.message, "Couldn't write /etc/passwd.");
+        assert_eq!(
+            failure.detail,
+            "The account this connection logged in as may not write it."
+        );
+        let _ = std::fs::remove_file(&local);
     }
 
     #[test]

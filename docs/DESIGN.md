@@ -543,6 +543,22 @@ for a second round trip to learn whether it points at a directory, which is the
 trade the local tree makes for the same reason and for the same one entry in a
 hundred.
 
+Files move one at a time. A download is written beside where it is going under a
+dotted name and renamed onto it once it is whole, the discipline the editor
+already saves with, so an interrupted transfer costs the copy rather than
+leaving half a file under the name something else would open. An upload arrives
+with the permission bits it has here, which is what the `sftp` program does too:
+a script that runs on this machine runs on the other one. How far it has got is
+counted rather than guessed, since this drives the loop instead of reading
+another program's output, and the number reaches the progress bar through two
+integers a worker writes and a local timer reads, which is a timer over memory
+and not a poll of anything remote. What it is not is quick: one request is
+outstanding at a time, so a file crosses at one round trip per 32 KiB, roughly
+640 KB/s on a 50 ms link. The protocol's request ids exist so that sixty-four
+can be in the air at once and that is a later commit. Until then a second
+transfer is refused rather than queued, because one pipe carries one file and a
+request waiting behind a lock has nothing on screen to say so.
+
 sshfs would have been free: mount the host, and every page in this window works
 on it unchanged, the editor and the git panel included. It is the worst idea
 available. The panel polls on the main thread, so each tick becomes a round trip

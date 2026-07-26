@@ -13,6 +13,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use adw::prelude::*;
@@ -21,7 +22,7 @@ use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
 
-use tuni_core::files::{Directory, Item, Tree, natural_cmp};
+use tuni_core::files::{Directory, Failure, Item, Tree, natural_cmp};
 use tuni_core::sftp::Session;
 
 use crate::files::bind_row;
@@ -30,6 +31,15 @@ use crate::files::row::Row;
 /// One host's session, shared with the threads that talk on it. The lock is
 /// what a single pipe needs anyway: one request, one reply, in that order.
 type Link = Arc<Mutex<Session>>;
+
+/// How far a transfer has got: written by the thread moving the bytes, read by
+/// the timer that draws them. Two numbers rather than a channel, which this
+/// crate has no dependency for and would not be any more accurate.
+#[derive(Default)]
+pub struct Moved {
+    done: AtomicU64,
+    total: AtomicU64,
+}
 
 /// The directories that have come back, which is everything there is to draw.
 #[derive(Default)]
@@ -42,7 +52,7 @@ impl Directory for Listed {
 }
 
 mod imp {
-    use super::{Cell, HashSet, Item, Link, Listed, PathBuf, RefCell, Tree, gio, glib};
+    use super::{Arc, Cell, HashSet, Item, Link, Listed, Moved, PathBuf, RefCell, Tree, gio, glib};
     use adw::prelude::*;
     use adw::subclass::prelude::*;
 
@@ -67,6 +77,11 @@ mod imp {
         pub title: RefCell<Option<gtk::Label>>,
         pub subtitle: RefCell<Option<gtk::Label>>,
         pub menu: RefCell<Option<gtk::PopoverMenu>>,
+        pub progress: RefCell<Option<gtk::ProgressBar>>,
+        /// The transfer running, if one is. One pipe carries one at a time, so
+        /// a second would sit behind the lock with nothing on screen saying
+        /// why; this is what refuses it instead.
+        pub moving: RefCell<Option<Arc<Moved>>>,
         /// The row whose context menu is open, and so the one its actions act
         /// on.
         pub target: RefCell<Option<Item>>,
@@ -142,6 +157,14 @@ impl TuniSftp {
             .build();
         up.add_css_class("flat");
 
+        let send = gtk::Button::builder()
+            .icon_name("document-send-symbolic")
+            .tooltip_text("Upload a File Here")
+            .action_name("sftp.upload-here")
+            .valign(gtk::Align::Center)
+            .build();
+        send.add_css_class("flat");
+
         let refresh = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
             .tooltip_text("Read Again")
@@ -157,7 +180,16 @@ impl TuniSftp {
         header.set_margin_bottom(8);
         header.append(&names);
         header.append(&up);
+        header.append(&send);
         header.append(&refresh);
+
+        let progress = gtk::ProgressBar::builder()
+            .show_text(true)
+            .visible(false)
+            .build();
+        progress.set_margin_start(12);
+        progress.set_margin_end(12);
+        progress.set_margin_bottom(6);
 
         let rows = gio::ListStore::new::<Row>();
         let selection = gtk::SingleSelection::builder()
@@ -219,6 +251,7 @@ impl TuniSftp {
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&header);
+        content.append(&progress);
         content.append(&stack);
         self.set_child(Some(&content));
 
@@ -231,6 +264,7 @@ impl TuniSftp {
         imp.title.replace(Some(title));
         imp.subtitle.replace(Some(subtitle));
         imp.menu.replace(Some(menu));
+        imp.progress.replace(Some(progress));
 
         self.say(
             "No Connection",
@@ -323,6 +357,22 @@ impl TuniSftp {
                 }
             }),
             entry("refresh", self, TuniSftp::reread),
+            entry("download", self, |sftp| {
+                let target = sftp.imp().target.borrow().clone();
+                if let Some(item) = target.filter(|item| !item.is_directory) {
+                    sftp.download(&item);
+                }
+            }),
+            entry("upload", self, |sftp| {
+                let target = sftp.imp().target.borrow().clone();
+                if let Some(item) = target.filter(|item| item.is_directory) {
+                    sftp.upload(&item.path);
+                }
+            }),
+            entry("upload-here", self, |sftp| {
+                let root = sftp.imp().tree.borrow().root().to_path_buf();
+                sftp.upload(&root);
+            }),
             entry("copy-path", self, |sftp| {
                 if let Some(item) = sftp.imp().target.borrow().as_ref() {
                     sftp.clipboard().set_text(&item.path.to_string_lossy());
@@ -521,6 +571,191 @@ impl TuniSftp {
         ));
     }
 
+    // --- moving files ---------------------------------------------------------
+
+    /// Copies one remote file to wherever the user says.
+    fn download(&self, item: &Item) {
+        let remote = item.path.to_string_lossy().into_owned();
+        let dialog = gtk::FileDialog::builder()
+            .title("Download File")
+            .accept_label("Download")
+            .initial_name(&item.name)
+            .build();
+        if let Some(folder) = glib::user_special_dir(glib::UserDirectory::Downloads) {
+            dialog.set_initial_folder(Some(&gio::File::for_path(folder)));
+        }
+        dialog.save(
+            self.window().as_ref(),
+            gio::Cancellable::NONE,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |chosen| {
+                    if let Some(local) = chosen.ok().and_then(|file| file.path()) {
+                        this.transfer(Way::Down, remote, local);
+                    }
+                }
+            ),
+        );
+    }
+
+    /// Sends one local file into a remote directory, under the name it has
+    /// here.
+    fn upload(&self, directory: &Path) {
+        if self.imp().link.borrow().is_none() {
+            return;
+        }
+        let directory = directory.to_path_buf();
+        let dialog = gtk::FileDialog::builder()
+            .title("Upload File")
+            .accept_label("Upload")
+            .build();
+        dialog.open(
+            self.window().as_ref(),
+            gio::Cancellable::NONE,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |chosen| {
+                    let Some(local) = chosen.ok().and_then(|file| file.path()) else {
+                        return;
+                    };
+                    let Some(name) = local.file_name() else {
+                        return;
+                    };
+                    let remote = directory.join(name).to_string_lossy().into_owned();
+                    this.transfer(Way::Up, remote, local);
+                }
+            ),
+        );
+    }
+
+    /// Moves one file, and draws how far it has got while it goes.
+    ///
+    /// One at a time, since the session is a single pipe behind a lock: a
+    /// second transfer would wait there with nothing on screen to say why.
+    fn transfer(&self, way: Way, remote: String, local: PathBuf) {
+        let imp = self.imp();
+        let Some(link) = imp.link.borrow().clone() else {
+            return;
+        };
+        if imp.moving.borrow().is_some() {
+            return;
+        }
+        let moved = Arc::new(Moved::default());
+        imp.moving.replace(Some(Arc::clone(&moved)));
+
+        let directory = Path::new(&remote).parent().map(Path::to_path_buf);
+        let name = Path::new(&remote).file_name().map_or_else(
+            || remote.clone(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        self.watch(&match way {
+            Way::Up => format!("Sending {name}"),
+            Way::Down => format!("Fetching {name}"),
+        });
+
+        let generation = imp.generation.get();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let moved = gio::spawn_blocking(move || {
+                    let Ok(mut session) = link.lock() else {
+                        return Err(Failure {
+                            message: String::from("The connection ended."),
+                            detail: String::from("Nothing is holding it open any more."),
+                        });
+                    };
+                    let mut note = |done: u64, total: u64| {
+                        moved.done.store(done, Ordering::Relaxed);
+                        moved.total.store(total, Ordering::Relaxed);
+                    };
+                    match way {
+                        Way::Up => session
+                            .put(&local, &remote, &mut note)
+                            .ok_or_else(|| failed(&session)),
+                        Way::Down => {
+                            // Written beside where it is going and moved onto
+                            // it when it is whole, which is how the editor
+                            // saves: a transfer that dies leaves nothing under
+                            // a name something else would open.
+                            let part = local.with_file_name(partial(&local));
+                            session
+                                .get(&remote, &part, &mut note)
+                                .ok_or_else(|| failed(&session))?;
+                            std::fs::rename(&part, &local).map_err(|error| {
+                                let _ = std::fs::remove_file(&part);
+                                Failure {
+                                    message: format!("Couldn't finish {}.", local.display()),
+                                    detail: error.to_string(),
+                                }
+                            })
+                        }
+                    }
+                })
+                .await;
+
+                this.imp().moving.replace(None);
+                if let Some(bar) = this.imp().progress.borrow().as_ref() {
+                    bar.set_visible(false);
+                }
+                if generation != this.imp().generation.get() {
+                    return;
+                }
+                match moved {
+                    Ok(Err(failure)) => this.report(&failure),
+                    // The directory has something in it that it did not have,
+                    // and nothing remote will say so on its own.
+                    Ok(Ok(())) => {
+                        if let (Way::Up, Some(directory)) = (way, directory) {
+                            this.list(directory, false);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        ));
+    }
+
+    /// Draws a transfer while it runs: a local timer over two numbers, not a
+    /// poll of anything on the other machine.
+    fn watch(&self, label: &str) {
+        let Some(bar) = self.imp().progress.borrow().clone() else {
+            return;
+        };
+        bar.set_text(Some(label));
+        bar.set_fraction(0.0);
+        bar.set_visible(true);
+        glib::timeout_add_local(
+            std::time::Duration::from_millis(100),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    let Some(moved) = this.imp().moving.borrow().clone() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let done = moved.done.load(Ordering::Relaxed);
+                    let total = moved.total.load(Ordering::Relaxed);
+                    if let Some(bar) = this.imp().progress.borrow().as_ref() {
+                        // A server that did not say how big a file is leaves
+                        // nothing to draw a fraction from, so the bar moves
+                        // without claiming to know how far along it is.
+                        if total == 0 {
+                            bar.pulse();
+                        } else {
+                            bar.set_fraction(done as f64 / total as f64);
+                        }
+                    }
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
+    }
+
     // --- drawing --------------------------------------------------------------
 
     fn reload(&self) {
@@ -579,6 +814,15 @@ impl TuniSftp {
         }
         imp.target.replace(Some(item.clone()));
         let model = gio::Menu::new();
+        // Left off entirely while a transfer runs rather than shown and
+        // refused: one pipe carries one file at a time.
+        if imp.moving.borrow().is_none() {
+            if item.is_directory {
+                model.append(Some("Upload File Here…"), Some("sftp.upload"));
+            } else {
+                model.append(Some("Download…"), Some("sftp.download"));
+            }
+        }
         model.append(Some("Copy Path"), Some("sftp.copy-path"));
         menu.set_menu_model(Some(&model));
 
@@ -587,6 +831,45 @@ impl TuniSftp {
             .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
         crate::menu::popup_at(&menu, point);
     }
+
+    /// What went wrong, in the two lines whatever failed wrote it in.
+    fn report(&self, failure: &Failure) {
+        let dialog = adw::AlertDialog::new(Some(&failure.message), Some(&failure.detail));
+        dialog.add_response("close", "Close");
+        dialog.set_default_response(Some("close"));
+        dialog.set_close_response("close");
+        dialog.present(Some(self));
+    }
+
+    fn window(&self) -> Option<gtk::Window> {
+        self.root().and_downcast::<gtk::Window>()
+    }
+}
+
+/// Which way a transfer goes. Everything else about the two is the same.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Way {
+    Up,
+    Down,
+}
+
+/// A name beside the file being written, and the reason it is a dotfile with a
+/// process id in it is the one [`tuni_core::editor::save`] gives: two windows
+/// fetching the same name at once must not share the temporary.
+fn partial(local: &Path) -> String {
+    let name = local
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    format!(".{name}.tuni-{}", std::process::id())
+}
+
+/// Why a transfer stopped, in the two parts a dialog wants.
+fn failed(session: &Session) -> Failure {
+    session.failure().cloned().unwrap_or_else(|| Failure {
+        message: String::from("The transfer stopped."),
+        detail: String::from("The connection ended."),
+    })
 }
 
 /// One directory's rows, in the order a file manager shows them.
