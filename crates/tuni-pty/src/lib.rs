@@ -85,8 +85,12 @@ fn executable(path: &std::path::Path) -> bool {
 pub struct PtyConfig {
     /// Shell to run. Defaults to `$SHELL`, then the passwd entry, then `/bin/sh`.
     /// Resolve a configured name with [`resolve_shell`] before putting it here:
-    /// this is the path that gets run.
+    /// this is the path that gets run. Ignored when `argv` says what to run.
     pub shell: Option<PathBuf>,
+    /// An exact argv to run instead of a login shell. Empty is the login shell,
+    /// which is what every pane was before there was anything else to run.
+    /// `argv[0]` is resolved on `PATH` the way a shell would resolve it.
+    pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
     /// Extra environment on top of the inherited one.
     pub env: HashMap<String, String>,
@@ -108,6 +112,7 @@ impl Default for PtyConfig {
 
         Self {
             shell: None,
+            argv: Vec::new(),
             cwd: None,
             env,
             cols: 80,
@@ -183,15 +188,29 @@ impl Pty {
             })
             .map_err(|e| Error::Spawn(e.to_string()))?;
 
-        // The default-prog builder is the one that starts a *login* shell: it
-        // resolves $SHELL then the passwd entry, and prefixes argv[0] with '-'.
-        // An explicit shell rides in through $SHELL rather than through argv,
-        // because the builder resolves the executable from argv[0] and a
-        // login-shell argv[0] is not a path.
-        let mut cmd = CommandBuilder::new_default_prog();
-        if let Some(shell) = &config.shell {
-            cmd.env("SHELL", shell);
-        }
+        // The two branches cannot be merged: `arg` panics on a default-prog
+        // builder, so a command has to be built from `new` instead.
+        let mut cmd = match config.argv.as_slice() {
+            [program, args @ ..] => {
+                let mut cmd = CommandBuilder::new(program);
+                cmd.args(args);
+                cmd
+            }
+            // The default-prog builder is the one that starts a *login* shell:
+            // it resolves $SHELL then the passwd entry, and prefixes argv[0]
+            // with '-'. An explicit shell rides in through $SHELL rather than
+            // through argv, because the builder resolves the executable from
+            // argv[0] and a login-shell argv[0] is not a path. Which is also
+            // why it stays in this branch: $SHELL is how a login shell is
+            // *chosen*, and it means nothing to a command that names itself.
+            [] => {
+                let mut cmd = CommandBuilder::new_default_prog();
+                if let Some(shell) = &config.shell {
+                    cmd.env("SHELL", shell);
+                }
+                cmd
+            }
+        };
         if let Some(cwd) = &config.cwd {
             cmd.cwd(cwd);
         }
@@ -351,5 +370,43 @@ mod tests {
         assert_eq!(resolve_shell("tuni-no-such-shell"), None);
         assert_eq!(resolve_shell("/etc/hostname"), None);
         assert_eq!(resolve_shell("   "), None);
+    }
+
+    /// Drains a PTY until it says the program is gone, and answers with
+    /// everything it printed. The reader hands over whole buffers rather than
+    /// lines, so a program that prints once can still take two of them.
+    fn drain(pty: &Pty) -> String {
+        let events = pty.events();
+        let mut out = Vec::new();
+        while let Ok(event) = events.recv_blocking() {
+            match event {
+                PtyEvent::Output(bytes) => out.extend_from_slice(&bytes),
+                PtyEvent::Exited => break,
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn a_command_runs_instead_of_the_login_shell() {
+        let pty = Pty::spawn(&PtyConfig {
+            argv: vec!["echo".to_owned(), "tuni".to_owned()],
+            ..PtyConfig::default()
+        })
+        .expect("echo starts");
+        assert!(drain(&pty).contains("tuni"));
+    }
+
+    #[test]
+    fn an_empty_argv_is_still_the_login_shell() {
+        // `/bin/sh` rather than the passwd entry, so the test does not depend
+        // on whichever shell the machine running it happens to use. It sits at
+        // a prompt and never exits, which is the point: `Drop` hangs it up.
+        let pty = Pty::spawn(&PtyConfig {
+            shell: Some(PathBuf::from("/bin/sh")),
+            ..PtyConfig::default()
+        })
+        .expect("a login shell starts");
+        assert!(pty.shell_pid().is_some());
     }
 }

@@ -49,6 +49,21 @@ const PROGRESS_STALE: Duration = Duration::from_secs(15);
 /// it costs throughput rather than the window's ability to answer.
 const FEED_BUDGET: Duration = Duration::from_millis(8);
 
+/// What a pane's session runs. `Launch::default()` is the configured shell in
+/// no particular directory, which is what every pane was before a pane could
+/// run anything else.
+#[derive(Clone, Debug, Default)]
+pub struct Launch {
+    pub cwd: Option<std::path::PathBuf>,
+    /// An exact argv, or empty for the configured command and then the login
+    /// shell.
+    pub argv: Vec<String>,
+    /// Extra environment, folded over the session's own. An ssh pane overrides
+    /// `TERM` here, because the terminfo this terminal describes itself with
+    /// is not on the machine at the far end.
+    pub env: Vec<(String, String)>,
+}
+
 /// What the pointer is doing between press and release. A drag either paints a
 /// selection or is reported to the application; never both.
 #[derive(Clone, Copy, Default)]
@@ -954,9 +969,9 @@ impl TuniTerminal {
 
     // --- session lifecycle -------------------------------------------------
 
-    /// Start the shell. Safe to call once the widget has a size; before that
+    /// Start the session. Safe to call once the widget has a size; before that
     /// the grid falls back to 80x24 and is corrected on the first allocation.
-    pub fn start(&self, cwd: Option<std::path::PathBuf>) -> Result<(), String> {
+    pub fn start(&self, launch: &Launch) -> Result<(), String> {
         let imp = self.imp();
         let m = imp.metrics.get();
         let (cols, rows) = {
@@ -972,18 +987,26 @@ impl TuniTerminal {
 
         // A configured shell this machine has no program for falls back to the
         // login shell rather than failing to open a terminal at all. The
-        // settings window says so where the name was typed.
-        let shell = tuni_pty::resolve_shell(&imp.config.borrow().command);
-        let pty = Pty::spawn(&PtyConfig {
+        // settings window says so where the name was typed. An argv of its own
+        // names the program it runs, so the configured shell means nothing to
+        // it.
+        let shell = launch
+            .argv
+            .is_empty()
+            .then(|| tuni_pty::resolve_shell(&imp.config.borrow().command))
+            .flatten();
+        let mut config = PtyConfig {
             shell,
-            cwd,
+            argv: launch.argv.clone(),
+            cwd: launch.cwd.clone(),
             cols,
             rows,
             cell_width_px: m.cell_width.round() as u16,
             cell_height_px: m.cell_height.round() as u16,
             ..PtyConfig::default()
-        })
-        .map_err(|e| e.to_string())?;
+        };
+        config.env.extend(launch.env.iter().cloned());
+        let pty = Pty::spawn(&config).map_err(|e| e.to_string())?;
 
         let events = pty.events();
         imp.session.replace(Some(Session { term, pty }));

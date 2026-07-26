@@ -38,7 +38,7 @@ use crate::palette;
 use crate::panel::TuniPanel;
 use crate::preferences;
 use crate::switcher::{Card, TuniSwitcher};
-use crate::terminal::TuniTerminal;
+use crate::terminal::{Launch, TuniTerminal};
 
 /// Sidebar width, and the range a narrow or a wide window may take it to. The
 /// maximum is kero's own default width rather than a fraction of a wide screen:
@@ -1499,7 +1499,7 @@ impl TuniWindow {
 
         // Every pane's widget exists before any of them is drawn, so the grid
         // is laid out once rather than once per pane.
-        let started: Vec<(TuniTerminal, Id, Option<PathBuf>)> = panes
+        let started: Vec<(TuniTerminal, Id, Launch)> = panes
             .into_iter()
             .filter_map(|(pane, directory, content)| {
                 if content != Content::Terminal {
@@ -1510,12 +1510,16 @@ impl TuniWindow {
                     .map(PathBuf::from)
                     .filter(|path| path.is_dir())
                     .or_else(|| fallback.clone());
-                Some((self.new_terminal(project, tab, pane), pane, cwd))
+                let launch = Launch {
+                    cwd,
+                    ..Launch::default()
+                };
+                Some((self.new_terminal(project, tab, pane), pane, launch))
             })
             .collect();
         self.rebuild_grid(project, tab);
-        for (terminal, pane, cwd) in started {
-            self.start_terminal(&terminal, pane, cwd);
+        for (terminal, pane, launch) in started {
+            self.start_terminal(&terminal, pane, launch);
         }
         Some(page)
     }
@@ -1535,7 +1539,14 @@ impl TuniWindow {
         let terminal = self.new_terminal(project, tab, pane_id);
         self.rebuild_grid(project, tab);
         self.refresh();
-        self.start_terminal(&terminal, pane_id, cwd);
+        self.start_terminal(
+            &terminal,
+            pane_id,
+            Launch {
+                cwd,
+                ..Launch::default()
+            },
+        );
     }
 
     /// Puts a pane the caller built into a tab's layout. `false` when the tab
@@ -1800,14 +1811,14 @@ impl TuniWindow {
     ///
     /// A restored pane replays what it had printed once the shell is up, so the
     /// old output sits above the new prompt rather than racing it.
-    fn start_terminal(&self, terminal: &TuniTerminal, pane: Id, cwd: Option<PathBuf>) {
+    fn start_terminal(&self, terminal: &TuniTerminal, pane: Id, launch: Launch) {
         glib::idle_add_local_once(glib::clone!(
             #[weak(rename_to = this)]
             self,
             #[weak]
             terminal,
             move || {
-                if let Err(error) = terminal.start(cwd) {
+                if let Err(error) = terminal.start(&launch) {
                     let dialog = adw::AlertDialog::new(Some("Cannot start shell"), Some(&error));
                     dialog.add_response("close", "Close");
                     dialog.present(Some(&this));
