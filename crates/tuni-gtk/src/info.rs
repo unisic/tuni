@@ -5,14 +5,16 @@
 //! listening on — which is the question a dev server makes people ask, and
 //! which otherwise costs an `ss` and a `ps` in another window.
 //!
-//! A pane on another machine gets one more heading, because the first question
-//! about a connection is whether it is still there.
+//! A pane on another machine gets two more headings, because the first question
+//! about a connection is whether it is still there and the second is which
+//! ports it is carrying.
 //!
 //! The reading is [`tuni_core::info`], off the main loop because it walks
 //! `/proc`, with a generation stamp so a read that lands after the focus moved
 //! is dropped rather than drawn.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -23,7 +25,7 @@ use gtk::gio;
 use gtk::glib;
 
 use tuni_core::info::{self, Port, Process, Snapshot};
-use tuni_core::ssh::{self, Source};
+use tuni_core::ssh::{self, Direction, Forward, Notes, Source};
 use tuni_core::usage::{self, Agent};
 
 /// How many rows a section draws. A build spawning a compiler per core makes a
@@ -39,7 +41,9 @@ const MAX_ROWS: usize = 200;
 const CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 mod imp {
-    use super::{Cell, Instant, Link, PathBuf, RefCell, Snapshot, gio, glib, usage};
+    use super::{
+        Cell, HashMap, Instant, Link, PathBuf, RefCell, Snapshot, Tunnels, gio, glib, usage,
+    };
     use adw::prelude::*;
     use adw::subclass::prelude::*;
 
@@ -61,6 +65,18 @@ mod imp {
         /// asking down to a heartbeat.
         pub checked: Cell<Option<Instant>>,
 
+        /// The forwarded ports on that host, and which of them are answering.
+        pub forwards: RefCell<Tunnels>,
+        /// The remote forwards tuni opened this run, by the spec they were
+        /// asked for and the port they were given. Nothing on this machine can
+        /// see a listener at the far end, so what tuni was told is all there is
+        /// to go on, and the port matters because a remote forward may ask the
+        /// far end to pick one.
+        pub opened: RefCell<HashMap<String, u16>>,
+        /// Whether a forward is being opened or closed, which is what stops two
+        /// clicks turning into two requests.
+        pub busy: Cell<bool>,
+
         /// The last snapshot drawn, so a poll that finds nothing new redraws
         /// nothing — the panel polls every couple of seconds.
         pub snapshot: RefCell<Snapshot>,
@@ -78,10 +94,14 @@ mod imp {
         pub menu_pid: Cell<u32>,
         pub menu_port: Cell<u16>,
         pub menu_executable: RefCell<String>,
+        /// Which of tuni's own forwards the row menu belongs to.
+        pub menu_tunnel: Cell<usize>,
 
         pub title: RefCell<Option<gtk::Label>>,
         pub subtitle: RefCell<Option<gtk::Label>>,
         pub connection: RefCell<Option<super::Connection>>,
+        pub tunnels: RefCell<Option<super::Section>>,
+        pub problem: RefCell<Option<gtk::Label>>,
         pub cwd_group: RefCell<Option<super::Directory>>,
         pub root_group: RefCell<Option<super::Directory>>,
         pub agent: RefCell<Option<super::AgentSection>>,
@@ -130,6 +150,22 @@ pub struct Link {
     uptime: Option<u64>,
 }
 
+/// The forwarded ports on a pane's host.
+///
+/// Two lists rather than one, because they are two different things. A forward
+/// the host's own block declares is brought up by `ssh` with the connection and
+/// there is nothing here to start or stop. One tuni is keeping is opened and
+/// closed against a connection that is already running, which is what the
+/// switch on its row does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Tunnels {
+    declared: Vec<Forward>,
+    own: Vec<Forward>,
+    /// Which of the ports above something on this machine is listening on. Only
+    /// the ones that listen here: a remote forward listens at the far end.
+    listening: HashSet<u16>,
+}
+
 /// The host a pane is on, with a dot for whether anything is still answering.
 #[derive(Clone)]
 pub struct Connection {
@@ -162,6 +198,8 @@ pub struct AgentSection {
 #[derive(Clone)]
 pub struct Section {
     container: gtk::Box,
+    /// The heading's own row, for a section with a button in it.
+    heading: gtk::Box,
     count: gtk::Label,
     list: gtk::ListBox,
     empty: gtk::Label,
@@ -225,6 +263,7 @@ impl TuniInfo {
              pinned from the project menu is used as it stands.",
         ));
 
+        let tunnels = self.tunnel_section();
         let agent = self.agent_section();
         let processes = self.section("Processes", "Nothing is running under this shell");
         let ports = self.section("Ports", "Nothing is listening");
@@ -232,6 +271,7 @@ impl TuniInfo {
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.set_margin_bottom(12);
         content.append(&connection.container);
+        content.append(&tunnels.container);
         content.append(&cwd_group.container);
         content.append(&root_group.container);
         content.append(&agent.container);
@@ -259,6 +299,7 @@ impl TuniInfo {
         imp.title.replace(Some(title));
         imp.subtitle.replace(Some(subtitle));
         imp.connection.replace(Some(connection));
+        imp.tunnels.replace(Some(tunnels));
         imp.cwd_group.replace(Some(cwd_group));
         imp.root_group.replace(Some(root_group));
         imp.agent.replace(Some(agent));
@@ -323,6 +364,40 @@ impl TuniInfo {
             address,
             jump,
         }
+    }
+
+    /// The ports section for the machine at the other end, which is the Ports
+    /// section's question asked of a connection rather than of a shell.
+    fn tunnel_section(&self) -> Section {
+        let section = self.section("Tunnels", "No forwarded ports");
+
+        let add = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Forward a port")
+            .action_name("info.add-tunnel")
+            .valign(gtk::Align::Center)
+            .build();
+        add.add_css_class("flat");
+        section.heading.append(&add);
+
+        // Where a refused port lands. The message names the process holding it,
+        // and a dialog for something the next click can fix would be in the way.
+        let problem = gtk::Label::builder().xalign(0.0).wrap(true).build();
+        problem.add_css_class("caption");
+        problem.add_css_class("error");
+        problem.set_visible(false);
+        section.container.append(&problem);
+
+        section.container.set_visible(false);
+        section.container.set_tooltip_text(Some(
+            "A forward the host's own configuration declares comes up with the \
+             connection and stays up. One added here is tuni's: it is kept with \
+             the host and opened against the connection already running, and \
+             Make Permanent moves it into the host's block.",
+        ));
+
+        self.imp().problem.replace(Some(problem));
+        section
     }
 
     fn directory(&self, title: &str, open: &str, copy: &str) -> Directory {
@@ -457,6 +532,7 @@ impl TuniInfo {
 
         Section {
             container,
+            heading,
             count,
             list,
             empty,
@@ -507,7 +583,15 @@ impl TuniInfo {
         if switched {
             imp.host.replace(host.map(str::to_owned));
             imp.link.replace(Link::default());
+            imp.forwards.replace(Tunnels::default());
+            imp.opened.borrow_mut().clear();
+            // A port that would not open on the host before this one is not
+            // news about this one.
+            if let Some(problem) = imp.problem.borrow().as_ref() {
+                problem.set_visible(false);
+            }
             self.draw_connection();
+            self.draw_tunnels();
             self.reload_connection(true);
         }
     }
@@ -619,16 +703,28 @@ impl TuniInfo {
                     link.uptime = crate::hosts::control()
                         .check(&host)
                         .and_then(tuni_core::info::age);
-                    link
+                    (link, tunnels(&host))
                 })
                 .await;
                 let imp = this.imp();
-                let Ok(link) = read else { return };
-                if imp.generation.get() != generation || *imp.link.borrow() == link {
+                let Ok((link, forwards)) = read else { return };
+                if imp.generation.get() != generation {
                     return;
                 }
-                imp.link.replace(link);
-                this.draw_connection();
+                let reconnected = *imp.link.borrow() != link;
+                if reconnected {
+                    imp.link.replace(link);
+                    this.draw_connection();
+                }
+                let moved = *imp.forwards.borrow() != forwards;
+                if moved {
+                    imp.forwards.replace(forwards);
+                }
+                // A master that came or went changes the rows too: nothing can
+                // be opened or closed on a connection that is not there.
+                if reconnected || moved {
+                    this.draw_tunnels();
+                }
             }
         ));
     }
@@ -666,6 +762,155 @@ impl TuniInfo {
         }
         section.jump.set_visible(!link.jump.is_empty());
         section.jump.set_text(&format!("through {}", link.jump));
+    }
+
+    fn draw_tunnels(&self) {
+        let Some(section) = self.imp().tunnels.borrow().clone() else {
+            return;
+        };
+        if self.imp().host.borrow().is_none() {
+            section.container.set_visible(false);
+            return;
+        }
+        section.container.set_visible(true);
+
+        let forwards = self.imp().forwards.borrow().clone();
+        let master = self.imp().link.borrow().uptime.is_some();
+        let count = forwards.declared.len() + forwards.own.len();
+        self.fill(&section, count, |list| {
+            for forward in &forwards.declared {
+                list.append(&self.tunnel_row(forward, None, self.is_open(forward), master));
+            }
+            for (index, forward) in forwards.own.iter().enumerate() {
+                list.append(&self.tunnel_row(forward, Some(index), self.is_open(forward), master));
+            }
+        });
+    }
+
+    /// Whether a forward is carrying anything.
+    ///
+    /// Read from the listening sockets on this machine, which is the honest
+    /// answer for the two directions that listen here. A remote forward listens
+    /// at the far end, so the answer for one is what the master said when it was
+    /// asked to open it, and nothing more.
+    fn is_open(&self, forward: &Forward) -> bool {
+        if forward.direction == Direction::Remote {
+            return self.imp().opened.borrow().contains_key(&forward.spec());
+        }
+        self.imp()
+            .forwards
+            .borrow()
+            .listening
+            .contains(&forward.listen_port)
+    }
+
+    fn tunnel_row(
+        &self,
+        forward: &Forward,
+        own: Option<usize>,
+        open: bool,
+        master: bool,
+    ) -> gtk::ListBoxRow {
+        let dot = gtk::Image::from_icon_name("media-record-symbolic");
+        dot.set_pixel_size(8);
+        dot.add_css_class("success");
+        if !open {
+            dot.set_icon_name(None);
+        }
+
+        let (what, written) = crate::forward_editor::describe(forward);
+        let name = gtk::Label::builder()
+            .label(forward.title())
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        if forward.label.is_empty() {
+            name.add_css_class("monospace");
+        }
+        // Under it rather than beside it: the panel is a column, and a spec and
+        // a sentence and a switch do not fit across one of those.
+        let detail = gtk::Label::builder().label(&what).xalign(0.0).build();
+        detail.add_css_class("caption");
+        detail.add_css_class("dim-label");
+        detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
+
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        line.append(&dot);
+        line.append(&name);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        content.set_margin_start(12);
+        content.set_margin_end(6);
+        content.set_margin_top(4);
+        content.set_margin_bottom(4);
+        content.append(&line);
+        content.append(&detail);
+
+        match own {
+            Some(index) => {
+                let switch = gtk::Switch::builder()
+                    .valign(gtk::Align::Center)
+                    .active(open)
+                    .state(open)
+                    .sensitive(master && !self.imp().busy.get())
+                    .build();
+                if !master {
+                    switch.set_tooltip_text(Some(
+                        "There is no shared connection to open a port on. \
+                         Connect to the host first.",
+                    ));
+                }
+                // Connected after the state is set, or drawing a row would ask
+                // ssh to do again whatever it has already done.
+                let forward = forward.clone();
+                switch.connect_state_set(glib::clone!(
+                    #[weak(rename_to = this)]
+                    self,
+                    #[upgrade_or]
+                    glib::Propagation::Proceed,
+                    move |_, wanted| {
+                        this.set_tunnel(&forward, wanted);
+                        // The switch follows what ssh answered rather than what
+                        // the click asked for, so the row is redrawn from the
+                        // result instead of moving here.
+                        glib::Propagation::Stop
+                    }
+                ));
+
+                let more = gtk::MenuButton::builder()
+                    .icon_name("view-more-symbolic")
+                    .menu_model(&tunnel_menu())
+                    .valign(gtk::Align::Center)
+                    .build();
+                more.add_css_class("flat");
+                // Which row it belongs to is remembered rather than passed: the
+                // actions the menu names are the group's and fire later.
+                more.set_create_popup_func(glib::clone!(
+                    #[weak(rename_to = this)]
+                    self,
+                    move |_: &gtk::MenuButton| this.imp().menu_tunnel.set(index)
+                ));
+
+                line.append(&switch);
+                line.append(&more);
+            }
+            None => {
+                let held = gtk::Label::new(Some("always on"));
+                held.add_css_class("caption");
+                held.add_css_class("dim-label");
+                line.append(&held);
+            }
+        }
+
+        let row = gtk::ListBoxRow::builder().child(&content).build();
+        row.set_tooltip_text(Some(&match own {
+            Some(_) => written,
+            None => {
+                format!("{written}\nDeclared by the host, so ssh brings it up with the connection")
+            }
+        }));
+        row
     }
 
     fn draw_directories(&self) {
@@ -1048,6 +1293,22 @@ impl TuniInfo {
                 let executable = this.imp().menu_executable.borrow().clone();
                 this.copy(&executable);
             }),
+            entry("add-tunnel", self, |this| {
+                if this.imp().host.borrow().is_none() {
+                    return;
+                }
+                crate::forward_editor::present(
+                    this,
+                    None,
+                    glib::clone!(
+                        #[weak]
+                        this,
+                        move |forward| this.keep_tunnel(forward)
+                    ),
+                );
+            }),
+            entry("pin-tunnel", self, |this| this.pin_tunnel()),
+            entry("remove-tunnel", self, |this| this.remove_tunnel()),
             entry("open-port", self, |this| {
                 let port = this.imp().menu_port.get();
                 this.open_url(&format!("http://localhost:{port}"));
@@ -1059,6 +1320,161 @@ impl TuniInfo {
         ]);
         self.insert_action_group("info", Some(&actions));
         self.imp().actions.replace(Some(actions));
+    }
+
+    // --- forwarded ports ---------------------------------------------------
+
+    /// Asks the master to open or close a forward.
+    ///
+    /// A port that something else is already listening on is caught before ssh
+    /// is asked, because the mux client's own answer for that is `Error: remote
+    /// port forwarding failed` with neither the port nor the process in it.
+    fn set_tunnel(&self, forward: &Forward, open: bool) {
+        let imp = self.imp();
+        let Some(host) = imp.host.borrow().clone() else {
+            return;
+        };
+        if imp.busy.get() {
+            return;
+        }
+        imp.busy.set(true);
+
+        // Closing one goes back as the port that ended up listening, which is
+        // not what was asked for when the far end picked it: the master matches
+        // a cancel against what it recorded.
+        let mut request = forward.clone();
+        if !open
+            && request.listen_port == 0
+            && let Some(port) = imp.opened.borrow().get(&forward.spec())
+        {
+            request.listen_port = *port;
+        }
+
+        let forward = forward.clone();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let done = gio::spawn_blocking(move || {
+                    let control = crate::hosts::control();
+                    if !open {
+                        return control.cancel(&host, &request).map(|()| 0);
+                    }
+                    ssh::check_port(&request)?;
+                    control.add(&host, &request)
+                })
+                .await;
+                let imp = this.imp();
+                imp.busy.set(false);
+                let outcome = done.unwrap_or_else(|_| Err("The request did not finish".to_owned()));
+                match outcome {
+                    Ok(port) if open => {
+                        imp.opened.borrow_mut().insert(forward.spec(), port);
+                    }
+                    Ok(_) => {
+                        imp.opened.borrow_mut().remove(&forward.spec());
+                    }
+                    Err(_) => {}
+                }
+                this.report_tunnel(outcome.map(|_| ()));
+            }
+        ));
+    }
+
+    /// Files a forward with the host, and opens it when there is a connection
+    /// to open it on. Kept either way: a host nobody is connected to yet is
+    /// still a host with a forward waiting on it.
+    fn keep_tunnel(&self, forward: Forward) {
+        let Some(host) = self.imp().host.borrow().clone() else {
+            return;
+        };
+        let live = self.imp().link.borrow().uptime.is_some();
+        let kept = forward.clone();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let written = gio::spawn_blocking(move || remember(&host, &kept))
+                    .await
+                    .unwrap_or_else(|_| Err("The write did not finish".to_owned()));
+                if written.is_ok() && live {
+                    this.set_tunnel(&forward, true);
+                    return;
+                }
+                this.report_tunnel(written);
+            }
+        ));
+    }
+
+    fn pin_tunnel(&self) {
+        let Some(forward) = self.tunnel() else {
+            return;
+        };
+        let Some(host) = self.imp().host.borrow().clone() else {
+            return;
+        };
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let moved = gio::spawn_blocking(move || pin(&host, &forward))
+                    .await
+                    .unwrap_or_else(|_| Err("The write did not finish".to_owned()));
+                this.report_tunnel(moved);
+            }
+        ));
+    }
+
+    /// Takes a forward off the host, closing it first when it is carrying
+    /// something. A forward left open on a master nothing lists any more is a
+    /// port nobody can find again.
+    fn remove_tunnel(&self) {
+        let Some(forward) = self.tunnel() else {
+            return;
+        };
+        let Some(host) = self.imp().host.borrow().clone() else {
+            return;
+        };
+        let open = self.is_open(&forward);
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let spec = forward.spec();
+                let removed = gio::spawn_blocking(move || {
+                    let closed = if open {
+                        crate::hosts::control().cancel(&host, &forward)
+                    } else {
+                        Ok(())
+                    };
+                    forget(&host, &forward)?;
+                    closed
+                })
+                .await
+                .unwrap_or_else(|_| Err("The write did not finish".to_owned()));
+                this.imp().opened.borrow_mut().remove(&spec);
+                this.report_tunnel(removed);
+            }
+        ));
+    }
+
+    /// The forward a row menu was opened over.
+    fn tunnel(&self) -> Option<Forward> {
+        let index = self.imp().menu_tunnel.get();
+        self.imp().forwards.borrow().own.get(index).cloned()
+    }
+
+    fn report_tunnel(&self, outcome: Result<(), String>) {
+        if let Some(problem) = self.imp().problem.borrow().as_ref() {
+            problem.set_visible(outcome.is_err());
+            if let Err(message) = &outcome {
+                problem.set_label(message);
+            }
+        }
+        // What is listening now is a question for the reader either way: a
+        // request that failed may still have changed something, and one that
+        // worked says nothing about the rest of the list.
+        self.reload_connection(false);
     }
 
     /// Signals the process, then reads again shortly after, so the row leaves
@@ -1144,6 +1560,81 @@ fn port_menu(port: u16) -> gio::Menu {
     signals.append(Some("Force Kill"), Some("info.kill"));
     menu.append_section(None, &signals);
     menu
+}
+
+fn tunnel_menu() -> gio::Menu {
+    let menu = gio::Menu::new();
+    menu.append(Some("Make Permanent"), Some("info.pin-tunnel"));
+    menu.append(Some("Remove"), Some("info.remove-tunnel"));
+    menu
+}
+
+/// What is forwarded on a host, and which of it is answering.
+///
+/// The configuration, the host's notes and `/proc`, so it belongs off the main
+/// thread with everything else here.
+fn tunnels(destination: &str) -> Tunnels {
+    let declared = ssh::host(destination).forwards;
+    let own = Notes::load().get(destination).forwards;
+    let watched: HashSet<u16> = declared
+        .iter()
+        .chain(own.iter())
+        .filter(|forward| forward.direction != Direction::Remote && forward.listen_port != 0)
+        .map(|forward| forward.listen_port)
+        .collect();
+    // One pair of file reads answers for the whole list, and a host with
+    // nothing forwarded on it costs not even that.
+    let listening = if watched.is_empty() {
+        HashSet::new()
+    } else {
+        let mut ports = info::listening_ports();
+        ports.retain(|port| watched.contains(port));
+        ports
+    };
+    Tunnels {
+        declared,
+        own,
+        listening,
+    }
+}
+
+fn remember(destination: &str, forward: &Forward) -> Result<(), String> {
+    let mut notes = Notes::load();
+    let mut meta = notes.get(destination);
+    if !meta.forwards.contains(forward) {
+        meta.forwards.push(forward.clone());
+    }
+    notes.set(destination, meta);
+    notes.save().map_err(|error| error.to_string())
+}
+
+fn forget(destination: &str, forward: &Forward) -> Result<(), String> {
+    let mut notes = Notes::load();
+    let mut meta = notes.get(destination);
+    meta.forwards.retain(|kept| kept != forward);
+    notes.set(destination, meta);
+    notes.save().map_err(|error| error.to_string())
+}
+
+/// Moves a forward out of the host's notes and into its block, where `ssh`
+/// brings it up with the connection instead of tuni asking for it.
+///
+/// Only into a block tuni owns. A host declared in `~/.ssh/config` is left
+/// alone here for the reason it is left alone in the editor: that file is the
+/// user's, and it is often under version control or config management.
+fn pin(destination: &str, forward: &Forward) -> Result<(), String> {
+    let mut hosts = ssh::saved();
+    let Some(host) = hosts.iter_mut().find(|host| host.alias == destination) else {
+        return Err(format!(
+            "{destination} is declared outside the file tuni keeps, so tuni does not \
+             write lines into it. Saving the host from the editor makes a copy tuni owns."
+        ));
+    };
+    if !host.forwards.contains(forward) {
+        host.forwards.push(forward.clone());
+    }
+    ssh::save(&hosts)?;
+    forget(destination, forward)
 }
 
 /// Where a destination actually goes, once `ssh` has applied everything it

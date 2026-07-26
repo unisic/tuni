@@ -522,12 +522,13 @@ pub struct Forward {
 }
 
 impl Forward {
-    /// What to call it in a sentence: the name somebody gave it, and otherwise
-    /// the flag and argument they would have typed themselves.
+    /// What to call it in a list: the name somebody gave it, and otherwise the
+    /// flag and the port, which is the half of a spec that identifies it. The
+    /// other half is what the row says underneath in words.
     #[must_use]
     pub fn title(&self) -> String {
         if self.label.is_empty() {
-            format!("{} {}", self.direction.flag(), self.spec())
+            format!("{} {}", self.direction.flag(), self.listen())
         } else {
             self.label.clone()
         }
