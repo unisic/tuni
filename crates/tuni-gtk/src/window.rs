@@ -33,6 +33,7 @@ use crate::diff::TuniDiff;
 use crate::editor::TuniEditor;
 use crate::find::TuniFind;
 use crate::grid::{Message, TuniGrid};
+use crate::hosts::TuniHosts;
 use crate::notify;
 use crate::palette;
 use crate::panel::TuniPanel;
@@ -94,6 +95,12 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "tab-new-symbolic",
         Some("Ctrl+Shift+T"),
         "win.new-tab",
+    ),
+    (
+        "New Connection",
+        "network-server-symbolic",
+        Some("Ctrl+Shift+O"),
+        "win.new-connection",
     ),
     (
         "New Project",
@@ -230,8 +237,8 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
 
 mod imp {
     use super::{
-        Cell, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniFind, TuniGrid, TuniPanel,
-        TuniRemote, TuniSwitcher, TuniTerminal, Workspace, glib,
+        Cell, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniFind, TuniGrid, TuniHosts,
+        TuniPanel, TuniRemote, TuniSwitcher, TuniTerminal, Workspace, glib,
     };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
@@ -250,6 +257,8 @@ mod imp {
         /// terminal underneath is in `terminals` like any other, since it is
         /// one: only what the grid draws differs.
         pub remotes: RefCell<HashMap<Id, TuniRemote>>,
+        /// One host list per pane showing one, by pane id.
+        pub hosts: RefCell<HashMap<Id, TuniHosts>>,
         /// One layout of panes per tab, by tab id.
         pub grids: RefCell<HashMap<Id, TuniGrid>>,
         /// The strip entry each tab was given, by tab id.
@@ -667,6 +676,17 @@ impl TuniWindow {
             ),
         );
 
+        // A host list reads files the user edits in some other window, and
+        // coming back to tuni is when they would expect to see the edit. It
+        // fires on losing the focus too, hence the question.
+        self.connect_is_active_notify(|window| {
+            if window.is_active() {
+                for hosts in window.imp().hosts.borrow().values() {
+                    hosts.refresh_if_stale();
+                }
+            }
+        });
+
         imp.split.replace(Some(split));
         imp.sidebar.replace(Some(sidebar));
         imp.panel.replace(Some(panel));
@@ -884,6 +904,11 @@ impl TuniWindow {
                 if let Some(alias) = target.and_then(glib::Variant::str) {
                     window.open_pane(Pane::ssh(alias.to_owned()));
                 }
+            }),
+            // Opens the host list in a tab of its own, whatever a new tab is
+            // configured to open.
+            entry("new-connection", None, |window, _| {
+                window.open_pane(Pane::hosts());
             }),
             entry("settings", None, |window, _| window.show_preferences()),
             entry("about", None, |window, _| window.show_about()),
@@ -1635,6 +1660,80 @@ impl TuniWindow {
             .map(|entry| entry.content.clone())
     }
 
+    /// The host list for one pane, wired to the three places a connection it is
+    /// asked for can go, and to the one thing it cannot do itself, which is
+    /// open the file it only reads.
+    fn new_hosts(&self, project: Id, tab: Id, pane: Id) -> TuniHosts {
+        use crate::hosts::Message;
+
+        let hosts = TuniHosts::new();
+        hosts.set_hexpand(true);
+        hosts.set_vexpand(true);
+        hosts.connect_message(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |message| match message {
+                Message::Connect(alias) => {
+                    this.replace_pane(project, tab, pane, Pane::ssh(alias));
+                }
+                Message::LocalShell => this.replace_pane(project, tab, pane, Pane::new()),
+                Message::ConnectToSide(alias) => this.open_pane_to_side(Pane::ssh(alias)),
+                Message::ConnectInTab(alias) => this.open_pane(Pane::ssh(alias)),
+                Message::OpenFile(path) => this.open_file(&path),
+            }
+        ));
+        self.imp().hosts.borrow_mut().insert(pane, hosts.clone());
+        hosts
+    }
+
+    /// Puts something else in a pane that is already on screen: the model, the
+    /// widget, and the session that goes with it.
+    ///
+    /// The tile stays the same tile. That is the whole of what picking a host
+    /// in the launcher does, and it is why the list is a pane rather than a
+    /// dialog: it is standing in the place the connection is about to be.
+    fn replace_pane(&self, project: Id, tab: Id, pane: Id, replacement: Pane) {
+        let content = replacement.content.clone();
+        {
+            let mut workspace = self.imp().workspace.borrow_mut();
+            let Some(entry) = workspace
+                .project_mut(project)
+                .and_then(|project| project.pane_mut(tab, pane))
+            else {
+                return;
+            };
+            entry.replace_with(replacement);
+        }
+        let cwd = self.directory_for_new_shell(project);
+        self.forget_pane(pane);
+        self.fill_pane(project, tab, pane, &content, cwd);
+    }
+
+    /// Builds, draws and starts what a pane holds, for a pane already in the
+    /// layout. Every way of opening one that is not a whole tab goes through
+    /// here; a tab builds all of its panes before drawing any of them.
+    fn fill_pane(&self, project: Id, tab: Id, pane: Id, content: &Content, cwd: Option<PathBuf>) {
+        let terminal = match content {
+            Content::Terminal | Content::Ssh { .. } => {
+                let terminal = self.new_terminal(project, tab, pane);
+                if is_remote(content) {
+                    self.new_remote(project, tab, pane, &terminal);
+                }
+                Some(terminal)
+            }
+            _ => {
+                self.new_content(project, tab, pane, content);
+                None
+            }
+        };
+        self.rebuild_grid(project, tab);
+        self.refresh();
+        self.focus_pane();
+        if let Some(terminal) = terminal {
+            self.start_session(&terminal, pane, content, cwd, true);
+        }
+    }
+
     /// An editor for one pane, opened on a file and remembered.
     fn new_editor(&self, project: Id, tab: Id, pane: Id, path: &Path) -> TuniEditor {
         let imp = self.imp();
@@ -1770,10 +1869,8 @@ impl TuniWindow {
         if !self.insert_pane(project, tab, pane, Edge::Right) {
             return;
         }
-        self.new_content(project, tab, pane_id, &content);
-        self.rebuild_grid(project, tab);
-        self.refresh();
-        self.focus_pane();
+        let cwd = self.directory_for_new_shell(project);
+        self.fill_pane(project, tab, pane_id, &content, cwd);
     }
 
     /// Builds whatever a pane holds, for a pane already in the layout. Not a
@@ -1787,6 +1884,9 @@ impl TuniWindow {
             }
             Content::Diff { path, staged } => {
                 self.new_diff(project, tab, pane, path, *staged);
+            }
+            Content::Hosts => {
+                self.new_hosts(project, tab, pane);
             }
         }
     }
@@ -2069,6 +2169,12 @@ impl TuniWindow {
                 .iter()
                 .map(|(id, diff)| (*id, diff.clone().upcast())),
         );
+        widgets.extend(
+            imp.hosts
+                .borrow()
+                .iter()
+                .map(|(id, hosts)| (*id, hosts.clone().upcast())),
+        );
         // Last, so a connection's bar replaces the bare terminal already
         // entered for it above.
         widgets.extend(
@@ -2276,6 +2382,7 @@ impl TuniWindow {
         }
         imp.editors.borrow_mut().remove(&pane);
         imp.remotes.borrow_mut().remove(&pane);
+        imp.hosts.borrow_mut().remove(&pane);
     }
 
     /// Closes one pane, and the tab with it when it was the last one.
@@ -2934,6 +3041,7 @@ impl TuniWindow {
                     .map(|terminal| terminal.preview(28))
                     .unwrap_or_else(|| alias.clone()),
             ),
+            Content::Hosts => ("network-server-symbolic", "Connect".to_owned()),
             Content::File(path) => ("text-x-generic-symbolic", shorten(&path.to_string_lossy())),
             Content::Diff { path, staged } => (
                 "media-record-symbolic",

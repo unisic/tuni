@@ -66,6 +66,8 @@ pub enum Content {
     /// configuration under that name, and a copy here would go stale the
     /// moment anybody edited `~/.ssh/config`.
     Ssh { alias: String },
+    /// The list of everything there is to connect to.
+    Hosts,
 }
 
 /// One tile: what it holds, and what that last said about itself.
@@ -129,6 +131,17 @@ impl Pane {
         }
     }
 
+    /// A pane holding the host list, named for what it is until something is
+    /// picked in it.
+    #[must_use]
+    pub fn hosts() -> Self {
+        Self {
+            content: Content::Hosts,
+            title: Some("Connect".to_owned()),
+            ..Self::new()
+        }
+    }
+
     /// A pane holding what changed in a file, named for the file with the side
     /// of the comparison after it, since both sides can be open at once.
     #[must_use]
@@ -157,7 +170,7 @@ impl Pane {
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         match &self.content {
-            Content::Terminal | Content::Ssh { .. } => None,
+            Content::Terminal | Content::Ssh { .. } | Content::Hosts => None,
             Content::File(path) | Content::Diff { path, .. } => Some(path),
         }
     }
@@ -177,6 +190,21 @@ impl Pane {
             &self.content,
             Content::Diff { path: open, staged: side } if open == path && *side == staged
         )
+    }
+
+    /// Puts something else in this pane, keeping the tile itself: its id, so
+    /// every map keyed by it still points here, and its share of the tab, so
+    /// nothing moves under the change.
+    ///
+    /// What the host list does when a host is picked in it. The list was only
+    /// ever the way to say what goes in this tile, so it becomes the session
+    /// rather than opening one beside itself.
+    pub fn replace_with(&mut self, pane: Self) {
+        *self = Self {
+            id: self.id,
+            weight: self.weight,
+            ..pane
+        };
     }
 
     /// Points a file pane at another path, after the file was renamed under it.

@@ -10,6 +10,7 @@ mod files;
 mod find;
 mod git;
 mod grid;
+mod hosts;
 mod info;
 mod keymap;
 mod menu;
@@ -50,6 +51,9 @@ const APP_ID: &str = "dev.unisic.Tuni";
 /// shortcut goes to the shorter reach.
 const ACCELS: &[(&str, &[&str])] = &[
     ("win.new-tab", &["<Ctrl><Shift>t"]),
+    // The host list, in a tab of its own. `Ctrl+Shift` had no `o` on it, and
+    // "open a connection" is what the key says everywhere else.
+    ("win.new-connection", &["<Ctrl><Shift>o"]),
     // Closing the last pane in a tab closes the tab, which is what one key for
     // both means in practice. Closing a *split* tab whole stays on the tab menu
     // rather than taking `Ctrl+Shift+Q`, which every desktop reads as quit.

@@ -62,6 +62,10 @@ pub struct PaneSnapshot {
     /// before there was ssh readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<String>,
+    /// Set on the pane that was showing the host list. It holds nothing of its
+    /// own, so there is nothing to write down beyond that it was there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hosts: bool,
 }
 
 /// What the window knows about a pane that the model does not: the scrollback
@@ -308,6 +312,7 @@ fn snap_tab(tab: &Tab, state: &impl Fn(Id) -> PaneState) -> TabSnapshot {
                                 Content::Ssh { alias } => Some(alias.clone()),
                                 _ => None,
                             },
+                            hosts: pane.content == Content::Hosts,
                         }
                     })
                     .collect(),
@@ -332,11 +337,14 @@ fn restore_tab(
                 .panes
                 .iter()
                 .map(|saved| {
-                    let mut pane = match (&saved.ssh, &saved.file, saved.diff) {
-                        (Some(alias), _, _) => Pane::ssh(alias.clone()),
-                        (None, Some(path), Some(staged)) => Pane::diff(PathBuf::from(path), staged),
-                        (None, Some(path), None) => Pane::file(PathBuf::from(path)),
-                        (None, None, _) => Pane::new(),
+                    let mut pane = match (saved.hosts, &saved.ssh, &saved.file, saved.diff) {
+                        (true, ..) => Pane::hosts(),
+                        (false, Some(alias), _, _) => Pane::ssh(alias.clone()),
+                        (false, None, Some(path), Some(staged)) => {
+                            Pane::diff(PathBuf::from(path), staged)
+                        }
+                        (false, None, Some(path), None) => Pane::file(PathBuf::from(path)),
+                        (false, None, None, _) => Pane::new(),
                     };
                     if saved.directory.is_some() {
                         pane.directory.clone_from(&saved.directory);
@@ -619,6 +627,27 @@ mod tests {
         // anything has been dialled and before a remote prompt has said
         // anything about itself.
         assert_eq!(pane.title.as_deref(), Some("prod-db"));
+    }
+
+    #[test]
+    fn a_host_list_comes_back_as_a_host_list() {
+        let mut saved = workspace(&[1]);
+        let project = saved.projects()[0].id();
+        let tab = saved.projects()[0].tabs()[0].id();
+        saved
+            .project_mut(project)
+            .and_then(|project| project.tab_mut(tab))
+            .expect("just built")
+            .layout_mut()
+            .split(Pane::hosts(), Edge::Right);
+
+        let text = serde_json::to_string(&Snapshot::of(&saved, |_| PaneState::default()))
+            .expect("plain data");
+        let read: Snapshot = serde_json::from_str(&text).expect("what we just wrote");
+        let restored = read.restore().workspace;
+
+        let panes = restored.projects()[0].tabs()[0].layout().columns()[1].panes();
+        assert_eq!(panes[0].content, Content::Hosts);
     }
 
     #[test]
