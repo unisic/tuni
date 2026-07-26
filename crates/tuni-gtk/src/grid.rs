@@ -70,7 +70,19 @@ mod imp {
         type ParentType = adw::Bin;
     }
 
-    impl ObjectImpl for TuniGrid {}
+    impl ObjectImpl for TuniGrid {
+        fn constructed(&self) {
+            self.parent_constructed();
+            crate::debug::born("TuniGrid");
+        }
+    }
+
+    impl Drop for TuniGrid {
+        fn drop(&mut self) {
+            crate::debug::died("TuniGrid");
+        }
+    }
+
     impl WidgetImpl for TuniGrid {}
     impl BinImpl for TuniGrid {}
 }

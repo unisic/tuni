@@ -83,7 +83,14 @@ mod imp {
     impl ObjectImpl for TuniEditor {
         fn constructed(&self) {
             self.parent_constructed();
+            crate::debug::born("TuniEditor");
             self.obj().build();
+        }
+    }
+
+    impl Drop for TuniEditor {
+        fn drop(&mut self) {
+            crate::debug::died("TuniEditor");
         }
     }
 

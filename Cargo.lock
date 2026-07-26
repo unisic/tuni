@@ -1179,6 +1179,7 @@ dependencies = [
 name = "tuni-gtk"
 version = "1.0.0"
 dependencies = [
+ "async-channel",
  "gdk4-wayland",
  "gtk4",
  "libadwaita",

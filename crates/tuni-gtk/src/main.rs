@@ -3,6 +3,7 @@
 //! Everything the window does lives in `window.rs`; this file is the process.
 
 mod blur;
+mod debug;
 mod diff;
 mod editor;
 mod files;

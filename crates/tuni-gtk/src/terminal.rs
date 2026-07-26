@@ -44,6 +44,11 @@ const SCROLLBAR_REVEAL: Duration = Duration::from_millis(100);
 const PROGRESS_HEIGHT: f32 = 2.0;
 const PROGRESS_STALE: Duration = Duration::from_secs(15);
 
+/// How long the PTY drain loop may hold the main loop before handing it back.
+/// Under a frame's worth, so output that arrives faster than the VT can parse
+/// it costs throughput rather than the window's ability to answer.
+const FEED_BUDGET: Duration = Duration::from_millis(8);
+
 /// What the pointer is doing between press and release. A drag either paints a
 /// selection or is reported to the application; never both.
 #[derive(Clone, Copy, Default)]
@@ -304,8 +309,10 @@ mod imp {
         pub(super) images: RefCell<Vec<tuni_vt::Placement>>,
         pub(super) textures: RefCell<Textures>,
         /// Draw timings, collected only when TUNI_DEBUG_FRAME_TIME is set.
-        /// This is the measurement that decides whether Pango can keep up.
-        pub(super) frame_timing: bool,
+        /// This is the measurement that decides whether Pango can keep up. The
+        /// value is how many frames go into one report, so a scenario that
+        /// draws a handful of times can still be measured; zero is off.
+        pub(super) frame_batch: usize,
         pub(super) frame_times: RefCell<Vec<std::time::Duration>>,
     }
 
@@ -356,8 +363,11 @@ mod imp {
                 progress_stale: RefCell::new(None),
                 images: RefCell::new(Vec::new()),
                 textures: RefCell::new(Textures::default()),
-                frame_timing: std::env::var_os("TUNI_DEBUG_FRAME_TIME").is_some(),
-                frame_times: RefCell::new(Vec::with_capacity(120)),
+                frame_batch: match std::env::var("TUNI_DEBUG_FRAME_TIME") {
+                    Ok(value) => value.trim().parse().unwrap_or(120).max(2),
+                    Err(_) => 0,
+                },
+                frame_times: RefCell::new(Vec::new()),
             }
         }
     }
@@ -417,6 +427,7 @@ mod imp {
 
         fn constructed(&self) {
             self.parent_constructed();
+            crate::debug::born("TuniTerminal");
             let obj = self.obj();
             obj.set_focusable(true);
             obj.set_can_focus(true);
@@ -445,7 +456,31 @@ mod imp {
         }
     }
 
+    impl Drop for TuniTerminal {
+        fn drop(&mut self) {
+            crate::debug::died("TuniTerminal");
+        }
+    }
+
     impl WidgetImpl for TuniTerminal {
+        fn root(&self) {
+            self.parent_root();
+            if let Some(im) = self.im.borrow().as_ref() {
+                im.set_client_widget(Some(&*self.obj()));
+            }
+        }
+
+        fn unroot(&self) {
+            // Breaks the reference the input method holds on this widget. A
+            // widget with no window under it has no input method to talk to
+            // anyway, and this is the point at which a closed pane's terminal
+            // becomes garbage rather than furniture.
+            if let Some(im) = self.im.borrow().as_ref() {
+                im.set_client_widget(gtk::Widget::NONE);
+            }
+            self.parent_unroot();
+        }
+
         fn measure(&self, orientation: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
             let m = self.metrics.get();
             // A terminal has no natural size worth defending; ask for a usable
@@ -463,7 +498,7 @@ mod imp {
         }
 
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
-            if !self.frame_timing {
+            if self.frame_batch == 0 {
                 self.obj().draw(snapshot);
                 return;
             }
@@ -474,11 +509,15 @@ mod imp {
 
             let mut frames = self.frame_times.borrow_mut();
             frames.push(elapsed);
-            if frames.len() == 120 {
+            if frames.len() >= self.frame_batch {
                 frames.sort_unstable();
+                let last = frames.len() - 1;
                 eprintln!(
-                    "frame: p50 {:?}  p95 {:?}  max {:?}",
-                    frames[60], frames[114], frames[119]
+                    "frame: n {}  p50 {:?}  p95 {:?}  max {:?}",
+                    frames.len(),
+                    frames[last / 2],
+                    frames[last * 95 / 100],
+                    frames[last]
                 );
                 frames.clear();
             }
@@ -714,7 +753,12 @@ impl TuniTerminal {
         self.set_cursor_from_name(Some("text"));
 
         let im = gtk::IMMulticontext::new();
-        im.set_client_widget(Some(self));
+        // The client widget is handed over in `root` and taken back in
+        // `unroot`, not here: the platform input methods hold a strong
+        // reference to it — GtkIMContextWayland keeps one — and a terminal that
+        // handed itself over for good would be its own last reference, never
+        // reach zero, never be disposed, and keep its VT, its scrollback and
+        // its timers for as long as the process ran.
 
         im.connect_commit(glib::clone!(
             #[weak(rename_to = this)]
@@ -811,7 +855,16 @@ impl TuniTerminal {
         motion.connect_leave(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |_| this.clear_links()
+            move |_| {
+                // A pointer that leaves while it was over the scrollbar strip
+                // is no longer hovering it, and only motion inside the widget
+                // ever said otherwise — so without this the flag stays set,
+                // `fade_scrollbar` reads it as held, the alpha never reaches
+                // zero, and the tick callback repaints the whole viewport at
+                // the frame clock for as long as the pane exists.
+                this.imp().bar_hover.set(false);
+                this.clear_links();
+            }
         ));
         self.add_controller(motion);
 
@@ -944,9 +997,35 @@ impl TuniTerminal {
             #[weak(rename_to = this)]
             self,
             async move {
+                // `recv()` completes without suspending whenever a chunk is
+                // already queued, so this loop is one `poll` for as long as the
+                // reader thread can keep the channel full — and the reader wins
+                // whenever the shell emits escapes faster than the VT parses
+                // them. Nothing else on the main loop runs in the meantime: not
+                // the frame clock, not the key handler, not the timer that was
+                // supposed to end it. Yielding on a budget rather than on every
+                // chunk keeps the main loop answering within a frame without
+                // paying a round trip through the loop for each 64 KiB.
+                let mut served = Instant::now();
                 while let Ok(event) = events.recv().await {
                     match event {
-                        PtyEvent::Output(bytes) => this.feed(&bytes),
+                        PtyEvent::Output(bytes) => {
+                            this.feed(&bytes);
+                            if served.elapsed() >= FEED_BUDGET {
+                                // Below the frame clock's redraw idle, not at
+                                // the default priority a plain yield uses:
+                                // a ready source at priority 0 outranks the
+                                // redraw at 120, so yielding there hands the
+                                // loop straight back to this future and the
+                                // window still never paints.
+                                glib::timeout_future_with_priority(
+                                    glib::Priority::DEFAULT_IDLE,
+                                    Duration::ZERO,
+                                )
+                                .await;
+                                served = Instant::now();
+                            }
+                        }
                         PtyEvent::Exited => {
                             this.imp().session.replace(None);
                             this.queue_draw();
@@ -955,6 +1034,7 @@ impl TuniTerminal {
                         }
                     }
                 }
+                crate::debug::note("feed future ended");
             }
         ));
 
@@ -1265,6 +1345,12 @@ impl TuniTerminal {
             return;
         }
         self.imp().blink_on.set(true);
+        // The blink timeout is measured from the last input, and a terminal
+        // that has been focused but never typed into has none — which left
+        // `idle` below permanently false and the cursor blinking for as long as
+        // the window kept focus. Focusing is what restarts the blink in every
+        // other text cursor on the desktop, so it is what starts the clock.
+        self.imp().last_input.set(Some(Instant::now()));
 
         let id = glib::timeout_add_local(
             cycle / 2,
@@ -1298,6 +1384,19 @@ impl TuniTerminal {
         if !imp.blink_wanted.get() || idle || !self.has_focus() {
             if !imp.blink_on.replace(true) {
                 self.queue_draw();
+            }
+            // Waking twice a second to decide not to draw is the whole cost of
+            // an idle terminal, so the timer stops rather than idles — but only
+            // for the two conditions with a way back: focus returns through
+            // `start_blink`, and a keystroke through `note_input`, which
+            // re-arms when the slot is empty. A cursor that merely asked to
+            // stay solid has no such path, so it keeps the timer until the
+            // idle timeout above retires it. Taking the id without removing it
+            // is what `Break` needs: `SourceId` is not a guard, and the source
+            // is gone the moment this returns.
+            if idle || !self.has_focus() {
+                let _ = imp.blink_source.take();
+                return glib::ControlFlow::Break;
             }
             return glib::ControlFlow::Continue;
         }
