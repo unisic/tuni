@@ -16,6 +16,7 @@ mod notify;
 mod palette;
 mod panel;
 mod preferences;
+mod sprites;
 mod switcher;
 mod terminal;
 mod tiles;

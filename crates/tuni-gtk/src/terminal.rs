@@ -93,6 +93,9 @@ struct Metrics {
     /// another face are aligned on this rather than on their own box, so a
     /// missing glyph does not lift or drop the line it lands in.
     ascent: f32,
+    /// How thick a line the face draws, which is the thickness the box drawing
+    /// characters are built from.
+    thickness: f32,
 }
 
 impl Default for Metrics {
@@ -101,6 +104,7 @@ impl Default for Metrics {
             cell_width: 8.0,
             cell_height: 16.0,
             ascent: 12.0,
+            thickness: 1.0,
         }
     }
 }
@@ -639,6 +643,11 @@ impl TuniTerminal {
             // goes half above the text and half below, so a line sits in the
             // middle of its cell rather than riding the top of it.
             ascent: (ascent + (cell_height - ascent - descent) / 2.0).round(),
+            // The underline is the only stroke a face states a thickness for,
+            // and it is the one Ghostty draws its box characters at.
+            thickness: (metrics.underline_thickness() as f32 / scale)
+                .ceil()
+                .max(1.0),
         });
     }
 
@@ -2867,6 +2876,11 @@ impl Painter<'_> {
         link: bool,
         fg: Rgb,
     ) {
+        if let Some(glyph) = crate::sprites::glyph(text) {
+            self.draw_sprite(glyph, start as f32 * self.m.cell_width, y, fg);
+            return;
+        }
+
         let mut desc = self.font.clone();
         if style.bold {
             desc.set_weight(pango::Weight::Bold);
@@ -2911,6 +2925,25 @@ impl Painter<'_> {
         self.snapshot.restore();
     }
 
+    /// A box drawing or block character, built from the cell rather than taken
+    /// from the font, so that the halves of a frame meet and a run of blocks is
+    /// one unbroken shape. Underlines are the layout's to draw and are lost
+    /// here, which costs nothing: these characters are the drawing.
+    fn draw_sprite(&self, glyph: char, x: f32, y: f32, fg: Rgb) {
+        crate::sprites::draw(
+            self.snapshot,
+            glyph,
+            crate::sprites::Cell {
+                x,
+                y,
+                width: self.m.cell_width,
+                height: self.m.cell_height,
+                thickness: self.m.thickness,
+            },
+            rgba(fg),
+        );
+    }
+
     /// How far to lift or drop this layout so its baseline lands on the row's.
     ///
     /// `append_layout` places the layout's top-left at the origin, so a run
@@ -2947,6 +2980,10 @@ impl Painter<'_> {
                     && !cell.text.is_empty()
                 {
                     let text = cursor.text_color.unwrap_or(cell.bg.unwrap_or(grid.bg));
+                    if let Some(glyph) = crate::sprites::glyph(&cell.text) {
+                        self.draw_sprite(glyph, x, y, text);
+                        return;
+                    }
                     // Back to the base description: the layout still carries
                     // whatever weight the last run of the frame asked for.
                     self.layout.set_font_description(Some(self.font));

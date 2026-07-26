@@ -366,6 +366,15 @@ default, which is a deliberate divergence from Ghostty and kero: a ligature is
 one glyph where the terminal still counts several cells. `TUNI_LIGATURES=1`
 turns them back on.
 
+Box drawing and block characters, U+2500 to U+259F, are the exception: they are
+drawn from the cell's own measurements rather than taken from the font. A
+designer's `█` is as tall as it was drawn and the cell is as tall as the line
+height says, so a font's answer leaves a column of blocks striped and a frame
+with holes at its corners. Ghostty calls its version of this the sprite font,
+and the geometry here is that one ported: light lines at the face's underline
+thickness, heavy at twice it, arms that stop level with whatever crosses them,
+and the rounded corners stroked as curves.
+
 A letter key is named by where it is rather than by what it types: the hardware
 keycode a GDK event carries is the XKB one, which is the evdev scancode plus
 eight on Wayland and X11 alike, and that is what the Kitty keyboard protocol
