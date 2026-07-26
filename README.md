@@ -34,7 +34,9 @@ Panes on one machine share a single authenticated connection, so the second tab
 does not ask again. The session inspector lists what a connection forwards, and
 switches tuni's own ports on and off against it without reconnecting. Snippets
 are typed into the pane rather than run behind it, so the shell sees what you
-would have typed and so do you.
+would have typed and so do you. Keys are listed with their fingerprints and
+whether the agent is holding them, and making one or copying one to a host is a
+command put on a prompt for you to read before it runs.
 
 Tuni is a ground-up Linux implementation of the workspace
 [egoist/kero](https://github.com/egoist/kero) built for macOS. Kero's Swift

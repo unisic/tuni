@@ -235,6 +235,7 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "win.toggle-mouse-reporting",
     ),
     ("Snippets", "text-x-generic-symbolic", None, "win.snippets"),
+    ("SSH Keys", "dialog-password-symbolic", None, "win.keys"),
     (
         "Preferences",
         "preferences-system-symbolic",
@@ -931,6 +932,16 @@ impl TuniWindow {
             entry("snippets", None, |window, _| {
                 crate::snippets::present(window);
             }),
+            entry("keys", None, |window, _| {
+                crate::keys::present(
+                    window,
+                    glib::clone!(
+                        #[weak]
+                        window,
+                        move |argv: Vec<String>| window.run_locally(&argv)
+                    ),
+                );
+            }),
             entry("settings", None, |window, _| window.show_preferences()),
             entry("about", None, |window, _| window.show_about()),
             entry("toggle-sidebar", None, |window, _| {
@@ -1229,6 +1240,35 @@ impl TuniWindow {
         };
         terminal.send_text(&snippet.body);
         terminal.grab_focus();
+    }
+
+    /// Puts a command on the prompt of a shell of its own, and leaves it there.
+    ///
+    /// `ssh-keygen`, `ssh-copy-id` and `ssh-add` each ask something eventually:
+    /// a passphrase, a password, whether to overwrite a key. So none of them
+    /// runs behind the window. A new pane rather than the one that has the
+    /// keyboard, because that one may well be a connection, and these are
+    /// commands about this machine. Typed and not run, for the reason a snippet
+    /// without a newline is not run: the line is somebody's to read first.
+    fn run_locally(&self, argv: &[String]) {
+        let Some(project) = self.imp().workspace.borrow().selected_id() else {
+            return;
+        };
+        let pane = Pane::new();
+        let pane_id = pane.id();
+        if !self.add_tab(project, Tab::with_pane(pane)) {
+            return;
+        }
+        let Some(terminal) = self.imp().terminals.borrow().get(&pane_id).cloned() else {
+            return;
+        };
+        let line = tuni_core::ssh::shell_line(argv);
+        // The shell is not there yet: `start_terminal` puts starting it on the
+        // idle loop, and this queues behind it.
+        glib::idle_add_local_once(move || {
+            terminal.send_text(&line);
+            terminal.grab_focus();
+        });
     }
 
     fn files_message(&self, message: &crate::files::Message) {
@@ -1579,15 +1619,22 @@ impl TuniWindow {
     /// terminal starting where the selected tab's shell is, or with the host
     /// list if that is what `new-tab` says a tab is.
     pub fn open_tab(&self, project: Id) {
-        let imp = self.imp();
-        let Some(view) = imp.views.borrow().get(&project).cloned() else {
-            return;
-        };
-
-        let tab = match imp.settings.borrow().new_tab {
+        let tab = match self.imp().settings.borrow().new_tab {
             NewTab::Shell => Tab::new(),
             NewTab::Hosts => Tab::with_pane(Pane::hosts()),
         };
+        self.add_tab(project, tab);
+    }
+
+    /// Puts a tab the caller has built beside the selected one and selects it.
+    /// Whether it went in, which is what tells the caller whether the widgets
+    /// for its panes now exist.
+    fn add_tab(&self, project: Id, tab: Tab) -> bool {
+        let imp = self.imp();
+        let Some(view) = imp.views.borrow().get(&project).cloned() else {
+            return false;
+        };
+
         let tab_id = tab.id();
         let position = view
             .selected_page()
@@ -1598,10 +1645,11 @@ impl TuniWindow {
         }
 
         let Some(page) = self.attach_tab(project, tab_id, position, true) else {
-            return;
+            return false;
         };
         view.set_selected_page(&page);
         self.refresh();
+        true
     }
 
     /// Builds the widgets for a tab the model already holds, and starts a shell
@@ -1779,6 +1827,7 @@ impl TuniWindow {
                 Message::ConnectToSide(alias) => this.open_pane_to_side(Pane::ssh(alias)),
                 Message::ConnectInTab(alias) => this.open_pane(Pane::ssh(alias)),
                 Message::OpenFile(path, line) => this.open_file_at(&path, line),
+                Message::RunLocally(argv) => this.run_locally(&argv),
             }
         ));
         self.imp().hosts.borrow_mut().insert(pane, hosts.clone());

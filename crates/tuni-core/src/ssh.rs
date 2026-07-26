@@ -58,9 +58,19 @@ pub fn store_path() -> PathBuf {
 /// a dialog out of a background process. `LC_ALL=C` is what makes reading the
 /// error text safe.
 pub fn run<S: AsRef<OsStr>>(args: &[S]) -> Output {
-    let output = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
+    let mut argv: Vec<&OsStr> = vec![OsStr::new("-o"), OsStr::new("BatchMode=yes")];
+    argv.extend(args.iter().map(AsRef::as_ref));
+    tool("ssh", &argv)
+}
+
+/// Runs one of the other ssh tools and waits for it.
+///
+/// The same environment as [`run`], minus the option only `ssh` itself takes.
+/// `ssh-keygen -l` and `ssh-add -l` are the two calls this is for, and neither
+/// of them touches the network or asks anything: the ones that do ask are typed
+/// into a pane instead.
+fn tool<S: AsRef<OsStr>>(program: &str, args: &[S]) -> Output {
+    let output = Command::new(program)
         .args(args)
         .env("SSH_ASKPASS_REQUIRE", "never")
         .env("LC_ALL", "C")
@@ -1357,6 +1367,181 @@ pub fn resolve(alias: &str) -> Option<Host> {
     Some(host)
 }
 
+/// A key in `~/.ssh`, as `ssh-keygen` describes it.
+///
+/// The public half, because that is the half that can be read: the private one
+/// may be encrypted, may be a handle to a smartcard, and is none of tuni's
+/// business either way.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Key {
+    /// The `.pub` file this was read from.
+    pub path: PathBuf,
+    /// `ED25519`, `RSA`, `ECDSA`, whatever the tool prints in brackets.
+    pub kind: String,
+    pub bits: u32,
+    /// The comment the key was made with, usually `user@machine`. Free text,
+    /// and `ssh-keygen` prints its own words when there is none.
+    pub comment: String,
+    /// `SHA256:...`, the same string the agent prints and the far end logs, so
+    /// it is what identifies a key rather than the name of its file.
+    pub fingerprint: String,
+    /// The whole public key line: what a copy button copies, and what an
+    /// `authorized_keys` on the other machine wants a line of.
+    pub public: String,
+    /// Whether the agent is holding the private half, which is what decides
+    /// whether connecting with it will ask for a passphrase.
+    pub loaded: bool,
+}
+
+impl Key {
+    /// The private half: the same path without `.pub`. What `-i` and `ssh-add`
+    /// are both given, even though ssh reads the public file beside it.
+    #[must_use]
+    pub fn private(&self) -> PathBuf {
+        let text = self.path.to_string_lossy();
+        PathBuf::from(text.strip_suffix(".pub").unwrap_or(&text))
+    }
+
+    /// What to call it in a list: the comment it was made with, and otherwise
+    /// the file name, which is what a key with no comment has instead.
+    #[must_use]
+    pub fn title(&self) -> String {
+        if self.comment.is_empty() {
+            self.private()
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            self.comment.clone()
+        }
+    }
+}
+
+/// What `ssh-add -l` answered, which is three things rather than two.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Agent {
+    /// Nothing to ask: `SSH_AUTH_SOCK` unset, or nothing listening on it. Keys
+    /// still work; every connection asks for the passphrase again.
+    Missing,
+    /// An agent holding nothing.
+    Empty,
+    /// The fingerprints it holds, in the order it offers them.
+    Holding(Vec<String>),
+}
+
+/// What the agent is holding, if there is one to ask.
+///
+/// `ssh-add -l` exits 0 with a list, 1 for an agent with nothing in it, and 2
+/// when it cannot reach an agent at all. A missing binary comes to the same
+/// thing as the last of those from here.
+#[must_use]
+pub fn agent() -> Agent {
+    let output = tool("ssh-add", &["-l"]);
+    match output.code {
+        0 => Agent::Holding(
+            output
+                .stdout
+                .lines()
+                .filter_map(listing)
+                .map(|key| key.fingerprint)
+                .collect(),
+        ),
+        1 => Agent::Empty,
+        _ => Agent::Missing,
+    }
+}
+
+/// Every key in `~/.ssh`, sorted by file name, with the agent asked once about
+/// all of them.
+///
+/// One subprocess per key and one for the agent, so this belongs off the main
+/// thread like everything else here.
+#[must_use]
+pub fn keys() -> Vec<Key> {
+    let held = match agent() {
+        Agent::Holding(fingerprints) => fingerprints,
+        Agent::Missing | Agent::Empty => Vec::new(),
+    };
+    let Ok(entries) = fs::read_dir(crate::settings::home().join(".ssh")) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "pub"))
+        .collect();
+    paths.sort();
+    paths.iter().filter_map(|path| key(path, &held)).collect()
+}
+
+/// One key, as far as `ssh-keygen` will describe it. Something in `~/.ssh` that
+/// only looks like a key is simply not one: `-l` exits non-zero and no row
+/// appears for it.
+fn key(path: &Path, held: &[String]) -> Option<Key> {
+    let public = fs::read_to_string(path).ok()?.trim().to_owned();
+    if public.is_empty() {
+        return None;
+    }
+    let output = tool(
+        "ssh-keygen",
+        &[OsStr::new("-l"), OsStr::new("-f"), path.as_os_str()],
+    );
+    if !output.is_ok() {
+        return None;
+    }
+    let listed = listing(output.stdout.lines().next()?)?;
+    Some(Key {
+        path: path.to_owned(),
+        loaded: held.contains(&listed.fingerprint),
+        public,
+        ..listed
+    })
+}
+
+/// One line of `ssh-keygen -l` or `ssh-add -l`, which print the same shape:
+/// `256 SHA256:jhyz... dean@kronos (ED25519)`.
+///
+/// The comment is whatever lies between the fingerprint and the type, spaces
+/// and all, because a comment is free text and often has some.
+fn listing(line: &str) -> Option<Key> {
+    let (bits, rest) = line.split_once(' ')?;
+    let (fingerprint, rest) = rest.split_once(' ')?;
+    let rest = rest.trim();
+    let (comment, kind) = rest.rsplit_once(' ').unwrap_or(("", rest));
+    Some(Key {
+        bits: bits.parse().ok()?,
+        fingerprint: fingerprint.to_owned(),
+        comment: comment.trim().to_owned(),
+        kind: kind.strip_prefix('(')?.strip_suffix(')')?.to_owned(),
+        ..Key::default()
+    })
+}
+
+/// An argv as one line for a shell to read, quoted only where a word would
+/// otherwise not survive one.
+///
+/// For the commands tuni types into a pane rather than runs itself. Quoting
+/// everything would be safe too, and would turn `ssh-copy-id -i key host` into
+/// a line of apostrophes nobody can check at a glance, which defeats the point
+/// of showing it.
+#[must_use]
+pub fn shell_line(argv: &[String]) -> String {
+    argv.iter()
+        .map(|word| {
+            let plain = !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+            if plain {
+                word.clone()
+            } else {
+                format!("'{}'", word.replace('\'', r"'\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Whether `text` matches an ssh pattern: `*` for any run of characters, `?`
 /// for exactly one, and everything else literal. What `Host` lines and
 /// `Include` globs are both written in.
@@ -2253,5 +2438,50 @@ mod tests {
 
         drop(listener);
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_key_reads_back_out_of_the_line_that_lists_it() {
+        let key = listing("256 SHA256:dpc7n/lgYvDdEu7 dean@kronos (ED25519)").expect("a key");
+        assert_eq!(key.bits, 256);
+        assert_eq!(key.fingerprint, "SHA256:dpc7n/lgYvDdEu7");
+        assert_eq!(key.comment, "dean@kronos");
+        assert_eq!(key.kind, "ED25519");
+
+        // A comment is free text and the type is what closes the line, so the
+        // spaces in between belong to the comment.
+        let spaced = listing("3072 SHA256:a47r1sw unisic ci (RSA)").expect("a key");
+        assert_eq!(spaced.comment, "unisic ci");
+        assert_eq!(spaced.kind, "RSA");
+
+        assert!(listing("The agent has no identities.").is_none());
+    }
+
+    #[test]
+    fn a_public_key_names_its_private_half() {
+        let key = Key {
+            path: PathBuf::from("/home/dean/.ssh/id_ed25519.pub"),
+            comment: String::new(),
+            ..Key::default()
+        };
+        assert_eq!(key.private(), PathBuf::from("/home/dean/.ssh/id_ed25519"));
+        assert_eq!(key.title(), "id_ed25519");
+    }
+
+    #[test]
+    fn a_typed_command_is_quoted_only_where_it_has_to_be() {
+        assert_eq!(
+            shell_line(&[
+                "ssh-copy-id".to_owned(),
+                "-i".to_owned(),
+                "/home/dean/.ssh/id_ed25519.pub".to_owned(),
+                "web".to_owned(),
+            ]),
+            "ssh-copy-id -i /home/dean/.ssh/id_ed25519.pub web"
+        );
+        assert_eq!(
+            shell_line(&["ssh-keygen".to_owned(), "dean's key".to_owned()]),
+            r"ssh-keygen 'dean'\''s key'"
+        );
     }
 }

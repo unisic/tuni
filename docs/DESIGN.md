@@ -505,6 +505,23 @@ the control socket, which ssh binds only after it has authenticated, and then
 asks the master once whether it is answering. A host whose configuration shares
 nothing has no such moment to point at and gets nothing typed.
 
+Keys are read and never held. The list under the launcher's menu is `~/.ssh`
+scanned for `.pub` files, one `ssh-keygen -l` each for the type, the size, the
+comment and the fingerprint, and one `ssh-add -l` for what the agent has, which
+answers the only question a key raises day to day: whether connecting with it
+will ask for a passphrase. That call tells three things apart and the row says
+which, since no agent at all and an agent holding nothing lead to different
+advice. Everything that changes something goes out as a command typed onto the
+prompt of a shell of its own: `ssh-keygen` to make a key, `ssh-copy-id` to put
+one on a host, `ssh-add` to hand one over. Each of them asks for a passphrase or
+a password sooner or later, and a dialog that collected the answer would be
+storing a secret, which is the one thing tuni does not do. Typed and not run,
+like a snippet without its newline, because a command about a private key is
+worth reading before it goes anywhere. Deleting a key, changing a passphrase and
+managing the agent are all missing on purpose: `ssh-agent` and the desktop's
+keyring do that job already, and a wrong button in this window would be a
+security bug rather than a bad row.
+
 An SSH library was the obvious alternative and it is ruled out by the same
 constraint everything else here follows. `russh` and `libssh2` bring their own
 authentication, so keys, passphrases and keyboard-interactive answers would

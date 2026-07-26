@@ -88,7 +88,19 @@ pub fn present<F>(
         .valign(gtk::Align::Center)
         .build();
     choose.add_css_class("flat");
+    // The keys in `~/.ssh` are the answer nearly every time, so they are one
+    // click rather than a file chooser. Insensitive until the scan comes back,
+    // because that is a subprocess per key and this dialog opens now.
+    let known = gtk::MenuButton::builder()
+        .icon_name("pan-down-symbolic")
+        .tooltip_text("A key from ~/.ssh")
+        .valign(gtk::Align::Center)
+        .sensitive(false)
+        .build();
+    known.add_css_class("flat");
+    identity.add_suffix(&known);
     identity.add_suffix(&choose);
+    offer_keys(&known, &identity);
     connection.add(&name);
     connection.add(&address);
     connection.add(&user);
@@ -395,6 +407,51 @@ fn draw(rows: &gtk::ListBox, forwards: &Rc<RefCell<Vec<Forward>>>) {
 
 /// Opens the file chooser on `~/.ssh`, where the keys are, and writes what
 /// comes back into the row.
+/// Hangs the keys `ssh-keygen` can describe under `button`, once they have been
+/// read. A machine with none simply keeps an insensitive button, which is the
+/// truthful thing for it to say.
+fn offer_keys(button: &gtk::MenuButton, row: &adw::EntryRow) {
+    glib::spawn_future_local(glib::clone!(
+        #[weak]
+        button,
+        #[weak]
+        row,
+        async move {
+            let Ok(keys) = gtk::gio::spawn_blocking(tuni_core::ssh::keys).await else {
+                return;
+            };
+            if keys.is_empty() {
+                return;
+            }
+            let popover = gtk::Popover::new();
+            let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            for key in keys {
+                let path = shorten(&key.private());
+                let item = gtk::Button::builder().label(&path).build();
+                item.add_css_class("flat");
+                item.set_tooltip_text(Some(&format!("{} {}", key.kind, key.title())));
+                if let Some(label) = item.child().and_downcast::<gtk::Label>() {
+                    label.set_xalign(0.0);
+                }
+                item.connect_clicked(glib::clone!(
+                    #[weak]
+                    row,
+                    #[weak]
+                    popover,
+                    move |_| {
+                        row.set_text(&path);
+                        popover.popdown();
+                    }
+                ));
+                list.append(&item);
+            }
+            popover.set_child(Some(&list));
+            button.set_popover(Some(&popover));
+            button.set_sensitive(true);
+        }
+    ));
+}
+
 fn pick_key(dialog: &adw::Dialog, row: &adw::EntryRow) {
     let chooser = gtk::FileDialog::builder().title("Choose a Key").build();
     if let Some(home) = std::env::var_os("HOME") {

@@ -15,6 +15,7 @@ mod host_editor;
 mod hosts;
 mod info;
 mod keymap;
+mod keys;
 mod menu;
 mod notify;
 mod palette;

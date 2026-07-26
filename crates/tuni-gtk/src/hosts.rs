@@ -100,6 +100,9 @@ mod imp {
         /// Open a file for editing at a line, which is how the real
         /// configuration is reached from a list that only reads it.
         OpenFile(std::path::PathBuf, usize),
+        /// Put a command on the prompt of a local shell. The key commands ask
+        /// questions and a list has nowhere to answer them.
+        RunLocally(Vec<String>),
     }
 
     #[derive(Default)]
@@ -429,6 +432,16 @@ impl TuniHosts {
             entry("local-shell", self, |hosts| hosts.send(Message::LocalShell)),
             entry("snippets", self, |hosts| {
                 crate::snippets::present(hosts);
+            }),
+            entry("keys", self, |hosts| {
+                crate::keys::present(
+                    hosts,
+                    glib::clone!(
+                        #[weak]
+                        hosts,
+                        move |argv: Vec<String>| hosts.send(Message::RunLocally(argv))
+                    ),
+                );
             }),
             entry("disconnect", self, TuniHosts::disconnect),
             entry("refresh", self, TuniHosts::reload),
@@ -906,6 +919,7 @@ where
 fn header_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append(Some("Local Shell"), Some("hosts.local-shell"));
+    menu.append(Some("Keys"), Some("hosts.keys"));
     menu.append(Some("Snippets"), Some("hosts.snippets"));
     menu.append(Some("Refresh"), Some("hosts.refresh"));
     menu.append(Some("Open ~/.ssh/config"), Some("hosts.open-config"));
