@@ -68,6 +68,10 @@ const ACCELS: &[(&str, &[&str])] = &[
     // ports.
     ("win.show-info", &["<Ctrl><Shift>i"]),
     ("win.settings", &["<Ctrl>comma"]),
+    // Take the mouse back from whatever has it, and hand it over again. Free
+    // in a terminal: `Ctrl+M` is carriage return, so only the shifted key is
+    // there to be had.
+    ("win.toggle-mouse-reporting", &["<Ctrl><Shift>m"]),
     // Find in whatever the focused pane holds. `Ctrl+F` belongs to the shell —
     // it is emacs-mode forward-char, and readline would never see it again.
     ("win.find", &["<Ctrl><Shift>f"]),

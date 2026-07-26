@@ -158,6 +158,9 @@ impl Settings {
         {
             settings.terminal.copy_on_select = on;
         }
+        if let Some(on) = table.boolean("mouse-reporting") {
+            settings.terminal.mouse_reporting = on;
+        }
         if let Some(on) = table.boolean("bell") {
             settings.terminal.bell = on;
         }
@@ -263,6 +266,9 @@ impl Settings {
         }
         if self.terminal.copy_on_select != default.terminal.copy_on_select {
             let _ = writeln!(out, "copy-on-select = {}", self.terminal.copy_on_select);
+        }
+        if self.terminal.mouse_reporting != default.terminal.mouse_reporting {
+            let _ = writeln!(out, "mouse-reporting = {}", self.terminal.mouse_reporting);
         }
         if self.terminal.bell != default.terminal.bell {
             let _ = writeln!(out, "bell = {}", self.terminal.bell);
@@ -596,6 +602,7 @@ mod tests {
                 cursor_blink: false,
                 cursor_style: CursorStyle::Bar,
                 copy_on_select: true,
+                mouse_reporting: false,
                 bell: false,
                 command: "/usr/bin/fish".to_owned(),
                 scrollback_lines: 50_000,
@@ -619,6 +626,7 @@ mod tests {
         assert!(!read.terminal.cursor_blink);
         assert_eq!(read.terminal.cursor_style, CursorStyle::Bar);
         assert!(read.terminal.copy_on_select);
+        assert!(!read.terminal.mouse_reporting);
         assert!(!read.terminal.bell);
         assert_eq!(read.terminal.command, "/usr/bin/fish");
         assert_eq!(read.terminal.scrollback_lines, 50_000);

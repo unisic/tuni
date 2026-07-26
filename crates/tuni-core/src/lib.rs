@@ -95,6 +95,12 @@ pub struct TerminalConfig {
     /// terminal that overwrites the clipboard on every drag loses whatever was
     /// copied to paste into it.
     pub copy_on_select: bool,
+    /// Whether an application is allowed to take the mouse at all. On, because
+    /// that is what an application asking for the mouse expects, and a knob
+    /// because the ones that follow the pointer take the drag that would have
+    /// selected text with it. Ghostty spells it `mouse-reporting` and means the
+    /// same thing.
+    pub mouse_reporting: bool,
     /// Whether `BEL` reaches the desktop at all. The widget's own alert sound
     /// and the notification a background tab raises. On, because a bell is a
     /// program asking for attention; a knob, because a build that ends in one
@@ -191,6 +197,7 @@ impl Default for TerminalConfig {
             cursor_blink: true,
             cursor_style: CursorStyle::Block,
             copy_on_select: false,
+            mouse_reporting: true,
             bell: true,
             command: String::new(),
             background_opacity: 1.0,

@@ -158,6 +158,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | Drag, double click, triple click | Select by character, word, line |
 | `Alt`+drag | Block selection |
 | `Shift`+click | Select even while an application is following the pointer |
+| `Ctrl+Shift+M` | Take the mouse back from applications entirely, and hand it over again |
 | `Ctrl`+click | Open the hyperlink under the pointer |
 | `Shift+Page Up` / `Shift+Page Down` | Scroll the viewport by a page |
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
@@ -398,8 +399,15 @@ about buttons and nothing else, and a drag handed to a program that cannot be
 told the pointer moved is a drag nobody receives while a selection nobody made
 is lost. So there the press waits: leaving the cell makes it a selection, and
 lifting inside the cell makes it a click, which the application then gets
-whole. Claude Code and a good many other full-screen programs enable exactly
-those modes, and in them the mouse works as it does anywhere else.
+whole.
+
+That leaves the programs that do follow the pointer, and there is no reading
+of a drag that serves both sides: it is either theirs or it is a selection.
+Shift is one answer and `mouse-reporting` is the other, the same key Ghostty
+uses for the same setting. Turned off, no application is given the mouse
+however loudly it asks, and every drag selects. `Ctrl+Shift+M` turns it off
+and on again, because whether a program should have the mouse is a thing that
+changes several times an hour.
 
 A hyperlink is whatever the program holding the PTY says it is, which over ssh
 is not the person at the keyboard. So `Ctrl` has to be held before one lights up
@@ -482,6 +490,7 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `window-padding-x` | `0` | Pixels of nothing between the sides of the window and the grid, up to `40` |
 | `window-padding-y` | `0` | The same above and below |
 | `copy-on-select` | `false` | Whether releasing a selection puts it on the clipboard |
+| `mouse-reporting` | `true` | Whether a program that asks for the mouse gets it. Off keeps every drag for selecting |
 | `bell` | `true` | Whether `\a` rings the desktop's own bell |
 | `command` | `""` | The shell to run; empty means the login shell |
 | `terminal.scrollback-lines` | `10000` | Lines kept above the screen |

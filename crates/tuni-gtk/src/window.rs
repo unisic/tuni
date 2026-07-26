@@ -213,6 +213,12 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "win.show-info",
     ),
     (
+        "Toggle Mouse Reporting",
+        "input-mouse-symbolic",
+        Some("Ctrl+Shift+M"),
+        "win.toggle-mouse-reporting",
+    ),
+    (
         "Preferences",
         "preferences-system-symbolic",
         Some("Ctrl+,"),
@@ -833,6 +839,14 @@ impl TuniWindow {
                 if let Some(terminal) = window.active_terminal() {
                     terminal.clear();
                 }
+            }),
+            // The setting, not a per-window mood: a program takes the mouse in
+            // every pane it runs in, so the way out of it is the same knob the
+            // preferences show, saved where the preferences save it.
+            entry("toggle-mouse-reporting", None, |window, _| {
+                let mut settings = window.settings();
+                settings.terminal.mouse_reporting = !settings.terminal.mouse_reporting;
+                window.apply_settings(settings);
             }),
             entry("new-window", None, |window, _| window.open_window()),
             entry("palette", None, |window, _| window.show_palette()),

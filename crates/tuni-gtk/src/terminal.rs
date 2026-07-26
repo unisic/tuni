@@ -1690,7 +1690,7 @@ impl TuniTerminal {
     /// Shift is the standard override: it takes the mouse back even while an
     /// application is tracking it.
     fn reports_mouse(&self, mods: Mods) -> bool {
-        if mods.contains(Mods::SHIFT) {
+        if mods.contains(Mods::SHIFT) || !self.imp().config.borrow().mouse_reporting {
             return false;
         }
         self.imp()

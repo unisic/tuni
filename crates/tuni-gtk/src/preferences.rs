@@ -430,6 +430,21 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
     ));
     behavior.add(&copy_on_select);
 
+    let mouse_reporting = adw::SwitchRow::builder()
+        .title("Mouse Reporting")
+        .subtitle("Programs that ask for the mouse get it. Off keeps the drag for selecting")
+        .active(settings.terminal.mouse_reporting)
+        .build();
+    mouse_reporting.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.terminal.mouse_reporting = on);
+        }
+    ));
+    behavior.add(&mouse_reporting);
+
     let bell = adw::SwitchRow::builder()
         .title("Bell")
         .subtitle("A program ringing the bell makes a sound and marks its tab")
