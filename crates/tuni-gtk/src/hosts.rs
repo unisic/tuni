@@ -427,6 +427,9 @@ impl TuniHosts {
                 hosts.clipboard().set_text(&format!("ssh {alias}"));
             }),
             entry("local-shell", self, |hosts| hosts.send(Message::LocalShell)),
+            entry("snippets", self, |hosts| {
+                crate::snippets::present(hosts);
+            }),
             entry("disconnect", self, TuniHosts::disconnect),
             entry("refresh", self, TuniHosts::reload),
             entry("add", self, |hosts| hosts.edit_host(None, false)),
@@ -903,6 +906,7 @@ where
 fn header_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append(Some("Local Shell"), Some("hosts.local-shell"));
+    menu.append(Some("Snippets"), Some("hosts.snippets"));
     menu.append(Some("Refresh"), Some("hosts.refresh"));
     menu.append(Some("Open ~/.ssh/config"), Some("hosts.open-config"));
     menu

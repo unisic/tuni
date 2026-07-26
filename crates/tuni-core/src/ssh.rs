@@ -815,6 +815,9 @@ pub struct Meta {
     /// is nothing here to start or stop.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<Forward>,
+    /// A snippet, by name, typed into the pane once the connection is up.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub on_connect: String,
 }
 
 fn never_used(count: &u32) -> bool {

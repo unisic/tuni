@@ -13,6 +13,7 @@ pub mod info;
 pub mod panes;
 pub mod session;
 pub mod settings;
+pub mod snippets;
 pub mod ssh;
 pub mod theme;
 pub mod usage;

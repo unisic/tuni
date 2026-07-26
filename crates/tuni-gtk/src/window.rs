@@ -16,6 +16,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -76,6 +77,13 @@ const GRIP: i32 = 5;
 /// directory is a descriptor per directory and a debounce to write, where a
 /// read of what is already in the page cache costs nothing anyone can measure.
 const PANEL_POLL_SECONDS: u32 = 2;
+
+/// How long a host's on-connect snippet waits for the connection, and how often
+/// it looks. Long enough for somebody to find a phone and type a code into it,
+/// and each look is one `stat` of a socket rather than anything that asks ssh a
+/// question.
+const CONNECT_INTERVAL: Duration = Duration::from_millis(250);
+const CONNECT_TRIES: u32 = 240;
 
 /// What a Find command found to act on. The bar over a terminal belongs to the
 /// window and is handed the terminal it is pointing at; a file pane carries its
@@ -226,6 +234,7 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         Some("Ctrl+Shift+M"),
         "win.toggle-mouse-reporting",
     ),
+    ("Snippets", "text-x-generic-symbolic", None, "win.snippets"),
     (
         "Preferences",
         "preferences-system-symbolic",
@@ -911,6 +920,17 @@ impl TuniWindow {
             entry("new-connection", None, |window, _| {
                 window.open_pane(Pane::hosts());
             }),
+            // Types a snippet into the pane that has the keyboard. The target is
+            // its name, since the palette carries a name and the file behind it
+            // may have been edited since the palette was filled.
+            entry("run-snippet", string, |window, target| {
+                if let Some(name) = target.and_then(glib::Variant::str) {
+                    window.run_snippet(name);
+                }
+            }),
+            entry("snippets", None, |window, _| {
+                crate::snippets::present(window);
+            }),
             entry("settings", None, |window, _| window.show_preferences()),
             entry("about", None, |window, _| window.show_about()),
             entry("toggle-sidebar", None, |window, _| {
@@ -1192,6 +1212,23 @@ impl TuniWindow {
                 diff.reload();
             }
         }
+    }
+
+    /// Types a snippet into the pane that has the keyboard.
+    ///
+    /// Typed rather than run: a shell sees the same characters it would have
+    /// seen from the keyboard, so nothing here has to know which shell it is,
+    /// and whether the last of them is a newline decides whether it runs or
+    /// waits on the prompt.
+    fn run_snippet(&self, name: &str) {
+        let Some(snippet) = tuni_core::snippets::Snippets::load().get(name).cloned() else {
+            return;
+        };
+        let Some(terminal) = self.active_terminal() else {
+            return;
+        };
+        terminal.send_text(&snippet.body);
+        terminal.grab_focus();
     }
 
     fn files_message(&self, message: &crate::files::Message) {
@@ -2089,20 +2126,34 @@ impl TuniWindow {
                     );
                     let host = tuni_core::ssh::host(&alias);
                     let destination = host.target();
-                    (dial || control.is_live(&destination))
-                        .then(|| (tuni_core::ssh::command(&host, &control), destination))
+                    if !dial && !control.is_live(&destination) {
+                        return None;
+                    }
+                    // The snippet and the socket to wait on are read here
+                    // because both are files and this is the thread that reads
+                    // files. Nothing is typed unless the host names one.
+                    let waited = greeting(&alias)
+                        .and_then(|body| Some((body, control.socket(&destination)?.0)));
+                    Some((
+                        tuni_core::ssh::command(&host, &control),
+                        destination,
+                        waited,
+                    ))
                 })
                 .await
                 else {
                     return;
                 };
                 let remote = this.imp().remotes.borrow().get(&pane).cloned();
-                let Some((argv, destination)) = dialled else {
+                let Some((argv, destination, waited)) = dialled else {
                     if let Some(remote) = remote {
                         remote.set_idle(&format!("Not connected to {name}"), "Connect");
                     }
                     return;
                 };
+                if let Some((body, socket)) = waited {
+                    this.type_on_connect(&terminal, destination.clone(), socket, body);
+                }
                 // Written down before the pane starts, so a connection is on the
                 // list to be hung up from the moment there is one to hang up.
                 crate::hosts::opened(destination);
@@ -2118,6 +2169,53 @@ impl TuniWindow {
                         ..Launch::default()
                     },
                 );
+            }
+        ));
+    }
+
+    /// Types a host's on-connect snippet, once there is a connection to type it
+    /// into.
+    ///
+    /// Waiting is the whole of this. Sent too early the text goes wherever the
+    /// login went, and a password prompt is one of the places that could be. The
+    /// control socket is the signal: `ssh` binds it after it has authenticated,
+    /// so a socket that exists means the far end is done asking. Watching for it
+    /// is a `stat`, which is why this can look four times a second without
+    /// asking ssh anything; one `-O check` at the end is what tells a live master
+    /// from a socket somebody's kill left behind.
+    ///
+    /// A host whose configuration turns sharing off has no socket, and so no
+    /// moment this can point at. Nothing is typed there, which is the safe way to
+    /// be wrong.
+    fn type_on_connect(
+        &self,
+        terminal: &TuniTerminal,
+        destination: String,
+        socket: PathBuf,
+        body: String,
+    ) {
+        let settings = self.settings();
+        glib::spawn_future_local(glib::clone!(
+            #[weak]
+            terminal,
+            async move {
+                for _ in 0..CONNECT_TRIES {
+                    glib::timeout_future(CONNECT_INTERVAL).await;
+                    if !socket.exists() {
+                        continue;
+                    }
+                    let destination = destination.clone();
+                    let persist = settings.ssh_control_persist;
+                    let shared = settings.ssh_share_connections;
+                    let live = gio::spawn_blocking(move || {
+                        tuni_core::ssh::Control::new(persist, shared).is_live(&destination)
+                    })
+                    .await;
+                    if live.unwrap_or(false) {
+                        terminal.send_text(&body);
+                    }
+                    return;
+                }
             }
         ));
     }
@@ -3232,8 +3330,8 @@ impl TuniWindow {
     }
 
     /// What the palette lists: the window's own actions, every host ssh knows
-    /// about, the projects around this one, and every terminal in the
-    /// workspace.
+    /// about, the snippets, the projects around this one, and every terminal in
+    /// the workspace.
     fn palette_entries(&self) -> Vec<palette::Entry> {
         use palette::Entry;
 
@@ -3256,6 +3354,19 @@ impl TuniWindow {
                 shortcut: None,
                 action: "win.connect",
                 target: Some(host.alias.to_variant()),
+                terminal: false,
+            });
+        }
+
+        for snippet in tuni_core::snippets::Snippets::load().all() {
+            entries.push(palette::Entry {
+                search: format!("{} snippet run", snippet.name),
+                title: snippet.name.clone(),
+                subtitle: Some(crate::snippets::summary(&snippet.body)),
+                icon: "text-x-generic-symbolic",
+                shortcut: None,
+                action: "win.run-snippet",
+                target: Some(snippet.name.to_variant()),
                 terminal: false,
             });
         }
@@ -3696,6 +3807,18 @@ impl TuniWindow {
             ),
         );
     }
+}
+
+/// What a host asked to have typed once it answers, if it asked for anything
+/// and the snippet it named is still there. Two file reads.
+fn greeting(alias: &str) -> Option<String> {
+    let named = tuni_core::ssh::Notes::load().get(alias).on_connect;
+    if named.is_empty() {
+        return None;
+    }
+    tuni_core::snippets::Snippets::load()
+        .get(&named)
+        .map(|snippet| snippet.body.clone())
 }
 
 /// One action, spelled the way `add_action_entries` wants it.

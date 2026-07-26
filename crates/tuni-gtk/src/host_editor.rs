@@ -120,9 +120,29 @@ pub fn present<F>(
                 .unwrap_or(0) as u32,
         )
         .build();
+    // Same shape as the jump host: nothing is the first answer and a real one.
+    let mut snippets = vec!["None".to_owned()];
+    snippets.extend(
+        tuni_core::snippets::Snippets::load()
+            .all()
+            .iter()
+            .map(|snippet| snippet.name.clone()),
+    );
+    let on_connect = adw::ComboRow::builder()
+        .title("Run on connect")
+        .subtitle("Typed into the pane once the connection is up")
+        .model(&string_list(&snippets))
+        .selected(
+            snippets
+                .iter()
+                .position(|name| *name == meta.on_connect)
+                .unwrap_or(0) as u32,
+        )
+        .build();
     options.add(&label);
     options.add(&tags);
     options.add(&jump);
+    options.add(&on_connect);
     page.add(&options);
 
     // Held apart from the rows, because a forward is added and removed rather
@@ -289,6 +309,11 @@ pub fn present<F>(
             let written_meta = Meta {
                 label: label.text().trim().to_owned(),
                 tags: split_tags(&tags.text()),
+                on_connect: snippets
+                    .get(on_connect.selected() as usize)
+                    .filter(|_| on_connect.selected() != 0)
+                    .cloned()
+                    .unwrap_or_default(),
                 ..meta.clone()
             };
             save(Edited {

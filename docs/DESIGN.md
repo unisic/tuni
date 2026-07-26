@@ -490,6 +490,21 @@ it rather than returning the mux client's error, which nobody can act on. That
 is a race, and the real failure path is still there: the check only makes the
 ordinary case readable.
 
+Snippets are a file of the same kind, `{name, body}` in
+`~/.config/tuni/ssh/snippets.json`, offered by name in the command palette. One
+is typed into the pane that has the keyboard rather than run behind it, so it
+works against whatever shell is there, on this machine or the far end, and what
+ran is on the screen where the person who ran it can read it. The last character
+carries the rest of the meaning: a body ending in a newline runs, one that does
+not lands on the prompt to be finished by hand, which is how a snippet that
+would drop a table can be kept without a mis-hit Return being able to fire it. A
+host may name one to have typed when it connects, and the waiting in front of
+that is the whole of it. Sent too early the text goes wherever the login went,
+and a password prompt is one of the places that could be, so tuni watches for
+the control socket, which ssh binds only after it has authenticated, and then
+asks the master once whether it is answering. A host whose configuration shares
+nothing has no such moment to point at and gets nothing typed.
+
 An SSH library was the obvious alternative and it is ruled out by the same
 constraint everything else here follows. `russh` and `libssh2` bring their own
 authentication, so keys, passphrases and keyboard-interactive answers would
