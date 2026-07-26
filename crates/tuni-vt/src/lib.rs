@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
-use libghostty_vt::terminal::{ScrollViewport, Terminal as VtTerminal, TerminalOptions};
+use libghostty_vt::terminal::{Options as TerminalOptions, ScrollViewport, Terminal as VtTerminal};
 use libghostty_vt::{key, mouse};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -180,8 +180,8 @@ impl Terminal {
             .set_button(input.button)
             .set_mods(input.mods)
             .set_position(mouse::Position {
-                x: f64::from(input.col),
-                y: f64::from(input.row),
+                x: f32::from(input.col),
+                y: f32::from(input.row),
             });
 
         self.encoded.clear();

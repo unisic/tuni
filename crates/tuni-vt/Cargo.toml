@@ -1,5 +1,5 @@
 [package]
-name = "kero-vt"
+name = "tuni-vt"
 description = "Facade over libghostty-vt: terminal state, render grid, input encoding"
 edition.workspace = true
 license.workspace = true

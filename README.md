@@ -1,13 +1,13 @@
-# kero for Linux
+# Tuni
 
 A native terminal workspace for Linux: terminal panes, projects, a file tree, a
 git panel, an editor, and a diff viewer in one window.
 
-This is a ground-up Linux implementation of the workspace that
+Tuni is a ground-up Linux implementation of the workspace that
 [egoist/kero](https://github.com/egoist/kero) built for macOS. Kero's Swift
 source is read as a specification of behavior, not translated; the macOS build
 is SwiftUI/AppKit over the libghostty embed API, which exists only for macOS and
-iOS. Kero is GPLv3 and so is this.
+iOS. Kero is GPLv3 and so is Tuni.
 
 ## Status
 
@@ -29,14 +29,14 @@ those two are ours.
 
 | Crate | Responsibility |
 | --- | --- |
-| `kero-vt` | Facade over `libghostty-vt`. Nothing above this line imports it. |
-| `kero-pty` | Shell process, PTY, reader thread, window resize. |
-| `kero-core` | Portable models: config, projects, panes, session, git. No GTK. |
-| `kero-gtk` | GTK4 + libadwaita widgets, window, actions, keybindings. |
+| `tuni-vt` | Facade over `libghostty-vt`. Nothing above this line imports it. |
+| `tuni-pty` | Shell process, PTY, reader thread, window resize. |
+| `tuni-core` | Portable models: config, projects, panes, session, git. No GTK. |
+| `tuni-gtk` | GTK4 + libadwaita widgets, window, actions, keybindings. |
 
 The upstream C API is explicitly pre-1.0 and expected to change, which is why
 the dependency is pinned to a commit and why every call to it goes through
-`kero-vt`.
+`tuni-vt`.
 
 Text is drawn with Pango rather than a GPU glyph atlas. Pango brings fontconfig
 fallback, subpixel antialiasing, and input methods, and text quality is what a

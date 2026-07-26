@@ -5,17 +5,17 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/unisic/terminal"
+repository = "https://github.com/unisic/tuni"
 rust-version = "1.90"
 version = "0.0.0"
 
 [workspace.dependencies]
-kero-core = { path = "crates/kero-core" }
-kero-pty = { path = "crates/kero-pty" }
-kero-vt = { path = "crates/kero-vt" }
+tuni-core = { path = "crates/tuni-core" }
+tuni-pty = { path = "crates/tuni-pty" }
+tuni-vt = { path = "crates/tuni-vt" }
 
 # Pre-1.0 and expected to move with the pinned Ghostty source, so pin the rev.
-# Everything that touches it lives behind the kero-vt facade.
+# Everything that touches it lives behind the tuni-vt facade.
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "cd59174fd2ef5de8f1169987363c7815e62cff73" }
 
 [profile.release]

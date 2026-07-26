@@ -1,7 +1,7 @@
 //! PTY spawning and I/O for a terminal session.
 //!
 //! The reader runs on its own thread and hands buffers to the GTK main thread
-//! over an async channel, because the VT state in `kero-vt` is `!Send` and must
+//! over an async channel, because the VT state in `tuni-vt` is `!Send` and must
 //! only ever be touched from the main thread.
 
 use std::collections::HashMap;
@@ -68,7 +68,7 @@ impl Default for PtyConfig {
         // shipping our own copy is Etap 10 work.
         env.insert("TERM".to_owned(), "xterm-ghostty".to_owned());
         env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
-        env.insert("TERM_PROGRAM".to_owned(), "kero".to_owned());
+        env.insert("TERM_PROGRAM".to_owned(), "tuni".to_owned());
 
         Self {
             shell: None,
@@ -95,21 +95,20 @@ impl Pty {
             .openpty(PtySize {
                 rows: config.rows.max(1),
                 cols: config.cols.max(1),
-                pixel_width: config.cell_width_px * config.cols,
-                pixel_height: config.cell_height_px * config.rows,
+                pixel_width: config.cell_width_px.saturating_mul(config.cols),
+                pixel_height: config.cell_height_px.saturating_mul(config.rows),
             })
             .map_err(|e| Error::Spawn(e.to_string()))?;
 
-        let shell = config.shell.clone().unwrap_or_else(login_shell);
-        let mut cmd = CommandBuilder::new(&shell);
-        // A leading '-' in argv[0] is what makes a shell a *login* shell, which
-        // is what a terminal emulator is expected to start.
-        cmd.arg0(format!(
-            "-{}",
-            shell
-                .file_name()
-                .map_or_else(|| "sh".into(), |n| n.to_string_lossy())
-        ));
+        // The default-prog builder is the one that starts a *login* shell: it
+        // resolves $SHELL then the passwd entry, and prefixes argv[0] with '-'.
+        // An explicit shell rides in through $SHELL rather than through argv,
+        // because the builder resolves the executable from argv[0] and a
+        // login-shell argv[0] is not a path.
+        let mut cmd = CommandBuilder::new_default_prog();
+        if let Some(shell) = &config.shell {
+            cmd.env("SHELL", shell);
+        }
         if let Some(cwd) = &config.cwd {
             cmd.cwd(cwd);
         }
@@ -138,7 +137,7 @@ impl Pty {
         // growing an unbounded queue the UI can never drain.
         let (tx, rx) = async_channel::bounded(64);
         std::thread::Builder::new()
-            .name("kero-pty-reader".to_owned())
+            .name("tuni-pty-reader".to_owned())
             .spawn(move || {
                 let mut buf = vec![0u8; READ_BUF];
                 loop {
@@ -183,8 +182,8 @@ impl Pty {
             .resize(PtySize {
                 rows: rows.max(1),
                 cols: cols.max(1),
-                pixel_width: cell_width_px * cols.max(1),
-                pixel_height: cell_height_px * rows.max(1),
+                pixel_width: cell_width_px.saturating_mul(cols.max(1)),
+                pixel_height: cell_height_px.saturating_mul(rows.max(1)),
             })
             .map_err(|e| Error::Spawn(e.to_string()))
     }
@@ -195,16 +194,4 @@ impl Pty {
     pub fn shell_pid(&self) -> Option<u32> {
         self.child.process_id()
     }
-}
-
-fn login_shell() -> PathBuf {
-    if let Ok(shell) = std::env::var("SHELL")
-        && !shell.is_empty()
-    {
-        return PathBuf::from(shell);
-    }
-    if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::getuid()) {
-        return user.shell;
-    }
-    PathBuf::from("/bin/sh")
 }

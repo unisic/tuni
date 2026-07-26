@@ -16,9 +16,9 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use unicode_width::UnicodeWidthStr;
 
-use kero_core::TerminalConfig;
-use kero_pty::{Pty, PtyConfig, PtyEvent};
-use kero_vt::{CursorShape, KeyAction, KeyInput, Mods, Rgb};
+use tuni_core::TerminalConfig;
+use tuni_pty::{Pty, PtyConfig, PtyEvent};
+use tuni_vt::{CursorShape, KeyAction, KeyInput, Mods, Rgb};
 
 use crate::keymap;
 
@@ -29,8 +29,6 @@ use crate::keymap;
 struct Metrics {
     cell_width: f32,
     cell_height: f32,
-    /// Distance from the top of a cell to the text baseline.
-    ascent: f32,
 }
 
 impl Default for Metrics {
@@ -38,20 +36,19 @@ impl Default for Metrics {
         Self {
             cell_width: 8.0,
             cell_height: 16.0,
-            ascent: 12.0,
         }
     }
 }
 
 struct Session {
-    term: kero_vt::Terminal,
+    term: tuni_vt::Terminal,
     pty: Pty,
 }
 
 mod imp {
     use super::*;
 
-    pub struct KeroTerminal {
+    pub struct TuniTerminal {
         pub(super) session: RefCell<Option<Session>>,
         pub(super) config: RefCell<TerminalConfig>,
         pub(super) font: RefCell<pango::FontDescription>,
@@ -65,7 +62,7 @@ mod imp {
         pub(super) title: RefCell<Option<String>>,
     }
 
-    impl Default for KeroTerminal {
+    impl Default for TuniTerminal {
         fn default() -> Self {
             Self {
                 session: RefCell::new(None),
@@ -81,13 +78,28 @@ mod imp {
     }
 
     #[glib::object_subclass]
-    impl ObjectSubclass for KeroTerminal {
-        const NAME: &'static str = "KeroTerminal";
-        type Type = super::KeroTerminal;
+    impl ObjectSubclass for TuniTerminal {
+        const NAME: &'static str = "TuniTerminal";
+        type Type = super::TuniTerminal;
         type ParentType = gtk::Widget;
     }
 
-    impl ObjectImpl for KeroTerminal {
+    impl ObjectImpl for TuniTerminal {
+        fn properties() -> &'static [glib::ParamSpec] {
+            static PROPERTIES: std::sync::OnceLock<Vec<glib::ParamSpec>> =
+                std::sync::OnceLock::new();
+            PROPERTIES.get_or_init(|| {
+                vec![glib::ParamSpecString::builder("title").read_only().build()]
+            })
+        }
+
+        fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+            match pspec.name() {
+                "title" => self.title.borrow().to_value(),
+                other => unimplemented!("unknown property {other}"),
+            }
+        }
+
         fn constructed(&self) {
             self.parent_constructed();
             let obj = self.obj();
@@ -105,7 +117,7 @@ mod imp {
         }
     }
 
-    impl WidgetImpl for KeroTerminal {
+    impl WidgetImpl for TuniTerminal {
         fn measure(&self, orientation: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
             let m = self.metrics.get();
             // A terminal has no natural size worth defending; ask for a usable
@@ -129,21 +141,31 @@ mod imp {
 }
 
 glib::wrapper! {
-    pub struct KeroTerminal(ObjectSubclass<imp::KeroTerminal>)
+    pub struct TuniTerminal(ObjectSubclass<imp::TuniTerminal>)
         @extends gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
-impl Default for KeroTerminal {
+impl Default for TuniTerminal {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl KeroTerminal {
+impl TuniTerminal {
     #[must_use]
     pub fn new() -> Self {
         glib::Object::new()
+    }
+
+    /// Write text straight to the shell, bypassing key encoding. Paste and
+    /// scripted smoke tests both need this.
+    pub fn send_text(&self, text: &str) {
+        let mut guard = self.imp().session.borrow_mut();
+        if let Some(session) = guard.as_mut() {
+            let _ = session.pty.write(text.as_bytes());
+            session.term.scroll_to_bottom();
+        }
     }
 
     #[must_use]
@@ -185,7 +207,6 @@ impl KeroTerminal {
         imp.metrics.set(Metrics {
             cell_width: cell_width.max(1.0),
             cell_height: (ascent + descent + extra).max(1.0),
-            ascent,
         });
     }
 
@@ -286,7 +307,7 @@ impl KeroTerminal {
             if c == 0 || r == 0 { (80, 24) } else { (c, r) }
         };
 
-        let term = kero_vt::Terminal::new(cols, rows, imp.config.borrow().scrollback_lines)
+        let term = tuni_vt::Terminal::new(cols, rows, imp.config.borrow().scrollback_lines)
             .map_err(|e| e.to_string())?;
 
         let pty = Pty::spawn(&PtyConfig {
@@ -334,6 +355,9 @@ impl KeroTerminal {
 
         let effects = session.term.take_effects();
         if !effects.pty_write.is_empty() {
+            if std::env::var_os("TUNI_DEBUG_PTY_WRITE").is_some() {
+                eprintln!("pty_write: {:?}", String::from_utf8_lossy(&effects.pty_write));
+            }
             let _ = session.pty.write(&effects.pty_write);
         }
         let title = effects
@@ -344,7 +368,7 @@ impl KeroTerminal {
 
         if let Some(title) = title {
             imp.title.replace(Some(title));
-            self.notify("title-changed");
+            self.notify("title");
         }
         if effects.bell {
             self.error_bell();
@@ -567,7 +591,7 @@ struct StyleKey {
     strikethrough: bool,
 }
 
-fn style_key(cell: &kero_vt::Cell) -> StyleKey {
+fn style_key(cell: &tuni_vt::Cell) -> StyleKey {
     StyleKey {
         fg: cell.fg,
         bold: cell.bold,
@@ -607,7 +631,7 @@ fn draw_run(
     start: usize,
     y: f32,
     text: &str,
-    style: &kero_vt::Cell,
+    style: &tuni_vt::Cell,
 ) {
     let mut desc = font.clone();
     if style.bold {
@@ -640,8 +664,8 @@ fn draw_cursor(
     snapshot: &gtk::Snapshot,
     layout: &pango::Layout,
     m: Metrics,
-    cursor: &kero_vt::Cursor,
-    grid: &kero_vt::Grid,
+    cursor: &tuni_vt::Cursor,
+    grid: &tuni_vt::Grid,
     focused: bool,
 ) {
     let x = f32::from(cursor.col) * m.cell_width;

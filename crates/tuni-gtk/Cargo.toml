@@ -1,5 +1,5 @@
 [package]
-name = "kero-gtk"
+name = "tuni-gtk"
 description = "GTK4/libadwaita front end"
 edition.workspace = true
 license.workspace = true
@@ -8,13 +8,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [[bin]]
-name = "kero"
+name = "tuni"
 path = "src/main.rs"
 
 [dependencies]
-kero-core.workspace = true
-kero-pty.workspace = true
-kero-vt.workspace = true
+tuni-core.workspace = true
+tuni-pty.workspace = true
+tuni-vt.workspace = true
 
 adw = { package = "libadwaita", version = "0.8", features = ["v1_6"] }
 gtk = { package = "gtk4", version = "0.10", features = ["v4_12"] }

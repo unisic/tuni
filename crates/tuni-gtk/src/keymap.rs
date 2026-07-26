@@ -10,7 +10,7 @@
 //! report the physical key the Kitty protocol expects.
 
 use gtk::gdk;
-use kero_vt::{Key, Mods};
+use tuni_vt::{Key, Mods};
 
 pub fn mods_from_state(state: gdk::ModifierType) -> Mods {
     let mut mods = Mods::empty();
