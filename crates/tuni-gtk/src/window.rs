@@ -1,13 +1,17 @@
-//! The window: a sidebar of projects, a strip of tabs, and the terminals.
+//! The window: a sidebar of projects, a strip of tabs, and the panes inside
+//! them.
 //!
-//! The model of record for projects lives in `tuni_core::workspace`; the model
-//! of record for tab *order and selection* is the `AdwTabView`, which already
-//! implements the rules kero wrote by hand — a new tab lands next to the
-//! selected one, closing one falls to its neighbor, a drag reorders the strip.
-//! Every change the view makes is reported back into the model, so the project
-//! name, the directory a new shell starts in, and the session file to come all
-//! read from one place. Nothing pushes the other way, which is why there is no
-//! guard flag here and no way for the two to drift.
+//! The model of record for projects, tabs and panes lives in `tuni_core`; the
+//! model of record for tab *order and selection* is the `AdwTabView`, which
+//! already implements the rules kero wrote by hand — a new tab lands next to
+//! the selected one, closing one falls to its neighbor, a drag reorders the
+//! strip. Every change the view makes is reported back into the model, so the
+//! project name, the directory a new shell starts in, and the session file to
+//! come all read from one place. Nothing pushes the other way, which is why
+//! there is no guard flag here and no way for the two to drift.
+//!
+//! Panes are the other way around, because no widget implements a niri layout:
+//! the model decides, and [`TuniGrid`] renders whatever it says.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -20,9 +24,11 @@ use gtk::gio;
 use gtk::glib;
 
 use tuni_core::TerminalConfig;
+use tuni_core::panes::{Edge, Layout, Pane};
 use tuni_core::theme::Theme;
 use tuni_core::workspace::{Id, Tab, Workspace};
 
+use crate::grid::{Message, TuniGrid};
 use crate::terminal::TuniTerminal;
 
 /// Sidebar width, and the range a narrow or a wide window may take it to.
@@ -31,15 +37,19 @@ const SIDEBAR_MIN: i32 = 180;
 const SIDEBAR_MAX: i32 = 400;
 
 mod imp {
-    use super::{Cell, HashMap, Id, RefCell, TerminalConfig, TuniTerminal, Workspace, glib};
+    use super::{Cell, HashMap, Id, RefCell, TerminalConfig, TuniGrid, TuniTerminal, Workspace, glib};
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
 
     #[derive(Default)]
     pub struct TuniWindow {
         pub workspace: RefCell<Workspace>,
-        /// One terminal per tab, by tab id.
+        /// One terminal per pane, by pane id.
         pub terminals: RefCell<HashMap<Id, TuniTerminal>>,
+        /// One layout of panes per tab, by tab id.
+        pub grids: RefCell<HashMap<Id, TuniGrid>>,
+        /// The strip entry each tab was given, by tab id.
+        pub pages: RefCell<HashMap<Id, adw::TabPage>>,
         /// One tab strip per project, by project id.
         pub views: RefCell<HashMap<Id, adw::TabView>>,
         pub config: RefCell<TerminalConfig>,
@@ -290,6 +300,29 @@ impl TuniWindow {
                     view.close_page(&page);
                 }
             }),
+            entry("close-pane", None, |window, _| window.close_focused_pane()),
+            entry("split-right", None, |window, _| window.split(Edge::Right)),
+            entry("split-down", None, |window, _| window.split(Edge::Down)),
+            entry("split-left", None, |window, _| window.split(Edge::Left)),
+            entry("split-up", None, |window, _| window.split(Edge::Up)),
+            entry("focus-pane-left", None, |window, _| window.focus_toward(Edge::Left)),
+            entry("focus-pane-right", None, |window, _| window.focus_toward(Edge::Right)),
+            entry("focus-pane-up", None, |window, _| window.focus_toward(Edge::Up)),
+            entry("focus-pane-down", None, |window, _| window.focus_toward(Edge::Down)),
+            entry("next-pane", None, |window, _| {
+                window.navigate(Layout::focus_next);
+            }),
+            entry("previous-pane", None, |window, _| {
+                window.navigate(Layout::focus_previous);
+            }),
+            entry("zoom-pane", None, |window, _| window.toggle_zoom()),
+            entry("equalize-panes", None, |window, _| {
+                window.reshape(Layout::equalize);
+            }),
+            entry("resize-pane-left", None, |window, _| window.resize(Edge::Left)),
+            entry("resize-pane-right", None, |window, _| window.resize(Edge::Right)),
+            entry("resize-pane-up", None, |window, _| window.resize(Edge::Up)),
+            entry("resize-pane-down", None, |window, _| window.resize(Edge::Down)),
             entry("next-tab", None, |window, _| window.shift_tab(1)),
             entry("previous-tab", None, |window, _| window.shift_tab(-1)),
             entry("select-tab", Some(glib::VariantTy::INT32), |window, target| {
@@ -307,6 +340,15 @@ impl TuniWindow {
             entry("previous-project", None, |window, _| {
                 window.imp().workspace.borrow_mut().select_previous();
                 window.show_selected_project();
+            }),
+            entry("select-project", Some(glib::VariantTy::INT32), |window, target| {
+                if let Some(number) = target.and_then(glib::Variant::get::<i32>) {
+                    let count = window.imp().workspace.borrow().projects().len();
+                    if count > 0 {
+                        let index = if number >= 9 { count - 1 } else { (number as usize).saturating_sub(1).min(count - 1) };
+                        window.select_project_at(index);
+                    }
+                }
             }),
             entry("close-project", uint64, |window, target| {
                 if let Some(id) = project_target(target) {
@@ -458,9 +500,13 @@ impl TuniWindow {
             return;
         };
         for tab in project.tabs() {
-            if let Some(terminal) = imp.terminals.borrow_mut().remove(&tab.id()) {
-                terminal.shutdown();
+            for pane in tab.layout().panes() {
+                if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane.id()) {
+                    terminal.shutdown();
+                }
             }
+            imp.grids.borrow_mut().remove(&tab.id());
+            imp.pages.borrow_mut().remove(&tab.id());
         }
         if let Some(view) = imp.views.borrow_mut().remove(&id)
             && let Some(stack) = imp.stack.borrow().as_ref()
@@ -508,50 +554,84 @@ impl TuniWindow {
 
     // --- tabs --------------------------------------------------------------
 
-    /// Opens a terminal in `project`, next to the selected tab, and starts its
-    /// shell where the selected one is.
+    /// Opens a tab in `project`, next to the selected one, with a single
+    /// terminal starting where the selected tab's shell is.
     pub fn open_tab(&self, project: Id) {
         let imp = self.imp();
         let Some(view) = imp.views.borrow().get(&project).cloned() else {
             return;
         };
 
-        let cwd = imp
-            .workspace
-            .borrow()
-            .project(project)
-            .and_then(|project| project.directory_for_new_tab().map(PathBuf::from))
-            .filter(|path| path.is_dir())
-            .or_else(|| std::env::current_dir().ok());
-
-        let terminal = TuniTerminal::new();
-        terminal.set_hexpand(true);
-        terminal.set_vexpand(true);
-        terminal.set_config(&imp.config.borrow());
-        terminal.set_theme(&self.theme());
-
+        let cwd = self.directory_for_new_shell(project);
         let tab = Tab::new();
         let tab_id = tab.id();
+        let pane = tab.layout().focused();
         let name = tab.name().to_owned();
         let position = view
             .selected_page()
             .map_or_else(|| view.n_pages(), |page| view.page_position(&page) + 1);
 
-        imp.terminals.borrow_mut().insert(tab_id, terminal.clone());
         if let Some(project) = imp.workspace.borrow_mut().project_mut(project) {
             project.insert_tab(position.max(0) as usize, tab);
         }
 
-        let page = view.insert(&terminal, position);
+        let terminal = self.new_terminal(project, tab_id, pane);
+        let grid = self.new_grid(project, tab_id);
+        let page = view.insert(&grid, position);
         page.set_title(&name);
         page.set_live_thumbnail(true);
-        self.watch_terminal(&terminal, &page, project, tab_id);
+        imp.pages.borrow_mut().insert(tab_id, page.clone());
+
+        self.rebuild_grid(project, tab_id);
         view.set_selected_page(&page);
         self.refresh();
+        self.start_terminal(&terminal, cwd);
+    }
 
-        // The shell learns its window size from the first allocation, so it is
-        // started once the widget has one — otherwise it opens at 80x24 and is
-        // corrected under its own feet.
+    /// Opens a pane beside the focused one, in the same tab.
+    fn split(&self, edge: Edge) {
+        let Some((project, tab)) = self.selected_tab() else {
+            return;
+        };
+        let cwd = self.directory_for_new_shell(project);
+        let pane = Pane::new();
+        let pane_id = pane.id();
+        {
+            let imp = self.imp();
+            let mut workspace = imp.workspace.borrow_mut();
+            let Some(entry) = workspace
+                .project_mut(project)
+                .and_then(|project| project.tab_mut(tab))
+            else {
+                return;
+            };
+            entry.layout_mut().split(pane, edge);
+        }
+
+        let terminal = self.new_terminal(project, tab, pane_id);
+        self.rebuild_grid(project, tab);
+        self.refresh();
+        self.start_terminal(&terminal, cwd);
+    }
+
+    /// A terminal for one pane, themed and remembered.
+    fn new_terminal(&self, project: Id, tab: Id, pane: Id) -> TuniTerminal {
+        let imp = self.imp();
+        let terminal = TuniTerminal::new();
+        terminal.set_hexpand(true);
+        terminal.set_vexpand(true);
+        terminal.set_config(&imp.config.borrow());
+        terminal.set_theme(&self.theme());
+        imp.terminals.borrow_mut().insert(pane, terminal.clone());
+        self.watch_terminal(&terminal, project, tab, pane);
+        terminal
+    }
+
+    /// Starts a shell once its widget has been allocated.
+    ///
+    /// The shell learns its window size from that first allocation, so starting
+    /// it any earlier opens it at 80x24 and corrects it under its own feet.
+    fn start_terminal(&self, terminal: &TuniTerminal, cwd: Option<PathBuf>) {
         glib::idle_add_local_once(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -569,30 +649,101 @@ impl TuniWindow {
         ));
     }
 
+    /// Where the next shell in `project` should start.
+    fn directory_for_new_shell(&self, project: Id) -> Option<PathBuf> {
+        self.imp()
+            .workspace
+            .borrow()
+            .project(project)
+            .and_then(|project| project.directory_for_new_tab().map(PathBuf::from))
+            .filter(|path| path.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+    }
+
+    /// The widget one tab's panes live in, listening for what only the pointer
+    /// can decide.
+    fn new_grid(&self, project: Id, tab: Id) -> TuniGrid {
+        let grid = TuniGrid::new();
+        grid.connect_message(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |message| this.grid_message(project, tab, message)
+        ));
+        self.imp().grids.borrow_mut().insert(tab, grid.clone());
+        grid
+    }
+
+    fn grid_message(&self, project: Id, tab: Id, message: Message) {
+        let imp = self.imp();
+        let mut reshaped = false;
+        {
+            let mut workspace = imp.workspace.borrow_mut();
+            let Some(layout) = workspace
+                .project_mut(project)
+                .and_then(|project| project.tab_mut(tab))
+                .map(Tab::layout_mut)
+            else {
+                return;
+            };
+            match message {
+                Message::Focus(pane) => layout.focus(pane),
+                Message::Move(dragged, edge, target) => {
+                    layout.move_pane(dragged, edge, target);
+                    reshaped = true;
+                }
+                Message::Columns(weights) => layout.set_column_weights(&weights),
+                Message::Panes(column, weights) => layout.set_pane_weights(column, &weights),
+            }
+        }
+        if reshaped {
+            self.rebuild_grid(project, tab);
+        }
+        self.refresh();
+        if reshaped {
+            self.focus_terminal();
+        }
+    }
+
+    /// Draws a tab's layout again, and hands the keyboard back to the pane that
+    /// had it.
+    fn rebuild_grid(&self, project: Id, tab: Id) {
+        let imp = self.imp();
+        let Some(grid) = imp.grids.borrow().get(&tab).cloned() else {
+            return;
+        };
+        let layout = imp
+            .workspace
+            .borrow()
+            .project(project)
+            .and_then(|project| project.tab(tab))
+            .map(|tab| tab.layout().clone());
+        let Some(layout) = layout else {
+            return;
+        };
+        // A copy of the map rather than a borrow of it: rebuilding moves the
+        // keyboard between widgets, and a shell that hangs up while that
+        // happens goes straight for this map.
+        let terminals = imp.terminals.borrow().clone();
+        grid.rebuild(&layout, &terminals);
+    }
+
     /// Follows one terminal: its title names the tab and the project, its
-    /// working directory is where the next tab starts, its bell marks the tab
-    /// when it is not the one on screen, and its shell's death closes the tab.
-    fn watch_terminal(&self, terminal: &TuniTerminal, page: &adw::TabPage, project: Id, tab: Id) {
+    /// working directory is where the next shell starts, its bell marks the tab
+    /// when it is not the one on screen, clicking into it moves the focus ring,
+    /// and its shell's death closes the pane.
+    fn watch_terminal(&self, terminal: &TuniTerminal, project: Id, tab: Id, pane: Id) {
         terminal.connect_notify_local(
             Some("title"),
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
-                #[weak]
-                page,
                 move |terminal: &TuniTerminal, _| {
-                    let name = {
-                        let mut workspace = this.imp().workspace.borrow_mut();
-                        let Some(entry) = workspace
-                            .project_mut(project)
-                            .and_then(|project| project.tab_mut(tab))
-                        else {
-                            return;
-                        };
-                        entry.title = terminal.title();
-                        entry.name().to_owned()
-                    };
-                    page.set_title(&name);
+                    let title = terminal.title();
+                    if let Some(entry) = this.imp().workspace.borrow_mut().project_mut(project)
+                        .and_then(|project| project.pane_mut(tab, pane))
+                    {
+                        entry.title = title;
+                    }
                     this.refresh();
                 }
             ),
@@ -603,21 +754,30 @@ impl TuniWindow {
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
-                #[weak]
-                page,
                 move |terminal: &TuniTerminal, _| {
                     let cwd = terminal.cwd();
-                    if let Some(entry) = this
-                        .imp()
-                        .workspace
-                        .borrow_mut()
-                        .project_mut(project)
-                        .and_then(|project| project.tab_mut(tab))
+                    if let Some(entry) = this.imp().workspace.borrow_mut().project_mut(project)
+                        .and_then(|project| project.pane_mut(tab, pane))
                     {
-                        entry.directory.clone_from(&cwd);
+                        entry.directory = cwd;
                     }
-                    page.set_tooltip(&cwd.as_deref().map(shorten).unwrap_or_default());
                     this.refresh();
+                }
+            ),
+        );
+
+        // The keyboard is GTK's to give; the model is told where it went rather
+        // than asked to move it, which is what keeps a click and a shortcut
+        // ending in the same place.
+        terminal.connect_notify_local(
+            Some("has-focus"),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |terminal: &TuniTerminal, _| {
+                    if terminal.has_focus() {
+                        this.pane_focused(project, tab, pane);
+                    }
                 }
             ),
         );
@@ -626,10 +786,12 @@ impl TuniWindow {
             "bell",
             false,
             glib::closure_local!(
-                #[weak]
-                page,
+                #[weak(rename_to = this)]
+                self,
                 move |_: TuniTerminal| {
-                    if !page.is_selected() {
+                    if let Some(page) = this.imp().pages.borrow().get(&tab)
+                        && !page.is_selected()
+                    {
                         page.set_needs_attention(true);
                     }
                 }
@@ -642,25 +804,89 @@ impl TuniWindow {
             glib::closure_local!(
                 #[weak(rename_to = this)]
                 self,
-                #[weak]
-                page,
-                move |_: TuniTerminal| {
-                    if let Some(view) = this.imp().views.borrow().get(&project).cloned() {
-                        view.close_page(&page);
-                    }
-                }
+                move |_: TuniTerminal| this.close_pane(project, tab, pane)
             ),
         );
     }
 
-    /// The strip has removed a tab: drop it from the model and hang up its
-    /// shell.
+    /// A pane took the keyboard: move the ring, and rename the tab, which is
+    /// named by whichever pane is being worked in.
+    fn pane_focused(&self, project: Id, tab: Id, pane: Id) {
+        let imp = self.imp();
+        let changed = {
+            let mut workspace = imp.workspace.borrow_mut();
+            let Some(layout) = workspace
+                .project_mut(project)
+                .and_then(|project| project.tab_mut(tab))
+                .map(Tab::layout_mut)
+            else {
+                return;
+            };
+            if layout.focused() == pane {
+                return;
+            }
+            layout.focus(pane);
+            layout.focused() == pane
+        };
+        if !changed {
+            return;
+        }
+        if let Some(grid) = imp.grids.borrow().get(&tab) {
+            grid.set_focused(pane);
+        }
+        self.refresh();
+    }
+
+    /// Closes one pane, and the tab with it when it was the last one.
+    fn close_pane(&self, project: Id, tab: Id, pane: Id) {
+        let imp = self.imp();
+        if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane) {
+            terminal.shutdown();
+        }
+        let alive = {
+            let mut workspace = imp.workspace.borrow_mut();
+            let Some(layout) = workspace
+                .project_mut(project)
+                .and_then(|project| project.tab_mut(tab))
+                .map(Tab::layout_mut)
+            else {
+                return;
+            };
+            layout.remove(pane)
+        };
+
+        if !alive {
+            let page = imp.pages.borrow().get(&tab).cloned();
+            if let (Some(view), Some(page)) =
+                (imp.views.borrow().get(&project).cloned(), page)
+            {
+                view.close_page(&page);
+            }
+            return;
+        }
+        self.rebuild_grid(project, tab);
+        self.refresh();
+        self.focus_terminal();
+    }
+
+    fn close_focused_pane(&self) {
+        let Some((project, tab)) = self.selected_tab() else {
+            return;
+        };
+        let Some(pane) = self.focused_pane() else {
+            return;
+        };
+        self.close_pane(project, tab, pane);
+    }
+
+    /// The strip has removed a tab: drop it from the model and hang up every
+    /// shell that was in it.
     fn tab_detached(&self, project: Id, position: i32) {
         let imp = self.imp();
-        let tab = {
+        let removed = {
             let mut workspace = imp.workspace.borrow_mut();
             let Some(entry) = workspace.project_mut(project) else {
-                // The project itself is going away; its terminals were hung up
+                // The project itself is going away; its shells were hung up
                 // with it.
                 return;
             };
@@ -671,13 +897,104 @@ impl TuniWindow {
             else {
                 return;
             };
-            entry.remove_tab(id);
-            id
+            entry.remove_tab(id)
         };
-        if let Some(terminal) = imp.terminals.borrow_mut().remove(&tab) {
-            terminal.shutdown();
+        let Some(tab) = removed else {
+            return;
+        };
+
+        for pane in tab.layout().panes() {
+            if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane.id()) {
+                terminal.shutdown();
+            }
+        }
+        imp.grids.borrow_mut().remove(&tab.id());
+        imp.pages.borrow_mut().remove(&tab.id());
+        self.refresh();
+    }
+
+    // --- panes -------------------------------------------------------------
+
+    /// Runs something over the selected tab's layout that changes only which
+    /// pane is focused or how big the tiles are — no rebuild needed, since the
+    /// tiles are laid out from the weights the widgets already hold.
+    fn navigate(&self, change: impl FnOnce(&mut Layout)) {
+        let Some((project, tab)) = self.selected_tab() else {
+            return;
+        };
+        let (zoomed, focused) = {
+            let imp = self.imp();
+            let mut workspace = imp.workspace.borrow_mut();
+            let Some(layout) = workspace
+                .project_mut(project)
+                .and_then(|project| project.tab_mut(tab))
+                .map(Tab::layout_mut)
+            else {
+                return;
+            };
+            let was_zoomed = layout.is_zoomed();
+            change(layout);
+            (was_zoomed != layout.is_zoomed(), layout.focused())
+        };
+        // Navigation lets go of zoom, and that does change what is on screen.
+        if zoomed {
+            self.rebuild_grid(project, tab);
+        } else if let Some(grid) = self.imp().grids.borrow().get(&tab) {
+            grid.set_focused(focused);
         }
         self.refresh();
+        self.focus_terminal();
+    }
+
+    fn focus_toward(&self, edge: Edge) {
+        self.navigate(|layout| layout.focus_toward(edge));
+    }
+
+    /// Runs something that changes the tiles' sizes but not the layout's shape.
+    fn reshape(&self, change: impl FnOnce(&mut Layout)) {
+        let Some((project, tab)) = self.selected_tab() else {
+            return;
+        };
+        {
+            let imp = self.imp();
+            let mut workspace = imp.workspace.borrow_mut();
+            let Some(layout) = workspace
+                .project_mut(project)
+                .and_then(|project| project.tab_mut(tab))
+                .map(Tab::layout_mut)
+            else {
+                return;
+            };
+            change(layout);
+        }
+        // Weights live in the widgets as well as in the model, so a size change
+        // is the one thing that has to be drawn again rather than nudged.
+        self.rebuild_grid(project, tab);
+        self.focus_terminal();
+    }
+
+    fn resize(&self, edge: Edge) {
+        self.reshape(|layout| layout.resize(edge));
+    }
+
+    fn toggle_zoom(&self) {
+        let Some((project, tab)) = self.selected_tab() else {
+            return;
+        };
+        {
+            let imp = self.imp();
+            let mut workspace = imp.workspace.borrow_mut();
+            let Some(layout) = workspace
+                .project_mut(project)
+                .and_then(|project| project.tab_mut(tab))
+                .map(Tab::layout_mut)
+            else {
+                return;
+            };
+            layout.toggle_zoom();
+        }
+        self.rebuild_grid(project, tab);
+        self.focus_terminal();
     }
 
     /// The strip has changed which tab is on screen.
@@ -765,24 +1082,41 @@ impl TuniWindow {
         Some((view, page))
     }
 
-    /// The tab a terminal widget belongs to. Tab ids are unique across
-    /// projects, so the whole map is the right thing to search.
+    /// The tab a page's child belongs to. Tab ids are unique across projects,
+    /// so the whole map is the right thing to search.
     fn tab_of(&self, child: &gtk::Widget) -> Option<Id> {
         self.imp()
-            .terminals
+            .grids
             .borrow()
             .iter()
-            .find(|(_, terminal)| terminal.upcast_ref::<gtk::Widget>() == child)
+            .find(|(_, grid)| grid.upcast_ref::<gtk::Widget>() == child)
             .map(|(id, _)| *id)
+    }
+
+    /// The project and tab on screen.
+    fn selected_tab(&self) -> Option<(Id, Id)> {
+        let workspace = self.imp().workspace.borrow();
+        let project = workspace.selected_project()?;
+        Some((project.id(), project.selected_id()?))
+    }
+
+    /// The pane holding the keyboard in the tab on screen.
+    fn focused_pane(&self) -> Option<Id> {
+        let workspace = self.imp().workspace.borrow();
+        Some(
+            workspace
+                .selected_project()?
+                .selected_tab()?
+                .layout()
+                .focused(),
+        )
     }
 
     /// The terminal on screen, for the smoke captures and for focus.
     #[must_use]
     pub fn active_terminal(&self) -> Option<TuniTerminal> {
-        let imp = self.imp();
-        let workspace = imp.workspace.borrow();
-        let tab = workspace.selected_project()?.selected_id()?;
-        imp.terminals.borrow().get(&tab).cloned()
+        let pane = self.focused_pane()?;
+        self.imp().terminals.borrow().get(&pane).cloned()
     }
 
     fn focus_terminal(&self) {
@@ -804,7 +1138,7 @@ impl TuniWindow {
                 project.map(|project| project.name().to_owned()),
                 project
                     .and_then(|project| project.selected_tab())
-                    .and_then(|tab| tab.directory.as_deref().map(shorten)),
+                    .and_then(|tab| tab.directory().map(shorten)),
                 project.is_some_and(|project| !project.is_empty()),
                 !workspace.is_empty(),
             )
@@ -841,6 +1175,19 @@ impl TuniWindow {
         let workspace = imp.workspace.borrow();
         for (label, project) in imp.labels.borrow().iter().zip(workspace.projects()) {
             label.set_text(project.name());
+        }
+
+        // A tab is named by the pane being worked in, so a title arriving in
+        // any pane can be the one the strip should show.
+        let pages = imp.pages.borrow();
+        for project in workspace.projects() {
+            for tab in project.tabs() {
+                let Some(page) = pages.get(&tab.id()) else {
+                    continue;
+                };
+                page.set_title(tab.name());
+                page.set_tooltip(&tab.directory().map(shorten).unwrap_or_default());
+            }
         }
     }
 
@@ -1188,7 +1535,16 @@ fn load_css() {
     PROVIDER.with(|provider| {
         provider.load_from_string(
             "row .tuni-row-close { opacity: 0; min-width: 20px; min-height: 20px; padding: 0; }\n\
-             row:hover .tuni-row-close, row:selected .tuni-row-close { opacity: 1; }\n",
+             row:hover .tuni-row-close, row:selected .tuni-row-close { opacity: 1; }\n\
+             /* The ring is only drawn once a tab is split: a lone pane is the\n\
+                whole tab, and outlining it says nothing. */\n\
+             .tuni-pane.ringed { border-radius: 8px; border: 1px solid alpha(currentColor, 0.14); }\n\
+             .tuni-pane.ringed.focused { border-color: alpha(@accent_color, 0.85); }\n\
+             .tuni-pane > .tuni-grip { min-height: 6px; opacity: 0; }\n\
+             .tuni-pane.ringed:hover > .tuni-grip { opacity: 0.35; \
+              background-image: radial-gradient(circle, currentColor 1px, transparent 1px); \
+              background-size: 4px 4px; }\n\
+             .tuni-drop { background-color: alpha(@accent_color, 0.28); border-radius: 6px; }\n",
         );
         gtk::style_context_add_provider_for_display(
             &display,

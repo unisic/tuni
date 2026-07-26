@@ -1,7 +1,7 @@
 //! Projects and their tabs.
 //!
-//! A project is one row in the left sidebar and one strip of tabs; a tab is one
-//! terminal. The rules here are kero's: a new tab opens next to the selected
+//! A project is one row in the left sidebar and one strip of tabs; a tab is a
+//! layout of panes. The rules here are kero's: a new tab opens next to the selected
 //! one rather than at the end, closing the selected tab falls to its neighbor,
 //! selection wraps at both ends, and a project whose tabs are all closed stays
 //! in the sidebar until it is closed on purpose.
@@ -14,6 +14,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::panes::{Layout, Pane};
 
 /// Identity for a project or a tab: unique for the life of the process, and
 /// unrelated to position, so a reorder cannot invalidate a reference.
@@ -44,20 +46,17 @@ impl From<u64> for Id {
 /// Shown when a tab has neither a name of its own nor a title from the shell.
 const UNTITLED_TAB: &str = "Terminal";
 
-/// One terminal in a project's strip.
+/// One entry in a project's strip: a layout of panes, which for a tab that was
+/// never split is one terminal.
 ///
-/// Etap 3 grows this into a niri-style layout of panes; the title and the
-/// directory then belong to the focused pane rather than to the tab, which is
-/// why both are already read through the tab rather than from a session.
+/// A tab holds no title or directory of its own — both belong to whichever pane
+/// has the keyboard, so a split tab is named by the half being worked in.
 #[derive(Clone, Debug)]
 pub struct Tab {
     id: Id,
     /// Set by "Rename…", cleared by "Use Automatic Title".
     pub custom_name: Option<String>,
-    /// What the shell last said through OSC 0/2.
-    pub title: Option<String>,
-    /// Where the shell last said it is, through OSC 7.
-    pub directory: Option<String>,
+    layout: Layout,
 }
 
 impl Tab {
@@ -66,8 +65,7 @@ impl Tab {
         Self {
             id: Id::next(),
             custom_name: None,
-            title: None,
-            directory: None,
+            layout: Layout::new(Pane::new()),
         }
     }
 
@@ -76,13 +74,39 @@ impl Tab {
         self.id
     }
 
-    /// What the strip shows: the name the user gave it, else the shell's own
-    /// title, else a placeholder.
+    #[must_use]
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    pub fn layout_mut(&mut self) -> &mut Layout {
+        &mut self.layout
+    }
+
+    /// The name the user gave it, else the focused shell's own title. Nothing
+    /// when neither has anything to say — which is what lets a project fall
+    /// back to its own name rather than to a placeholder.
+    #[must_use]
+    pub fn display_name(&self) -> Option<&str> {
+        non_empty(self.custom_name.as_deref()).or_else(|| {
+            self.layout
+                .focused_pane()
+                .and_then(|pane| non_empty(pane.title.as_deref()))
+        })
+    }
+
+    /// What the strip shows.
     #[must_use]
     pub fn name(&self) -> &str {
-        non_empty(self.custom_name.as_deref())
-            .or_else(|| non_empty(self.title.as_deref()))
-            .unwrap_or(UNTITLED_TAB)
+        self.display_name().unwrap_or(UNTITLED_TAB)
+    }
+
+    /// Where the focused shell last said it is.
+    #[must_use]
+    pub fn directory(&self) -> Option<&str> {
+        self.layout
+            .focused_pane()
+            .and_then(|pane| non_empty(pane.directory.as_deref()))
     }
 }
 
@@ -132,7 +156,7 @@ impl Project {
     #[must_use]
     pub fn name(&self) -> &str {
         non_empty(self.custom_name.as_deref())
-            .or_else(|| self.selected_tab().and_then(|tab| non_empty(tab.title.as_deref())))
+            .or_else(|| self.selected_tab().and_then(Tab::display_name))
             .unwrap_or(&self.fallback_name)
     }
 
@@ -219,8 +243,19 @@ impl Project {
     #[must_use]
     pub fn directory_for_new_tab(&self) -> Option<&str> {
         self.selected_tab()
-            .and_then(|tab| non_empty(tab.directory.as_deref()))
+            .and_then(Tab::directory)
             .or_else(|| non_empty(self.custom_directory.as_deref()))
+    }
+
+    /// One pane, addressed the way the window addresses it: which tab, which
+    /// pane inside it.
+    #[must_use]
+    pub fn pane(&self, tab: Id, pane: Id) -> Option<&Pane> {
+        self.tab(tab)?.layout().pane(pane)
+    }
+
+    pub fn pane_mut(&mut self, tab: Id, pane: Id) -> Option<&mut Pane> {
+        self.tab_mut(tab)?.layout_mut().pane_mut(pane)
     }
 
     /// The root the file tree and the git panel anchor to, and whether it was
@@ -401,6 +436,14 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 mod tests {
     use super::*;
 
+    /// What the shell in the focused pane says about itself.
+    fn shell_says(tab: &mut Tab, title: &str, directory: &str) {
+        let focused = tab.layout().focused();
+        let pane = tab.layout_mut().pane_mut(focused).expect("focused pane");
+        pane.title = Some(title.to_owned());
+        pane.directory = Some(directory.to_owned());
+    }
+
     /// A project with `count` tabs, the last one selected — the state the
     /// strip leaves behind after opening that many.
     fn project_with_tabs(count: usize) -> (Project, Vec<Id>) {
@@ -420,7 +463,7 @@ mod tests {
         let mut tab = Tab::new();
         assert_eq!(tab.name(), UNTITLED_TAB);
 
-        tab.title = Some("vim src/main.rs".to_owned());
+        shell_says(&mut tab, "vim src/main.rs", "/home/me/src");
         assert_eq!(tab.name(), "vim src/main.rs");
 
         tab.custom_name = Some("editor".to_owned());
@@ -436,8 +479,8 @@ mod tests {
         let (mut project, ids) = project_with_tabs(2);
         assert_eq!(project.name(), "Project 1");
 
-        project.tab_mut(ids[0]).unwrap().title = Some("build".to_owned());
-        project.tab_mut(ids[1]).unwrap().title = Some("test".to_owned());
+        shell_says(project.tab_mut(ids[0]).unwrap(), "build", "/src");
+        shell_says(project.tab_mut(ids[1]).unwrap(), "test", "/src");
         assert_eq!(project.name(), "test");
 
         project.select(Some(ids[0]));
@@ -450,9 +493,29 @@ mod tests {
     #[test]
     fn a_renamed_tab_that_is_blank_is_not_a_name() {
         let mut tab = Tab::new();
-        tab.title = Some("zsh".to_owned());
+        shell_says(&mut tab, "zsh", "/home/me");
         tab.custom_name = Some("   ".to_owned());
         assert_eq!(tab.name(), "zsh");
+    }
+
+    #[test]
+    fn a_split_tab_is_named_by_the_pane_being_worked_in() {
+        let mut tab = Tab::new();
+        shell_says(&mut tab, "server", "/srv");
+
+        let pane = crate::panes::Pane::new();
+        let second = pane.id();
+        tab.layout_mut().split(pane, crate::panes::Edge::Right);
+        shell_says(&mut tab, "tests", "/srv/tests");
+
+        assert_eq!(tab.name(), "tests");
+        assert_eq!(tab.directory(), Some("/srv/tests"));
+
+        tab.layout_mut().focus_previous();
+        assert_eq!(tab.name(), "server");
+        assert_eq!(tab.directory(), Some("/srv"));
+        assert_eq!(tab.layout().focused(), tab.layout().columns()[0].panes()[0].id());
+        assert_ne!(tab.layout().focused(), second);
     }
 
     #[test]
@@ -501,7 +564,7 @@ mod tests {
         project.custom_directory = Some("/srv/pinned".to_owned());
         assert_eq!(project.directory_for_new_tab(), Some("/srv/pinned"));
 
-        project.tab_mut(ids[1]).unwrap().directory = Some("/home/me/src".to_owned());
+        shell_says(project.tab_mut(ids[1]).unwrap(), "zsh", "/home/me/src");
         assert_eq!(project.directory_for_new_tab(), Some("/home/me/src"));
 
         project.select(Some(ids[0]));

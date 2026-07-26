@@ -2,8 +2,10 @@
 //!
 //! Everything the window does lives in `window.rs`; this file is the process.
 
+mod grid;
 mod keymap;
 mod terminal;
+mod tiles;
 mod window;
 
 use adw::prelude::*;
@@ -22,15 +24,38 @@ const APP_ID: &str = "dev.unisic.Tuni";
 /// `Ctrl+Shift`, which is the convention every Linux terminal follows, and tab
 /// selection on `Alt`+digit, which is what a tabbed terminal does. `Ctrl+Tab`
 /// is the exception, because nothing in a shell wants it.
+///
+/// Panes take the arrow keys under `Ctrl+Alt`, which is where a tiling window
+/// manager puts them and what kero spends ⌘⌥ on. That pushes project switching
+/// onto `Ctrl+Alt+Page Up/Down`: moving between panes happens many times a
+/// minute and moving between projects a few times an hour, so the shorter
+/// shortcut goes to the shorter reach.
 const ACCELS: &[(&str, &[&str])] = &[
     ("win.new-tab", &["<Ctrl><Shift>t"]),
-    ("win.close-tab", &["<Ctrl><Shift>w"]),
+    // Closing the last pane in a tab closes the tab, which is what one key for
+    // both means in practice. Closing a *split* tab whole stays on the tab menu
+    // rather than taking `Ctrl+Shift+Q`, which every desktop reads as quit.
+    ("win.close-pane", &["<Ctrl><Shift>w"]),
     ("win.next-tab", &["<Ctrl>Tab", "<Ctrl>Page_Down"]),
     ("win.previous-tab", &["<Ctrl><Shift>Tab", "<Ctrl>Page_Up"]),
     ("win.new-project", &["<Ctrl><Shift>n"]),
-    ("win.next-project", &["<Ctrl><Alt>Down"]),
-    ("win.previous-project", &["<Ctrl><Alt>Up"]),
+    ("win.next-project", &["<Ctrl><Alt>Page_Down"]),
+    ("win.previous-project", &["<Ctrl><Alt>Page_Up"]),
     ("win.toggle-sidebar", &["F9", "<Ctrl><Shift>b"]),
+    ("win.split-right", &["<Ctrl><Shift>d"]),
+    ("win.split-down", &["<Ctrl><Shift>e"]),
+    ("win.focus-pane-left", &["<Ctrl><Alt>Left"]),
+    ("win.focus-pane-right", &["<Ctrl><Alt>Right"]),
+    ("win.focus-pane-up", &["<Ctrl><Alt>Up"]),
+    ("win.focus-pane-down", &["<Ctrl><Alt>Down"]),
+    ("win.next-pane", &["<Ctrl><Shift>bracketright"]),
+    ("win.previous-pane", &["<Ctrl><Shift>bracketleft"]),
+    ("win.zoom-pane", &["<Ctrl><Shift>Return"]),
+    ("win.equalize-panes", &["<Ctrl><Alt>equal"]),
+    ("win.resize-pane-left", &["<Ctrl><Alt><Shift>Left"]),
+    ("win.resize-pane-right", &["<Ctrl><Alt><Shift>Right"]),
+    ("win.resize-pane-up", &["<Ctrl><Alt><Shift>Up"]),
+    ("win.resize-pane-down", &["<Ctrl><Alt><Shift>Down"]),
 ];
 
 fn main() -> glib::ExitCode {
@@ -49,6 +74,10 @@ fn main() -> glib::ExitCode {
             app.set_accels_for_action(
                 &format!("win.select-tab({number})"),
                 &[&format!("<Alt>{number}")],
+            );
+            app.set_accels_for_action(
+                &format!("win.select-project({number})"),
+                &[&format!("<Ctrl><Shift>{number}")],
             );
         }
     });

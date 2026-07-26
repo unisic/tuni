@@ -19,20 +19,30 @@ preference, OSC 8 hyperlinks opened with `Ctrl`+click, a configurable font with
 live zoom, and Ghostty's 574 color themes, which paint the window chrome as
 well as the terminal. `ls`, `vi`, and `top` all render correctly.
 
-Around it: a sidebar of projects, each with its own strip of tabs. A project is
-named by whatever its visible shell calls itself until you rename it, and a
-project directory can be pinned for the file tree and the git panel to come. A
-new tab starts where the visible one is, opens next to it, and closes when its
-shell exits; a project whose tabs are all closed stays in the sidebar until it
-is closed on purpose.
+Around it: a sidebar of projects, each with its own strip of tabs, and inside a
+tab a niri-style layout of panes. A project is named by whatever its visible
+shell calls itself until you rename it, and a project directory can be pinned
+for the file tree and the git panel to come. A new tab starts where the visible
+one is, opens next to it, and closes when its last shell exits; a project whose
+tabs are all closed stays in the sidebar until it is closed on purpose.
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+Shift+T` / `Ctrl+Shift+W` | New tab, close tab |
+| `Ctrl+Shift+D` / `Ctrl+Shift+E` | Split right, split down |
+| `Ctrl+Shift+W` | Close the pane — and the tab, when it was the last one |
+| `Ctrl+Alt`+arrows | Move the focus one pane in that direction |
+| `Ctrl+Shift+]` / `Ctrl+Shift+[` | Next pane, previous pane |
+| `Ctrl+Shift+Enter` | Show the focused pane alone, and back |
+| `Ctrl+Alt+Shift`+arrows | Grow or shrink the focused pane |
+| `Ctrl+Alt+=` | Give every pane the same room |
+| Drag a pane's grip onto another | Move it to that pane's left, right, top, or bottom |
+| Drag the gap between panes | Move the divider |
+| `Ctrl+Shift+T` | New tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next tab, previous tab — also `Ctrl+Page Down` / `Ctrl+Page Up` |
 | `Alt+1` … `Alt+9` | Jump to a tab; `Alt+9` is the last one |
 | `Ctrl+Shift+N` | New project |
-| `Ctrl+Alt+Down` / `Ctrl+Alt+Up` | Next project, previous project |
+| `Ctrl+Alt+Page Down` / `Ctrl+Alt+Page Up` | Next project, previous project |
+| `Ctrl+Shift+1` … `Ctrl+Shift+9` | Jump to a project |
 | `F9` | Show or hide the sidebar |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection, paste |
 | Middle click | Paste the primary selection |
@@ -45,9 +55,8 @@ is closed on purpose.
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
 
-From here the work runs to full parity: the niri-style pane layout, session
-persistence, the file tree, the git panel, the editor, the diff viewer, the
-command palette, and packaging.
+From here the work runs to full parity: session persistence, the file tree, the
+git panel, the editor, the diff viewer, the command palette, and packaging.
 
 Consuming a 200 MiB stream, measured with `scripts/throughput.sh` on this
 machine:
@@ -89,6 +98,16 @@ one falls to a neighbor, that a drag ends where it was dropped. So the widget is
 the record of tab order and selection, and it reports one way into the model —
 never the reverse. Two records that can disagree need a guard against drift;
 one record needs nothing.
+
+Panes are the other way around, for the same reason. No GTK widget implements a
+niri layout — a tab is a row of columns, a column is a stack of panes, and
+nothing nests deeper than that — so the model in `tuni-core` is the record and
+the widget draws whatever it says. `GtkPaned` was the alternative and it is the
+wrong shape: it holds two children and nests to hold more, which turns a flat
+row of four into a tree of three, and dragging one divider then moves panes that
+were nowhere near the pointer. Sizes are weights rather than pixels, and the
+arithmetic that turns weights into a row of tiles lives in the model beside its
+tests, not in a widget where nothing can reach it.
 
 Ghostty's theme catalog is vendored under `data/themes` and baked into the
 binary at build time, so a fresh checkout runs with all 574 and a packaged
