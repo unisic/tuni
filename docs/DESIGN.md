@@ -38,10 +38,16 @@ sizes by and what an undragged one should go on doing.
 
 On the other side, a panel under `Ctrl+Shift+B` shows the directory the focused
 shell is working in, or the project's own if one is pinned, and follows it as
-the focus moves. Its Files page opens directories in place and files in a pane of
+the focus moves. It stands beside the tab strip rather than under it, since the
+strip names the terminals and the panel is the same three pages whichever tab
+is in front. Its Files page opens directories in place and files in a pane of
 their own, and a right click opens one beside what is already there, renames,
 creates, copies a path, shows a file in the desktop's file manager, moves one to
-the trash, or types a `cd` into the terminal that has the keyboard.
+the trash, or types a `cd` into the terminal that has the keyboard. The header
+steps to the parent directory, or takes a typed path the way a prompt would,
+`~` included; wandering off holds until the window has an actually different
+directory to show, so the focus moving between panes of one project does not
+snap the tree back.
 
 Its Git page, under `Ctrl+Shift+G`, is the repository that directory belongs to:
 the branch and how far it is from its upstream, what is in conflict, what is

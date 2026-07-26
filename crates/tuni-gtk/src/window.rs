@@ -588,9 +588,16 @@ impl TuniWindow {
                 move |path, staged| this.open_diff(&path, staged)
             ));
         }
+        // The tab strip belongs to the terminals, so it stops where they do:
+        // stretched over the panel it would name tabs for a column that shows
+        // the same three pages whichever tab is in front.
+        let terminal_view = adw::ToolbarView::new();
+        terminal_view.add_top_bar(&tab_bar);
+        terminal_view.set_content(Some(&content_overlay));
+
         let panel = adw::OverlaySplitView::builder()
             .sidebar_position(gtk::PackType::End)
-            .content(&content_overlay)
+            .content(&terminal_view)
             .show_sidebar(false)
             .sidebar_width_fraction(PANEL_FRACTION)
             .min_sidebar_width(f64::from(PANEL_MIN))
@@ -612,7 +619,6 @@ impl TuniWindow {
 
         let content_view = adw::ToolbarView::new();
         content_view.add_top_bar(&header);
-        content_view.add_top_bar(&tab_bar);
         content_view.set_content(Some(&panel));
 
         let split = adw::OverlaySplitView::builder()

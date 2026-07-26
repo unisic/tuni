@@ -97,10 +97,17 @@ mod imp {
     #[derive(Default)]
     pub struct TuniFiles {
         pub tree: RefCell<Tree>,
+        /// The directory the window last pointed the panel at. Browsing --
+        /// stepping up, typing a path -- moves the tree without moving this,
+        /// and the window saying the same root again is not a reason to snap
+        /// back; a root that actually changed is.
+        pub given: RefCell<std::path::PathBuf>,
         pub rows: RefCell<Option<gio::ListStore>>,
         pub list: RefCell<Option<gtk::ListView>>,
         pub title: RefCell<Option<gtk::Label>>,
         pub subtitle: RefCell<Option<gtk::Label>>,
+        pub location: RefCell<Option<gtk::Entry>>,
+        pub location_bar: RefCell<Option<gtk::Revealer>>,
         pub menu: RefCell<Option<gtk::PopoverMenu>>,
         /// The row whose context menu is open, and so the one every action in
         /// it acts on.
@@ -185,6 +192,22 @@ impl TuniFiles {
         names.append(&title);
         names.append(&subtitle);
 
+        let up = gtk::Button::builder()
+            .icon_name("go-up-symbolic")
+            .tooltip_text("Parent Directory")
+            .action_name("files.up")
+            .valign(gtk::Align::Center)
+            .build();
+        up.add_css_class("flat");
+
+        let jump = gtk::Button::builder()
+            .icon_name("go-jump-symbolic")
+            .tooltip_text("Go to Directory")
+            .action_name("files.location")
+            .valign(gtk::Align::Center)
+            .build();
+        jump.add_css_class("flat");
+
         let add = gtk::MenuButton::builder()
             .icon_name("list-add-symbolic")
             .tooltip_text("New File or Folder")
@@ -199,7 +222,42 @@ impl TuniFiles {
         header.set_margin_top(8);
         header.set_margin_bottom(8);
         header.append(&names);
+        header.append(&up);
+        header.append(&jump);
         header.append(&add);
+
+        // A place to say where to go, shown when asked for and typed into the
+        // way a shell would be: Enter goes, Escape thinks better of it.
+        let location = gtk::Entry::builder()
+            .placeholder_text("Directory path")
+            .margin_start(12)
+            .margin_end(6)
+            .margin_bottom(8)
+            .build();
+        location.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |entry| this.go_to(&entry.text())
+        ));
+        // A path that led nowhere reddens the entry; typing again is the start
+        // of a new answer, not more of the wrong one.
+        location.connect_changed(|entry| entry.remove_css_class("error"));
+        let escape = gtk::EventControllerKey::new();
+        escape.connect_key_pressed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, _| {
+                if key == gdk::Key::Escape {
+                    this.show_location(false);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            }
+        ));
+        location.add_controller(escape);
+        let location_bar = gtk::Revealer::builder().child(&location).build();
 
         let rows = gio::ListStore::new::<Row>();
         let selection = gtk::SingleSelection::builder()
@@ -249,6 +307,7 @@ impl TuniFiles {
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&header);
+        content.append(&location_bar);
         content.append(&scroller);
         self.set_child(Some(&content));
 
@@ -258,6 +317,8 @@ impl TuniFiles {
         imp.list.replace(Some(list));
         imp.title.replace(Some(title));
         imp.subtitle.replace(Some(subtitle));
+        imp.location.replace(Some(location));
+        imp.location_bar.replace(Some(location_bar));
         imp.menu.replace(Some(menu));
     }
 
@@ -386,6 +447,23 @@ impl TuniFiles {
                 let root = files.imp().tree.borrow().root().to_path_buf();
                 files.reveal(&root);
             }),
+            entry("up", self, |files| {
+                let parent = files
+                    .imp()
+                    .tree
+                    .borrow()
+                    .root()
+                    .parent()
+                    .map(Path::to_path_buf);
+                if let Some(parent) = parent {
+                    files.browse(&parent);
+                }
+            }),
+            entry("location", self, |files| {
+                let bar = files.imp().location_bar.borrow().clone();
+                let open = bar.is_some_and(|bar| bar.reveals_child());
+                files.show_location(!open);
+            }),
             entry("rename", self, |files| {
                 if let Some(item) = files.target() {
                     files.rename(&item);
@@ -402,13 +480,68 @@ impl TuniFiles {
 
     // --- what the tree says ------------------------------------------------
 
-    /// Points the panel at a directory and draws it.
+    /// Points the panel at a directory and draws it. Browsing away is
+    /// respected until the window names a different directory: the focus
+    /// moving between panes of one project says the same root over and over,
+    /// and snapping back on every poll would make browsing impossible.
     pub fn sync(&self, root: &Path) {
+        if self.imp().given.borrow().as_path() == root {
+            return;
+        }
+        self.imp().given.replace(root.to_path_buf());
+        self.show_location(false);
         let changed = self.imp().tree.borrow_mut().sync(root);
         if changed {
             self.reload();
         }
         self.refresh_header();
+    }
+
+    /// Steps the tree somewhere of the user's own choosing.
+    fn browse(&self, directory: &Path) {
+        if self.imp().tree.borrow_mut().sync(directory) {
+            self.reload();
+        }
+        self.refresh_header();
+        if let Some(location) = self.imp().location.borrow().as_ref() {
+            location.set_text(&directory.to_string_lossy());
+        }
+    }
+
+    /// The typed path, gone to if it leads anywhere. `~` is the shell's home,
+    /// because a path is typed here the way it would be typed at a prompt.
+    fn go_to(&self, text: &str) {
+        let text = text.trim();
+        let expanded = text
+            .strip_prefix("~")
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+            .map(|rest| glib::home_dir().join(rest.trim_start_matches('/')))
+            .unwrap_or_else(|| Path::new(text).to_path_buf());
+        if !expanded.is_dir() {
+            if let Some(location) = self.imp().location.borrow().as_ref() {
+                location.add_css_class("error");
+            }
+            return;
+        }
+        self.browse(&expanded);
+        self.show_location(false);
+    }
+
+    fn show_location(&self, show: bool) {
+        let imp = self.imp();
+        let (Some(bar), Some(location)) = (
+            imp.location_bar.borrow().clone(),
+            imp.location.borrow().clone(),
+        ) else {
+            return;
+        };
+        location.remove_css_class("error");
+        bar.set_reveal_child(show);
+        if show {
+            location.set_text(&imp.tree.borrow().root().to_string_lossy());
+            location.set_position(-1);
+            location.grab_focus();
+        }
     }
 
     /// Re-reads what is open. Draws nothing when nothing moved, which is the
