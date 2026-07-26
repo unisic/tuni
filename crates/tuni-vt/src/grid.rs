@@ -25,6 +25,16 @@ impl From<libghostty_vt::style::RgbColor> for Rgb {
     }
 }
 
+impl From<Rgb> for libghostty_vt::style::RgbColor {
+    fn from(c: Rgb) -> Self {
+        Self {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+        }
+    }
+}
+
 /// One grid cell. `text` is empty for a blank cell and holds a full grapheme
 /// cluster otherwise, so combining marks stay attached to their base.
 #[derive(Clone, Debug, Default)]
@@ -67,6 +77,10 @@ pub struct Cursor {
     pub shape: CursorShape,
     pub blinking: bool,
     pub color: Option<Rgb>,
+    /// The glyph the cursor covers, when the theme names a color for it.
+    /// `None` means paint it in the cell's own background, so the cursor reads
+    /// as an inversion.
+    pub text_color: Option<Rgb>,
 }
 
 /// A viewport snapshot: `rows * cols` cells in row-major order.

@@ -1,7 +1,10 @@
 //! Portable workspace models — no GTK, no libghostty.
 //!
-//! Etap 0 only needs the terminal's own configuration. Projects, pane layout,
-//! session persistence, the file tree, and git status land here in Etapy 2–6.
+//! Etap 0 only needs the terminal's own configuration and its colors. Projects,
+//! pane layout, session persistence, the file tree, and git status land here in
+//! Etapy 2–6.
+
+pub mod theme;
 
 /// Terminal appearance and behavior. Serialization and a settings UI arrive in
 /// Etap 4; until then the defaults are the whole story.
@@ -16,6 +19,19 @@ pub struct TerminalConfig {
     /// Whether the cursor blinks when the application has not asked for a
     /// particular style. The desktop's own blink preference still wins.
     pub cursor_blink: bool,
+    /// Bundled theme names, one per desktop appearance. The desktop decides
+    /// which of the two is in use, so both are configured, as Ghostty and kero
+    /// both do.
+    pub theme_light: String,
+    pub theme_dark: String,
+}
+
+impl TerminalConfig {
+    /// The colors for one desktop appearance.
+    pub fn theme(&self, dark: bool) -> theme::Theme {
+        let name = if dark { &self.theme_dark } else { &self.theme_light };
+        theme::theme_or_default(name, dark)
+    }
 }
 
 impl Default for TerminalConfig {
@@ -26,6 +42,8 @@ impl Default for TerminalConfig {
             scrollback_lines: 10_000,
             line_height_extra: 0.0,
             cursor_blink: true,
+            theme_light: theme::DEFAULT_LIGHT.to_owned(),
+            theme_dark: theme::DEFAULT_DARK.to_owned(),
         }
     }
 }

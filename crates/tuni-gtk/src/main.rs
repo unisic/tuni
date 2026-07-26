@@ -74,6 +74,22 @@ fn build_window(app: &adw::Application) {
         ),
     );
 
+    // The theme is the desktop's business, not one terminal's: the style
+    // manager says light or dark, the config names a theme for each, and the
+    // window paints its chrome to match whatever the terminal ended up with.
+    let style = adw::StyleManager::default();
+    let recolor = glib::clone!(
+        #[weak]
+        terminal,
+        move |style: &adw::StyleManager| {
+            let theme = config().theme(style.is_dark());
+            terminal.set_theme(&theme);
+            apply_chrome(&theme);
+        }
+    );
+    style.connect_dark_notify(recolor.clone());
+    recolor(&style);
+
     window.present();
 
     // Spawn after presenting, so the first allocation has already sized the
@@ -96,6 +112,79 @@ fn build_window(app: &adw::Application) {
     ));
 }
 
+/// The configuration for this run.
+///
+/// Etap 4 reads this from disk and a settings window edits it. Until then the
+/// defaults are the whole story, except for `TUNI_THEME`, which names one of
+/// the bundled themes for both appearances — enough to look at any of the 574
+/// without a settings UI.
+fn config() -> tuni_core::TerminalConfig {
+    let mut config = tuni_core::TerminalConfig::default();
+    if let Ok(name) = std::env::var("TUNI_THEME") {
+        config.theme_light = name.clone();
+        config.theme_dark = name;
+    }
+    config
+}
+
+/// Paint the window chrome from the terminal's theme.
+///
+/// libadwaita builds its whole stylesheet out of named colors, so overriding
+/// those recolors the header bar, dialogs, and popovers consistently — far more
+/// robust than styling widgets one by one, and it keeps working as libadwaita
+/// adds widgets. One provider, reloaded, so switching themes does not stack
+/// stylesheets on the display.
+fn apply_chrome(theme: &tuni_core::theme::Theme) {
+    thread_local! {
+        static PROVIDER: gtk::CssProvider = gtk::CssProvider::new();
+    }
+
+    let accent = theme.accent();
+    let css = format!(
+        "@define-color window_bg_color {bg};\n\
+         @define-color window_fg_color {fg};\n\
+         @define-color view_bg_color {bg};\n\
+         @define-color view_fg_color {fg};\n\
+         @define-color headerbar_bg_color {header};\n\
+         @define-color headerbar_fg_color {fg};\n\
+         @define-color headerbar_border_color {border};\n\
+         @define-color headerbar_backdrop_color {bg};\n\
+         @define-color sidebar_bg_color {sidebar};\n\
+         @define-color sidebar_fg_color {fg};\n\
+         @define-color sidebar_border_color {border};\n\
+         @define-color sidebar_backdrop_color {bg};\n\
+         @define-color popover_bg_color {raised};\n\
+         @define-color popover_fg_color {fg};\n\
+         @define-color dialog_bg_color {raised};\n\
+         @define-color dialog_fg_color {fg};\n\
+         @define-color card_bg_color {raised};\n\
+         @define-color card_fg_color {fg};\n\
+         @define-color accent_color {accent};\n\
+         @define-color accent_bg_color {accent};\n\
+         @define-color accent_fg_color {on_accent};\n",
+        bg = theme.background.to_hex(),
+        fg = theme.foreground.to_hex(),
+        header = theme.surface(0.06).to_hex(),
+        sidebar = theme.surface(0.03).to_hex(),
+        raised = theme.surface(0.10).to_hex(),
+        border = theme.surface(0.20).to_hex(),
+        accent = accent.to_hex(),
+        on_accent = accent.contrasting().to_hex(),
+    );
+
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    PROVIDER.with(|provider| {
+        provider.load_from_string(&css);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
+}
+
 /// A path as a person would write it: `/home/me/src` is `~/src`.
 fn shorten(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -113,6 +202,10 @@ fn shorten(path: &str) -> String {
 /// `TUNI_CAPTURE_PNG` is the output path, `TUNI_CAPTURE_INPUT` is text typed
 /// into the shell first, and `TUNI_CAPTURE_DELAY_MS` is how long to wait for
 /// that command to finish before the shot is taken.
+///
+/// The terminal only: `GtkWidgetPaintable` renders our own widget but draws
+/// nothing for the window or its content box, so the header bar cannot be
+/// captured this way.
 fn maybe_capture(window: &adw::ApplicationWindow, terminal: &TuniTerminal) {
     let Ok(path) = std::env::var("TUNI_CAPTURE_PNG") else {
         return;
@@ -177,7 +270,7 @@ fn maybe_capture(window: &adw::ApplicationWindow, terminal: &TuniTerminal) {
             #[weak]
             window,
             move || {
-                if let Err(error) = capture(&terminal, &path) {
+                if let Err(error) = capture(terminal.upcast_ref(), &path) {
                     eprintln!("capture failed: {error}");
                 }
                 window.close();
@@ -194,20 +287,20 @@ fn parse_select(spec: &str) -> Option<(f64, f64, f64, f64)> {
     }
 }
 
-fn capture(terminal: &TuniTerminal, path: &str) -> Result<(), String> {
+fn capture(widget: &gtk::Widget, path: &str) -> Result<(), String> {
     use gtk::prelude::{NativeExt, PaintableExt, TextureExt};
 
-    let renderer = terminal
+    let renderer = widget
         .native()
         .and_then(|native| native.renderer())
         .ok_or("widget is not realized")?;
 
-    let paintable = gtk::WidgetPaintable::new(Some(terminal));
+    let paintable = gtk::WidgetPaintable::new(Some(widget));
     let snapshot = gtk::Snapshot::new();
     paintable.snapshot(
         &snapshot,
-        f64::from(terminal.width()),
-        f64::from(terminal.height()),
+        f64::from(widget.width()),
+        f64::from(widget.height()),
     );
     let node = snapshot.to_node().ok_or("nothing was drawn")?;
 

@@ -18,10 +18,11 @@ use gtk::subclass::prelude::*;
 use unicode_width::UnicodeWidthStr;
 
 use tuni_core::TerminalConfig;
+use tuni_core::theme::Theme;
 use tuni_pty::{Pty, PtyConfig, PtyEvent};
 use tuni_vt::{
-    ClipboardTarget, CursorShape, Geometry, KeyAction, KeyInput, Mods, MouseAction, MouseButton,
-    MouseInput, Rgb, ScrollPosition,
+    ClipboardTarget, Colors, CursorShape, Geometry, KeyAction, KeyInput, Mods, MouseAction,
+    MouseButton, MouseInput, Rgb, ScrollPosition,
 };
 
 use crate::keymap;
@@ -91,6 +92,10 @@ mod imp {
     pub struct TuniTerminal {
         pub(super) session: RefCell<Option<Session>>,
         pub(super) config: RefCell<TerminalConfig>,
+        /// Colors in effect. Kept here as well as pushed into the VT, because
+        /// the widget's own chrome — the scrollbar, the empty background before
+        /// a shell starts — is painted from the theme rather than from CSS.
+        pub(super) theme: RefCell<Theme>,
         pub(super) font: RefCell<pango::FontDescription>,
         pub(super) metrics: Cell<Metrics>,
         /// Grid size last pushed to the VT and the PTY, so a resize that does
@@ -140,6 +145,9 @@ mod imp {
         fn default() -> Self {
             Self {
                 session: RefCell::new(None),
+                theme: RefCell::new(
+                    TerminalConfig::default().theme(adw::StyleManager::default().is_dark()),
+                ),
                 config: RefCell::new(TerminalConfig::default()),
                 font: RefCell::new(pango::FontDescription::new()),
                 metrics: Cell::new(Metrics::default()),
@@ -443,6 +451,31 @@ impl TuniTerminal {
         let _ = WidgetExt::grab_focus(self);
     }
 
+    // --- colors ------------------------------------------------------------
+
+    /// Repaint in a theme's colors.
+    ///
+    /// Safe to call before the shell starts: the theme is kept and handed to
+    /// the session when one is created. Safe to call repeatedly, which is what
+    /// happens when the desktop flips between light and dark.
+    pub fn set_theme(&self, theme: &Theme) {
+        let imp = self.imp();
+        if *imp.theme.borrow() == *theme {
+            return;
+        }
+        imp.theme.replace(theme.clone());
+
+        if let Some(session) = imp.session.borrow_mut().as_mut() {
+            let _ = session.term.set_colors(&colors(theme));
+        }
+        self.queue_draw();
+    }
+
+    /// The theme currently painting this terminal.
+    pub fn theme(&self) -> Theme {
+        self.imp().theme.borrow().clone()
+    }
+
     // --- session lifecycle -------------------------------------------------
 
     /// Start the shell. Safe to call once the widget has a size; before that
@@ -458,6 +491,7 @@ impl TuniTerminal {
         let mut term = tuni_vt::Terminal::new(cols, rows, imp.config.borrow().scrollback_lines)
             .map_err(|e| e.to_string())?;
         let _ = term.set_default_cursor_blink(Some(imp.config.borrow().cursor_blink));
+        let _ = term.set_colors(&colors(&imp.theme.borrow()));
 
         let pty = Pty::spawn(&PtyConfig {
             cwd,
@@ -1223,17 +1257,21 @@ impl TuniTerminal {
         let height = self.height() as f32;
 
         let mut guard = imp.session.borrow_mut();
-        let Some(session) = guard.as_mut() else {
-            return;
-        };
-        let Ok(grid) = session.term.snapshot() else {
-            return;
-        };
+        let grid = guard.as_mut().and_then(|session| session.term.snapshot().ok());
 
+        // The page color: whatever the terminal is actually using, which is the
+        // theme unless an application overrode it with OSC 11. Falling back to
+        // the theme keeps the widget the right color before a shell starts and
+        // after one exits, when there is no terminal to ask.
+        let background = grid.map_or_else(|| theme_rgb(imp.theme.borrow().background), |g| g.bg);
         snapshot.append_color(
-            &rgba(grid.bg),
+            &rgba(background),
             &graphene::Rect::new(0.0, 0.0, width, height),
         );
+
+        let Some(grid) = grid else {
+            return;
+        };
 
         let context = self.pango_context();
         let font = imp.font.borrow();
@@ -1331,10 +1369,10 @@ impl TuniTerminal {
             return;
         };
 
-        // The widget's own foreground color, so the thumb reads as part of the
-        // desktop rather than of the terminal's palette.
+        // The theme's foreground rather than the desktop's: a dark theme in a
+        // light session would otherwise draw a dark thumb on a dark page.
         let held = imp.bar_hover.get() || imp.bar_drag.get().is_some();
-        let mut color = self.color();
+        let mut color = rgba(theme_rgb(imp.theme.borrow().foreground));
         color.set_alpha(alpha * if held { 0.5 } else { 0.35 });
 
         let rect = graphene::Rect::new(thumb.x, thumb.y, thumb.width, thumb.height);
@@ -1384,6 +1422,29 @@ fn rgba(color: Rgb) -> gdk::RGBA {
         f32::from(color.b) / 255.0,
         1.0,
     )
+}
+
+/// A theme in the terms the VT understands. The two crates keep their own color
+/// types on purpose — `tuni-core` knows nothing about libghostty — so the
+/// translation lives here, where both are in scope.
+fn colors(theme: &Theme) -> Colors {
+    Colors {
+        foreground: theme_rgb(theme.foreground),
+        background: theme_rgb(theme.background),
+        cursor: theme.cursor.map(theme_rgb),
+        cursor_text: theme.cursor_text.map(theme_rgb),
+        selection_background: theme.selection_background.map(theme_rgb),
+        selection_foreground: theme.selection_foreground.map(theme_rgb),
+        palette: theme.palette.map(theme_rgb),
+    }
+}
+
+fn theme_rgb(color: tuni_core::theme::Rgb) -> Rgb {
+    Rgb {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+    }
 }
 
 /// Where a frame is painted and with what. Bundled so the row helpers take one
@@ -1456,17 +1517,19 @@ impl Painter<'_> {
                     &rgba(color),
                     &graphene::Rect::new(x, y, m.cell_width, m.cell_height),
                 );
-                // Repaint the covered glyph in the background color so it stays
-                // readable under the block.
+                // Repaint the covered glyph so it stays readable under the
+                // block: in the theme's cursor-text color when it names one,
+                // otherwise in the cell's own background, which reads as an
+                // inversion.
                 if let Some(cell) = grid.cell(cursor.col, cursor.row)
                     && !cell.text.is_empty()
                 {
+                    let text = cursor.text_color.unwrap_or(cell.bg.unwrap_or(grid.bg));
                     self.layout.set_text(&cell.text);
                     self.layout.set_attributes(None);
                     self.snapshot.save();
                     self.snapshot.translate(&graphene::Point::new(x, y));
-                    self.snapshot
-                        .append_layout(self.layout, &rgba(cell.bg.unwrap_or(grid.bg)));
+                    self.snapshot.append_layout(self.layout, &rgba(text));
                     self.snapshot.restore();
                 }
             }

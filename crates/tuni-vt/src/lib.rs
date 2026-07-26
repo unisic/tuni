@@ -192,6 +192,24 @@ impl From<Geometry> for EncoderSize {
     }
 }
 
+/// The colors a terminal draws with, as a theme names them.
+///
+/// The sixteen ANSI slots are theme data; the remaining 240 slots of the
+/// 256-color palette are the standard cube and grayscale ramp, which the
+/// terminal already knows and no theme overrides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Colors {
+    pub foreground: Rgb,
+    pub background: Rgb,
+    pub cursor: Option<Rgb>,
+    /// Text under a block cursor. `None` inverts the cell instead.
+    pub cursor_text: Option<Rgb>,
+    /// Selected text. `None` inverts the cells instead, as before a theme.
+    pub selection_background: Option<Rgb>,
+    pub selection_foreground: Option<Rgb>,
+    pub palette: [Rgb; 16],
+}
+
 pub struct Terminal {
     inner: VtTerminal<'static, 'static>,
     render: RenderState<'static>,
@@ -211,6 +229,11 @@ pub struct Terminal {
     encoded: Vec<u8>,
     /// Scratch buffer for formatted selection text.
     selection_buf: Vec<u8>,
+    /// Selection colors, which the library does not own: selection is drawn by
+    /// us, over cells the library only marks.
+    selection_colors: Option<(Option<Rgb>, Option<Rgb>)>,
+    /// The theme's cursor text color, applied to the cell under a block cursor.
+    cursor_text: Option<Rgb>,
 }
 
 impl Terminal {
@@ -292,7 +315,35 @@ impl Terminal {
             grid: Grid::default(),
             encoded: Vec::with_capacity(64),
             selection_buf: Vec::new(),
+            selection_colors: None,
+            cursor_text: None,
         })
+    }
+
+    /// Repaint the terminal in a theme's colors.
+    ///
+    /// The default foreground, background, cursor, and ANSI palette belong to
+    /// the library, which keeps its own overrides from OSC 4/10/11/12 layered
+    /// on top; setting the *defaults* means an application that changed a color
+    /// keeps its change, and one that reset it lands on the new theme. The
+    /// selection and cursor-text colors are ours, because selection and cursor
+    /// drawing are ours.
+    pub fn set_colors(&mut self, colors: &Colors) -> Result<()> {
+        self.inner.set_default_fg_color(Some(colors.foreground.into()))?;
+        self.inner.set_default_bg_color(Some(colors.background.into()))?;
+        self.inner.set_default_cursor_color(colors.cursor.map(Into::into))?;
+
+        // Only the first sixteen slots are theme data; the rest of the cube has
+        // to survive, so the palette is read back and patched rather than built.
+        let mut palette = self.inner.default_color_palette()?;
+        for (slot, color) in palette.0.iter_mut().zip(colors.palette) {
+            *slot = color.into();
+        }
+        self.inner.set_default_color_palette(Some(palette))?;
+
+        self.selection_colors = Some((colors.selection_background, colors.selection_foreground));
+        self.cursor_text = colors.cursor_text;
+        Ok(())
     }
 
     /// Feed PTY output into the VT parser. Never fails — malformed input is
@@ -555,6 +606,7 @@ impl Terminal {
                 },
                 blinking: snapshot.cursor_blinking().unwrap_or(false),
                 color: snapshot.cursor_color().ok().flatten().map(Rgb::from),
+                text_color: self.cursor_text,
             })
         } else {
             None
@@ -593,9 +645,25 @@ impl Terminal {
                 }
 
                 if selected {
-                    let swapped = bg.unwrap_or(colors.background);
-                    bg = Some(fg);
-                    fg = swapped;
+                    match self.selection_colors {
+                        // A theme's own selection colors. A theme that names
+                        // only a background keeps the cell's own text color,
+                        // which is what Ghostty does and what makes syntax
+                        // highlighting survive being selected.
+                        Some((background, foreground)) if background.is_some() => {
+                            bg = background.map(Into::into);
+                            if let Some(foreground) = foreground {
+                                fg = foreground.into();
+                            }
+                        }
+                        // No theme, or a theme with nothing to say about
+                        // selection: invert, which always reads.
+                        _ => {
+                            let swapped = bg.unwrap_or(colors.background);
+                            bg = Some(fg);
+                            fg = swapped;
+                        }
+                    }
                 }
 
                 if cell.graphemes_len().unwrap_or(0) > 0 {

@@ -14,9 +14,10 @@ iOS. Kero is GPLv3 and so is Tuni.
 One window, one terminal: keyboard input, Pango rendering, mouse selection with
 word and line clicks, clipboard and bracketed paste, SGR mouse reporting for
 applications that ask for it, an overlay scrollbar that fades when idle, a
-cursor that blinks by the desktop's own preference, and a window title and
-subtitle that follow OSC 0/2 and OSC 7. `ls`, `vi`, and `top` all render
-correctly. Still missing before it is a daily terminal: themes, font
+cursor that blinks by the desktop's own preference, a window title and subtitle
+that follow OSC 0/2 and OSC 7, and Ghostty's 574 color themes, which paint the
+window chrome as well as the terminal. `ls`, `vi`, and `top` all
+render correctly. Still missing before it is a daily terminal: font
 configuration, hyperlinks, tabs.
 
 | Shortcut | Action |
@@ -61,12 +62,18 @@ those two are ours.
 | --- | --- |
 | `tuni-vt` | Facade over `libghostty-vt`. Nothing above this line imports it. |
 | `tuni-pty` | Shell process, PTY, reader thread, window resize. |
-| `tuni-core` | Portable models: config, projects, panes, session, git. No GTK. |
+| `tuni-core` | Portable models: config, themes, projects, panes, session, git. No GTK. |
 | `tuni-gtk` | GTK4 + libadwaita widgets, window, actions, keybindings. |
 
 The upstream C API is explicitly pre-1.0 and expected to change, which is why
 the dependency is pinned to a commit and why every call to it goes through
 `tuni-vt`.
+
+Ghostty's theme catalog is vendored under `data/themes` and baked into the
+binary at build time, so a fresh checkout runs with all 574 and a packaged
+build needs no data directory beside the executable. The same theme drives the
+window: libadwaita builds its stylesheet out of named colors, so overriding
+those recolors the header bar and dialogs along with the terminal.
 
 Text is drawn with Pango rather than a GPU glyph atlas. Pango brings fontconfig
 fallback, subpixel antialiasing, and input methods, and text quality is what a
@@ -87,10 +94,12 @@ rustup-init -y
 cargo run --release
 ```
 
-Debugging aids, all off unless set: `TUNI_DEBUG_FRAME_TIME` prints draw-time
-percentiles, `TUNI_DEBUG_PTY_WRITE` logs what the terminal answers back to the
-shell, and `TUNI_CAPTURE_PNG` renders the widget to a file and exits — useful
-on compositors with no screenshot protocol.
+Debugging aids, all off unless set: `TUNI_THEME` names one of the bundled
+themes for the run, which is how to look at them until there is a settings
+window; `TUNI_DEBUG_FRAME_TIME` prints draw-time percentiles;
+`TUNI_DEBUG_PTY_WRITE` logs what the terminal answers back to the shell; and
+`TUNI_CAPTURE_PNG` renders the widget to a file and exits — useful on
+compositors with no screenshot protocol.
 
 ## License
 

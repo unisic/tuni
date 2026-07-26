@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use tuni_vt::{
-    CursorShape, Geometry, Key, KeyAction, KeyInput, Mods, MouseAction, MouseButton, MouseInput,
-    Rgb, Terminal,
+    Colors, CursorShape, Geometry, Key, KeyAction, KeyInput, Mods, MouseAction, MouseButton,
+    MouseInput, Rgb, Terminal,
 };
 
 fn row_text(terminal: &mut Terminal, row: u16) -> String {
@@ -416,4 +416,105 @@ fn osc_seven_ignores_a_directory_on_another_machine() {
     terminal.feed(b"\x1b]7;file://somewhere-else/home/user\x07");
     // An SSH session's path is not one this machine can open.
     assert_eq!(terminal.pwd(), None);
+}
+
+// --- colors -----------------------------------------------------------------
+
+fn test_colors() -> Colors {
+    Colors {
+        foreground: Rgb { r: 0xe0, g: 0xe0, b: 0xe0 },
+        background: Rgb { r: 0x10, g: 0x12, b: 0x14 },
+        cursor: Some(Rgb { r: 0xff, g: 0xa0, b: 0x00 }),
+        cursor_text: Some(Rgb { r: 0x00, g: 0x00, b: 0x00 }),
+        selection_background: Some(Rgb { r: 0x30, g: 0x40, b: 0x50 }),
+        selection_foreground: Some(Rgb { r: 0xff, g: 0xff, b: 0xff }),
+        palette: [Rgb { r: 0x01, g: 0x02, b: 0x03 }; 16],
+    }
+}
+
+#[test]
+fn a_theme_repaints_the_page_the_palette_and_the_cursor() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    let mut colors = test_colors();
+    // A distinguishable ANSI red, so the SGR below has something to prove.
+    colors.palette[1] = Rgb { r: 0xd0, g: 0x20, b: 0x20 };
+    terminal.set_colors(&colors).expect("set colors");
+
+    // SGR 31 is "ANSI red", which the palette now defines.
+    terminal.feed(b"\x1b[31mred");
+
+    let grid = terminal.snapshot().expect("snapshot");
+    assert_eq!(grid.bg, colors.background);
+    assert_eq!(grid.fg, colors.foreground);
+    assert_eq!(grid.cell(0, 0).expect("cell").fg, colors.palette[1]);
+
+    let cursor = grid.cursor.expect("a visible cursor");
+    assert_eq!(cursor.color, colors.cursor);
+    assert_eq!(cursor.text_color, colors.cursor_text);
+}
+
+#[test]
+fn a_theme_recolors_the_selection_instead_of_inverting_it() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    let colors = test_colors();
+    terminal.set_colors(&colors).expect("set colors");
+    terminal.feed(b"hello");
+
+    let geometry = geometry(20, 5);
+    let (x, y) = at(0, 0);
+    terminal
+        .select_press(x, y, geometry, Duration::from_millis(0))
+        .expect("press");
+    let (x, y) = at(2, 0);
+    terminal.select_drag(x, y, geometry, false).expect("drag");
+
+    let grid = terminal.snapshot().expect("snapshot");
+    let cell = grid.cell(0, 0).expect("cell");
+    assert_eq!(cell.bg, colors.selection_background);
+    assert_eq!(cell.fg, colors.selection_foreground.expect("set above"));
+}
+
+#[test]
+fn a_theme_with_no_selection_colors_still_inverts() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    let colors = Colors {
+        selection_background: None,
+        selection_foreground: None,
+        ..test_colors()
+    };
+    terminal.set_colors(&colors).expect("set colors");
+    terminal.feed(b"hello");
+
+    let geometry = geometry(20, 5);
+    let (x, y) = at(0, 0);
+    terminal
+        .select_press(x, y, geometry, Duration::from_millis(0))
+        .expect("press");
+    let (x, y) = at(2, 0);
+    terminal.select_drag(x, y, geometry, false).expect("drag");
+
+    let grid = terminal.snapshot().expect("snapshot");
+    assert_eq!(grid.cell(0, 0).expect("cell").bg, Some(grid.fg));
+}
+
+#[test]
+fn an_application_that_sets_a_color_outranks_the_theme() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    terminal.set_colors(&test_colors()).expect("set colors");
+
+    // OSC 11 is an application asking for its own background.
+    terminal.feed(b"\x1b]11;#123456\x07");
+    assert_eq!(
+        terminal.snapshot().expect("snapshot").bg,
+        Rgb { r: 0x12, g: 0x34, b: 0x56 }
+    );
+
+    // And a theme change while that override stands leaves it alone.
+    let mut later = test_colors();
+    later.background = Rgb { r: 0xff, g: 0xff, b: 0xff };
+    terminal.set_colors(&later).expect("set colors");
+    assert_eq!(
+        terminal.snapshot().expect("snapshot").bg,
+        Rgb { r: 0x12, g: 0x34, b: 0x56 }
+    );
 }
