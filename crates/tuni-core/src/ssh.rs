@@ -16,12 +16,14 @@
 //! Nothing here is asynchronous, and two of these functions start a subprocess,
 //! so the caller belongs off the main thread.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
+
+use serde::{Deserialize, Serialize};
 
 use crate::git::Output;
 
@@ -312,6 +314,16 @@ impl Direction {
             Self::Dynamic => "-D",
         }
     }
+
+    /// The same thing spelled as a configuration file spells it.
+    #[must_use]
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Local => "LocalForward",
+            Self::Remote => "RemoteForward",
+            Self::Dynamic => "DynamicForward",
+        }
+    }
 }
 
 /// One forwarded port.
@@ -333,14 +345,18 @@ impl Forward {
     /// The argument that follows the flag: `8080:localhost:80`, `1080`.
     #[must_use]
     pub fn spec(&self) -> String {
-        let listen = if self.bind.is_empty() {
+        match self.direction {
+            Direction::Dynamic => self.listen(),
+            _ => format!("{}:{}:{}", self.listen(), literal(&self.host), self.port),
+        }
+    }
+
+    /// What is listened on, as the side of a spec before the target.
+    fn listen(&self) -> String {
+        if self.bind.is_empty() {
             self.listen_port.to_string()
         } else {
             format!("{}:{}", literal(&self.bind), self.listen_port)
-        };
-        match self.direction {
-            Direction::Dynamic => listen,
-            _ => format!("{listen}:{}:{}", literal(&self.host), self.port),
         }
     }
 
@@ -566,6 +582,426 @@ impl Hosts {
             read,
         }
     }
+}
+
+/// What ssh syntax has no way to say about a host.
+///
+/// A file of its own, keyed by alias, so it attaches equally to a host the user
+/// wrote by hand: somebody can tag a host in `~/.ssh/config`, and have the
+/// launcher put it where they last left it, without tuni writing a byte into
+/// their file.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+pub struct Meta {
+    /// What to call the host instead of its alias, for an alias that is a
+    /// hostname nobody wants to read.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Seconds since the epoch, which is what the Recent section sorts on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used: Option<u64>,
+    #[serde(default, skip_serializing_if = "never_used")]
+    pub uses: u32,
+}
+
+fn never_used(count: &u32) -> bool {
+    *count == 0
+}
+
+/// The metadata for every host that has any.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Notes(HashMap<String, Meta>);
+
+impl Notes {
+    #[must_use]
+    pub fn path() -> PathBuf {
+        crate::settings::config_dir().join("ssh/meta.json")
+    }
+
+    /// What is on disk, or nothing, which is the same thing as a host list
+    /// nobody has labelled yet.
+    #[must_use]
+    pub fn load() -> Self {
+        fs::read_to_string(Self::path())
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// A host with nothing written down about it reads as a host with the
+    /// default written down about it, so no caller has to hold an `Option`.
+    #[must_use]
+    pub fn get(&self, alias: &str) -> Meta {
+        self.0.get(alias).cloned().unwrap_or_default()
+    }
+
+    /// Files metadata under an alias, or forgets it when there is nothing left
+    /// in it worth a line in the file.
+    pub fn set(&mut self, alias: &str, meta: Meta) {
+        if meta == Meta::default() {
+            self.0.remove(alias);
+        } else {
+            self.0.insert(alias.to_owned(), meta);
+        }
+    }
+
+    /// Records that a connection was opened, which is what puts a host at the
+    /// top of the list next time.
+    pub fn used(&mut self, alias: &str) {
+        let mut meta = self.get(alias);
+        meta.uses = meta.uses.saturating_add(1);
+        meta.last_used = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|since| since.as_secs());
+        self.set(alias, meta);
+    }
+
+    /// Written beside itself and renamed into place, the way every other file
+    /// tuni owns is.
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let text = serde_json::to_string(self).map_err(std::io::Error::other)?;
+        let temporary = path.with_extension("json.new");
+        fs::write(&temporary, text)?;
+        fs::rename(&temporary, &path)
+    }
+}
+
+/// What tuni writes at the top of the file it owns, so somebody who opens it
+/// knows what happens to an edit made there.
+const STORE_HEADER: &str = "\
+# Written by tuni. This file is rewritten whole whenever a host in it changes.
+#
+# A keyword tuni does not generate is kept as it was written, so an option it
+# has never heard of survives an edit made in the window. The layout does not:
+# comments and blank lines between blocks are not read back.
+";
+
+/// What tuni adds to the user's own configuration, and the only thing it ever
+/// adds there.
+const INCLUDE_HEADER: &str =
+    "# Added by tuni. Everything below this line is yours; tuni does not touch it.";
+
+/// The copy taken of `~/.ssh/config` before it is first modified, kept forever
+/// after and never overwritten.
+#[must_use]
+pub fn backup_path() -> PathBuf {
+    config_path().with_extension("tuni-backup")
+}
+
+/// The hosts in the file tuni owns, which is the set the window may change.
+#[must_use]
+pub fn saved() -> Vec<Host> {
+    Hosts::read_from(&store_path())
+        .hosts
+        .into_iter()
+        .filter(|host| host.source == Source::Tuni)
+        .collect()
+}
+
+/// Rewrites the file tuni owns from `hosts`, whole.
+///
+/// Validated before it is put in place, because this file is included into the
+/// user's own configuration and a broken include breaks `ssh` for every script
+/// on the machine, not only for tuni. `ssh -F` on the file that is about to
+/// become the real one is the only check that agrees with the program that
+/// will read it, and it touches no network.
+pub fn save(hosts: &[Host]) -> Result<(), String> {
+    write_hosts(&store_path(), hosts)
+}
+
+/// Adds tuni's `Include` to `~/.ssh/config` if it is not there yet, and says
+/// whether it wrote anything.
+///
+/// At the top, because `ssh` takes the first value it obtains for a keyword and
+/// a `Host *` block early in the file swallows everything after it, so an
+/// include appended to the end is partly dead configuration.
+pub fn ensure_include() -> Result<bool, String> {
+    add_include(&config_path(), &store_path(), &backup_path())
+}
+
+fn write_hosts(path: &Path, hosts: &[Host]) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let text = render(hosts)?;
+    let Some(directory) = path.parent() else {
+        return Err(format!("{} has no directory to write into", path.display()));
+    };
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .or_else(|error| {
+            if directory.is_dir() {
+                Ok(())
+            } else {
+                Err(describe_io(directory, &error))
+            }
+        })?;
+
+    // 0600 from the moment it exists rather than after the write: a host list
+    // names machines and accounts, and there is no instant where it is worth
+    // being readable by everybody.
+    let temporary = path.with_extension("conf.new");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|error| describe_io(&temporary, &error))?;
+    let written = std::io::Write::write_all(&mut file, text.as_bytes())
+        .and_then(|()| std::io::Write::flush(&mut file));
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(describe_io(&temporary, &error));
+    }
+
+    let alias = hosts.first().map_or("tuni-check", |host| &host.alias);
+    let checked = run(&[
+        OsStr::new("-F"),
+        temporary.as_os_str(),
+        OsStr::new("-G"),
+        OsStr::new("--"),
+        OsStr::new(alias),
+    ]);
+    if checked.code != 0 {
+        let _ = fs::remove_file(&temporary);
+        let complaint = checked
+            .stderr
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("ssh would not read the file");
+        return Err(format!("ssh rejects the hosts file: {complaint}"));
+    }
+
+    fs::rename(&temporary, path).map_err(|error| describe_io(path, &error))
+}
+
+/// The whole file, or the first host that cannot be written and the reason.
+fn render(hosts: &[Host]) -> Result<String, String> {
+    let mut out = String::from(STORE_HEADER);
+    for host in hosts {
+        let alias = quote(&host.alias)
+            .filter(|_| !host.alias.is_empty())
+            .ok_or_else(|| format!("{} cannot be a host name", host.alias))?;
+        // A name with a wildcard in it is a pattern, and a pattern here would
+        // silently answer for hosts the user never meant it to.
+        if host.alias.contains(['*', '?', '!']) {
+            return Err(format!("{} is a pattern rather than a name", host.alias));
+        }
+        out.push_str(&format!("\nHost {alias}\n"));
+
+        let mut line = |keyword: &str, value: &str| -> Result<(), String> {
+            if value.is_empty() {
+                return Ok(());
+            }
+            let value =
+                quote(value).ok_or_else(|| format!("{value} cannot be the value of {keyword}"))?;
+            out.push_str(&format!("    {keyword} {value}\n"));
+            Ok(())
+        };
+        line("HostName", &host.hostname)?;
+        line("User", &host.user)?;
+        if host.port != 0 {
+            line("Port", &host.port.to_string())?;
+        }
+        for identity in &host.identities {
+            line("IdentityFile", identity)?;
+        }
+        line("ProxyJump", &host.proxy_jump)?;
+
+        for forward in &host.forwards {
+            // `-L` takes the whole forward as one colon-joined argument and a
+            // configuration file does not: it reads the target as a word of its
+            // own, and rejects the joined form with `Missing target argument`.
+            // So the two sides are written, and quoted, apart.
+            let keyword = forward.direction.keyword();
+            let word = |value: &str| -> Result<String, String> {
+                quote(value).ok_or_else(|| format!("{value} cannot be the value of {keyword}"))
+            };
+            let mut text = format!("    {keyword} {}", word(&forward.listen())?);
+            if forward.direction != Direction::Dynamic {
+                let target = format!("{}:{}", literal(&forward.host), forward.port);
+                text.push(' ');
+                text.push_str(&word(&target)?);
+            }
+            out.push_str(&text);
+            out.push('\n');
+        }
+
+        for extra in &host.extra {
+            let extra = extra.trim();
+            if extra.is_empty() {
+                continue;
+            }
+            // Written as it was typed, so the check has to be the whole line.
+            // A newline in one would add a keyword nobody asked for, and a
+            // `Host` or `Match` in one would end this block and hand every
+            // line after it to a host that is not this one.
+            if extra.contains(['\n', '\r', '\0']) {
+                return Err(format!("{extra} cannot be an option"));
+            }
+            let keyword = extra.split_whitespace().next().unwrap_or_default();
+            if keyword.eq_ignore_ascii_case("host") || keyword.eq_ignore_ascii_case("match") {
+                return Err(format!("{keyword} would start another host's block"));
+            }
+            out.push_str(&format!("    {extra}\n"));
+        }
+    }
+    Ok(out)
+}
+
+/// One value as the file may hold it, or `None` for one it may not.
+///
+/// This is the security boundary of the whole store. The file is included into
+/// the user's own configuration, so a value carrying a newline carries an
+/// arbitrary keyword with it, `ProxyCommand` among them, and that keyword runs
+/// a command. The answer is to refuse the value rather than to escape it: there
+/// is no address, user or path anybody means that contains a line break.
+fn quote(value: &str) -> Option<String> {
+    if value.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+    if !value.contains([' ', '\t', '"', '\\']) {
+        return Some(value.to_owned());
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for character in value.chars() {
+        if character == '"' || character == '\\' {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out.push('"');
+    Some(out)
+}
+
+fn add_include(config: &Path, store: &Path, backup: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let line = format!("Include {}", tilde(store));
+    let existing = fs::read_to_string(config).ok();
+
+    if let Some(text) = &existing
+        && includes(text, store)
+    {
+        return Ok(false);
+    }
+
+    let Some(directory) = config.parent() else {
+        return Err(format!("{} has no directory", config.display()));
+    };
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .or_else(|error| {
+            if directory.is_dir() {
+                Ok(())
+            } else {
+                Err(describe_io(directory, &error))
+            }
+        })?;
+
+    let Some(body) = existing else {
+        // No configuration at all: the file tuni creates is the whole of it,
+        // and 0600 is what `ssh` expects of anything in `~/.ssh`.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(config)
+            .map_err(|error| describe_io(config, &error))?;
+        std::io::Write::write_all(&mut file, format!("{INCLUDE_HEADER}\n{line}\n").as_bytes())
+            .map_err(|error| describe_io(config, &error))?;
+        return Ok(true);
+    };
+
+    // `~/.ssh/config` is very often a symlink into a dotfiles repository.
+    // Renaming onto the link replaces the link with a regular file and quietly
+    // detaches somebody from their own dotfiles, so the write goes to what the
+    // link points at.
+    let real = fs::canonicalize(config).map_err(|error| describe_io(config, &error))?;
+    let Some(directory) = real.parent() else {
+        return Err(format!("{} has no directory", real.display()));
+    };
+
+    // The user's most valuable dotfile, copied once and then left alone: a
+    // second copy would overwrite the one from before tuni ever touched it.
+    if !backup.exists() {
+        fs::copy(&real, backup).map_err(|error| describe_io(backup, &error))?;
+    }
+
+    let mode = fs::metadata(&real)
+        .map(|data| std::os::unix::fs::PermissionsExt::mode(&data.permissions()))
+        .unwrap_or(0o600);
+    let temporary = directory.join("config.tuni-new");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(&temporary)
+        .map_err(|error| describe_io(&temporary, &error))?;
+    let written = std::io::Write::write_all(
+        &mut file,
+        format!("{INCLUDE_HEADER}\n{line}\n\n{body}").as_bytes(),
+    );
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(describe_io(&temporary, &error));
+    }
+    fs::rename(&temporary, &real).map_err(|error| describe_io(&real, &error))?;
+    Ok(true)
+}
+
+/// Whether a configuration already includes `store`, whatever it spells the
+/// path as.
+fn includes(text: &str, store: &Path) -> bool {
+    let store = real(store);
+    text.lines().any(|line| {
+        let Some((keyword, value)) = split(line) else {
+            return false;
+        };
+        keyword == "include"
+            && words(&value)
+                .iter()
+                .any(|path| real(&untilde(path)) == store)
+    })
+}
+
+/// A path under `$HOME` written the way a configuration file writes it, which
+/// is the form that still means the same thing to somebody reading the file on
+/// another machine.
+fn tilde(path: &Path) -> String {
+    let home = crate::settings::home();
+    match path.strip_prefix(&home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+fn untilde(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => crate::settings::home().join(rest),
+        None => PathBuf::from(path),
+    }
+}
+
+/// An `io::Error` with the file it happened to in front of it, which is the
+/// half of the message the caller cannot add afterwards.
+fn describe_io(path: &Path, error: &std::io::Error) -> String {
+    format!("{}: {error}", path.display())
 }
 
 /// Everything `ssh` decides an alias means, one lowercase keyword per line,
@@ -1244,6 +1680,151 @@ mod tests {
         assert_eq!(host.hostname, "tuni-no-such-alias");
         assert_eq!(host.port, 22);
         assert!(!host.user.is_empty());
+    }
+
+    #[test]
+    fn a_host_written_out_reads_back_the_same() {
+        let directory = tempdir();
+        let path = directory.join("hosts.conf");
+        let host = Host {
+            alias: "web".to_owned(),
+            hostname: "10.0.0.4".to_owned(),
+            port: 2222,
+            user: "deploy".to_owned(),
+            identities: vec!["~/.ssh/id_ed25519".to_owned()],
+            proxy_jump: "bastion".to_owned(),
+            forwards: vec![Forward::parse(Direction::Local, "5432:localhost:5432").expect("spec")],
+            extra: vec!["ForwardAgent yes".to_owned()],
+            source: Source::Tuni,
+            ..Host::default()
+        };
+        write_hosts(&path, std::slice::from_ref(&host)).expect("write");
+
+        let read = Hosts::read_from(&path);
+        let back = read.get("web").expect("web");
+        assert_eq!(back.hostname, host.hostname);
+        assert_eq!(back.port, host.port);
+        assert_eq!(back.user, host.user);
+        assert_eq!(back.identities, host.identities);
+        assert_eq!(back.proxy_jump, host.proxy_jump);
+        assert_eq!(back.forwards, host.forwards);
+        // A keyword this crate does not generate survives being rewritten,
+        // which is the whole point of keeping the extra lines.
+        assert_eq!(back.extra, host.extra);
+    }
+
+    #[test]
+    fn a_value_that_would_start_a_line_of_its_own_is_refused() {
+        assert_eq!(quote("10.0.0.4"), Some("10.0.0.4".to_owned()));
+        assert_eq!(quote("/home/a b/key"), Some("\"/home/a b/key\"".to_owned()));
+        assert_eq!(quote("host\nProxyCommand touch /tmp/pwned"), None);
+        assert_eq!(quote("host\rProxyCommand x"), None);
+
+        let injected = Host {
+            alias: "web".to_owned(),
+            hostname: "10.0.0.4\nProxyCommand touch /tmp/pwned".to_owned(),
+            ..Host::default()
+        };
+        assert!(render(&[injected]).is_err());
+
+        // Not a value at all, but a line that would hand every keyword after
+        // it to a host nobody named.
+        let smuggled = Host {
+            alias: "web".to_owned(),
+            extra: vec!["Host *".to_owned()],
+            ..Host::default()
+        };
+        assert!(render(&[smuggled]).is_err());
+    }
+
+    #[test]
+    fn a_name_that_answers_for_other_hosts_is_not_a_name() {
+        let pattern = Host {
+            alias: "*.corp".to_owned(),
+            hostname: "10.0.0.4".to_owned(),
+            ..Host::default()
+        };
+        assert!(render(&[pattern]).is_err());
+    }
+
+    #[test]
+    fn a_file_ssh_would_not_read_is_never_put_in_place() {
+        let directory = tempdir();
+        let path = directory.join("hosts.conf");
+        write_hosts(&path, &[]).expect("write an empty one");
+        let before = fs::read_to_string(&path).expect("read");
+
+        let broken = Host {
+            alias: "web".to_owned(),
+            extra: vec!["NotAKeyword yes".to_owned()],
+            ..Host::default()
+        };
+        assert!(write_hosts(&path, &[broken]).is_err());
+        assert_eq!(fs::read_to_string(&path).expect("read"), before);
+        assert!(!path.with_extension("conf.new").exists());
+    }
+
+    #[test]
+    fn the_include_is_added_once_and_the_file_below_it_is_untouched() {
+        let directory = tempdir();
+        let config = directory.join("config");
+        let store = directory.join("hosts.conf");
+        let backup = directory.join("config.tuni-backup");
+        let body = "Host web\n  HostName 10.0.0.4\n";
+        fs::write(&config, body).expect("write");
+
+        assert!(add_include(&config, &store, &backup).expect("first"));
+        let text = fs::read_to_string(&config).expect("read");
+        assert!(text.contains(&format!("Include {}", store.display())));
+        assert!(text.ends_with(body), "the user's own file is kept whole");
+        // Before the first line, because ssh takes the first value it obtains
+        // and an early `Host *` would swallow an include put at the end.
+        assert!(text.find("Include").unwrap() < text.find("Host web").unwrap());
+        assert_eq!(fs::read_to_string(&backup).expect("backup"), body);
+
+        assert!(!add_include(&config, &store, &backup).expect("second"));
+        assert_eq!(fs::read_to_string(&config).expect("read"), text);
+    }
+
+    #[test]
+    fn a_configuration_that_is_a_symlink_stays_a_symlink() {
+        let directory = tempdir();
+        let real = directory.join("dotfiles-config");
+        let config = directory.join("config");
+        let store = directory.join("hosts.conf");
+        let backup = directory.join("config.tuni-backup");
+        fs::write(&real, "Host web\n").expect("write");
+        std::os::unix::fs::symlink(&real, &config).expect("symlink");
+
+        assert!(add_include(&config, &store, &backup).expect("include"));
+        assert!(
+            fs::symlink_metadata(&config)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "renaming onto the link would detach the user from their dotfiles"
+        );
+        assert!(fs::read_to_string(&real).expect("read").contains("Include"));
+    }
+
+    #[test]
+    fn metadata_survives_being_written_down() {
+        let mut notes = Notes::default();
+        assert_eq!(notes.get("web"), Meta::default());
+
+        notes.used("web");
+        let text = serde_json::to_string(&notes).expect("write");
+        let read: Notes = serde_json::from_str(&text).expect("read");
+        assert_eq!(read.get("web").uses, 1);
+        assert!(read.get("web").last_used.is_some());
+
+        // Nothing left worth saying about it, so it stops taking a line.
+        notes.set("web", Meta::default());
+        assert!(
+            !serde_json::to_string(&notes)
+                .expect("write")
+                .contains("web")
+        );
     }
 
     #[test]
