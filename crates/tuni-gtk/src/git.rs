@@ -467,6 +467,12 @@ impl TuniGit {
         }
         imp.directory.replace(directory.to_path_buf());
         imp.status.replace(None);
+        // The stamp the in-flight read below is checked against. Moving the
+        // panel to another repository is exactly the case that check exists
+        // for, and `run_task` was the only place bumping it — so a `cd` that
+        // landed while a read was out put the previous repository's branch and
+        // status under the new repository's name.
+        imp.generation.set(imp.generation.get().wrapping_add(1));
         self.reload(true);
     }
 
