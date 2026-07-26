@@ -6,7 +6,7 @@
 # GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
 # populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.0.0/ -o tuni-1.0.0.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.0.1/ -o tuni-1.0.1.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.15.2
 
 Name:           tuni
-Version:        1.0.0
+Version:        1.0.1
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -25,7 +25,7 @@ URL:            https://github.com/unisic/tuni
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo
-BuildRequires:  rust >= 1.90
+BuildRequires:  rust >= 1.95
 BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  pkgconfig(gtk4)
@@ -79,5 +79,16 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/symbolic/apps/%{app_id}-symbolic.svg
 
 %changelog
+* Mon Jul 27 2026 Unisic <hello@unisic.dev> - 1.0.1-1
+- Mouse reporting, focus reporting, and box drawing characters stroked in the
+  terminal rather than left to the font.
+- Background opacity, blur, and padding; the font list the machine actually has.
+- An about dialog, plan usage drawn as bars, and a settings window that carries
+  more of the settings.
+- A Files panel beside the tab strip rather than under it, taking a typed path
+  or a step to the parent directory.
+- Fixes: panes that closed without being forgotten, a command palette that kept
+  the window alive, a resize that stranded the prompt.
+
 * Sun Jul 26 2026 Unisic <hello@unisic.dev> - 1.0.0-1
 - First release.

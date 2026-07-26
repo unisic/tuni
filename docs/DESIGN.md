@@ -511,6 +511,15 @@ during the build. `make zig` fetches that Zig into `~/.local`, because every
 distribution's package has moved past the version the pinned Ghostty commit
 builds with.
 
+Zig 0.16 is the other half of that pin, not a separate problem: Ghostty's main
+branch requires it and the pinned commit rejects it, so building with the Zig a
+current distribution ships means building against a newer Ghostty as well.
+`make build-next` does exactly that — the 0.16 toolchain beside the 0.15.2 one,
+a shallow checkout of the Ghostty commit this tree is tested against, and
+`GHOSTTY_SOURCE_DIR` pointing the build at it. It is a second known-good pair,
+which is why both are commits rather than branches; releases are built from the
+0.15.2 one, since that is what the checked-in bindings were generated from.
+
 ## Configuration
 
 `~/.config/tuni/config.toml`, written by the settings window and readable

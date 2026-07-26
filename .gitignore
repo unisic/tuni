@@ -2,3 +2,13 @@
 /.cargo
 *.log
 .direnv/
+
+# What the packaging commands in packaging/README.md drop in the tree: the
+# tarball `make dist` writes, the copy of packaging/debian dpkg-buildpackage
+# wants at the root, and everything makepkg builds beside the PKGBUILD.
+/tuni-*.tar.gz
+/debian
+/packaging/arch/*.tar.gz
+/packaging/arch/*.pkg.tar.zst
+/packaging/arch/pkg
+/packaging/arch/src

@@ -6,8 +6,8 @@ resolver = "3"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/unisic/tuni"
-rust-version = "1.90"
-version = "1.0.0"
+rust-version = "1.95"
+version = "1.0.1"
 
 [workspace.dependencies]
 tuni-core = { path = "crates/tuni-core" }

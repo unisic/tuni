@@ -1,0 +1,34 @@
+Source: tuni
+Section: utils
+Priority: optional
+Maintainer: Unisic <hello@unisic.dev>
+# Ubuntu 26.04 or later, for libadwaita 1.6. The compiler comes from rustup,
+# because no Ubuntu packages a rustc new enough — 26.04 is on 1.93 and rusqlite
+# 0.40 wants 1.95. `apt install rustup && rustup default stable` puts cargo and
+# rustc in /usr/bin, which is why the alternative reads the way it does.
+Build-Depends: debhelper-compat (= 13),
+               rustup | cargo (>= 1.95),
+               pkg-config,
+               libgtk-4-dev,
+               libadwaita-1-dev,
+               libgtksourceview-5-dev,
+               libsqlite3-dev,
+               curl,
+               ca-certificates
+Standards-Version: 4.7.0
+Homepage: https://github.com/unisic/tuni
+Rules-Requires-Root: no
+
+Package: tuni
+Architecture: any
+# git and curl are shelled out to: the Git panel runs git itself, and the Info
+# page fetches the plan bars with curl. Everything linked comes from shlibs.
+Depends: ${shlibs:Depends}, ${misc:Depends}, git, curl
+Description: Terminals, projects, files, and Git in one window
+ Tuni is a terminal workspace: a window of projects, each with tabs, each tab a
+ layout of panes holding a terminal, a file, or a diff.
+ .
+ The terminal emulation is Ghostty's own through libghostty-vt — the VT parser,
+ the grid, reflow, scrollback, Kitty keyboard encoding, SGR mouse reporting, and
+ 574 colour themes that paint the window as well as the terminal. The file tree,
+ the Git panel, the editor, and the diff viewer sit around it in the same window.

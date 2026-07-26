@@ -1,0 +1,17 @@
+tuni (1.0.1) unstable; urgency=medium
+
+  * Mouse reporting, focus reporting, and box drawing characters stroked in
+    the terminal rather than left to the font.
+  * Background opacity, blur, and padding; the font list the machine has.
+  * An about dialog, plan usage drawn as bars, and more of the settings.
+  * A Files panel beside the tab strip, taking a typed path or a step up.
+  * Fixes: panes that closed without being forgotten, a command palette that
+    kept the window alive, a resize that stranded the prompt.
+
+ -- Unisic <hello@unisic.dev>  Mon, 27 Jul 2026 12:00:00 +0000
+
+tuni (1.0.0) unstable; urgency=medium
+
+  * First release.
+
+ -- Unisic <hello@unisic.dev>  Sun, 26 Jul 2026 12:00:00 +0000

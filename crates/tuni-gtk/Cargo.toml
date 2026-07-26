@@ -16,13 +16,13 @@ tuni-core.workspace = true
 tuni-pty.workspace = true
 tuni-vt.workspace = true
 
-adw = { package = "libadwaita", version = "0.8", features = ["v1_6"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
 # 4.14 for the path API the box drawing characters are stroked with. No floor
 # is raised by it: libadwaita 1.6 already asks for a newer GTK than that.
-gtk = { package = "gtk4", version = "0.10", features = ["v4_14"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 unicode-width = "0.2"
-sourceview5 = { version = "0.10", features = ["v5_10"] }
-gdk4-wayland = { version = "0.10", features = ["wayland_crate"] }
+sourceview5 = { version = "0.11", features = ["v5_10"] }
+gdk4-wayland = { version = "0.11", features = ["wayland_crate"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 

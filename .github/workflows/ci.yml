@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     # Fedora, because that is the desktop this is developed against and it
     # carries GTK 4 and libadwaita new enough without a PPA.
-    container: fedora:43
+    container: fedora:44
 
     steps:
       - name: Install dependencies
@@ -27,7 +27,7 @@ jobs:
             gtk4-devel libadwaita-devel gtksourceview5-devel sqlite-devel \
             desktop-file-utils libappstream-glib
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
@@ -37,7 +37,7 @@ jobs:
           echo "${GITHUB_WORKSPACE}/zig-x86_64-linux-${ZIG_VERSION}" >> "${GITHUB_PATH}"
 
       - name: Cache cargo and the Ghostty source
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -67,7 +67,26 @@ jobs:
       - name: Install into a staging root
         run: make install PREFIX=/usr DESTDIR="${GITHUB_WORKSPACE}/staging"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tuni-x86_64
           path: staging
+
+  # The other known-good pair: the Zig current distributions ship, and the
+  # Ghostty commit that requires it. Releases are built from the pinned pair
+  # above; this job is what keeps `make build-next` from rotting.
+  zig-next:
+    runs-on: ubuntu-latest
+    container: fedora:44
+
+    steps:
+      - name: Install dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            cargo rust gcc make git-core curl tar xz \
+            gtk4-devel libadwaita-devel gtksourceview5-devel
+
+      - uses: actions/checkout@v7
+
+      - name: Build and test against the newer Zig
+        run: make test-next ZIG_PREFIX="${GITHUB_WORKSPACE}/toolchains"

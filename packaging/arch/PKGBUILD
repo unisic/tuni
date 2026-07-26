@@ -1,0 +1,49 @@
+# Arch package.
+#
+# Two things are unusual here, both for the same reason — libghostty-vt is Zig
+# source compiled during the build:
+#
+#   * Zig comes down in source(), pinned by URL and checksum, because Arch's
+#     own zig is 0.16 and the Ghostty commit libghostty-rs pins does not build
+#     with it. See ../README.md.
+#   * build() needs the network: cargo fetches the registry and the
+#     libghostty-vt-sys build script fetches the pinned Ghostty source. Set
+#     CARGO_HOME and GHOSTTY_SOURCE_DIR to build without it.
+#
+#   make -C ../.. dist && mv ../../tuni-1.0.1.tar.gz . && makepkg -si
+
+pkgname=tuni
+# Plain literal: the release workflow seds the Cargo.toml version in here.
+pkgver=1.0.1
+pkgrel=1
+pkgdesc='Terminals, projects, files, and Git in one window'
+arch=('x86_64' 'aarch64')
+url='https://github.com/unisic/tuni'
+license=('GPL-3.0-or-later')
+# sqlite: the Info page reads OpenCode's session database. git and curl are
+# shelled out to by the Git panel and the plan bars on the Info page.
+depends=('gtk4' 'libadwaita' 'gtksourceview5' 'sqlite' 'git' 'curl'
+         'hicolor-icon-theme')
+makedepends=('rust' 'cargo' 'make' 'gcc' 'pkgconf')
+# !debug: makepkg would otherwise split out a tuni-debug package, which is one
+# more file on the release page than anyone downloading a terminal wants.
+options=('!debug')
+source=("${pkgname}-${pkgver}.tar.gz")
+sha256sums=('SKIP')
+_zigver=0.15.2
+source_x86_64=("https://ziglang.org/download/${_zigver}/zig-x86_64-linux-${_zigver}.tar.xz")
+sha256sums_x86_64=('02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239')
+source_aarch64=("https://ziglang.org/download/${_zigver}/zig-aarch64-linux-${_zigver}.tar.xz")
+sha256sums_aarch64=('958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f')
+
+build() {
+    export PATH="${srcdir}/zig-${CARCH}-linux-${_zigver}:${PATH}"
+    make -C "${pkgname}-${pkgver}" build
+}
+
+package() {
+    # The pinned zig again: `make install` depends on `build`, which re-runs
+    # cargo — a no-op here, but only if it can still find the toolchain.
+    export PATH="${srcdir}/zig-${CARCH}-linux-${_zigver}:${PATH}"
+    make -C "${pkgname}-${pkgver}" install PREFIX=/usr DESTDIR="${pkgdir}"
+}
