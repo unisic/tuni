@@ -60,6 +60,10 @@ mod imp {
         /// Text the input method committed during the current key press.
         pub(super) pending_commit: RefCell<Option<String>>,
         pub(super) title: RefCell<Option<String>>,
+        /// Draw timings, collected only when TUNI_DEBUG_FRAME_TIME is set.
+        /// This is the measurement that decides whether Pango can keep up.
+        pub(super) frame_timing: bool,
+        pub(super) frame_times: RefCell<Vec<std::time::Duration>>,
     }
 
     impl Default for TuniTerminal {
@@ -73,6 +77,8 @@ mod imp {
                 im: RefCell::new(None),
                 pending_commit: RefCell::new(None),
                 title: RefCell::new(None),
+                frame_timing: std::env::var_os("TUNI_DEBUG_FRAME_TIME").is_some(),
+                frame_times: RefCell::new(Vec::with_capacity(120)),
             }
         }
     }
@@ -135,7 +141,27 @@ mod imp {
         }
 
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            if !self.frame_timing {
+                self.obj().draw(snapshot);
+                return;
+            }
+
+            let started = std::time::Instant::now();
             self.obj().draw(snapshot);
+            let elapsed = started.elapsed();
+
+            let mut frames = self.frame_times.borrow_mut();
+            frames.push(elapsed);
+            if frames.len() == 120 {
+                frames.sort_unstable();
+                eprintln!(
+                    "frame: p50 {:?}  p95 {:?}  max {:?}",
+                    frames[60],
+                    frames[114],
+                    frames[119]
+                );
+                frames.clear();
+            }
         }
     }
 }

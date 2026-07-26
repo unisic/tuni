@@ -11,13 +11,28 @@ iOS. Kero is GPLv3 and so is Tuni.
 
 ## Status
 
-Etap 0 — feasibility spike. One window, one terminal, keyboard input, Pango
-rendering. Not usable yet.
+Feasibility spike. One window, one terminal, keyboard input, Pango rendering.
+`ls`, `vi`, and `top` all render correctly. Not usable as a daily terminal yet:
+no selection, no clipboard, no scrollbar, no themes, no tabs.
 
-The staged plan runs from here to full parity: a complete standalone terminal,
-then projects and tabs, the niri-style pane layout, session persistence, the
-file tree, the git panel, the editor, the diff viewer, the command palette, and
-packaging. Every stage ends with an application that builds and runs.
+From here the work runs to full parity: a complete standalone terminal, then
+projects and tabs, the niri-style pane layout, session persistence, the file
+tree, the git panel, the editor, the diff viewer, the command palette, and
+packaging.
+
+Consuming a 200 MiB stream, measured with `scripts/throughput.sh` on this
+machine:
+
+| Terminal | Throughput |
+| --- | --- |
+| Tuni | 117 MiB/s |
+| Ghostty | 98 MiB/s |
+| Konsole | 45 MiB/s |
+
+Drawing a full 120x37 viewport costs 516 µs at the median and 1.0 ms at the
+95th percentile, against a 16.7 ms frame budget. That answers the question the
+spike existed to answer: Pango is not the bottleneck, and there is no reason to
+reach for a GPU glyph atlas.
 
 ## How it works
 
@@ -40,21 +55,27 @@ the dependency is pinned to a commit and why every call to it goes through
 
 Text is drawn with Pango rather than a GPU glyph atlas. Pango brings fontconfig
 fallback, subpixel antialiasing, and input methods, and text quality is what a
-terminal is judged on. Whether it keeps up under load is the question the Etap 0
-benchmark answers.
+terminal is judged on.
 
 ## Building
 
 Requires a Rust toolchain, GTK4 and libadwaita development headers, and Zig —
 `libghostty-vt` is Zig source that is compiled during the build.
 
+Fedora ships Zig 0.16, which is too new; fetch 0.15.2 from ziglang.org and put
+it on `PATH`.
+
 ```sh
-# Fedora
 sudo dnf install rustup gtk4-devel libadwaita-devel gtksourceview5-devel
 rustup-init -y
 
 cargo run --release
 ```
+
+Debugging aids, all off unless set: `TUNI_DEBUG_FRAME_TIME` prints draw-time
+percentiles, `TUNI_DEBUG_PTY_WRITE` logs what the terminal answers back to the
+shell, and `TUNI_CAPTURE_PNG` renders the widget to a file and exits — useful
+on compositors with no screenshot protocol.
 
 ## License
 
