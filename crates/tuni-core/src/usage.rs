@@ -517,27 +517,80 @@ fn fetch_plan() -> Option<Vec<Limit>> {
     Some(plan_limits(&String::from_utf8_lossy(&output.stdout)))
 }
 
-/// The endpoint's windows, in the order the usage page lists them.
+/// The endpoint's windows, shortest first. Every window with a reading becomes
+/// a bar, whatever it is called: the names are minted per model, `seven_day`,
+/// `seven_day_opus`, whatever the next model's will be, and a list written
+/// here would go stale with the next launch.
 fn plan_limits(json: &str) -> Vec<Limit> {
-    let Ok(usage) = serde_json::from_str::<PlanUsage>(json) else {
+    let Ok(serde_json::Value::Object(windows)) = serde_json::from_str(json) else {
         return Vec::new();
     };
-    [
-        (usage.five_hour, "5 hours"),
-        (usage.seven_day, "7 days"),
-        (usage.seven_day_opus, "7 days (Opus)"),
-        (usage.seven_day_sonnet, "7 days (Sonnet)"),
-    ]
-    .into_iter()
-    .filter_map(|(window, label)| {
-        let window = window?;
-        Some(Limit {
-            window: label.to_owned(),
-            used_percent: window.utilization?,
-            resets_at: window.resets_at.as_ref().and_then(reset_time),
+    let mut limits: Vec<(u64, Limit)> = windows
+        .iter()
+        .filter_map(|(key, window)| {
+            let utilization = window.get("utilization")?.as_f64()?;
+            let (minutes, label) = plan_window(key);
+            Some((
+                minutes,
+                Limit {
+                    window: label,
+                    used_percent: utilization,
+                    resets_at: window.get("resets_at").and_then(reset_time),
+                },
+            ))
         })
-    })
-    .collect()
+        .collect();
+    limits.sort_by(|(left, a), (right, b)| left.cmp(right).then_with(|| a.window.cmp(&b.window)));
+    limits.into_iter().map(|(_, limit)| limit).collect()
+}
+
+/// A window's name, read as the endpoint writes them: a number word, a unit,
+/// and sometimes the model the window is scoped to, as in `five_hour` and
+/// `seven_day_opus`. Returns the window's length for sorting and the label to
+/// draw; a name shaped some other way is shown as it stands, at the end.
+fn plan_window(key: &str) -> (u64, String) {
+    let parts: Vec<&str> = key.split('_').collect();
+    let spelled = (u64::MAX, key.replace('_', " "));
+    let Some((count, unit)) = parts.first().zip(parts.get(1)) else {
+        return spelled;
+    };
+    let count = match count.parse::<u64>() {
+        Ok(count) => count,
+        Err(_) => match *count {
+            "one" => 1,
+            "two" => 2,
+            "three" => 3,
+            "four" => 4,
+            "five" => 5,
+            "six" => 6,
+            "seven" => 7,
+            "eight" => 8,
+            "nine" => 9,
+            "ten" => 10,
+            _ => return spelled,
+        },
+    };
+    let unit = match unit.trim_end_matches('s') {
+        "minute" => 1,
+        "hour" => 60,
+        "day" => 1440,
+        "week" => 10080,
+        _ => return spelled,
+    };
+    let minutes = count * unit;
+    let mut label = window_label(minutes);
+    // The rest of the name is what the window is scoped to, usually a model,
+    // and a model's name starts with a capital.
+    let scope = parts.get(2..).unwrap_or_default().join(" ");
+    let mut letters = scope.chars();
+    if let Some(first) = letters.next() {
+        label = format!(
+            "{label} ({}{})",
+            first.to_ascii_uppercase(),
+            letters.as_str()
+        );
+    }
+    (minutes, label)
 }
 
 /// When a window starts over, however the endpoint said it: a timestamp
@@ -761,28 +814,6 @@ struct Oauth {
     expires_at: i64,
 }
 
-/// What the plan endpoint answers: a reading per window, some of them absent
-/// on plans that do not have them.
-#[derive(Default, Deserialize)]
-struct PlanUsage {
-    #[serde(default)]
-    five_hour: Option<PlanWindow>,
-    #[serde(default)]
-    seven_day: Option<PlanWindow>,
-    #[serde(default)]
-    seven_day_opus: Option<PlanWindow>,
-    #[serde(default)]
-    seven_day_sonnet: Option<PlanWindow>,
-}
-
-#[derive(Deserialize)]
-struct PlanWindow {
-    #[serde(default)]
-    utilization: Option<f64>,
-    #[serde(default)]
-    resets_at: Option<serde_json::Value>,
-}
-
 impl CodexWindow {
     fn into_limit(self) -> Limit {
         Limit {
@@ -890,12 +921,14 @@ mod tests {
     }
 
     #[test]
-    fn the_plan_answer_becomes_bars_in_the_pages_order() {
+    fn every_plan_window_with_a_reading_becomes_a_bar_shortest_first() {
         let limits = plan_limits(
-            r#"{"five_hour":{"utilization":12.5,"resets_at":"2026-07-26T15:00:00Z"},
+            r#"{"seven_day_fable":{"utilization":33.0},
                 "seven_day":{"utilization":61.0,"resets_at":1785069161},
+                "five_hour":{"utilization":12.5,"resets_at":"2026-07-26T15:00:00Z"},
                 "seven_day_opus":{"utilization":null},
-                "seven_day_sonnet":null}"#,
+                "seven_day_sonnet":null,
+                "unheard_of":{"utilization":5.0}}"#,
         );
         assert_eq!(
             limits,
@@ -910,8 +943,19 @@ mod tests {
                     used_percent: 61.0,
                     resets_at: Some(1_785_069_161),
                 },
+                Limit {
+                    window: "7 days (Fable)".to_owned(),
+                    used_percent: 33.0,
+                    resets_at: None,
+                },
+                Limit {
+                    window: "unheard of".to_owned(),
+                    used_percent: 5.0,
+                    resets_at: None,
+                },
             ],
-            "a window without a reading is not a bar"
+            "a window without a reading is not a bar, and a window named for \
+             a model not yet released still is"
         );
         assert!(plan_limits("not json").is_empty());
     }
