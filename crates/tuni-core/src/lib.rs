@@ -2,9 +2,10 @@
 //!
 //! The terminal's own configuration and colors, the projects and tabs around
 //! them, the pane layout inside a tab, what all of it is restored from, and the
-//! directory tree beside it. Git status lands here next.
+//! directory tree and repository state beside it.
 
 pub mod files;
+pub mod git;
 pub mod panes;
 pub mod session;
 pub mod settings;

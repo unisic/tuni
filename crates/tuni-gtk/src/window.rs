@@ -29,8 +29,8 @@ use tuni_core::settings::{Appearance, HISTORY_LINE_LIMIT, Settings};
 use tuni_core::theme::Theme;
 use tuni_core::workspace::{Id, Tab, Workspace};
 
-use crate::files::TuniFiles;
 use crate::grid::{Message, TuniGrid};
+use crate::panel::TuniPanel;
 use crate::preferences;
 use crate::terminal::TuniTerminal;
 
@@ -39,20 +39,20 @@ const SIDEBAR_FRACTION: f64 = 0.2;
 const SIDEBAR_MIN: i32 = 180;
 const SIDEBAR_MAX: i32 = 400;
 
-/// The Files panel, on the other side.
+/// The Files and Git panel, on the other side.
 const PANEL_FRACTION: f64 = 0.22;
-const PANEL_MIN: i32 = 200;
-const PANEL_MAX: i32 = 500;
+const PANEL_MIN: i32 = 240;
+const PANEL_MAX: i32 = 560;
 
-/// How often the Files panel re-reads the directories it is showing. kero's
-/// own interval, and for the same reason: a watch on every open directory is
-/// a descriptor per directory and a debounce to write, where a read of what is
-/// already in the page cache costs nothing anyone can measure.
+/// How often the panel re-reads the directories and the repository it is
+/// showing. kero's own interval, and for the same reason: a watch on every open
+/// directory is a descriptor per directory and a debounce to write, where a
+/// read of what is already in the page cache costs nothing anyone can measure.
 const PANEL_POLL_SECONDS: u32 = 2;
 
 mod imp {
     use super::{
-        Cell, HashMap, Id, RefCell, Settings, TuniFiles, TuniGrid, TuniTerminal, Workspace, glib,
+        Cell, HashMap, Id, RefCell, Settings, TuniGrid, TuniPanel, TuniTerminal, Workspace, glib,
     };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
@@ -75,9 +75,10 @@ mod imp {
 
         pub split: RefCell<Option<adw::OverlaySplitView>>,
         pub sidebar: RefCell<Option<gtk::ListBox>>,
-        /// The Files panel and the split it lives in, on the other side.
+        /// The Files and Git panel, and the split it lives in, on the other
+        /// side.
         pub panel: RefCell<Option<adw::OverlaySplitView>>,
-        pub files: RefCell<Option<TuniFiles>>,
+        pub panel_view: RefCell<Option<TuniPanel>>,
         /// Project name labels, in sidebar order.
         pub labels: RefCell<Vec<gtk::Label>>,
         /// Shared context menu for the sidebar rows, parented once.
@@ -241,7 +242,7 @@ impl TuniWindow {
 
         let show_files = gtk::ToggleButton::builder()
             .icon_name("view-list-symbolic")
-            .tooltip_text("Files (Ctrl+Shift+B)")
+            .tooltip_text("Files and Git (Ctrl+Shift+B)")
             .build();
         header.pack_end(&show_files);
 
@@ -278,16 +279,18 @@ impl TuniWindow {
             .end_action_widget(&new_tab)
             .build();
 
-        // --- the Files panel, on the far side of the terminals
+        // --- the Files and Git panel, on the far side of the terminals
 
-        let files = TuniFiles::new();
-        files.connect_message(glib::clone!(
-            #[weak(rename_to = this)]
-            self,
-            move |message| this.files_message(&message)
-        ));
+        let panel_view = TuniPanel::new();
+        if let Some(files) = panel_view.files() {
+            files.connect_message(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |message| this.files_message(&message)
+            ));
+        }
         let panel = adw::OverlaySplitView::builder()
-            .sidebar(&files)
+            .sidebar(&panel_view)
             .sidebar_position(gtk::PackType::End)
             .content(&content_stack)
             .show_sidebar(false)
@@ -356,7 +359,7 @@ impl TuniWindow {
         imp.split.replace(Some(split));
         imp.sidebar.replace(Some(sidebar));
         imp.panel.replace(Some(panel));
-        imp.files.replace(Some(files));
+        imp.panel_view.replace(Some(panel_view));
         imp.row_menu.replace(Some(row_menu));
         imp.stack.replace(Some(stack));
         imp.content.replace(Some(content_stack));
@@ -518,6 +521,19 @@ impl TuniWindow {
                     window.focus_terminal();
                 }
             }),
+            // One key that both opens the panel and puts it on the repository:
+            // asking for git while the panel is showing the files is asking for
+            // the panel to change page, not to close.
+            entry("show-git", None, |window, _| {
+                let imp = window.imp();
+                if let Some(panel) = imp.panel_view.borrow().as_ref() {
+                    panel.set_page(crate::panel::GIT);
+                }
+                if let Some(panel) = imp.panel.borrow().as_ref() {
+                    panel.set_show_sidebar(true);
+                }
+                window.sync_files();
+            }),
             entry("tab-rename", None, |window, _| window.rename_tab()),
             entry("tab-automatic-title", None, |window, _| {
                 let Some(page) = window.imp().menu_page.borrow().clone() else {
@@ -618,13 +634,14 @@ impl TuniWindow {
         preferences::present(self, &self.imp().settings.borrow().clone());
     }
 
-    // --- the Files panel ---------------------------------------------------
+    // --- the Files and Git panel -------------------------------------------
 
     /// Points the panel at the project's directory.
     ///
     /// The root is re-derived on every call rather than remembered, so a shell
-    /// that `cd`s out of one repository and into another takes the tree with
-    /// it; a pinned project directory is what stops that from happening.
+    /// that `cd`s out of one repository and into another takes the tree and the
+    /// repository with it; a pinned project directory is what stops that from
+    /// happening.
     fn sync_files(&self) {
         let imp = self.imp();
         if !imp
@@ -635,7 +652,7 @@ impl TuniWindow {
         {
             return;
         }
-        let Some(files) = imp.files.borrow().clone() else {
+        let Some(panel) = imp.panel_view.borrow().clone() else {
             return;
         };
         let cwd = {
@@ -651,7 +668,7 @@ impl TuniWindow {
                 .unwrap_or_default();
             project.panel_root(&cwd).0
         };
-        files.sync(&cwd);
+        panel.sync(&cwd);
     }
 
     /// The timer's half of that: the root cannot have moved without something
@@ -669,8 +686,8 @@ impl TuniWindow {
         // Cheap when the root has not moved, and it is what catches a `cd`
         // into a different repository.
         self.sync_files();
-        if let Some(files) = imp.files.borrow().as_ref() {
-            files.poll();
+        if let Some(panel) = imp.panel_view.borrow().as_ref() {
+            panel.poll();
         }
     }
 
@@ -725,6 +742,7 @@ impl TuniWindow {
                 .borrow()
                 .as_ref()
                 .map(adw::OverlaySplitView::shows_sidebar);
+            snapshot.panel_page = imp.panel_view.borrow().as_ref().map(TuniPanel::page);
             snapshot
         };
 
@@ -802,6 +820,11 @@ impl TuniWindow {
             && let Some(panel) = imp.panel.borrow().as_ref()
         {
             panel.set_show_sidebar(show);
+        }
+        if let Some(page) = restored.panel_page.as_deref()
+            && let Some(panel) = imp.panel_view.borrow().as_ref()
+        {
+            panel.set_page(page);
         }
 
         self.rebuild_sidebar();
@@ -1962,6 +1985,7 @@ fn main_menu() -> gio::Menu {
     let panels = gio::Menu::new();
     panels.append(Some("Projects"), Some("win.toggle-sidebar"));
     panels.append(Some("Files"), Some("win.toggle-panel"));
+    panels.append(Some("Git"), Some("win.show-git"));
 
     let application = gio::Menu::new();
     application.append(Some("Preferences"), Some("win.settings"));

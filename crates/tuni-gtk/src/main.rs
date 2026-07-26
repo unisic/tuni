@@ -3,8 +3,10 @@
 //! Everything the window does lives in `window.rs`; this file is the process.
 
 mod files;
+mod git;
 mod grid;
 mod keymap;
+mod panel;
 mod preferences;
 mod terminal;
 mod tiles;
@@ -46,6 +48,8 @@ const ACCELS: &[(&str, &[&str])] = &[
     ("win.toggle-sidebar", &["F9"]),
     // kero's own key for the panel on the other side.
     ("win.toggle-panel", &["<Ctrl><Shift>b"]),
+    // And its key for the repository, which opens the panel on that page.
+    ("win.show-git", &["<Ctrl><Shift>g"]),
     ("win.settings", &["<Ctrl>comma"]),
     ("win.split-right", &["<Ctrl><Shift>d"]),
     ("win.split-down", &["<Ctrl><Shift>e"]),

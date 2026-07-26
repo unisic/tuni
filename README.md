@@ -22,16 +22,29 @@ well as the terminal. `ls`, `vi`, and `top` all render correctly.
 Around it: a sidebar of projects, each with its own strip of tabs, and inside a
 tab a niri-style layout of panes. A project is named by whatever its visible
 shell calls itself until you rename it, and a project directory can be pinned
-for the file tree and the git panel to come. A new tab starts where the visible
-one is, opens next to it, and closes when its last shell exits; a project whose
-tabs are all closed stays in the sidebar until it is closed on purpose.
+for the file tree and the git panel to stay on. A new tab starts where the
+visible one is, opens next to it, and closes when its last shell exits; a
+project whose tabs are all closed stays in the sidebar until it is closed on
+purpose.
 
-On the other side, a Files panel under `Ctrl+Shift+B` shows the directory the
-focused shell is working in, or the project's own if one is pinned, and follows
-it as the focus moves. Directories open in place, files open in whatever the
-desktop opens them with, and a right click renames, creates, copies a path,
+On the other side, a panel under `Ctrl+Shift+B` shows the directory the focused
+shell is working in, or the project's own if one is pinned, and follows it as
+the focus moves. Its Files page opens directories in place and files in whatever
+the desktop opens them with, and a right click renames, creates, copies a path,
 shows a file in the desktop's file manager, moves one to the trash, or types a
 `cd` into the terminal that has the keyboard.
+
+Its Git page, under `Ctrl+Shift+G`, is the repository that directory belongs to:
+the branch and how far it is from its upstream, what is in conflict, what is
+staged, what has changed, and the last few commits. Files stage, unstage and
+discard one at a time or all at once, a message commits what is staged or
+everything, and fetch, pull, push and stash are a button each. Every one of them
+is the `git` you would have typed, run as a process, so the repository ends up
+in the state the command line would have left it in — including the reflog entry
+to undo it by. Discarding asks first, and what git would delete outright goes to
+the desktop's trash instead. The state of a file is spelled out, never carried
+by color alone: the two porcelain letters are on the row, and what they mean is
+in its tooltip.
 
 Closing the window writes that arrangement down, and opening it again puts it
 back: the projects, their tabs, the columns and panes inside each one with the
@@ -59,7 +72,8 @@ scrollback, and that last decision, writing each change to
 | `Ctrl+Alt+Page Down` / `Ctrl+Alt+Page Up` | Next project, previous project |
 | `Ctrl+Shift+1` … `Ctrl+Shift+9` | Jump to a project |
 | `F9` | Show or hide the sidebar |
-| `Ctrl+Shift+B` | Show or hide the Files panel |
+| `Ctrl+Shift+B` | Show or hide the panel |
+| `Ctrl+Shift+G` | Open the panel on the repository |
 | `Ctrl+,` | Preferences |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection, paste |
 | Middle click | Paste the primary selection |
@@ -72,8 +86,8 @@ scrollback, and that last decision, writing each change to
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
 
-From here the work runs to full parity: the git panel, the editor, the diff
-viewer, the command palette, and packaging.
+From here the work runs to full parity: the editor, the diff viewer — which is
+where staging a single hunk belongs — the command palette, and packaging.
 
 Consuming a 200 MiB stream, measured with `scripts/throughput.sh` on this
 machine:
@@ -155,7 +169,25 @@ and a cached directory read costs nothing measurable. The panel redraws only
 when the rows actually differ, so most of those reads change nothing on screen.
 Deleting is `GFile.trash`, which is recoverable, and revealing a file goes
 through `GtkFileLauncher` so it reaches the portal in a sandbox and the session
-bus outside one. Whether the panel was showing is part of `session.json`.
+bus outside one. Whether the panel was showing, and which page it was on, is
+part of `session.json`.
+
+The repository is read by running `git`, not by linking a library, because the
+question the panel answers is what the command line would say — the same
+config, the same hooks, the same includes, the same worktree rules. Every one of
+those processes runs off the main loop and comes back as a future, with a
+generation number attached: a status that arrives after the shell has `cd`'d
+into another repository is dropped rather than drawn. Reads carry
+`GIT_OPTIONAL_LOCKS=0` so watching a repository cannot fight a build for the
+index lock, `GIT_TERMINAL_PROMPT=0` so a fetch that wants a password fails
+instead of hanging on a terminal that is not there, and `LC_ALL=C` because the
+output is parsed. Status is `--porcelain=v2 -z`, which is the format that
+survives a filename with a newline in it. Only one action runs at a time; the
+working tree is re-read from scratch afterwards, since a commit moves the
+history and a checkout moves everything. What that model decides — whether a
+commit is possible, which paths a discard has to restore and which it has to
+delete — lives in `tuni-core` with tests against a real repository, and the
+widget only draws the answer.
 
 Ghostty's theme catalog is vendored under `data/themes` and baked into the
 binary at build time, so a fresh checkout runs with all 574 and a packaged

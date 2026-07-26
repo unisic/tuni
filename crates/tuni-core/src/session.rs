@@ -79,9 +79,14 @@ pub struct Snapshot {
     /// the window remembered this leaves it at the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar: Option<bool>,
-    /// Whether the Files panel was showing, on the same terms.
+    /// Whether the panel was showing, on the same terms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel: Option<bool>,
+    /// Which of the panel's pages was showing, by name. A name this version
+    /// does not have is ignored rather than refused, so a session written by a
+    /// version with more pages still opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_page: Option<String>,
 }
 
 fn one() -> f64 {
@@ -96,6 +101,7 @@ pub struct Restored {
     pub histories: HashMap<Id, String>,
     pub sidebar: Option<bool>,
     pub panel: Option<bool>,
+    pub panel_page: Option<String>,
 }
 
 impl Snapshot {
@@ -126,6 +132,7 @@ impl Snapshot {
                 .and_then(|id| workspace.index_of(id)),
             sidebar: None,
             panel: None,
+            panel_page: None,
         }
     }
 
@@ -178,6 +185,7 @@ impl Snapshot {
             histories,
             sidebar: self.sidebar,
             panel: self.panel,
+            panel_page: self.panel_page.clone(),
         }
     }
 
