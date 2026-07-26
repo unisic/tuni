@@ -1,27 +1,34 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-  <!-- Tuni. A window with a prompt in it: the two things the application is. -->
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <!-- Tuni, in the Unisic family: the same tile, the same palette, but what it
+       holds is a terminal. -->
   <defs>
-    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#3d3846"/>
-      <stop offset="1" stop-color="#241f31"/>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#433D8B"/>
+      <stop offset="1" stop-color="#2E236C"/>
     </linearGradient>
-    <linearGradient id="edge" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
-      <stop offset="1" stop-color="#ffffff" stop-opacity="0.04"/>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2E236C"/>
+      <stop offset="1" stop-color="#17153B"/>
     </linearGradient>
   </defs>
 
-  <rect x="8" y="14" width="112" height="100" rx="22" fill="url(#screen)"/>
-  <rect x="8.5" y="14.5" width="111" height="99" rx="21.5" fill="none" stroke="url(#edge)" stroke-width="1"/>
+  <!-- rounded app tile -->
+  <rect x="8" y="8" width="112" height="112" rx="30" fill="url(#bg)"/>
+  <rect x="8" y="8" width="112" height="112" rx="30" fill="none" stroke="#C8ACD6" stroke-opacity="0.28" stroke-width="2"/>
+  <!-- top sheen -->
+  <path d="M 38 8 h 52 a 30 30 0 0 1 30 30 v 8 H 8 v -8 a 30 30 0 0 1 30 -30 z" fill="#FFFFFF" opacity="0.06"/>
 
-  <!-- The strip along the top is the tab bar, which is what makes this a
-       workspace rather than a single terminal. -->
-  <path d="M8 36 h112 v56 a22 22 0 0 1 -22 22 h-68 a22 22 0 0 1 -22 -22 z" fill="#1c1a26" opacity="0.55"/>
-  <rect x="20" y="22" width="34" height="8" rx="4" fill="#99c1f1" opacity="0.9"/>
-  <rect x="60" y="22" width="24" height="8" rx="4" fill="#ffffff" opacity="0.25"/>
+  <!-- the screen: where Unisic puts a lens, Tuni puts a window -->
+  <rect x="24" y="24" width="80" height="80" rx="18" fill="url(#screen)"/>
+  <!-- the strip along the top is the tab bar, which is what makes this a
+       workspace rather than a single terminal -->
+  <path d="M24 46 V42 A18 18 0 0 1 42 24 H86 A18 18 0 0 1 104 42 V46 Z" fill="#FFFFFF" opacity="0.07"/>
+  <rect x="40" y="30.5" width="26" height="9" rx="4.5" fill="#C8ACD6" opacity="0.9"/>
+  <rect x="71" y="30.5" width="16" height="9" rx="4.5" fill="#FFFFFF" opacity="0.25"/>
 
-  <!-- The prompt. -->
-  <path d="M30 56 L48 68 L30 80" fill="none" stroke="#8ff0a4" stroke-width="8"
+  <!-- the prompt -->
+  <path d="M40 63 L55 75 L40 87" fill="none" stroke="#E2CFEE" stroke-width="8"
         stroke-linecap="round" stroke-linejoin="round"/>
-  <rect x="60" y="62" width="38" height="10" rx="5" fill="#f6f5f4" opacity="0.92"/>
+  <rect x="64" y="70" width="28" height="10" rx="5" fill="#F5EFF9" opacity="0.92"/>
 </svg>

@@ -1,6 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <!-- One color, recolored by the desktop: the window outline and the prompt. -->
+  <!-- One color, recolored by the desktop: the window outline and the prompt.
+       Fills only, no strokes: GTK recolors symbolic icons by forcing `fill` on
+       rect, circle and path, and would leave a stroke its literal color. -->
   <path fill="#2e3436" d="M2 2h12a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1zm0 1.5v9h12v-9z"/>
-  <path fill="#2e3436" d="M4.4 5.6a.75.75 0 0 1 1.05-.15L8 7.4a.75.75 0 0 1 0 1.2l-2.55 1.95a.75.75 0 1 1-.9-1.2L6.35 8 4.55 6.65a.75.75 0 0 1-.15-1.05z"/>
-  <rect fill="#2e3436" x="9" y="9.25" width="3.5" height="1.25" rx="0.6"/>
+  <g fill="#2e3436" transform="translate(-0.35,0)">
+    <g transform="translate(6.275,8) scale(1.1) translate(-6.275,-8)">
+      <path d="M4.4 5.6a.75.75 0 0 1 1.05-.15L8 7.4a.75.75 0 0 1 0 1.2l-2.55 1.95a.75.75 0 1 1-.9-1.2L6.35 8 4.55 6.65a.75.75 0 0 1-.15-1.05z"/>
+    </g>
+    <rect x="9.2" y="7.3" width="3.3" height="1.4" rx="0.7"/>
+  </g>
 </svg>

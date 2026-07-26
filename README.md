@@ -1,4 +1,10 @@
+<div align="center">
+
+<img src="data/icons/hicolor/scalable/apps/dev.unisic.Tuni.svg" width="160" height="160" alt="Tuni" />
+
 # Tuni
+
+</div>
 
 A native terminal workspace for Linux: terminal panes, projects, a file tree, a
 git panel, a session inspector, an editor, and a diff viewer in one window.
