@@ -115,11 +115,12 @@ struct Session {
 /// past a picture costs; it is not a limit on how many a terminal may hold.
 const TEXTURE_CACHE: usize = 16;
 
-/// How often to look at whether the widget has stopped resizing. Two quiet
-/// ticks end the wait, so the shell hears about a new size between one and two
-/// of these after the last frame — near enough to instant for a person, and
-/// long enough to swallow a whole slide-in animation. Kitty debounces the same
-/// way and for the same reason.
+/// How often a widget that is still being resized passes its size on, and how
+/// often it is looked at to see whether it has stopped. Two quiet ticks end the
+/// wait, so the shell hears about the size a drag finished on between one and
+/// two of these after the last frame. Twenty resizes a second is enough to read
+/// as text moving with the pointer and few enough that a shell has time to
+/// answer each one; kitty's own debounce is in the same range.
 const RESIZE_SETTLE: Duration = Duration::from_millis(50);
 
 /// Uploaded inline images, keyed by which image and which version of it.
@@ -215,11 +216,15 @@ mod imp {
         /// the widget's own context when it was made. See `text_context`.
         pub(super) pango: RefCell<Option<pango::Context>>,
         pub(super) pango_serial: Cell<u32>,
-        /// Grid size last pushed to the VT and the PTY, so a resize that does
-        /// not cross a cell boundary costs nothing. The cell's pixel size goes
-        /// with it, because zooming changes that without changing the grid.
+        /// Grid size last pushed to the VT, so a resize that does not cross a
+        /// cell boundary costs nothing. The cell's pixel size goes with it,
+        /// because zooming changes that without changing the grid.
         pub(super) grid_size: Cell<(u16, u16)>,
         pub(super) cell_size: Cell<(u16, u16)>,
+        /// The same two as the shell was last told, which is not the same
+        /// thing: a resize in progress reflows the screen every tick and hands
+        /// the shell the size it finished on. See `apply_size`.
+        pub(super) shell_size: Cell<((u16, u16), (u16, u16))>,
         /// A size the widget has been given but the shell has not been told
         /// about yet, and the timer that will tell it once the widget stops
         /// moving. See `apply_size`.
@@ -307,6 +312,7 @@ mod imp {
                 pango_serial: Cell::new(0),
                 grid_size: Cell::new((0, 0)),
                 cell_size: Cell::new((0, 0)),
+                shell_size: Cell::new(((0, 0), (0, 0))),
                 pending_size: Cell::new(None),
                 resize_timer: RefCell::new(None),
                 im: RefCell::new(None),
@@ -881,9 +887,11 @@ impl TuniTerminal {
 
         let events = pty.events();
         imp.session.replace(Some(Session { term, pty }));
+        let cell = (m.cell_width.round() as u16, m.cell_height.round() as u16);
         imp.grid_size.set((cols, rows));
-        imp.cell_size
-            .set((m.cell_width.round() as u16, m.cell_height.round() as u16));
+        imp.cell_size.set(cell);
+        // The shell was started at this size, so it already knows it.
+        imp.shell_size.set(((cols, rows), cell));
 
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
@@ -1057,24 +1065,26 @@ impl TuniTerminal {
         self.queue_draw();
     }
 
-    /// Takes note of the widget's new size and tells the shell about it once
-    /// the widget stops moving.
+    /// Takes note of the widget's new size: reshapes the screen to it while it
+    /// is still moving, and tells the shell once it has stopped.
     ///
-    /// A sidebar or a panel slides open over a quarter of a second, and every
-    /// frame of that animation is a different width. Telling the shell each
-    /// time is not just wasted work: a shell redraws its prompt for every
-    /// SIGWINCH, and a prompt written to fill the old width no longer fits the
-    /// new one, so the terminal wraps it onto a second row while the shell —
-    /// which believes it wrote one row — erases from one row up. The head of
-    /// the old prompt survives, once per frame, and a single animation leaves a
-    /// screenful of them. Waiting for the size to settle turns that into one
-    /// resize, which is what dragging a window edge in any terminal does.
+    /// A resize is worth following rather than waiting out — text that rewraps
+    /// under the pointer is what dragging an edge is for, and a terminal still
+    /// showing the old shape until the edge is let go looks stuck — but only
+    /// the terminal's half of it can be followed. Every SIGWINCH is a prompt
+    /// the shell draws again, and a shell draws it by counting the rows it
+    /// wrote and moving back over them, which the reflow has just rewrapped
+    /// into a different number: the move lands short and the head of the old
+    /// prompt stays on screen. One resize leaves one; twenty a second leave a
+    /// screenful. So the reflow runs at the tick rate below and the SIGWINCH
+    /// waits for the size to settle, which is the one thing that has to happen
+    /// exactly once.
     fn apply_size(&self, width: i32, height: i32) {
         let imp = self.imp();
         // Nothing is running yet: the first allocation decides what size the
         // shell is started at, and there is no output to disturb.
         if imp.session.borrow().is_none() {
-            self.commit_size(width, height);
+            self.commit_size(width, height, true);
             return;
         }
 
@@ -1083,7 +1093,7 @@ impl TuniTerminal {
             return;
         }
         // What the previous tick saw. Two ticks that read the same size mean
-        // nothing moved in between, which is the end of the animation.
+        // nothing moved in between, which is the end of the resize.
         let seen: Cell<Option<(i32, i32)>> = Cell::new(None);
         let id = glib::timeout_add_local(
             RESIZE_SETTLE,
@@ -1095,23 +1105,42 @@ impl TuniTerminal {
                 move || {
                     let imp = this.imp();
                     let now = imp.pending_size.get();
-                    if now != seen.get() {
-                        seen.set(now);
-                        return glib::ControlFlow::Continue;
+                    let settled = now == seen.get();
+                    seen.set(now);
+                    if settled {
+                        imp.resize_timer.replace(None);
+                        imp.pending_size.set(None);
                     }
-                    imp.resize_timer.replace(None);
-                    imp.pending_size.set(None);
+                    // Reshaped on the way as well as at the end, and the shell
+                    // told only at the end. The settling tick has nothing new
+                    // to reflow by definition, and reflowing it is free: a size
+                    // the grid is already at is dropped.
                     if let Some((width, height)) = now {
-                        this.commit_size(width, height);
+                        this.commit_size(width, height, settled);
                     }
-                    glib::ControlFlow::Break
+                    if settled {
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    }
                 }
             ),
         );
         imp.resize_timer.replace(Some(id));
     }
 
-    fn commit_size(&self, width: i32, height: i32) {
+    /// Reshapes the screen, and hands the shell the same shape when
+    /// `tell_shell` says the resize is over.
+    ///
+    /// The two are separate because they answer to different clocks. Reflowing
+    /// costs a pass over the scrollback and shows on screen, so it happens
+    /// while the pointer is still moving. A SIGWINCH costs whatever the program
+    /// on the other end does about it, which for a shell is drawing its prompt
+    /// again from a cursor it moved by counting the rows it wrote at the *old*
+    /// width — one row out for every row the reflow rewrapped, and the head of
+    /// the old prompt left on screen per resize. One SIGWINCH at the end is one
+    /// redraw, and one redraw cannot land in the wrong place.
+    fn commit_size(&self, width: i32, height: i32, tell_shell: bool) {
         let imp = self.imp();
         let m = imp.metrics.get();
         let cols =
@@ -1126,20 +1155,32 @@ impl TuniTerminal {
         // Zooming can leave the grid the same shape while changing what a cell
         // measures, and an application that draws with sixels or images needs
         // the pixel size to be right either way.
-        if imp.grid_size.get() == (cols, rows) && imp.cell_size.get() == cell {
+        let reshaped = imp.grid_size.get() != (cols, rows) || imp.cell_size.get() != cell;
+        let tell_shell = tell_shell && imp.shell_size.get() != ((cols, rows), cell);
+        if !reshaped && !tell_shell {
             return;
         }
         imp.grid_size.set((cols, rows));
         imp.cell_size.set(cell);
+        if tell_shell {
+            imp.shell_size.set(((cols, rows), cell));
+        }
 
         {
             let mut guard = imp.session.borrow_mut();
             if let Some(session) = guard.as_mut() {
-                let _ = session
-                    .term
-                    .resize(cols, rows, u32::from(cell.0), u32::from(cell.1));
-                let _ = session.pty.resize(cols, rows, cell.0, cell.1);
+                if reshaped {
+                    let _ = session
+                        .term
+                        .resize(cols, rows, u32::from(cell.0), u32::from(cell.1));
+                }
+                if tell_shell {
+                    let _ = session.pty.resize(cols, rows, cell.0, cell.1);
+                }
             }
+        }
+        if !reshaped {
+            return;
         }
         // Reflow moves every viewport coordinate, the hover's cells among them,
         // and every row a match was found on.
