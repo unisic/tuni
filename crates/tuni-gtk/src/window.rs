@@ -1371,7 +1371,20 @@ impl TuniWindow {
             stack.set_visible_child_name(&id.raw().to_string());
         }
         if let Some(bar) = imp.tab_bar.borrow().as_ref() {
+            // Pointing the strip at another project rebuilds every tab in it,
+            // and each rebuilt tab plays an appear animation that libadwaita
+            // then forgets: `adw_tab_box_set_view` frees the tabs it is
+            // replacing without stopping their animations, so the *next*
+            // switch leaves a timer running on freed memory, and the frame
+            // after that is a segmentation fault. Two switches inside the
+            // animation's fifth of a second are enough, which is one hand on
+            // the sidebar. An unmapped widget skips its animations outright
+            // rather than starting them, so the strip is hidden across the
+            // switch: no frame is drawn in between, and nothing is left
+            // running to tick on a tab that has gone.
+            bar.set_visible(false);
             bar.set_view(view.as_ref());
+            bar.set_visible(true);
         }
 
         // Writing the sidebar's selection here would otherwise come straight
