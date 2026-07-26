@@ -6,17 +6,20 @@
 //! keyval and the hardware keycode, and on Linux that keycode is the XKB one:
 //! the evdev scancode plus eight, on Wayland and on X11 alike.
 //!
-//! So the scancode is the answer, and the keyval only settles what the scancode
-//! cannot: which key a keypad scancode is while Num Lock is off. The keyval
-//! table below stays as a fallback for a backend that reports no usable
-//! keycode.
+//! So the scancode is the answer for the keys a layout moves around — the
+//! letters, digits and punctuation the W3C calls the writing system keys. For
+//! everything else the keyval wins, because that is the only way an XKB option
+//! like `caps:swapescape` can take effect at all: XKB implements it by handing
+//! out a different keyval for the same scancode. Ghostty draws the line in the
+//! same place, and for the same reason.
 //!
 //! The scancode table is Ghostty's own — `src/input/keycodes.zig`, itself taken
 //! from Chromium's `dom_code_data.inc` — reduced to the XKB column and the keys
 //! this enum names.
 
 use gtk::gdk;
-use tuni_vt::{Key, Mods};
+use gtk::prelude::*;
+use tuni_vt::{Key, KeyAction, Mods};
 
 pub fn mods_from_state(state: gdk::ModifierType) -> Mods {
     let mut mods = Mods::empty();
@@ -38,39 +41,132 @@ pub fn mods_from_state(state: gdk::ModifierType) -> Mods {
     mods
 }
 
-/// The key a press was on, physically.
+/// The modifiers a key event carries.
+///
+/// GDK reports the state as it stood *before* the event, so a press of Ctrl
+/// does not have Ctrl in its own mask and a release still does. The key that
+/// moved settles that, and it is also the only thing that says which side of
+/// the keyboard the modifier was on — the state mask does not distinguish
+/// them, and the Kitty protocol reports it.
+pub fn mods_for_key(
+    state: gdk::ModifierType,
+    key: Key,
+    action: KeyAction,
+    num_locked: bool,
+) -> Mods {
+    let mut mods = mods_from_state(state);
+    mods.set(Mods::NUM_LOCK, num_locked);
+
+    let (modifier, side, right) = match key {
+        Key::ShiftLeft => (Mods::SHIFT, Mods::SHIFT_SIDE, false),
+        Key::ShiftRight => (Mods::SHIFT, Mods::SHIFT_SIDE, true),
+        Key::ControlLeft => (Mods::CTRL, Mods::CTRL_SIDE, false),
+        Key::ControlRight => (Mods::CTRL, Mods::CTRL_SIDE, true),
+        Key::AltLeft => (Mods::ALT, Mods::ALT_SIDE, false),
+        Key::AltRight => (Mods::ALT, Mods::ALT_SIDE, true),
+        Key::MetaLeft => (Mods::SUPER, Mods::SUPER_SIDE, false),
+        Key::MetaRight => (Mods::SUPER, Mods::SUPER_SIDE, true),
+        _ => return mods,
+    };
+    mods.set(modifier, !matches!(action, KeyAction::Release));
+    mods.set(side, right);
+    mods
+}
+
+/// What the key types with nothing held down at all, on the layout this event
+/// arrived under.
+///
+/// The Kitty protocol reports it, and it is what lets `Ctrl`+`С` on a Cyrillic
+/// layout arrive as `Ctrl+C`: level 0 of the event's own group is the same key
+/// on the same layout with no modifier applied.
+pub fn unshifted_codepoint(display: &gdk::Display, event: &gdk::KeyEvent) -> Option<char> {
+    let group = event.layout() as i32;
+    display
+        .map_keycode(event.keycode())?
+        .into_iter()
+        .find(|(entry, _)| entry.group() == group && entry.level() == 0)
+        .and_then(|(_, keyval)| keyval.to_unicode())
+}
+
+/// The key a press was on.
+///
+/// A key outside the writing system is whatever the keymap says it is, because
+/// swapping such a key is a thing users ask their keymap for and XKB grants it
+/// by changing the keyval alone. Inside the writing system it is the other way
+/// round: a layout moves the letters about, the position stays put, and the
+/// position is what a binding resolves against and what the Kitty protocol
+/// reports.
 pub fn key_from_event(keyval: gdk::Key, keycode: u32) -> Key {
-    // The keypad is where the physical key stops being the whole story: with
-    // Num Lock off, one scancode navigates rather than types, and only the
-    // keyval says which of the two this press is.
-    if let Some(key) = keypad_from_keyval(keyval) {
-        return key;
+    let remapped = key_from_keyval(keyval);
+    if remapped != Key::Unidentified && should_be_remappable(remapped) {
+        return remapped;
     }
     match key_from_scancode(keycode) {
-        Key::Unidentified => key_from_keyval(keyval),
+        Key::Unidentified => remapped,
         key => key,
     }
 }
 
-/// The keypad with Num Lock off, which reports its own set of keys rather than
-/// the ones on the main block.
-fn keypad_from_keyval(keyval: gdk::Key) -> Option<Key> {
-    use gdk::Key as K;
-
-    Some(match keyval {
-        K::KP_Home => Key::NumpadHome,
-        K::KP_End => Key::NumpadEnd,
-        K::KP_Up => Key::NumpadUp,
-        K::KP_Down => Key::NumpadDown,
-        K::KP_Left => Key::NumpadLeft,
-        K::KP_Right => Key::NumpadRight,
-        K::KP_Page_Up => Key::NumpadPageUp,
-        K::KP_Page_Down => Key::NumpadPageDown,
-        K::KP_Insert => Key::NumpadInsert,
-        K::KP_Delete => Key::NumpadDelete,
-        K::KP_Begin => Key::NumpadBegin,
-        _ => return None,
-    })
+/// Whether the keymap has the last word on this key.
+///
+/// False for the writing system keys of the W3C's §3.1.1, which are the ones
+/// that "change meaning based on the current locale and keyboard layout" and
+/// so have to be named by position; true for everything else, which is
+/// harmless to let the user move around.
+fn should_be_remappable(key: Key) -> bool {
+    !matches!(
+        key,
+        Key::Backquote
+            | Key::Backslash
+            | Key::BracketLeft
+            | Key::BracketRight
+            | Key::Comma
+            | Key::Digit0
+            | Key::Digit1
+            | Key::Digit2
+            | Key::Digit3
+            | Key::Digit4
+            | Key::Digit5
+            | Key::Digit6
+            | Key::Digit7
+            | Key::Digit8
+            | Key::Digit9
+            | Key::Equal
+            | Key::IntlBackslash
+            | Key::IntlRo
+            | Key::IntlYen
+            | Key::A
+            | Key::B
+            | Key::C
+            | Key::D
+            | Key::E
+            | Key::F
+            | Key::G
+            | Key::H
+            | Key::I
+            | Key::J
+            | Key::K
+            | Key::L
+            | Key::M
+            | Key::N
+            | Key::O
+            | Key::P
+            | Key::Q
+            | Key::R
+            | Key::S
+            | Key::T
+            | Key::U
+            | Key::V
+            | Key::W
+            | Key::X
+            | Key::Y
+            | Key::Z
+            | Key::Minus
+            | Key::Period
+            | Key::Quote
+            | Key::Semicolon
+            | Key::Slash
+    )
 }
 
 /// XKB keycode → physical key. An unknown code is `Unidentified`, which sends
@@ -233,11 +329,14 @@ fn key_from_scancode(keycode: u32) -> Key {
     }
 }
 
+/// The key the keymap says this is. Authoritative for everything outside the
+/// writing system, and the fallback for a backend that reports no usable
+/// keycode.
 fn key_from_keyval(keyval: gdk::Key) -> Key {
     use gdk::Key as K;
 
     match keyval {
-        K::Return | K::KP_Enter | K::ISO_Enter => Key::Enter,
+        K::Return | K::ISO_Enter => Key::Enter,
         K::BackSpace => Key::Backspace,
         K::Tab | K::ISO_Left_Tab => Key::Tab,
         K::Escape => Key::Escape,
@@ -276,6 +375,43 @@ fn key_from_keyval(keyval: gdk::Key) -> Key {
         K::Super_R => Key::MetaRight,
         K::Caps_Lock => Key::CapsLock,
         K::Num_Lock => Key::NumLock,
+        K::Scroll_Lock => Key::ScrollLock,
+        K::Print => Key::PrintScreen,
+        K::Pause => Key::Pause,
+        K::Menu => Key::ContextMenu,
+
+        // The keypad, which is where the keymap earns its keep: one scancode
+        // types with Num Lock on and navigates with it off, and the keyval is
+        // what tells the two apart.
+        K::KP_0 => Key::Numpad0,
+        K::KP_1 => Key::Numpad1,
+        K::KP_2 => Key::Numpad2,
+        K::KP_3 => Key::Numpad3,
+        K::KP_4 => Key::Numpad4,
+        K::KP_5 => Key::Numpad5,
+        K::KP_6 => Key::Numpad6,
+        K::KP_7 => Key::Numpad7,
+        K::KP_8 => Key::Numpad8,
+        K::KP_9 => Key::Numpad9,
+        K::KP_Enter => Key::NumpadEnter,
+        K::KP_Add => Key::NumpadAdd,
+        K::KP_Subtract => Key::NumpadSubtract,
+        K::KP_Multiply => Key::NumpadMultiply,
+        K::KP_Divide => Key::NumpadDivide,
+        K::KP_Decimal => Key::NumpadDecimal,
+        K::KP_Separator => Key::NumpadSeparator,
+        K::KP_Equal => Key::NumpadEqual,
+        K::KP_Home => Key::NumpadHome,
+        K::KP_End => Key::NumpadEnd,
+        K::KP_Up => Key::NumpadUp,
+        K::KP_Down => Key::NumpadDown,
+        K::KP_Left => Key::NumpadLeft,
+        K::KP_Right => Key::NumpadRight,
+        K::KP_Page_Up => Key::NumpadPageUp,
+        K::KP_Page_Down => Key::NumpadPageDown,
+        K::KP_Insert => Key::NumpadInsert,
+        K::KP_Delete => Key::NumpadDelete,
+        K::KP_Begin => Key::NumpadBegin,
 
         other => other.to_unicode().map_or(Key::Unidentified, key_from_char),
     }
@@ -365,5 +501,44 @@ mod tests {
     fn the_sides_of_a_modifier_are_told_apart() {
         assert_eq!(key_from_event(gdk::Key::Control_L, 37), Key::ControlLeft);
         assert_eq!(key_from_event(gdk::Key::Control_R, 105), Key::ControlRight);
+    }
+
+    /// `caps:swapescape` is XKB handing out Escape for the Caps Lock scancode
+    /// and Caps Lock for Escape's. A user who asked for that meant it.
+    #[test]
+    fn a_key_the_keymap_moved_stays_moved() {
+        assert_eq!(key_from_event(gdk::Key::Escape, 66), Key::Escape);
+        assert_eq!(key_from_event(gdk::Key::Caps_Lock, 9), Key::CapsLock);
+    }
+
+    /// The same option applied to a letter is the bug it guards against: a
+    /// Cyrillic layout hands out `Cyrillic_es` for the key where C is, and
+    /// `Ctrl+C` still has to be `Ctrl+C`.
+    #[test]
+    fn a_letter_the_layout_moved_is_still_named_by_position() {
+        assert_eq!(key_from_event(gdk::Key::Cyrillic_es, 54), Key::C);
+    }
+
+    /// GDK reports the state before the event, so the modifier that moved is
+    /// missing from a press and still present on a release.
+    #[test]
+    fn the_modifier_that_moved_is_in_the_press_and_out_of_the_release() {
+        let none = gdk::ModifierType::empty();
+        let held = gdk::ModifierType::CONTROL_MASK;
+
+        let press = mods_for_key(none, Key::ControlRight, KeyAction::Press, false);
+        assert!(press.contains(Mods::CTRL));
+        assert!(press.contains(Mods::CTRL_SIDE));
+
+        let release = mods_for_key(held, Key::ControlLeft, KeyAction::Release, false);
+        assert!(!release.contains(Mods::CTRL));
+        assert!(!release.contains(Mods::CTRL_SIDE));
+    }
+
+    #[test]
+    fn num_lock_is_reported_because_the_keypad_encoding_turns_on_it() {
+        let none = gdk::ModifierType::empty();
+        assert!(mods_for_key(none, Key::Numpad7, KeyAction::Press, true).contains(Mods::NUM_LOCK));
+        assert!(!mods_for_key(none, Key::NumpadHome, KeyAction::Press, false).contains(Mods::NUM_LOCK));
     }
 }

@@ -188,6 +188,7 @@ fn press(terminal: &mut Terminal, key: Key, mods: Mods, text: Option<&str>) -> V
             mods,
             consumed_mods: consumed,
             text,
+            unshifted_codepoint: None,
         })
         .expect("encode")
         .to_vec()
@@ -215,6 +216,29 @@ fn control_keys_encode_to_their_c0_bytes() {
         b"\x7f"
     );
     assert_eq!(press(&mut terminal, Key::Tab, Mods::empty(), None), b"\t");
+}
+
+/// On a Cyrillic layout the key that is physically C types "с", and the Kitty
+/// protocol reports what it types with no modifier. The escape has to name the
+/// Latin letter regardless, which is what the unshifted codepoint is for.
+#[test]
+fn the_unshifted_codepoint_names_the_key_under_the_kitty_protocol() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    // Kitty progressive enhancement: disambiguate, report alternates.
+    terminal.feed(b"\x1b[>5u");
+
+    let escape = terminal
+        .encode_key(&KeyInput {
+            action: KeyAction::Press,
+            key: Key::C,
+            mods: Mods::CTRL,
+            consumed_mods: Mods::empty(),
+            text: None,
+            unshifted_codepoint: Some('c'),
+        })
+        .expect("encode")
+        .to_vec();
+    assert_eq!(escape, b"\x1b[99;5u");
 }
 
 #[test]

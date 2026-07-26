@@ -127,6 +127,9 @@ pub struct Geometry {
 /// A key press translated from a GTK event, ready to be encoded.
 pub struct KeyInput<'a> {
     pub action: KeyAction,
+    /// The key by position, in W3C `KeyboardEvent.code` terms, not by what it
+    /// types. On a Dvorak layout the key a US keyboard calls S is `Key::S`
+    /// however the layout maps it.
     pub key: Key,
     pub mods: Mods,
     /// Mods already baked into `text` — Shift is consumed when the toolkit
@@ -135,6 +138,10 @@ pub struct KeyInput<'a> {
     pub consumed_mods: Mods,
     /// Committed text for this event, when the key produced any.
     pub text: Option<&'a str>,
+    /// What this key types with no modifier at all on the layout in force. The
+    /// Kitty protocol reports it, and it is what lets `Ctrl+С` on a Cyrillic
+    /// layout arrive as `Ctrl+C`. `None` when the key types nothing.
+    pub unshifted_codepoint: Option<char>,
 }
 
 pub struct MouseInput {
@@ -455,6 +462,10 @@ impl Terminal {
             .set_key(input.key)
             .set_mods(input.mods)
             .set_consumed_mods(input.consumed_mods)
+            // Set on every event: the encoder's event is reused between calls,
+            // and an absent codepoint has to overwrite the last one rather than
+            // leave it standing. NUL is the encoder's own word for "none".
+            .set_unshifted_codepoint(input.unshifted_codepoint.unwrap_or('\0'))
             .set_utf8(input.text);
 
         self.encoded.clear();

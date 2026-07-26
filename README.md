@@ -89,12 +89,19 @@ ASCII share one layout; anything wide, combining, or borrowed from a fallback
 face gets a layout of its own. Ligatures are off by default for the same
 reason — a ligature is one glyph where the terminal still counts several cells.
 
-A key is named by where it is rather than by what it types: the hardware
+A letter key is named by where it is rather than by what it types: the hardware
 keycode a GDK event carries is the XKB one, which is the evdev scancode plus
 eight on Wayland and X11 alike, and that is what the Kitty keyboard protocol
 reports. The table is Ghostty's own, so the key where a US keyboard has Q is
-`KeyQ` on an AZERTY layout too. The keyval only settles what the scancode
-cannot: which key a keypad scancode is while Num Lock is off.
+`KeyQ` on an AZERTY layout too, and `Ctrl+Shift+C` is under the same finger on
+every layout. Every other key is named by what the keymap says it is, because
+that is the only way `caps:swapescape` and its like can work at all — XKB grants
+them by handing out a different keyval for the same scancode. The line between
+the two is the W3C's writing system keys, which is where Ghostty draws it. What
+a key types with nothing held down travels with the event as well, so `Ctrl`+`С`
+on a Cyrillic layout arrives as `Ctrl+C`, and the modifiers the keymap already
+folded into the character are the ones GDK says it consumed rather than a guess
+at Shift.
 
 A hyperlink is whatever the program holding the PTY says it is, which over ssh
 is not the person at the keyboard. So `Ctrl` has to be held before one lights up

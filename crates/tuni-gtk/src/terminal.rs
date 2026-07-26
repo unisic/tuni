@@ -21,7 +21,7 @@ use tuni_core::TerminalConfig;
 use tuni_core::theme::Theme;
 use tuni_pty::{Pty, PtyConfig, PtyEvent};
 use tuni_vt::{
-    ClipboardTarget, Colors, CursorShape, Geometry, KeyAction, KeyInput, Mods, MouseAction,
+    ClipboardTarget, Colors, CursorShape, Geometry, Key, KeyAction, KeyInput, Mods, MouseAction,
     MouseButton, MouseInput, Rgb, ScrollPosition,
 };
 
@@ -476,12 +476,8 @@ impl TuniTerminal {
         keys.connect_key_released(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |controller, _, _, _| {
-                if let Some(im) = this.imp().im.borrow().as_ref()
-                    && let Some(event) = controller.current_event()
-                {
-                    im.filter_keypress(&event);
-                }
+            move |controller, keyval, keycode, state| {
+                this.on_key_release(controller, keyval, keycode, state);
             }
         ));
         self.add_controller(keys);
@@ -1413,26 +1409,29 @@ impl TuniTerminal {
             return glib::Propagation::Stop;
         }
 
-        let mods = keymap::mods_from_state(state);
+        // Every shortcut below is on the physical key, so that it stays under
+        // the same finger whatever the layout puts there.
+        let key = keymap::key_from_event(keyval, keycode);
+        let mods = keymap::mods_for_key(state, key, KeyAction::Press, num_locked(controller));
         imp.mods.set(mods);
 
         // Scrollback navigation sits on plain Shift, where every terminal on
         // this desktop puts it.
         if mods.contains(Mods::SHIFT) && !mods.contains(Mods::CTRL) {
             let page = imp.grid_size.get().1.max(1) as isize;
-            match keyval {
-                gdk::Key::Page_Up => {
+            match key {
+                Key::PageUp => {
                     self.scroll_by(-page);
                     return glib::Propagation::Stop;
                 }
-                gdk::Key::Page_Down => {
+                Key::PageDown => {
                     self.scroll_by(page);
                     return glib::Propagation::Stop;
                 }
-                gdk::Key::Home | gdk::Key::End => {
+                Key::Home | Key::End => {
                     let mut guard = imp.session.borrow_mut();
                     if let Some(session) = guard.as_mut() {
-                        if keyval == gdk::Key::Home {
+                        if key == Key::Home {
                             session.term.scroll_to_top();
                         } else {
                             session.term.scroll_to_bottom();
@@ -1451,16 +1450,16 @@ impl TuniTerminal {
         // Font size sits on plain Ctrl, where Ghostty and every browser put it.
         // None of these three keys carries a control code a shell would miss.
         if mods.contains(Mods::CTRL) && !mods.contains(Mods::ALT) {
-            match keyval {
-                gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => {
+            match key {
+                Key::Equal | Key::NumpadAdd => {
                     self.zoom(1);
                     return glib::Propagation::Stop;
                 }
-                gdk::Key::minus | gdk::Key::KP_Subtract => {
+                Key::Minus | Key::NumpadSubtract => {
                     self.zoom(-1);
                     return glib::Propagation::Stop;
                 }
-                gdk::Key::_0 | gdk::Key::KP_0 => {
+                Key::Digit0 | Key::Numpad0 => {
                     self.reset_zoom();
                     return glib::Propagation::Stop;
                 }
@@ -1471,19 +1470,19 @@ impl TuniTerminal {
         // Application shortcuts live on Ctrl+Shift, because Ctrl+C and Ctrl+V
         // belong to the shell.
         if mods.contains(Mods::CTRL) && mods.contains(Mods::SHIFT) {
-            match keyval.to_unicode().map(|c| c.to_ascii_lowercase()) {
-                Some('c') => {
+            match key {
+                Key::C => {
                     // With nothing selected, fall through so Ctrl+Shift+C still
                     // reaches the application.
                     if self.copy_selection() {
                         return glib::Propagation::Stop;
                     }
                 }
-                Some('v') => {
+                Key::V => {
                     self.paste_clipboard();
                     return glib::Propagation::Stop;
                 }
-                Some('a') => {
+                Key::A => {
                     let mut guard = imp.session.borrow_mut();
                     if let Some(session) = guard.as_mut() {
                         let _ = session.term.select_all();
@@ -1496,7 +1495,56 @@ impl TuniTerminal {
             }
         }
 
+        if self.send_key(controller, keyval, key, mods, KeyAction::Press, committed) {
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    }
+
+    /// A release reaches the shell only under the Kitty protocol's
+    /// event-reporting mode; every other mode encodes it as nothing at all.
+    fn on_key_release(
+        &self,
+        controller: &gtk::EventControllerKey,
+        keyval: gdk::Key,
+        keycode: u32,
+        state: gdk::ModifierType,
+    ) {
+        let imp = self.imp();
+
+        if let Some(im) = imp.im.borrow().as_ref()
+            && let Some(event) = controller.current_event()
+        {
+            im.filter_keypress(&event);
+        }
+
         let key = keymap::key_from_event(keyval, keycode);
+        let mods = keymap::mods_for_key(state, key, KeyAction::Release, num_locked(controller));
+        imp.mods.set(mods);
+
+        self.send_key(controller, keyval, key, mods, KeyAction::Release, None);
+        // Letting go of Ctrl puts out whatever link it lit.
+        self.refresh_links(mods);
+    }
+
+    /// Hand a key event to the encoder and write back whatever it answers
+    /// with. Says whether anything went to the shell at all.
+    fn send_key(
+        &self,
+        controller: &gtk::EventControllerKey,
+        keyval: gdk::Key,
+        key: Key,
+        mods: Mods,
+        action: KeyAction,
+        committed: Option<String>,
+    ) -> bool {
+        let imp = self.imp();
+        let event = controller.current_event();
+        let key_event = event
+            .as_ref()
+            .and_then(|event| event.downcast_ref::<gdk::KeyEvent>());
+
         let text = committed.or_else(|| {
             keyval
                 .to_unicode()
@@ -1504,25 +1552,28 @@ impl TuniTerminal {
                 .map(String::from)
         });
 
-        // Shift is already baked into the character the toolkit produced;
-        // reporting it again would double it under the Kitty protocol.
-        let consumed_mods = if text.is_some() && mods.contains(Mods::SHIFT) {
-            Mods::SHIFT
-        } else {
-            Mods::empty()
-        };
+        // What the keymap already folded into that character: Shift on a
+        // capital, AltGr on the third level. Reporting those again would
+        // double them under the Kitty protocol, and GDK has worked out which
+        // ones they were, which beats guessing at Shift.
+        let consumed_mods = key_event.map_or(Mods::empty(), |event| {
+            keymap::mods_from_state(event.consumed_modifiers() & gdk::MODIFIER_MASK)
+        });
+        let unshifted_codepoint =
+            key_event.and_then(|event| keymap::unshifted_codepoint(&self.display(), event));
 
         let mut guard = imp.session.borrow_mut();
         let Some(session) = guard.as_mut() else {
-            return glib::Propagation::Proceed;
+            return false;
         };
 
         let input = KeyInput {
-            action: KeyAction::Press,
+            action,
             key,
             mods,
             consumed_mods,
             text: text.as_deref(),
+            unshifted_codepoint,
         };
 
         match session.term.encode_key(&input) {
@@ -1535,9 +1586,9 @@ impl TuniTerminal {
                 drop(guard);
                 self.note_input();
                 self.queue_draw();
-                glib::Propagation::Stop
+                true
             }
-            _ => glib::Propagation::Proceed,
+            _ => false,
         }
     }
 
@@ -1730,6 +1781,14 @@ fn mouse_button(button: u32) -> Option<MouseButton> {
         9 => Some(MouseButton::Five),
         _ => None,
     }
+}
+
+/// Whether Num Lock was on for the event in hand. The keyboard knows, and the
+/// keypad encoding turns on it.
+fn num_locked(controller: &gtk::EventControllerKey) -> bool {
+    controller
+        .current_event_device()
+        .is_some_and(|device| device.is_num_locked())
 }
 
 /// Whether a cell may share a layout with its neighbours.
