@@ -146,10 +146,19 @@ impl TuniPanel {
     /// The Info page is told more than a directory, because what it draws is
     /// the shell rather than the tree: `cwd` is where that shell is working
     /// and `directory` is what the other two anchored to, which are the same
-    /// path until a project pins one or a repository is found above it.
-    pub fn sync(&self, directory: &Path, cwd: &Path, shell_pid: Option<u32>, automatic: bool) {
+    /// path until a project pins one or a repository is found above it. It is
+    /// also told the host, when the pane is on one, which is the one thing on
+    /// that page that is not about this machine.
+    pub fn sync(
+        &self,
+        directory: &Path,
+        cwd: &Path,
+        shell_pid: Option<u32>,
+        automatic: bool,
+        host: Option<&str>,
+    ) {
         if let Some(info) = self.info() {
-            info.sync(shell_pid, cwd, directory, automatic);
+            info.sync(shell_pid, cwd, directory, automatic, host);
         }
         if let Some(files) = self.files() {
             files.sync(directory);

@@ -5,12 +5,16 @@
 //! listening on — which is the question a dev server makes people ask, and
 //! which otherwise costs an `ss` and a `ps` in another window.
 //!
+//! A pane on another machine gets one more heading, because the first question
+//! about a connection is whether it is still there.
+//!
 //! The reading is [`tuni_core::info`], off the main loop because it walks
 //! `/proc`, with a generation stamp so a read that lands after the focus moved
 //! is dropped rather than drawn.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -19,14 +23,23 @@ use gtk::gio;
 use gtk::glib;
 
 use tuni_core::info::{self, Port, Process, Snapshot};
+use tuni_core::ssh::{self, Source};
 use tuni_core::usage::{self, Agent};
 
 /// How many rows a section draws. A build spawning a compiler per core makes a
 /// long list, and past this many the count in the heading is the useful part.
 const MAX_ROWS: usize = 200;
 
+/// How rarely the panel asks whether a connection is still answering.
+///
+/// Every ask is a subprocess, and the two-second poll the rest of this page
+/// runs on is the wrong rate for a question whose answer changes when a laptop
+/// closes. Nothing waits on it: an operation that fails is a liveness check
+/// with better provenance than any timer.
+const CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
 mod imp {
-    use super::{Cell, PathBuf, RefCell, Snapshot, gio, glib, usage};
+    use super::{Cell, Instant, Link, PathBuf, RefCell, Snapshot, gio, glib, usage};
     use adw::prelude::*;
     use adw::subclass::prelude::*;
 
@@ -39,6 +52,14 @@ mod imp {
         /// hand or worked out from the shell's directory.
         pub root: RefCell<PathBuf>,
         pub automatic: Cell<bool>,
+
+        /// The host the pane is connected to, when it is a connection rather
+        /// than a shell of its own, and what asking about it found.
+        pub host: RefCell<Option<String>>,
+        pub link: RefCell<Link>,
+        /// When the connection was last asked about, which is what keeps the
+        /// asking down to a heartbeat.
+        pub checked: Cell<Option<Instant>>,
 
         /// The last snapshot drawn, so a poll that finds nothing new redraws
         /// nothing — the panel polls every couple of seconds.
@@ -60,6 +81,7 @@ mod imp {
 
         pub title: RefCell<Option<gtk::Label>>,
         pub subtitle: RefCell<Option<gtk::Label>>,
+        pub connection: RefCell<Option<super::Connection>>,
         pub cwd_group: RefCell<Option<super::Directory>>,
         pub root_group: RefCell<Option<super::Directory>>,
         pub agent: RefCell<Option<super::AgentSection>>,
@@ -92,6 +114,31 @@ mod imp {
 
     impl WidgetImpl for TuniInfo {}
     impl BinImpl for TuniInfo {}
+}
+
+/// What asking about a pane's connection found: where it actually goes, and
+/// how long the shared connection carrying it has been up.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Link {
+    /// `deploy@10.0.0.1:2222`, as `ssh` resolves the alias rather than as the
+    /// block for it happens to be written.
+    address: String,
+    /// The host this one is reached through, empty for one reached directly.
+    jump: String,
+    /// Seconds the master has been running, or nothing when none is: a
+    /// connection nobody is sharing has no age to report.
+    uptime: Option<u64>,
+}
+
+/// The host a pane is on, with a dot for whether anything is still answering.
+#[derive(Clone)]
+pub struct Connection {
+    container: gtk::Box,
+    name: gtk::Label,
+    dot: gtk::Image,
+    state: gtk::Label,
+    address: gtk::Label,
+    jump: gtk::Label,
 }
 
 /// A path with the two things anyone wants to do to one.
@@ -169,6 +216,7 @@ impl TuniInfo {
         header.append(&heading);
         header.append(&refresh);
 
+        let connection = self.connection_section();
         let cwd_group = self.directory("Current directory", "info.open-cwd", "info.copy-cwd");
         let root_group = self.directory("Project directory", "info.open-root", "info.copy-root");
         root_group.container.set_tooltip_text(Some(
@@ -183,6 +231,7 @@ impl TuniInfo {
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.set_margin_bottom(12);
+        content.append(&connection.container);
         content.append(&cwd_group.container);
         content.append(&root_group.container);
         content.append(&agent.container);
@@ -209,12 +258,71 @@ impl TuniInfo {
 
         imp.title.replace(Some(title));
         imp.subtitle.replace(Some(subtitle));
+        imp.connection.replace(Some(connection));
         imp.cwd_group.replace(Some(cwd_group));
         imp.root_group.replace(Some(root_group));
         imp.agent.replace(Some(agent));
         imp.processes.replace(Some(processes));
         imp.ports.replace(Some(ports));
         imp.menu.replace(Some(menu));
+    }
+
+    fn connection_section(&self) -> Connection {
+        let name = gtk::Label::builder().xalign(0.0).build();
+        name.add_css_class("heading");
+        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+
+        // Emptied rather than hidden when nothing is answering, so the heading
+        // does not shift sideways every time a link drops.
+        let dot = gtk::Image::from_icon_name("media-record-symbolic");
+        dot.set_pixel_size(8);
+        dot.add_css_class("success");
+        let state = gtk::Label::builder().hexpand(true).xalign(0.0).build();
+        state.add_css_class("caption");
+        state.add_css_class("dim-label");
+
+        let heading = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        heading.append(&name);
+        heading.append(&dot);
+        heading.append(&state);
+
+        let address = gtk::Label::builder()
+            .xalign(0.0)
+            .selectable(true)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+        address.add_css_class("monospace");
+        address.add_css_class("caption");
+        address.add_css_class("dim-label");
+
+        let jump = gtk::Label::builder().xalign(0.0).build();
+        jump.add_css_class("caption");
+        jump.add_css_class("dim-label");
+        jump.set_ellipsize(gtk::pango::EllipsizeMode::End);
+
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        container.set_margin_start(12);
+        container.set_margin_end(12);
+        container.set_margin_top(6);
+        container.set_visible(false);
+        container.set_tooltip_text(Some(
+            "Tuni shares one authenticated connection per host, so a second \
+             pane costs no second login. The dot is whether that shared \
+             connection is still answering, which is not the same question as \
+             whether this pane's own shell is alive.",
+        ));
+        container.append(&heading);
+        container.append(&address);
+        container.append(&jump);
+
+        Connection {
+            container,
+            name,
+            dot,
+            state,
+            address,
+            jump,
+        }
     }
 
     fn directory(&self, title: &str, open: &str, copy: &str) -> Directory {
@@ -359,11 +467,21 @@ impl TuniInfo {
     // --- what the panel is looking at --------------------------------------
 
     /// Points the panel at a pane: the shell running in it, where it is
-    /// working, and what the other pages are anchored to.
-    pub fn sync(&self, shell_pid: Option<u32>, cwd: &Path, root: &Path, automatic: bool) {
+    /// working, what the other pages are anchored to, and the host it is on
+    /// when it is on one.
+    pub fn sync(
+        &self,
+        shell_pid: Option<u32>,
+        cwd: &Path,
+        root: &Path,
+        automatic: bool,
+        host: Option<&str>,
+    ) {
         let imp = self.imp();
         let pid = shell_pid.unwrap_or_default();
-        let moved = imp.shell_pid.get() != pid
+        let switched = imp.host.borrow().as_deref() != host;
+        let moved = switched
+            || imp.shell_pid.get() != pid
             || imp.cwd.borrow().as_path() != cwd
             || imp.root.borrow().as_path() != root
             || imp.automatic.get() != automatic;
@@ -383,12 +501,38 @@ impl TuniInfo {
         self.draw_agent(&usage::Snapshot::default());
         self.draw_directories();
         self.reload();
+        // Only when the pane changed host. Asking again costs `ssh -G`, which
+        // runs whatever the user's `Match exec` blocks run, and a `cd` is not a
+        // reason to run somebody's script.
+        if switched {
+            imp.host.replace(host.map(str::to_owned));
+            imp.link.replace(Link::default());
+            self.draw_connection();
+            self.reload_connection(true);
+        }
     }
 
     /// The timer's re-read: nothing above says when a build finishes or a
     /// server binds a port.
     pub fn poll(&self) {
         self.reload();
+
+        if self.imp().host.borrow().is_none() {
+            return;
+        }
+        // A window on another workspace is not being read, and a connection
+        // does not change because time passed.
+        if !self.window().is_some_and(|window| window.is_active()) {
+            return;
+        }
+        let due = self
+            .imp()
+            .checked
+            .get()
+            .is_none_or(|at| at.elapsed() >= CHECK_INTERVAL);
+        if due {
+            self.reload_connection(false);
+        }
     }
 
     fn reload(&self) {
@@ -447,7 +591,82 @@ impl TuniInfo {
         ));
     }
 
+    /// Asks about the pane's connection: where the alias goes, and whether a
+    /// shared connection to it is still answering.
+    ///
+    /// `resolved` says whether the address has to be worked out again. It costs
+    /// an `ssh -G`, which applies `Match`, `Include` and canonicalisation and
+    /// therefore runs the user's own `Match exec` commands, so it happens when
+    /// the pane changes host and when somebody asks for a refresh. Never on the
+    /// timer, which only asks who is answering.
+    fn reload_connection(&self, resolved: bool) {
+        let imp = self.imp();
+        let Some(host) = imp.host.borrow().clone() else {
+            return;
+        };
+        let known = (!resolved).then(|| imp.link.borrow().clone());
+        let generation = imp.generation.get();
+        imp.checked.set(Some(Instant::now()));
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let read = gio::spawn_blocking(move || {
+                    let mut link = known.unwrap_or_else(|| resolve(&host));
+                    // The master is not a child of this process, so how long it
+                    // has been up is a question for `/proc` rather than for
+                    // `ssh`, which reports only that it is there.
+                    link.uptime = crate::hosts::control()
+                        .check(&host)
+                        .and_then(tuni_core::info::age);
+                    link
+                })
+                .await;
+                let imp = this.imp();
+                let Ok(link) = read else { return };
+                if imp.generation.get() != generation || *imp.link.borrow() == link {
+                    return;
+                }
+                imp.link.replace(link);
+                this.draw_connection();
+            }
+        ));
+    }
+
     // --- drawing -----------------------------------------------------------
+
+    fn draw_connection(&self) {
+        let Some(section) = self.imp().connection.borrow().clone() else {
+            return;
+        };
+        let Some(host) = self.imp().host.borrow().clone() else {
+            section.container.set_visible(false);
+            return;
+        };
+        let link = self.imp().link.borrow().clone();
+
+        section.container.set_visible(true);
+        section.name.set_text(&host);
+        section.address.set_text(&link.address);
+        section.address.set_tooltip_text(Some(&link.address));
+        match link.uptime {
+            Some(seconds) => {
+                section.dot.set_icon_name(Some("media-record-symbolic"));
+                section
+                    .state
+                    .set_text(&format!("connected for {}", uptime_label(seconds)));
+            }
+            None => {
+                section.dot.set_icon_name(None);
+                // What was actually measured, and not "disconnected": a pane
+                // whose shell is perfectly alive has no master behind it when
+                // the configuration turns sharing off.
+                section.state.set_text("no shared connection");
+            }
+        }
+        section.jump.set_visible(!link.jump.is_empty());
+        section.jump.set_text(&format!("through {}", link.jump));
+    }
 
     fn draw_directories(&self) {
         let imp = self.imp();
@@ -798,6 +1017,7 @@ impl TuniInfo {
                 // to run even if the last read found nothing new.
                 this.imp().snapshot.replace(Snapshot::default());
                 this.reload();
+                this.reload_connection(true);
             }),
             entry("open-cwd", self, |this| {
                 let path = this.imp().cwd.borrow().clone();
@@ -926,6 +1146,42 @@ fn port_menu(port: u16) -> gio::Menu {
     menu
 }
 
+/// Where a destination actually goes, once `ssh` has applied everything it
+/// applies. Off the main thread: it reads the configuration and forks.
+///
+/// An address somebody typed is left alone. It carries its own user and port
+/// already, and its port travels as `-p` rather than in the name, so asking
+/// `ssh` about it would get an answer with the port missing from it.
+fn resolve(destination: &str) -> Link {
+    let host = ssh::host(destination);
+    let host = if host.source == Source::Adhoc {
+        host
+    } else {
+        ssh::resolve(&host.target()).unwrap_or(host)
+    };
+    Link {
+        address: host.address(),
+        jump: host.proxy_jump,
+        uptime: None,
+    }
+}
+
+/// How long a connection has been up, in the largest unit that still says
+/// something. A connection made in the last minute is new, and the number of
+/// seconds is not the interesting part of that.
+fn uptime_label(seconds: u64) -> String {
+    let (count, unit) = if seconds >= 86_400 {
+        (seconds / 86_400, "day")
+    } else if seconds >= 3_600 {
+        (seconds / 3_600, "hour")
+    } else if seconds >= 60 {
+        (seconds / 60, "minute")
+    } else {
+        return "less than a minute".to_owned();
+    };
+    format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
+}
+
 /// A token count short enough for a row. The exact figure is out of date a
 /// second after it is drawn, so thousands and millions are as far as it goes.
 fn tokens_label(count: u64) -> String {
@@ -978,4 +1234,17 @@ fn usage_text(process: &Process) -> String {
         format!("{} KB", process.memory_kb)
     };
     format!("{:.0}% · {memory}", process.cpu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_uptime_is_read_in_whichever_unit_it_is_worth_reading_in() {
+        assert_eq!(uptime_label(30), "less than a minute");
+        assert_eq!(uptime_label(90), "1 minute");
+        assert_eq!(uptime_label(7_200), "2 hours");
+        assert_eq!(uptime_label(200_000), "2 days");
+    }
 }

@@ -238,16 +238,44 @@ impl Control {
     /// Two subprocesses, so the caller belongs off the main thread.
     #[must_use]
     pub fn is_live(&self, destination: &str) -> bool {
+        run(&self.request(destination, "check")).is_ok()
+    }
+
+    /// The master answering for `destination`, by process id.
+    ///
+    /// `ssh -O check` prints `Master running (pid=12345)` on the error stream.
+    /// That number is the only way to learn when a connection was made: the
+    /// master is not tuni's child, and nothing in the protocol reports its own
+    /// age.
+    ///
+    /// Two subprocesses, so the caller belongs off the main thread.
+    #[must_use]
+    pub fn check(&self, destination: &str) -> Option<u32> {
+        let output = run(&self.request(destination, "check"));
+        if !output.is_ok() {
+            return None;
+        }
+        master_pid(&output.stderr)
+    }
+
+    /// `ssh -O <command> -- <destination>`, with the settings that decide which
+    /// socket it goes to in front of it. The shape of every request this file
+    /// makes of a master.
+    ///
+    /// Runs `ssh -G` by way of [`Self::options`], so the caller belongs off the
+    /// main thread.
+    fn request(&self, destination: &str, command: &str) -> Vec<String> {
         let mut args = Vec::new();
         for option in self.options(destination) {
             args.push("-o".to_owned());
             args.push(option);
         }
         args.push("-O".to_owned());
-        args.push("check".to_owned());
+        args.push(command.to_owned());
+        // `--` because a destination may begin with a dash.
         args.push("--".to_owned());
         args.push(destination.to_owned());
-        run(&args).code == 0
+        args
     }
 
     /// Hangs up the shared connection to `destination`, and with it every pane,
@@ -261,7 +289,7 @@ impl Control {
     /// Ending something that is not running is not a failure: there is no
     /// connection either way round.
     ///
-    /// Three subprocesses, so the caller belongs off the main thread.
+    /// Four subprocesses, so the caller belongs off the main thread.
     pub fn stop(&self, destination: &str) -> Result<(), String> {
         let Some((path, ours)) = self.socket(destination) else {
             return Ok(());
@@ -275,16 +303,7 @@ impl Control {
                  so tuni leaves it running"
             ));
         }
-        let mut args = Vec::new();
-        for option in self.options(destination) {
-            args.push("-o".to_owned());
-            args.push(option);
-        }
-        args.push("-O".to_owned());
-        args.push("exit".to_owned());
-        args.push("--".to_owned());
-        args.push(destination.to_owned());
-        let output = run(&args);
+        let output = run(&self.request(destination, "exit"));
         if output.is_ok() {
             return Ok(());
         }
@@ -1151,6 +1170,18 @@ fn described(options: &[String], destination: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The process id out of what a master answers an alive check with, which is
+/// `Master running (pid=12345)` and a carriage return.
+fn master_pid(text: &str) -> Option<u32> {
+    let digits: String = text
+        .split_once("pid=")?
+        .1
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
 /// Whether a name is the forty hex characters `%C` expands to, which is what
 /// tells a socket tuni asked for from anything else in the directory. OpenSSH
 /// binds a master to a name with a suffix on it and moves it into place once it
@@ -1968,6 +1999,12 @@ mod tests {
         // there and gives up at once, without touching the network.
         assert!(!Control::new(CONTROL_PERSIST, true).is_live("tuni-no-such-alias"));
         assert!(!Control::new(CONTROL_PERSIST, false).is_live("tuni-no-such-alias"));
+    }
+
+    #[test]
+    fn a_master_is_read_out_of_the_line_it_answers_a_check_with() {
+        assert_eq!(master_pid("Master running (pid=12345)\r\n"), Some(12345));
+        assert_eq!(master_pid("Control socket connect: No such file"), None);
     }
 
     #[test]

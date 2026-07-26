@@ -1139,7 +1139,24 @@ impl TuniWindow {
         let shell = self
             .active_terminal()
             .and_then(|terminal| terminal.shell_pid());
-        panel.sync(&root, &cwd, shell, automatic);
+        panel.sync(
+            &root,
+            &cwd,
+            shell,
+            automatic,
+            self.focused_host().as_deref(),
+        );
+    }
+
+    /// The host the pane holding the keyboard is connected to, and nothing for
+    /// a pane running on this machine, which is most of them.
+    fn focused_host(&self) -> Option<String> {
+        let (project, tab) = self.selected_tab()?;
+        let pane = self.focused_pane()?;
+        match self.pane_content(project, tab, pane)? {
+            Content::Ssh { alias } => Some(alias),
+            _ => None,
+        }
     }
 
     /// The timer's half of that: the root cannot have moved without something

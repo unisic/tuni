@@ -160,6 +160,19 @@ pub fn terminate(pid: u32, force: bool) {
     }
 }
 
+/// How long the process `pid` has been running, in seconds.
+///
+/// Nothing for a process that is not there, which is the answer that matters
+/// to the one caller: a shared connection whose master has gone is not a
+/// connection any more.
+#[must_use]
+pub fn age(pid: u32) -> Option<u64> {
+    let uptime = read_uptime(Path::new("/proc/uptime"))?;
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let started = parse_stat(&text)?.start_ticks as f64 / clock_ticks();
+    Some((uptime - started).max(0.0) as u64)
+}
+
 /// Every `/proc/<pid>/stat` the reader is allowed to see.
 fn read_stats(proc: &Path) -> HashMap<u32, Stat> {
     let Ok(entries) = std::fs::read_dir(proc) else {

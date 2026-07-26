@@ -1117,7 +1117,7 @@ fn answering(destinations: Vec<String>) -> HashSet<String> {
 
 /// The shared connections as this run is configured to keep them. Off the main
 /// thread, always: it reads the settings file.
-fn control() -> ssh::Control {
+pub(crate) fn control() -> ssh::Control {
     let settings = Settings::load();
     ssh::Control::new(settings.ssh_control_persist, settings.ssh_share_connections)
 }
