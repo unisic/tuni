@@ -111,6 +111,14 @@ pub struct Snapshot {
     /// version with more pages still opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel_page: Option<String>,
+    /// The width the sidebar was dragged to, if it was dragged at all. Absent
+    /// for a sidebar left at the default, which is a fraction of the window
+    /// rather than a width and so has nothing to remember.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<f64>,
+    /// The panel's own dragged width, on the same terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_width: Option<f64>,
 }
 
 fn one() -> f64 {
@@ -128,6 +136,8 @@ pub struct Restored {
     pub sidebar: Option<bool>,
     pub panel: Option<bool>,
     pub panel_page: Option<String>,
+    pub sidebar_width: Option<f64>,
+    pub panel_width: Option<f64>,
 }
 
 impl Snapshot {
@@ -160,6 +170,8 @@ impl Snapshot {
             sidebar: None,
             panel: None,
             panel_page: None,
+            sidebar_width: None,
+            panel_width: None,
         }
     }
 
@@ -215,6 +227,8 @@ impl Snapshot {
             sidebar: self.sidebar,
             panel: self.panel,
             panel_page: self.panel_page.clone(),
+            sidebar_width: self.sidebar_width,
+            panel_width: self.panel_width,
         }
     }
 

@@ -29,7 +29,10 @@ shell calls itself until you rename it, and a project directory can be pinned
 for the file tree and the git panel to stay on. A new tab starts where the
 visible one is, opens next to it, and closes when its last shell exits; a
 project whose tabs are all closed stays in the sidebar until it is closed on
-purpose.
+purpose. The sidebar and the panel are both dragged to a width by their inner
+edge, and one dragged to a width keeps it — until then each is a fraction of the
+window, which is what a split view sizes by and what an undragged one should go
+on doing.
 
 On the other side, a panel under `Ctrl+Shift+B` shows the directory the focused
 shell is working in, or the project's own if one is pinned, and follows it as
@@ -258,8 +261,8 @@ and a cached directory read costs nothing measurable. The panel redraws only
 when the rows actually differ, so most of those reads change nothing on screen.
 Deleting is `GFile.trash`, which is recoverable, and revealing a file goes
 through `GtkFileLauncher` so it reaches the portal in a sandbox and the session
-bus outside one. Whether the panel was showing, and which page it was on, is
-part of `session.json`.
+bus outside one. Whether the panel was showing, which page it was on, and how
+wide it was dragged are part of `session.json`.
 
 The repository is read by running `git`, not by linking a library, because the
 question the panel answers is what the command line would say — the same

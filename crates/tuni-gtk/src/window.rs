@@ -55,6 +55,20 @@ const PANEL_FRACTION: f64 = 0.22;
 const PANEL_MIN: i32 = 200;
 const PANEL_MAX: i32 = 240;
 
+/// Where a drag may take each of them instead. Wider on both ends than the
+/// defaults above, which are what a window nobody has dragged should open at:
+/// once someone has taken hold of the edge they have said what they want the
+/// width to be, and the only widths worth refusing are the ones that leave the
+/// sidebar unreadable or the work beside it too narrow to use.
+const SIDEBAR_DRAG_MIN: f64 = 140.0;
+const SIDEBAR_DRAG_MAX: f64 = 480.0;
+const PANEL_DRAG_MIN: f64 = 180.0;
+const PANEL_DRAG_MAX: f64 = 620.0;
+
+/// How much of a sidebar's inner edge takes the pointer. Narrow enough to read
+/// as an edge rather than a strip, wide enough to hit without aiming.
+const GRIP: i32 = 5;
+
 /// How often the panel re-reads the directories and the repository it is
 /// showing. kero's own interval, and for the same reason: a watch on every open
 /// directory is a descriptor per directory and a debounce to write, where a
@@ -526,7 +540,6 @@ impl TuniWindow {
             ));
         }
         let panel = adw::OverlaySplitView::builder()
-            .sidebar(&panel_view)
             .sidebar_position(gtk::PackType::End)
             .content(&content_overlay)
             .show_sidebar(false)
@@ -534,6 +547,7 @@ impl TuniWindow {
             .min_sidebar_width(f64::from(PANEL_MIN))
             .max_sidebar_width(f64::from(PANEL_MAX))
             .build();
+        add_sidebar_grip(&panel, &panel_view, PANEL_DRAG_MIN, PANEL_DRAG_MAX);
         show_files
             .bind_property("active", &panel, "show-sidebar")
             .bidirectional()
@@ -553,12 +567,12 @@ impl TuniWindow {
         content_view.set_content(Some(&panel));
 
         let split = adw::OverlaySplitView::builder()
-            .sidebar(&sidebar_view)
             .content(&content_view)
             .sidebar_width_fraction(SIDEBAR_FRACTION)
             .min_sidebar_width(f64::from(SIDEBAR_MIN))
             .max_sidebar_width(f64::from(SIDEBAR_MAX))
             .build();
+        add_sidebar_grip(&split, &sidebar_view, SIDEBAR_DRAG_MIN, SIDEBAR_DRAG_MAX);
         toggle
             .bind_property("active", &split, "show-sidebar")
             .bidirectional()
@@ -1082,6 +1096,8 @@ impl TuniWindow {
                 .as_ref()
                 .map(adw::OverlaySplitView::shows_sidebar);
             snapshot.panel_page = imp.panel_view.borrow().as_ref().map(TuniPanel::page);
+            snapshot.sidebar_width = imp.split.borrow().as_ref().and_then(pinned_width);
+            snapshot.panel_width = imp.panel.borrow().as_ref().and_then(pinned_width);
             snapshot
         };
 
@@ -1167,6 +1183,19 @@ impl TuniWindow {
             && let Some(panel) = imp.panel_view.borrow().as_ref()
         {
             panel.set_page(page);
+        }
+        // Already in the split's own unit, so it goes back the way it came out.
+        // Clamped anyway: the file is text on disk, and a width from a hand
+        // edited one is still a width the window has to live with.
+        if let Some(width) = restored.sidebar_width
+            && let Some(split) = imp.split.borrow().as_ref()
+        {
+            set_pinned_width(split, width.clamp(SIDEBAR_DRAG_MIN, SIDEBAR_DRAG_MAX));
+        }
+        if let Some(width) = restored.panel_width
+            && let Some(panel) = imp.panel.borrow().as_ref()
+        {
+            set_pinned_width(panel, width.clamp(PANEL_DRAG_MIN, PANEL_DRAG_MAX));
         }
 
         self.rebuild_sidebar();
@@ -3253,6 +3282,137 @@ fn tab_menu() -> gio::Menu {
     menu
 }
 
+/// Hands a split view its sidebar with a drag handle down the inner edge.
+///
+/// `AdwOverlaySplitView` has no divider to take hold of: the sidebar is a
+/// fraction of the window, clamped between a minimum and a maximum width, and
+/// that is the whole of it. The handle is the missing divider — a few pixels of
+/// the sidebar's inner edge that take the pointer — and dragging it pins the
+/// clamp shut at the width it lands on, so the sidebar keeps that width instead
+/// of going back to tracking the window.
+///
+/// `minimum` and `maximum` are read in the split's own width unit, the same as
+/// the clamp they are written into.
+fn add_sidebar_grip(
+    split: &adw::OverlaySplitView,
+    content: &impl IsA<gtk::Widget>,
+    minimum: f64,
+    maximum: f64,
+) {
+    let content = content.as_ref();
+    content.set_hexpand(true);
+
+    let grip = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    grip.set_size_request(GRIP, -1);
+    grip.add_css_class("tuni-sidebar-grip");
+    grip.set_cursor_from_name(Some("col-resize"));
+
+    // The handle belongs on the edge the content is on: after a sidebar packed
+    // before the content, before one packed after it. Said in packing order
+    // rather than in left and right, so a right-to-left desktop puts it on the
+    // other side without being asked.
+    let sidebar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    if split.sidebar_position() == gtk::PackType::Start {
+        sidebar.append(content);
+        sidebar.append(&grip);
+    } else {
+        sidebar.append(&grip);
+        sidebar.append(content);
+    }
+
+    // Where in the handle it was taken hold of, so the pointer keeps the same
+    // grip on it however far the drag goes.
+    let grabbed = std::rc::Rc::new(Cell::new(0.0_f64));
+    let drag = gtk::GestureDrag::new();
+    drag.connect_drag_begin(glib::clone!(
+        #[strong]
+        grabbed,
+        move |_, x, _| grabbed.set(x)
+    ));
+    drag.connect_drag_update(glib::clone!(
+        #[strong]
+        grabbed,
+        #[weak]
+        split,
+        #[weak]
+        grip,
+        move |gesture, _, _| {
+            // Where the pointer is, rather than how far it has come from where
+            // the drag began: the handle travels with the edge it is resizing,
+            // so an offset is measured against a start point that has moved out
+            // from under it, and a drag on one stalls after a pixel.
+            let Some((x, _)) = gesture.point(None) else {
+                return;
+            };
+            // Where the handle starts, which is where the pointer is less the
+            // part of the handle it is holding.
+            let Some(point) = grip.compute_point(
+                &split,
+                &gtk::graphene::Point::new((x - grabbed.get()) as f32, 0.0),
+            ) else {
+                return;
+            };
+            // That edge is the width, measured from whichever side of the split
+            // the sidebar is against.
+            let edge = f64::from(point.x());
+            let width = if sidebar_on_left(&split) {
+                edge + f64::from(grip.width())
+            } else {
+                f64::from(split.width()) - edge
+            };
+            pin_sidebar(&split, width, minimum, maximum);
+        }
+    ));
+    grip.add_controller(drag);
+
+    split.set_sidebar(Some(&sidebar));
+}
+
+/// Whether a split view's sidebar is the one on the left of the screen, which
+/// is what its packing says until a right-to-left desktop says otherwise.
+fn sidebar_on_left(split: &adw::OverlaySplitView) -> bool {
+    (split.sidebar_position() == gtk::PackType::Start)
+        != (split.direction() == gtk::TextDirection::Rtl)
+}
+
+/// Fixes a split view's sidebar at `pixels` wide, whatever the window does
+/// next.
+///
+/// A width that is at least the minimum and at most the maximum can only be the
+/// one width when the two ends of the clamp meet, so shutting the clamp is how
+/// a fraction of the window becomes a width. The clamp is read in the split's
+/// own unit — scalable pixels, so a desktop set to larger text gets a
+/// proportionally wider sidebar — where a drag is measured in real ones, which
+/// is what the conversion is for.
+fn pin_sidebar(split: &adw::OverlaySplitView, pixels: f64, minimum: f64, maximum: f64) {
+    let unit = split.sidebar_width_unit();
+    let settings = split.settings();
+    let width = unit.from_px(pixels, Some(&settings));
+    // Never past half the window: a sidebar is beside the work rather than
+    // instead of it, and a clamp is obeyed whether or not there is room for it.
+    let room = unit
+        .from_px(f64::from(split.width()) / 2.0, Some(&settings))
+        .max(minimum);
+    set_pinned_width(split, width.clamp(minimum, maximum.min(room)));
+}
+
+/// Shuts a split view's clamp on one width, in the split's own unit.
+fn set_pinned_width(split: &adw::OverlaySplitView, width: f64) {
+    split.set_min_sidebar_width(width);
+    split.set_max_sidebar_width(width);
+}
+
+/// The width a sidebar was dragged to, or `None` for one still sizing itself
+/// off the window.
+///
+/// A dragged sidebar is the one whose clamp has been shut, and a shut clamp is
+/// the one whose minimum has caught up with its maximum — every default here
+/// leaves daylight between the two.
+fn pinned_width(split: &adw::OverlaySplitView) -> Option<f64> {
+    let width = split.max_sidebar_width();
+    (split.min_sidebar_width() >= width).then_some(width)
+}
+
 /// Tuni's own styling, as opposed to the theme's. Loaded once.
 fn load_css() {
     thread_local! {
@@ -3273,6 +3433,10 @@ fn load_css() {
              .tuni-pane.ringed:hover > .tuni-grip { opacity: 0.35; \
               background-image: radial-gradient(circle, currentColor 1px, transparent 1px); \
               background-size: 4px 4px; }\n\
+             /* Invisible until it is pointed at, like the edge of a window:\n\
+                the sidebar already has a border there, and a second line\n\
+                drawn over it would only say the same thing twice. */\n\
+             .tuni-sidebar-grip:hover { background-color: alpha(@accent_color, 0.5); }\n\
              .tuni-drop { background-color: alpha(@accent_color, 0.28); border-radius: 6px; }\n\
              .tuni-switcher { border-radius: 26px; padding: 8px; }\n\
              .tuni-switch-card { padding: 9px 9px 14px 9px; border-radius: 16px; }\n\
