@@ -173,6 +173,75 @@ pub fn age(pid: u32) -> Option<u64> {
     Some((uptime - started).max(0.0) as u64)
 }
 
+/// Every TCP port anything on this machine is listening on.
+///
+/// Two file reads whatever the question was, which is what makes it the right
+/// shape for a list of forwards: one read answers for all of them, and asking
+/// the far end would have meant a round trip a piece.
+#[must_use]
+pub fn listening_ports() -> HashSet<u16> {
+    let mut ports = HashSet::new();
+    for family in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(text) = std::fs::read_to_string(family) {
+            ports.extend(parse_listening(&text).into_values());
+        }
+    }
+    ports
+}
+
+/// What is listening on `port`, by process id and the name to call it.
+///
+/// Every process this user can see rather than one shell's descendants,
+/// because whatever is holding a port a forward wanted has usually nothing to
+/// do with the pane the forward was asked for in. That means a walk of every
+/// open descriptor in `/proc`, so it belongs on the path where a bind has
+/// already failed and not on any timer.
+///
+/// Nothing for a port held by another user: `/proc` shows the socket in
+/// `net/tcp` and then refuses the descriptor that would name the process.
+#[must_use]
+pub fn listener(port: u16) -> Option<(u32, String)> {
+    let proc = Path::new("/proc");
+    let mut inodes = HashSet::new();
+    for family in ["net/tcp", "net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(proc.join(family)) else {
+            continue;
+        };
+        inodes.extend(
+            parse_listening(&text)
+                .into_iter()
+                .filter(|(_, listening)| *listening == port)
+                .map(|(inode, _)| inode),
+        );
+    }
+    if inodes.is_empty() {
+        return None;
+    }
+
+    let stats = read_stats(proc);
+    // The lowest process id of the ones holding it, which for a server that
+    // forked its workers is the parent somebody would go and stop.
+    let mut holders: Vec<u32> = stats
+        .keys()
+        .copied()
+        .filter(|pid| {
+            socket_inodes(proc, *pid)
+                .iter()
+                .any(|inode| inodes.contains(inode))
+        })
+        .collect();
+    holders.sort_unstable();
+    let pid = *holders.first()?;
+    let name = executable(proc, pid)
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .or_else(|| stats.get(&pid).map(|stat| stat.comm.clone()))
+        .unwrap_or_else(|| "?".to_owned());
+    Some((pid, name))
+}
+
 /// Every `/proc/<pid>/stat` the reader is allowed to see.
 fn read_stats(proc: &Path) -> HashMap<u32, Stat> {
     let Ok(entries) = std::fs::read_dir(proc) else {

@@ -238,7 +238,7 @@ impl Control {
     /// Two subprocesses, so the caller belongs off the main thread.
     #[must_use]
     pub fn is_live(&self, destination: &str) -> bool {
-        run(&self.request(destination, "check")).is_ok()
+        run(&self.request(destination, "check", None)).is_ok()
     }
 
     /// The master answering for `destination`, by process id.
@@ -251,11 +251,49 @@ impl Control {
     /// Two subprocesses, so the caller belongs off the main thread.
     #[must_use]
     pub fn check(&self, destination: &str) -> Option<u32> {
-        let output = run(&self.request(destination, "check"));
+        let output = run(&self.request(destination, "check", None));
         if !output.is_ok() {
             return None;
         }
         master_pid(&output.stderr)
+    }
+
+    /// Asks the master carrying `destination` to open `forward`.
+    ///
+    /// The port that ended up listening, which is `forward.listen_port` except
+    /// for a remote forward asking the far end to pick one: there the number
+    /// comes back in `Allocated port 34567 for remote forward`, and that line is
+    /// the only confirmation the protocol offers for a remote forward at all.
+    ///
+    /// Fails when no master is answering. Opening a connection first is the
+    /// caller's, because a connection may want a password and this cannot ask
+    /// for one.
+    ///
+    /// Four subprocesses, so the caller belongs off the main thread.
+    pub fn add(&self, destination: &str, forward: &Forward) -> Result<u16, String> {
+        let output = run(&self.request(destination, "forward", Some(forward)));
+        if !output.is_ok() {
+            return Err(output.message(&format!("{} would not open", forward.title())));
+        }
+        Ok(allocated_port(&output.stdout)
+            .or_else(|| allocated_port(&output.stderr))
+            .unwrap_or(forward.listen_port))
+    }
+
+    /// Closes a forward the master is carrying.
+    ///
+    /// The spec has to arrive spelled the way it was sent, since the master
+    /// matches it as text: a `localhost` helpfully turned into `127.0.0.1` on
+    /// the way through matches nothing and the forward stays up. Both go
+    /// through [`Forward::spec`], so both say the same thing.
+    ///
+    /// Four subprocesses, so the caller belongs off the main thread.
+    pub fn cancel(&self, destination: &str, forward: &Forward) -> Result<(), String> {
+        let output = run(&self.request(destination, "cancel", Some(forward)));
+        if output.is_ok() {
+            return Ok(());
+        }
+        Err(output.message(&format!("{} would not close", forward.title())))
     }
 
     /// `ssh -O <command> -- <destination>`, with the settings that decide which
@@ -264,7 +302,7 @@ impl Control {
     ///
     /// Runs `ssh -G` by way of [`Self::options`], so the caller belongs off the
     /// main thread.
-    fn request(&self, destination: &str, command: &str) -> Vec<String> {
+    fn request(&self, destination: &str, command: &str, forward: Option<&Forward>) -> Vec<String> {
         let mut args = Vec::new();
         for option in self.options(destination) {
             args.push("-o".to_owned());
@@ -272,6 +310,10 @@ impl Control {
         }
         args.push("-O".to_owned());
         args.push(command.to_owned());
+        if let Some(forward) = forward {
+            args.push(forward.direction.flag().to_owned());
+            args.push(forward.spec());
+        }
         // `--` because a destination may begin with a dash.
         args.push("--".to_owned());
         args.push(destination.to_owned());
@@ -303,7 +345,7 @@ impl Control {
                  so tuni leaves it running"
             ));
         }
-        let output = run(&self.request(destination, "exit"));
+        let output = run(&self.request(destination, "exit", None));
         if output.is_ok() {
             return Ok(());
         }
@@ -425,7 +467,8 @@ pub struct Origin {
 }
 
 /// Which way a forwarded port points.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Direction {
     /// `-L`: a port here, reached through the far end.
     #[default]
@@ -458,21 +501,38 @@ impl Direction {
 }
 
 /// One forwarded port.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Forward {
+    #[serde(default)]
     pub direction: Direction,
     /// What is listened on. Empty means localhost for `Local` and `Dynamic`,
     /// and whatever `GatewayPorts` says for `Remote`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bind: String,
     /// Zero asks the far end to allocate one, which only `Remote` can do.
+    #[serde(default)]
     pub listen_port: u16,
     /// Empty for `Dynamic`, which has no far end until something connects.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host: String,
+    #[serde(default)]
     pub port: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
 }
 
 impl Forward {
+    /// What to call it in a sentence: the name somebody gave it, and otherwise
+    /// the flag and argument they would have typed themselves.
+    #[must_use]
+    pub fn title(&self) -> String {
+        if self.label.is_empty() {
+            format!("{} {}", self.direction.flag(), self.spec())
+        } else {
+            self.label.clone()
+        }
+    }
+
     /// The argument that follows the flag: `8080:localhost:80`, `1080`.
     #[must_use]
     pub fn spec(&self) -> String {
@@ -734,6 +794,12 @@ pub struct Meta {
     pub last_used: Option<u64>,
     #[serde(default, skip_serializing_if = "never_used")]
     pub uses: u32,
+    /// The forwards tuni opens and closes on a connection that is already up.
+    /// The ones a `Host` carries are a different thing: those are lines in a
+    /// configuration file, `ssh` brings them up with the connection, and there
+    /// is nothing here to start or stop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<Forward>,
 }
 
 fn never_used(count: &u32) -> bool {
@@ -1168,6 +1234,59 @@ fn described(options: &[String], destination: &str) -> Vec<(String, String)> {
         .filter_map(|line| line.split_once(' '))
         .map(|(keyword, value)| (keyword.to_owned(), value.to_owned()))
         .collect()
+}
+
+/// Whether the local side of `forward` is free, and what is on it when it is
+/// not.
+///
+/// Only the forwards that listen on this machine. A remote forward listens at
+/// the far end, where nothing here can look, and the master's own answer is all
+/// there is.
+///
+/// This is a race and it is written as one: the socket is bound and dropped
+/// again, and something else can take the port between that and the master's
+/// own bind. The real error path stays where it is. What this buys is a
+/// sentence a person can act on, because the mux client's own version of it is
+/// `Error: remote port forwarding failed` with no port and no process in it.
+pub fn check_port(forward: &Forward) -> Result<(), String> {
+    use std::net::TcpListener;
+
+    if forward.direction == Direction::Remote || forward.listen_port == 0 {
+        return Ok(());
+    }
+    let bind = forward.bind.trim_matches(['[', ']'].as_slice());
+    let bind = if bind.is_empty() { "127.0.0.1" } else { bind };
+    let port = forward.listen_port;
+    let error = match TcpListener::bind((bind, port)) {
+        Ok(_) => return Ok(()),
+        Err(error) => error,
+    };
+    match error.kind() {
+        std::io::ErrorKind::AddrInUse => Err(match crate::info::listener(port) {
+            Some((pid, process)) => {
+                format!("Port {port} is already in use: {process} (pid {pid}) is listening on it")
+            }
+            // Another user's process, which `/proc` does not let this one see
+            // through to a name.
+            None => format!("Port {port} is already in use by another program"),
+        }),
+        std::io::ErrorKind::PermissionDenied => Err(format!(
+            "Port {port} is one of the first 1024, which only the system may listen on"
+        )),
+        _ => Err(format!("Nothing can listen on {bind}:{port}: {error}")),
+    }
+}
+
+/// The port a remote forward was actually given, out of `Allocated port 34567
+/// for remote forward to localhost:5432`.
+fn allocated_port(text: &str) -> Option<u16> {
+    let digits: String = text
+        .split_once("Allocated port ")?
+        .1
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// The process id out of what a master answers an alive check with, which is
@@ -1999,6 +2118,72 @@ mod tests {
         // there and gives up at once, without touching the network.
         assert!(!Control::new(CONTROL_PERSIST, true).is_live("tuni-no-such-alias"));
         assert!(!Control::new(CONTROL_PERSIST, false).is_live("tuni-no-such-alias"));
+    }
+
+    #[test]
+    fn a_forward_tuni_opens_survives_being_written_down() {
+        let mut notes = Notes::default();
+        notes.set(
+            "web",
+            Meta {
+                forwards: vec![
+                    Forward::parse(Direction::Local, "8080:localhost:80").expect("local"),
+                    Forward::parse(Direction::Dynamic, "1080").expect("dynamic"),
+                ],
+                ..Meta::default()
+            },
+        );
+        let text = serde_json::to_string(&notes).expect("write");
+        let read: Notes = serde_json::from_str(&text).expect("read");
+        let forwards = read.get("web").forwards;
+        assert_eq!(forwards[0].spec(), "8080:localhost:80");
+        assert_eq!(forwards[1].direction, Direction::Dynamic);
+        assert_eq!(forwards[1].spec(), "1080");
+    }
+
+    #[test]
+    fn a_port_somebody_else_is_listening_on_is_refused_by_name() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = held.local_addr().expect("address").port();
+        let taken = Forward {
+            direction: Direction::Local,
+            listen_port: port,
+            host: "localhost".to_owned(),
+            port: 80,
+            ..Forward::default()
+        };
+        // This process is the one holding it, so the message has to name this
+        // process: that naming is the whole point of checking first.
+        let refused = check_port(&taken).expect_err("in use");
+        assert!(
+            refused.contains(&format!("Port {port} is already in use")),
+            "{refused}"
+        );
+        assert!(
+            refused.contains(&format!("(pid {})", std::process::id())),
+            "{refused}"
+        );
+
+        // The far end's ports are the far end's business, and a forward that
+        // asks for whichever port is free cannot be checked at all.
+        drop(held);
+        assert!(check_port(&taken).is_ok());
+        assert!(
+            check_port(&Forward {
+                direction: Direction::Remote,
+                ..taken
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_remote_forward_reports_the_port_it_was_given() {
+        assert_eq!(
+            allocated_port("Allocated port 34567 for remote forward to localhost:5432\n"),
+            Some(34567)
+        );
+        assert_eq!(allocated_port("Master running (pid=12345)"), None);
     }
 
     #[test]
