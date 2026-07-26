@@ -296,8 +296,10 @@ impl TuniInfo {
         container.set_margin_end(12);
         container.set_visible(false);
         container.set_tooltip_text(Some(
-            "Read from the agent's own session logs. Nothing here is asked of \
-             an account: no login, no key, and no request leaves this machine.",
+            "Read from the agent's own session logs, except the plan bars: \
+             Codex writes its own into the log, and Claude Code's are asked \
+             of the account's usage page with the login the agent already \
+             keeps. Nothing here signs in anywhere.",
         ));
         container.append(&heading);
         container.append(&list);
@@ -534,20 +536,6 @@ impl TuniInfo {
             Some(&breakdown(usage.session)),
             None,
         ));
-        if let Some(recent) = usage.recent.filter(|recent| recent.total() > 0) {
-            let row = self.agent_row(
-                "Last 5 hours",
-                &tokens_label(recent.total()),
-                Some(&breakdown(recent)),
-                None,
-            );
-            row.set_tooltip_text(Some(
-                "Everything the agent spent in the last five hours, in every \
-                 directory it worked in. Its own limits are counted over a \
-                 window like this one, which a single pane is never the whole of.",
-            ));
-            section.list.append(&row);
-        }
         if let Some(context) = usage.context {
             let row = self.agent_row(
                 "Context",

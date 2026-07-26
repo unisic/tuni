@@ -68,14 +68,19 @@ the page is showing and no more often than that.
 
 When a coding agent is running under that shell, the page grows an Agent section
 for it. Claude Code, Codex and OpenCode each keep a record of their own turns on
-disk, and that is where every figure comes from: what the session working in this
+disk, and that is where the figures come from: what the session working in this
 directory has spent, split into fresh input, output and what came back from the
 cache, which is most of a long conversation and costs a fraction of the rest.
-Codex says how full the model's context is and how much of each plan window is
-gone, so those get a bar apiece; Claude Code's limits are counted over five hours
-across every directory it worked in, so that total is a row of its own. Tokens,
-never prices. And no account is asked anything: no login, no key, nothing over
-the network.
+Above the tokens sit the plan's own windows, a bar per window with how much of
+it is gone and when it starts over, which is the reason to look: the
+alternative is a browser tab. Codex writes those percentages into its log along with how
+full the model's context is; Claude Code's log does not carry them, so they are
+asked of the account's usage endpoint, the numbers its own usage page shows,
+with the login the agent already keeps on disk, at most once a minute, only
+while the agent runs. That request is the one exception to everything staying
+on this machine, it goes to the same place the agent itself talks to, and it
+carries nothing that was not already in `~/.claude`. Tokens and percentages,
+never prices, and nothing here signs in anywhere.
 
 A pane holds a file as readily as it holds a shell. Opening one from either page
 puts it where a terminal would have gone — syntax highlighting for whatever

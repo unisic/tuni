@@ -2,8 +2,11 @@
 //!
 //! Claude Code, Codex and OpenCode each keep a record of their own turns on
 //! disk: the first two a JSONL log per session, the third a SQLite database.
-//! Every number here comes from those files, so nothing in this module needs a
-//! login, a stored token, or the network.
+//! Tokens come from those files, and so do Codex's plan bars, which it writes
+//! into its own log. Claude Code's plan is the one thing its log does not
+//! carry, so those bars are asked of the account's usage endpoint, the same
+//! numbers its website shows, with the login the agent already keeps on disk.
+//! Nothing here signs in, and nothing but that one request leaves the machine.
 //!
 //! The logs are appended to and the panel polls, so a [`Reader`] remembers how
 //! far into each file it read and what that came to. A session log runs to tens
@@ -12,8 +15,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -21,8 +25,10 @@ use serde::Deserialize;
 use crate::info::Process;
 use crate::settings::home;
 
-/// The window Claude Code's own usage is counted over, in seconds.
-const WINDOW: i64 = 5 * 60 * 60;
+/// How long an answer from the plan endpoint keeps being the answer, in
+/// seconds. The bars move slowly and the panel polls often; a failure is held
+/// just as long, so being offline costs one attempt a minute.
+const PLAN_FRESH: i64 = 60;
 
 /// How many session logs are opened looking for the one that belongs to a
 /// directory. Codex writes them a day at a time and the newest are the ones a
@@ -131,11 +137,8 @@ pub struct Snapshot {
     pub model: Option<String>,
     /// The session running in this directory.
     pub session: Tokens,
-    /// Everything the agent spent in the last five hours, wherever it was
-    /// working. Claude Code's own limits are counted over a window like this
-    /// one, and one pane is never the whole of it.
-    pub recent: Option<Tokens>,
     pub context: Option<Fill>,
+    /// The plan's windows, each a share used. The account's, not the pane's.
     pub limits: Vec<Limit>,
 }
 
@@ -144,10 +147,7 @@ impl Snapshot {
     /// has a log with no turns in it yet.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.session.total() == 0
-            && self.recent.is_none_or(|recent| recent.total() == 0)
-            && self.context.is_none()
-            && self.limits.is_empty()
+        self.session.total() == 0 && self.context.is_none() && self.limits.is_empty()
     }
 }
 
@@ -155,6 +155,16 @@ impl Snapshot {
 #[derive(Debug, Default)]
 pub struct Reader {
     logs: HashMap<PathBuf, Tail>,
+    /// The last word from Claude Code's plan endpoint and when it arrived,
+    /// because a request a minute is plenty for bars that move by the hour.
+    plan: Option<Plan>,
+}
+
+/// A fetched reading of the plan, held until it is stale.
+#[derive(Debug)]
+struct Plan {
+    at: i64,
+    limits: Vec<Limit>,
 }
 
 /// What a log has said so far, and how much of it has been read. Which fields
@@ -168,28 +178,11 @@ struct Tail {
     model: Option<String>,
     /// The directory the session was started in, for the logs that say.
     directory: Option<PathBuf>,
-    /// One entry per turn, kept only as long as the rolling window needs it.
-    turns: Vec<(i64, Tokens)>,
     /// Turns already counted, so a line the agent wrote twice is not paid for
     /// twice.
     seen: HashSet<String>,
     context: Option<Fill>,
     limits: Vec<Limit>,
-}
-
-impl Tail {
-    /// What the turns inside the window come to.
-    fn since(&self, cutoff: i64) -> Tokens {
-        let mut tokens = Tokens::default();
-        for (_, turn) in self.turns.iter().filter(|(at, _)| *at >= cutoff) {
-            tokens.add(*turn);
-        }
-        tokens
-    }
-
-    fn forget_before(&mut self, cutoff: i64) {
-        self.turns.retain(|(at, _)| *at >= cutoff);
-    }
 }
 
 impl Reader {
@@ -218,21 +211,33 @@ impl Reader {
             snapshot.model.clone_from(&tail.model);
         }
 
-        // The window is the account's, not the pane's, so every log the agent
-        // has touched inside it counts. Only those can hold a turn that recent,
-        // which is what makes this a handful of files rather than the thousand
-        // a year of sessions leaves behind.
-        let cutoff = now() - WINDOW;
-        let mut recent = Tokens::default();
-        for log in touched_since(&root, cutoff) {
-            recent.add(self.claude_tail(&log).since(cutoff));
-        }
-        snapshot.recent = Some(recent);
+        snapshot.limits = self.claude_plan();
         snapshot
     }
 
+    /// The plan's windows, the way the account's own usage page draws them,
+    /// cached so the answer is asked for at most once a minute. The one thing
+    /// the log cannot say, since the plan is spent by every session at once.
+    fn claude_plan(&mut self) -> Vec<Limit> {
+        let at = now();
+        if let Some(plan) = &self.plan
+            && at - plan.at < PLAN_FRESH
+        {
+            return plan.limits.clone();
+        }
+        // A failed ask keeps the previous answer on the bars: percentages a
+        // minute or two old are still the picture, and the sky being out is no
+        // reason to blank the panel.
+        let limits = fetch_plan().or_else(|| self.plan.take().map(|plan| plan.limits));
+        let limits = limits.unwrap_or_default();
+        self.plan = Some(Plan {
+            at,
+            limits: limits.clone(),
+        });
+        limits
+    }
+
     fn claude_tail(&mut self, log: &Path) -> &Tail {
-        let cutoff = now() - WINDOW;
         let tail = self.logs.entry(log.to_path_buf()).or_default();
         read_lines(log, tail, |tail, line| {
             let Ok(entry) = serde_json::from_str::<ClaudeLine>(line) else {
@@ -261,16 +266,12 @@ impl Reader {
                 cache_write: usage.cache_creation_input_tokens,
             };
             tail.tokens.add(tokens);
-            if let Some(at) = unix_time(&entry.timestamp) {
-                tail.turns.push((at, tokens));
-            }
             // The last model to answer is the one the session is on: a session
             // that changed models mid-way is on the one it changed to.
             if message.model.is_some() {
                 tail.model = message.model;
             }
         });
-        tail.forget_before(cutoff);
         tail
     }
 
@@ -471,19 +472,81 @@ fn newest_first(root: &Path) -> Vec<PathBuf> {
     logs.into_iter().map(|(_, path)| path).collect()
 }
 
-/// Every log under a tree written since `cutoff`. A file older than that cannot
-/// hold a turn newer than that.
-fn touched_since(root: &Path, cutoff: i64) -> Vec<PathBuf> {
-    walk(root)
-        .into_iter()
-        .filter(|path| {
-            path.metadata()
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-                .is_some_and(|since| since.as_secs() as i64 >= cutoff)
+/// Asks the account's usage endpoint how full the plan's windows are, with the
+/// login Claude Code keeps in `~/.claude/.credentials.json`. This is the one
+/// request the module sends anywhere, it goes to the same place the agent
+/// itself talks to, and it carries nothing but the token that was already
+/// there. The token rides in on stdin, where `/proc` cannot read it off the
+/// argument list the way it could a flag.
+fn fetch_plan() -> Option<Vec<Limit>> {
+    let credentials = home().join(".claude/.credentials.json");
+    let credentials = std::fs::read_to_string(credentials).ok()?;
+    let oauth = serde_json::from_str::<Credentials>(&credentials)
+        .ok()?
+        .claude_ai_oauth;
+    // An expired token would only buy a 401: the agent refreshes it while it
+    // runs, and the bars are only drawn while it runs.
+    if oauth.expires_at <= now().saturating_mul(1000) {
+        return None;
+    }
+
+    let mut curl = Command::new("curl")
+        .args([
+            "-sf",
+            "--max-time",
+            "4",
+            "-H",
+            "@-",
+            "-H",
+            "anthropic-beta: oauth-2025-04-20",
+            "https://api.anthropic.com/api/oauth/usage",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    curl.stdin
+        .take()?
+        .write_all(format!("Authorization: Bearer {}\n", oauth.access_token).as_bytes())
+        .ok()?;
+    let output = curl.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(plan_limits(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// The endpoint's windows, in the order the usage page lists them.
+fn plan_limits(json: &str) -> Vec<Limit> {
+    let Ok(usage) = serde_json::from_str::<PlanUsage>(json) else {
+        return Vec::new();
+    };
+    [
+        (usage.five_hour, "5 hours"),
+        (usage.seven_day, "7 days"),
+        (usage.seven_day_opus, "7 days (Opus)"),
+        (usage.seven_day_sonnet, "7 days (Sonnet)"),
+    ]
+    .into_iter()
+    .filter_map(|(window, label)| {
+        let window = window?;
+        Some(Limit {
+            window: label.to_owned(),
+            used_percent: window.utilization?,
+            resets_at: window.resets_at.as_ref().and_then(reset_time),
         })
-        .collect()
+    })
+    .collect()
+}
+
+/// When a window starts over, however the endpoint said it: a timestamp
+/// written out, or seconds already counted.
+fn reset_time(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::String(text) => unix_time(text),
+        other => other.as_i64(),
+    }
 }
 
 /// Every `.jsonl` file under a directory, however deep. Both agents file their
@@ -592,8 +655,6 @@ pub fn window_label(minutes: u64) -> String {
 
 #[derive(Deserialize)]
 struct ClaudeLine {
-    #[serde(default)]
-    timestamp: String,
     #[serde(default, rename = "requestId")]
     request_id: Option<String>,
     #[serde(default)]
@@ -682,6 +743,44 @@ struct CodexWindow {
 #[derive(Deserialize)]
 struct OpenCodeModel {
     id: String,
+}
+
+/// The file Claude Code keeps its login in.
+#[derive(Deserialize)]
+struct Credentials {
+    #[serde(rename = "claudeAiOauth")]
+    claude_ai_oauth: Oauth,
+}
+
+#[derive(Deserialize)]
+struct Oauth {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+    /// In milliseconds, the way JavaScript keeps a moment.
+    #[serde(default, rename = "expiresAt")]
+    expires_at: i64,
+}
+
+/// What the plan endpoint answers: a reading per window, some of them absent
+/// on plans that do not have them.
+#[derive(Default, Deserialize)]
+struct PlanUsage {
+    #[serde(default)]
+    five_hour: Option<PlanWindow>,
+    #[serde(default)]
+    seven_day: Option<PlanWindow>,
+    #[serde(default)]
+    seven_day_opus: Option<PlanWindow>,
+    #[serde(default)]
+    seven_day_sonnet: Option<PlanWindow>,
+}
+
+#[derive(Deserialize)]
+struct PlanWindow {
+    #[serde(default)]
+    utilization: Option<f64>,
+    #[serde(default)]
+    resets_at: Option<serde_json::Value>,
 }
 
 impl CodexWindow {
@@ -788,6 +887,33 @@ mod tests {
         assert_eq!(reader.claude_tail(&log).tokens.output, 5, "same turn twice");
 
         std::fs::remove_dir_all(&directory).expect("clean up");
+    }
+
+    #[test]
+    fn the_plan_answer_becomes_bars_in_the_pages_order() {
+        let limits = plan_limits(
+            r#"{"five_hour":{"utilization":12.5,"resets_at":"2026-07-26T15:00:00Z"},
+                "seven_day":{"utilization":61.0,"resets_at":1785069161},
+                "seven_day_opus":{"utilization":null},
+                "seven_day_sonnet":null}"#,
+        );
+        assert_eq!(
+            limits,
+            vec![
+                Limit {
+                    window: "5 hours".to_owned(),
+                    used_percent: 12.5,
+                    resets_at: Some(1_785_078_000),
+                },
+                Limit {
+                    window: "7 days".to_owned(),
+                    used_percent: 61.0,
+                    resets_at: Some(1_785_069_161),
+                },
+            ],
+            "a window without a reading is not a bar"
+        );
+        assert!(plan_limits("not json").is_empty());
     }
 
     #[test]
