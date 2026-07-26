@@ -14,7 +14,7 @@ bindir = $(DESTDIR)$(PREFIX)/bin
 datadir = $(DESTDIR)$(PREFIX)/share
 icondir = $(datadir)/icons/hicolor
 
-.PHONY: all build install uninstall check dist clean
+.PHONY: all build install install-data uninstall check dist clean
 
 all: build
 
@@ -23,8 +23,15 @@ build:
 
 # Themes are baked into the binary at build time, so an installed Tuni needs
 # nothing beside the executable but its desktop integration.
-install: build
+install: build install-data
 	install -Dm755 target/release/tuni $(bindir)/tuni
+
+# The window names its icon rather than carrying one, so a Tuni run straight
+# out of the build directory shows the desktop's fallback icon until the entry
+# and the icon are somewhere the compositor looks:
+#
+#   make install-data PREFIX=$$HOME/.local
+install-data:
 	install -Dm644 data/$(APP_ID).desktop $(datadir)/applications/$(APP_ID).desktop
 	install -Dm644 data/$(APP_ID).metainfo.xml $(datadir)/metainfo/$(APP_ID).metainfo.xml
 	install -Dm644 data/icons/hicolor/scalable/apps/$(APP_ID).svg \
