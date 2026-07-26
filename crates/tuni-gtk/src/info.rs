@@ -522,8 +522,19 @@ impl TuniInfo {
         content.append(&process);
         content.append(&open);
 
-        let row = gtk::ListBoxRow::builder().child(&content).build();
+        // The whole row opens it, not only the button on the end: the port is
+        // the link, and kero's row is a button for the same reason.
+        let row = gtk::ListBoxRow::builder()
+            .child(&content)
+            .activatable(true)
+            .build();
         row.set_tooltip_text(Some(&port.url()));
+        let target = port.url();
+        row.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.open_url(&target)
+        ));
         self.attach_menu(&row, port.pid, port.port, "");
         row
     }
