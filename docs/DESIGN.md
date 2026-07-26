@@ -108,6 +108,27 @@ either way it is a patch handed to `git apply`, so the index ends up where the
 command line would have left it. What the shell beside the pane does to the file
 lands in the diff on its own.
 
+A pane holds a machine that is not this one just as readily. `Ctrl+Shift+O`
+opens the host list: everything `~/.ssh/config` declares and everything added
+in tuni, in one list, narrowed by the same typing the palette answers to, with
+Enter connecting in this pane, `Ctrl+Enter` in a split beside it, and
+`Shift+Enter` in a tab of its own. A dot says which machines are answering.
+Setting `new-tab` to `hosts` makes that list what `Ctrl+Shift+T` opens, for
+people who connect more often than they start a shell here.
+
+None of the connecting is tuni's own work. Opening a host runs `ssh` in the
+pane, so every prompt an authentication can raise, the unknown-host question
+included, is asked in a terminal and answered there, and tuni sees no password
+and no passphrase at any point. Panes on one host go through a single
+authenticated connection, so a second tab costs no second login, and the Info
+page says which host a pane is on, what its name resolves to, and how long that
+shared connection has been up. Hosts added here go in a file of tuni's own; a
+host declared in `~/.ssh/config` is read, listed and connected to but never
+rewritten, and editing one opens that file at the line that declares it, in an
+editor pane. A session that ends leaves its last screen where it is with a
+Reconnect button over it, rather than closing the pane, since a connection that
+dropped has usually just said why.
+
 Three ways to get somewhere. `Ctrl+Shift+F` opens a find bar over the terminal:
 every match on screen and in the scrollback is highlighted as you type, the
 tally counts them, and Enter walks forward while Shift+Enter walks back,
@@ -155,7 +176,8 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+Alt+=` | Give every pane the same room |
 | Drag a pane's grip onto another | Move it to that pane's left, right, top, or bottom |
 | Drag the gap between panes | Move the divider |
-| `Ctrl+Shift+T` | New tab |
+| `Ctrl+Shift+T` | New tab: a shell, or the host list when `new-tab` says so |
+| `Ctrl+Shift+O` | The host list, in a tab of its own, whichever that setting says |
 | `Ctrl+Page Down` / `Ctrl+Page Up` | Next tab, previous tab |
 | Hold `Ctrl`, press `Tab` | The tab switcher: cards for every tab, most recently used first. `Shift+Tab` walks back, `Escape` cancels, letting `Ctrl` go switches |
 | `Alt+1` … `Alt+9` | Jump to a tab; `Alt+9` is the last one |
@@ -373,6 +395,93 @@ and then says how much it left. The pane re-reads on the same two-second timer
 as the panel, so a change made by the shell beside it appears without asking,
 and a read that comes back byte-for-byte identical is dropped rather than
 redrawn, which is what keeps the scroll position under someone reading.
+
+The SSH client drives OpenSSH instead of speaking the protocol, for the reason
+the git panel runs `git`: what tuni shows has to be what the command line would
+do. So what an alias means is a question for `ssh -G`, which prints the
+configuration a real connection would use with `Match`, `Include`, wildcard
+blocks and canonicalisation already applied. Tuni's own reader of
+`~/.ssh/config` therefore only enumerates the names a list can show; it never
+has to agree with ssh about what one of them resolves to. One caveat has teeth:
+`ssh -G` runs the user's `Match exec` commands, so it is asked when a host is
+opened, edited or looked at, and never on a timer or for a whole list at once.
+
+Connecting is `ssh` running in a pane, and that is the design rather than an
+implementation detail. Everything an authentication can involve is interactive:
+a password, a passphrase, a push notification, a touch on a hardware key, the
+question about an unknown host's key, a password that expired this morning. A
+terminal is the one thing in this window that answers an interactive prompt
+correctly, and it already exists. So tuni holds no secret because it never
+receives one, and there is nothing to leak, sync or store. The alternative,
+watching a hidden pty for output that looks prompt-shaped and popping a text
+field over it, is a keylogger with a guess in front of it: it cannot tell a
+password prompt from a banner, and it would put the password in tuni's address
+space, which is the one place this feature is built to keep it out of.
+Everything tuni runs that is not a pane carries `BatchMode=yes`, the same
+sentence as the git panel's `GIT_TERMINAL_PROMPT=0`, plus
+`SSH_ASKPASS_REQUIRE=never` so an askpass inherited from the environment cannot
+open a dialog out of a background process.
+
+Panes on one host share one connection, since a second tab asking for a second
+2FA code is what makes a client tiring. That is OpenSSH multiplexing, and the
+master is not tuni's child: it is the first pane's own `ssh`, left running by
+`ControlPersist` for everything after it to attach to. The socket goes under
+`$XDG_RUNTIME_DIR/tuni/ssh`, which is tmpfs, 0700 and emptied at logout, so a
+socket left by a killed master cannot outlive the machine's uptime;
+`~/.cache/tuni/ssh` is the fallback, and it is the whole reason startup sweeps
+for sockets nothing answers on. Sharing is arranged with the shortest set of
+options that makes it work, because every option tuni adds overrides one
+somebody set on purpose, and a host whose own configuration already sets
+`ControlPath` gets none of them at all: overriding a working `ControlMaster`
+would put tuni's connection and the `ssh prod` typed in the next pane on two
+separate logins. The exception on merit is `ServerAliveInterval`, without which
+a suspended laptop's connection hangs for the kernel's retransmit timeout,
+about fifteen minutes, and every pane on that host reads as frozen rather than
+disconnected.
+
+What the connection outlives is the part worth knowing. `ControlPersist` means
+the master is still there after the pane closed, so the last window out hangs
+up every master tuni started, on the way through the close and on that thread,
+because a thread detached there dies with the process. The ones the user's own
+configuration owns are never hung up, since a session tuni knows nothing about
+may be sitting in one. A `SIGKILL` leaves up to `ssh-control-persist` seconds
+of connection behind, which is bounded and swept at the next start; a cleanup
+handler that cannot run would not have done better. Inside a Flatpak the
+sandbox has an `$XDG_RUNTIME_DIR` of its own, so those sockets are invisible to
+an `ssh` typed outside it, and the sharing stops at the sandbox boundary.
+
+Tuni owns one file and writes one line into another. The line is an `Include`
+of `~/.config/tuni/ssh/hosts.conf`, placed at the top because ssh keeps the
+first value it obtains for a keyword and an early `Host *` block would swallow
+an include appended to the end, and `~/.ssh/config` is copied to
+`config.tuni-backup` before it is ever touched. There is no setting for
+whether tuni may write it: without that line the hosts tuni saves would be
+invisible to the `ssh` it runs, so the switch would only be a switch for
+half-breaking the feature, and a backup plus one self-explaining line is the
+better answer. `hosts.conf` is rewritten whole from the model, at 0600 from the
+moment it exists, and a host declared in the user's own file is read, listed and
+connected to but never rewritten: that file has includes, first-value-wins
+ordering and comments people rely on, it is frequently a symlink into a
+dotfiles repository, and a terminal that reformats it loses trust once and
+permanently. Two guards sit in front of the rename. The new file is put to
+`ssh -F` first, which exits 255 on a keyword it does not know and touches no
+network, because a broken include breaks ssh for every script on the machine.
+And a value that could start a line of its own is refused rather than written,
+since our file is included into theirs and a newline inside a value is an
+arbitrary keyword, `ProxyCommand` among them. What ssh syntax cannot express,
+a label, tags, when a host was last opened, lives in
+`~/.config/tuni/ssh/meta.json` keyed by alias, which is what lets a hand-written
+host carry them without tuni putting a byte in the file that declares it.
+
+An SSH library was the obvious alternative and it is ruled out by the same
+constraint everything else here follows. `russh` and `libssh2` bring their own
+authentication, so keys, passphrases and keyboard-interactive answers would
+land in this process, which is precisely what running `ssh` avoids. They also
+carry their own reading of `ssh_config`, `known_hosts`, the agent protocol and
+`ProxyJump`, each of them subtly different from the `ssh` in the pane beside
+them, so an alias could resolve to one machine in the window and another on the
+command line. And they cannot attach to a `ControlMaster`, which is what the
+rest of this is built on.
 
 Ghostty's theme catalog is vendored under `data/themes` and baked into the
 binary at build time, so a fresh checkout runs with all 574 and a packaged

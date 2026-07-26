@@ -17,11 +17,21 @@ A native terminal workspace for Linux.
 - File tree, git panel, and a session inspector: processes and listening ports
 - Source editor and a hunk-staging diff viewer, in panes beside the shells
 - Command palette, tab switcher, find in whatever pane has the keyboard
-- SSH from the palette: the hosts in `~/.ssh/config`, opened by OpenSSH itself,
-  so tuni never holds a password or a passphrase
+- A host list over the hosts `~/.ssh/config` already declares, one shared
+  connection per machine, and no password or passphrase held anywhere in tuni
 - Kitty graphics, OSC 8 hyperlinks, desktop notifications, progress bars
 - Ghostty's 574 themes, which paint the window chrome as well as the terminal
 - The window comes back as it was left
+
+Connecting to another machine is OpenSSH's job here, not tuni's. A host opens by
+running `ssh` in a pane, so `~/.ssh/config` still means what it always meant,
+the question about an unknown host's key is asked in a terminal, and a
+password, a passphrase, a hardware key or a 2FA push is answered where it has
+always been answered. Tuni stores no secret and has nowhere to put one: keys,
+`ssh-agent` and the desktop's keyring already do that job. It is also why hosts
+will never sync to a cloud account: syncing a credential means storing one.
+Panes on one machine share a single authenticated connection, so the second tab
+does not ask again.
 
 Tuni is a ground-up Linux implementation of the workspace
 [egoist/kero](https://github.com/egoist/kero) built for macOS. Kero's Swift
