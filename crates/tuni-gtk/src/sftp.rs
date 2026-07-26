@@ -157,13 +157,16 @@ impl TuniSftp {
             .build();
         up.add_css_class("flat");
 
-        let send = gtk::Button::builder()
-            .icon_name("document-send-symbolic")
-            .tooltip_text("Upload a File Here")
-            .action_name("sftp.upload-here")
+        let here = gio::Menu::new();
+        here.append(Some("Upload File Here…"), Some("sftp.upload-here"));
+        here.append(Some("New Folder…"), Some("sftp.new-folder-here"));
+        let more = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("More")
+            .menu_model(&here)
             .valign(gtk::Align::Center)
             .build();
-        send.add_css_class("flat");
+        more.add_css_class("flat");
 
         let refresh = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
@@ -180,7 +183,7 @@ impl TuniSftp {
         header.set_margin_bottom(8);
         header.append(&names);
         header.append(&up);
-        header.append(&send);
+        header.append(&more);
         header.append(&refresh);
 
         let progress = gtk::ProgressBar::builder()
@@ -372,6 +375,28 @@ impl TuniSftp {
             entry("upload-here", self, |sftp| {
                 let root = sftp.imp().tree.borrow().root().to_path_buf();
                 sftp.upload(&root);
+            }),
+            entry("new-folder", self, |sftp| {
+                let target = sftp.imp().target.borrow().clone();
+                if let Some(item) = target.filter(|item| item.is_directory) {
+                    sftp.new_folder(&item.path);
+                }
+            }),
+            entry("new-folder-here", self, |sftp| {
+                let root = sftp.imp().tree.borrow().root().to_path_buf();
+                sftp.new_folder(&root);
+            }),
+            entry("rename", self, |sftp| {
+                let target = sftp.imp().target.borrow().clone();
+                if let Some(item) = target {
+                    sftp.rename(&item);
+                }
+            }),
+            entry("delete", self, |sftp| {
+                let target = sftp.imp().target.borrow().clone();
+                if let Some(item) = target {
+                    sftp.delete(&item);
+                }
             }),
             entry("copy-path", self, |sftp| {
                 if let Some(item) = sftp.imp().target.borrow().as_ref() {
@@ -718,6 +743,146 @@ impl TuniSftp {
         ));
     }
 
+    // --- changing them --------------------------------------------------------
+
+    /// Makes a directory inside another one.
+    fn new_folder(&self, directory: &Path) {
+        let directory = directory.to_path_buf();
+        self.ask(
+            "New Folder",
+            &format!("Inside “{}”", directory.to_string_lossy()),
+            "",
+            "Create",
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |name: String| {
+                    let Some(path) = this.named(&directory, &name) else {
+                        return;
+                    };
+                    // Opened when it lands, so the thing that was just made is
+                    // visible rather than inside a folder nobody opened.
+                    this.change(directory.clone(), true, move |session| session.mkdir(&path));
+                }
+            ),
+        );
+    }
+
+    /// Gives one file or directory another name in the same directory.
+    fn rename(&self, item: &Item) {
+        let Some(directory) = item.path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let from = item.path.to_string_lossy().into_owned();
+        let current = item.name.clone();
+        self.ask(
+            "Rename",
+            &format!("“{}”", item.name),
+            &item.name,
+            "Rename",
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |name: String| {
+                    if name.trim() == current {
+                        return;
+                    }
+                    let Some(to) = this.named(&directory, &name) else {
+                        return;
+                    };
+                    let from = from.clone();
+                    this.change(directory.clone(), false, move |session| {
+                        session.rename(&from, &to)
+                    });
+                }
+            ),
+        );
+    }
+
+    /// Deletes one file, or one directory that has nothing in it.
+    fn delete(&self, item: &Item) {
+        let Some(directory) = item.path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let path = item.path.to_string_lossy().into_owned();
+        let is_directory = item.is_directory;
+        let body = if is_directory {
+            "There is no trash on the other machine, so this is gone for good. A \
+             directory with anything in it is refused."
+        } else {
+            "There is no trash on the other machine, so this is gone for good."
+        };
+        let dialog = adw::AlertDialog::new(Some(&format!("Delete “{}”?", item.name)), Some(body));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("delete", "Delete");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(
+            None,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_, response| {
+                    if response != "delete" {
+                        return;
+                    }
+                    let path = path.clone();
+                    this.change(directory.clone(), false, move |session| {
+                        if is_directory {
+                            session.rmdir(&path)
+                        } else {
+                            session.remove(&path)
+                        }
+                    });
+                }
+            ),
+        );
+        dialog.present(Some(self));
+    }
+
+    /// Runs one change at the far end and reads the directory it happened in,
+    /// since nothing over there will say what changed.
+    fn change<F>(&self, directory: PathBuf, expand: bool, apply: F)
+    where
+        F: FnOnce(&mut Session) -> Option<()> + Send + 'static,
+    {
+        let Some(link) = self.imp().link.borrow().clone() else {
+            return;
+        };
+        let generation = self.imp().generation.get();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let Ok(done) = gio::spawn_blocking(move || {
+                    let Ok(mut session) = link.lock() else {
+                        return Err(Failure {
+                            message: String::from("The connection ended."),
+                            detail: String::from("Nothing is holding it open any more."),
+                        });
+                    };
+                    apply(&mut session).ok_or_else(|| failed(&session))
+                })
+                .await
+                else {
+                    return;
+                };
+                if generation != this.imp().generation.get() {
+                    return;
+                }
+                match done {
+                    Ok(()) => {
+                        // The cached listing is a directory ago, and `list`
+                        // writes over it with what is there now.
+                        this.list(directory, expand);
+                    }
+                    Err(failure) => this.report(&failure),
+                }
+            }
+        ));
+    }
+
     /// Draws a transfer while it runs: a local timer over two numbers, not a
     /// poll of anything on the other machine.
     fn watch(&self, label: &str) {
@@ -814,22 +979,80 @@ impl TuniSftp {
         }
         imp.target.replace(Some(item.clone()));
         let model = gio::Menu::new();
+        let move_files = gio::Menu::new();
         // Left off entirely while a transfer runs rather than shown and
         // refused: one pipe carries one file at a time.
         if imp.moving.borrow().is_none() {
             if item.is_directory {
-                model.append(Some("Upload File Here…"), Some("sftp.upload"));
+                move_files.append(Some("Upload File Here…"), Some("sftp.upload"));
             } else {
-                model.append(Some("Download…"), Some("sftp.download"));
+                move_files.append(Some("Download…"), Some("sftp.download"));
             }
         }
-        model.append(Some("Copy Path"), Some("sftp.copy-path"));
+        if item.is_directory {
+            move_files.append(Some("New Folder…"), Some("sftp.new-folder"));
+        }
+        move_files.append(Some("Copy Path"), Some("sftp.copy-path"));
+        model.append_section(None, &move_files);
+
+        let edit = gio::Menu::new();
+        edit.append(Some("Rename…"), Some("sftp.rename"));
+        edit.append(Some("Delete…"), Some("sftp.delete"));
+        model.append_section(None, &edit);
         menu.set_menu_model(Some(&model));
 
         let point = widget
             .compute_point(&list, &gtk::graphene::Point::new(x as f32, y as f32))
             .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
         crate::menu::popup_at(&menu, point);
+    }
+
+    /// A name typed into a dialog, joined onto the directory it belongs in.
+    ///
+    /// Nothing at all for an empty name, which is what an untouched field
+    /// means, and a complaint for a name that would put the thing somewhere
+    /// else: neither dialog offered that, and the far end would do it.
+    fn named(&self, directory: &Path, name: &str) -> Option<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        if name.contains('/') || name == "." || name == ".." {
+            self.report(&Failure {
+                message: format!("Couldn't use “{name}”."),
+                detail: String::from("A name can't contain “/” or be “.” or “..”."),
+            });
+            return None;
+        }
+        Some(directory.join(name).to_string_lossy().into_owned())
+    }
+
+    /// One name, asked for the way the local tree asks for one.
+    fn ask(
+        &self,
+        heading: &str,
+        body: &str,
+        current: &str,
+        confirm: &str,
+        apply: impl Fn(String) + 'static,
+    ) {
+        let entry = gtk::Entry::builder()
+            .text(current)
+            .activates_default(true)
+            .build();
+        let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+        dialog.set_extra_child(Some(&entry));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("confirm", confirm);
+        dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("confirm"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, move |_, response| {
+            if response == "confirm" {
+                apply(entry.text().to_string());
+            }
+        });
+        dialog.present(Some(self));
     }
 
     /// What went wrong, in the two lines whatever failed wrote it in.

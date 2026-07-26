@@ -42,8 +42,12 @@ const READ: u8 = 5;
 const WRITE: u8 = 6;
 const OPENDIR: u8 = 11;
 const READDIR: u8 = 12;
+const REMOVE: u8 = 13;
+const MKDIR: u8 = 14;
+const RMDIR: u8 = 15;
 const REALPATH: u8 = 16;
 const STAT: u8 = 17;
+const RENAME: u8 = 18;
 const LSTAT: u8 = 7;
 const CLOSE: u8 = 4;
 
@@ -275,10 +279,102 @@ impl Session {
         done
     }
 
+    /// Makes one directory, which the far end refuses if it is already there.
+    pub fn mkdir(&mut self, path: &str) -> Option<()> {
+        let mut request = encode_string(path);
+        // No attributes, so the directory gets the mode the server's umask
+        // gives it, the same as one made by a shell over there.
+        request.extend_from_slice(&0_u32.to_be_bytes());
+        if self.settle(MKDIR, &request, "make", path).is_some() {
+            return Some(());
+        }
+        if self.probe(|session| session.lstat(path)).is_some() {
+            self.because("There is already something there with that name.");
+        }
+        None
+    }
+
+    /// Deletes one file. There is no trash at the far end and nothing here
+    /// invents one.
+    pub fn remove(&mut self, path: &str) -> Option<()> {
+        if self
+            .settle(REMOVE, &encode_string(path), "delete", path)
+            .is_some()
+        {
+            return Some(());
+        }
+        if self
+            .probe(|session| session.lstat(path))
+            .is_some_and(|entry| entry.is_directory)
+        {
+            self.because("That is a directory, not a file.");
+        }
+        None
+    }
+
+    /// Deletes one directory, which the far end refuses unless it is empty.
+    pub fn rmdir(&mut self, path: &str) -> Option<()> {
+        if self
+            .settle(RMDIR, &encode_string(path), "delete", path)
+            .is_some()
+        {
+            return Some(());
+        }
+        if self
+            .probe(|session| session.list(path))
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            self.because("It still has something in it, and only an empty directory can go.");
+        }
+        None
+    }
+
+    /// Renames one path to another.
+    ///
+    /// Version 3 leaves it to the server whether an existing name is replaced,
+    /// and OpenSSH's refuses, which is the behaviour worth having: a rename
+    /// cannot quietly delete something.
+    pub fn rename(&mut self, from: &str, to: &str) -> Option<()> {
+        let mut request = encode_string(from);
+        request.extend_from_slice(&encode_string(to));
+        self.settle(RENAME, &request, "rename", from)
+    }
+
     /// Why the last call failed, in the two parts a dialog wants.
     #[must_use]
     pub fn failure(&self) -> Option<&Failure> {
         self.failure.as_ref()
+    }
+
+    /// Asks the far end one more question with the failure that prompted it
+    /// kept, since every call here writes over that.
+    fn probe<T>(&mut self, ask: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        let failure = self.failure.take();
+        let answer = ask(self);
+        self.failure = failure;
+        answer
+    }
+
+    /// Says why a refusal happened, once something has been asked that knows.
+    ///
+    /// Version 3 has no status code for "it is already there" or "it is not
+    /// empty": both arrive as the same bare failure. One extra round trip on
+    /// the failure path buys the sentence a person can act on.
+    fn because(&mut self, detail: &str) {
+        if let Some(failure) = self.failure.as_mut() {
+            failure.detail = detail.to_owned();
+        }
+    }
+
+    /// One request whose whole answer is whether it worked.
+    fn settle(&mut self, kind: u8, request: &[u8], verb: &str, path: &str) -> Option<()> {
+        let id = self.request(kind, request)?;
+        let (reply, body) = self.reply(id)?;
+        if reply != REPLY_STATUS || Reader::new(&body).u32() != Some(OK) {
+            self.blame(reply, &body, verb, path);
+            return None;
+        }
+        Some(())
     }
 
     fn attributes(&mut self, kind: u8, path: &str) -> Option<Entry> {
@@ -532,7 +628,11 @@ impl Session {
         let message = reader
             .string()
             .map(|text| String::from_utf8_lossy(&text).into_owned())
-            .filter(|text| !text.is_empty());
+            .filter(|text| !text.is_empty())
+            // OpenSSH's server sends the status code's own name as the message,
+            // so the general one says nothing the code did not. Dropping it
+            // leaves room for a sentence.
+            .filter(|text| !text.eq_ignore_ascii_case("failure"));
         let detail = match code {
             NO_SUCH_FILE => "There is nothing there.".to_owned(),
             PERMISSION_DENIED => {
@@ -853,6 +953,75 @@ mod tests {
             "The account this connection logged in as may not write it."
         );
         let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn a_rename_names_both_paths_in_the_order_the_protocol_reads_them() {
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_STATUS, body(1, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+        assert_eq!(session.rename("/srv/old.txt", "/srv/new.txt"), Some(()));
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        assert_eq!(asked[1].0, RENAME);
+        let mut reader = Reader::new(&asked[1].1);
+        reader.u32().expect("the request id");
+        assert_eq!(reader.string().as_deref(), Some(&b"/srv/old.txt"[..]));
+        assert_eq!(reader.string().as_deref(), Some(&b"/srv/new.txt"[..]));
+    }
+
+    #[test]
+    fn a_directory_the_far_end_will_not_delete_says_what_it_said() {
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let mut status = 4_u32.to_be_bytes().to_vec();
+        status.extend_from_slice(&encode_string("Directory not empty"));
+        let (mut session, _far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_STATUS, body(1, &status)),
+        ]);
+        assert!(session.handshake());
+        assert!(session.rmdir("/srv/logs").is_none());
+
+        let failure = session.failure().expect("a reason");
+        assert_eq!(failure.message, "Couldn't delete /srv/logs.");
+        assert_eq!(failure.detail, "Directory not empty");
+    }
+
+    #[test]
+    fn a_name_that_is_taken_is_named_as_taken_rather_than_as_a_failure() {
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        // What OpenSSH's server answers with, which is the code's own name and
+        // nothing a person can act on.
+        let mut status = 4_u32.to_be_bytes().to_vec();
+        status.extend_from_slice(&encode_string("Failure"));
+        let mut attributes = PERMISSIONS.to_be_bytes().to_vec();
+        attributes.extend_from_slice(&(DIRECTORY | 0o755).to_be_bytes());
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_STATUS, body(1, &status)),
+            (REPLY_ATTRS, body(2, &attributes)),
+        ]);
+        assert!(session.handshake());
+        assert!(session.mkdir("/srv/logs").is_none());
+
+        let failure = session.failure().expect("a reason");
+        assert_eq!(failure.message, "Couldn't make /srv/logs.");
+        assert_eq!(
+            failure.detail,
+            "There is already something there with that name."
+        );
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        assert_eq!(asked[1].0, MKDIR);
+        assert_eq!(asked[2].0, LSTAT);
     }
 
     #[test]

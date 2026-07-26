@@ -559,6 +559,19 @@ can be in the air at once and that is a later commit. Until then a second
 transfer is refused rather than queued, because one pipe carries one file and a
 request waiting behind a lock has nothing on screen to say so.
 
+Making a directory, renaming and deleting are the rest of it. Deleting asks
+first, and the question says that there is no trash on the other machine, since
+nothing here can put one there and a dialog that implies otherwise is a lie a
+person only finds out about once. A directory goes only when it is empty, which
+is the far end's rule and not this one's. Every change re-reads the directory it
+happened in, because nothing over there will say what changed. What version 3
+will not say is why it refused: OpenSSH's server answers a name that is taken and
+a directory that is not empty with the same bare failure, whose text is the word
+"Failure". So a refusal spends one more round trip asking the question the code
+should have answered, and the dialog says that something is already there with
+that name, or that the directory still has something in it, rather than repeating
+the far end's least useful word. That costs nothing until something goes wrong.
+
 sshfs would have been free: mount the host, and every page in this window works
 on it unchanged, the editor and the git panel included. It is the worst idea
 available. The panel polls on the main thread, so each tick becomes a round trip
