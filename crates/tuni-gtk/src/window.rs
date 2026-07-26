@@ -23,12 +23,14 @@ use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
 
-use tuni_core::TerminalConfig;
 use tuni_core::panes::{Edge, Layout, Pane};
+use tuni_core::session::{History, Snapshot};
+use tuni_core::settings::{Appearance, HISTORY_LINE_LIMIT, Settings};
 use tuni_core::theme::Theme;
 use tuni_core::workspace::{Id, Tab, Workspace};
 
 use crate::grid::{Message, TuniGrid};
+use crate::preferences;
 use crate::terminal::TuniTerminal;
 
 /// Sidebar width, and the range a narrow or a wide window may take it to.
@@ -37,7 +39,7 @@ const SIDEBAR_MIN: i32 = 180;
 const SIDEBAR_MAX: i32 = 400;
 
 mod imp {
-    use super::{Cell, HashMap, Id, RefCell, TerminalConfig, TuniGrid, TuniTerminal, Workspace, glib};
+    use super::{Cell, HashMap, Id, RefCell, Settings, TuniGrid, TuniTerminal, Workspace, glib};
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
 
@@ -52,7 +54,10 @@ mod imp {
         pub pages: RefCell<HashMap<Id, adw::TabPage>>,
         /// One tab strip per project, by project id.
         pub views: RefCell<HashMap<Id, adw::TabView>>,
-        pub config: RefCell<TerminalConfig>,
+        pub settings: RefCell<Settings>,
+        /// Scrollback waiting for the shell it belongs to, by pane id. Emptied
+        /// one pane at a time as the restored shells start.
+        pub pending_history: RefCell<HashMap<Id, String>>,
 
         pub split: RefCell<Option<adw::OverlaySplitView>>,
         pub sidebar: RefCell<Option<gtk::ListBox>>,
@@ -105,6 +110,10 @@ mod imp {
 
     impl WindowImpl for TuniWindow {
         fn close_request(&self) -> glib::Propagation {
+            // Written before the shells are hung up: the scrollback is read out
+            // of the live terminals, and a terminal that has been shut down has
+            // nothing left to read.
+            self.obj().save_session();
             // Hang up every shell before the widgets go, so the closing window
             // does not race the reader threads.
             for terminal in self.terminals.borrow().values() {
@@ -127,13 +136,13 @@ glib::wrapper! {
 
 impl TuniWindow {
     #[must_use]
-    pub fn new(app: &adw::Application, config: TerminalConfig) -> Self {
+    pub fn new(app: &adw::Application, settings: Settings) -> Self {
         let window: Self = glib::Object::builder()
             .property("application", app)
             .property("default-width", 1100)
             .property("default-height", 700)
             .build();
-        window.imp().config.replace(config);
+        window.imp().settings.replace(settings);
         window
     }
 
@@ -204,6 +213,14 @@ impl TuniWindow {
             .title_widget(&title)
             .build();
         header.pack_start(&toggle);
+
+        let menu = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .tooltip_text("Main Menu")
+            .menu_model(&main_menu())
+            .primary(true)
+            .build();
+        header.pack_end(&menu);
 
         let stack = gtk::Stack::new();
         stack.set_hexpand(true);
@@ -380,6 +397,7 @@ impl TuniWindow {
                     project.custom_directory = None;
                 }
             }),
+            entry("settings", None, |window, _| window.show_preferences()),
             entry("toggle-sidebar", None, |window, _| {
                 if let Some(split) = window.imp().split.borrow().as_ref() {
                     split.set_show_sidebar(!split.shows_sidebar());
@@ -424,7 +442,7 @@ impl TuniWindow {
             #[weak(rename_to = this)]
             self,
             move |style: &adw::StyleManager| {
-                let theme = this.imp().config.borrow().theme(style.is_dark());
+                let theme = this.imp().settings.borrow().terminal.theme(style.is_dark());
                 for terminal in this.imp().terminals.borrow().values() {
                     terminal.set_theme(&theme);
                 }
@@ -438,18 +456,175 @@ impl TuniWindow {
     /// The colors this run's terminals are painted with.
     fn theme(&self) -> Theme {
         self.imp()
-            .config
+            .settings
             .borrow()
+            .terminal
             .theme(adw::StyleManager::default().is_dark())
+    }
+
+    // --- settings ----------------------------------------------------------
+
+    /// Takes the edited settings: writes them, repaints every terminal, and
+    /// tells the desktop which appearance was asked for.
+    ///
+    /// Everything is applied to the terminals that are already open rather than
+    /// only to the next one, which is the difference between a settings window
+    /// and a configuration file.
+    pub(crate) fn settings(&self) -> Settings {
+        self.imp().settings.borrow().clone()
+    }
+
+    pub(crate) fn apply_settings(&self, settings: Settings) {
+        let imp = self.imp();
+        imp.settings.replace(settings.clone());
+        apply_appearance(settings.appearance);
+
+        let theme = self.theme();
+        for terminal in imp.terminals.borrow().values() {
+            terminal.set_config(&settings.terminal);
+            terminal.set_theme(&theme);
+        }
+        apply_chrome(&theme);
+
+        // Turning history off should not leave the last session's output on
+        // disk waiting for the setting to be turned back on.
+        if !settings.restore_history {
+            History::forget();
+        }
+        if let Err(error) = settings.save() {
+            eprintln!("cannot save settings: {error}");
+        }
+    }
+
+    fn show_preferences(&self) {
+        preferences::present(self, &self.imp().settings.borrow().clone());
+    }
+
+    // --- the session ------------------------------------------------------
+
+    /// Writes the window's shape, and the scrollback if that was asked for.
+    ///
+    /// Runs while the window is closing, so it does the least it can: a
+    /// snapshot of the model, one pass over the live terminals, two files.
+    fn save_session(&self) {
+        if !session_enabled() {
+            return;
+        }
+        let imp = self.imp();
+        let keep_history = imp.settings.borrow().restore_history;
+        let terminals = imp.terminals.borrow();
+        let history = RefCell::new(History::default());
+
+        let snapshot = {
+            let workspace = imp.workspace.borrow();
+            let mut snapshot = Snapshot::of(&workspace, |pane| {
+                if !keep_history {
+                    return None;
+                }
+                let text = terminals.get(&pane)?.history(HISTORY_LINE_LIMIT)?;
+                // Unique within one saved session, which is all a key has to
+                // be: the file is rewritten whole, so nothing older survives to
+                // collide with.
+                let key = format!("pane-{}", pane.raw());
+                history.borrow_mut().insert(key.clone(), text);
+                Some(key)
+            });
+            snapshot.sidebar = imp.split.borrow().as_ref().map(adw::OverlaySplitView::shows_sidebar);
+            snapshot
+        };
+
+        if let Err(error) = snapshot.save() {
+            eprintln!("cannot save session: {error}");
+        }
+        if let Err(error) = history.borrow().save() {
+            eprintln!("cannot save terminal history: {error}");
+        }
+    }
+
+    /// Rebuilds the last session's window. `false` when there is nothing saved
+    /// to rebuild, which is the caller's cue to open a first project instead.
+    pub fn restore_session(&self) -> bool {
+        let Some(restored) = Snapshot::load().map(|snapshot| snapshot.restore()) else {
+            return false;
+        };
+        if restored.workspace.is_empty() {
+            return false;
+        }
+        let imp = self.imp();
+
+        if imp.settings.borrow().restore_history && !restored.histories.is_empty() {
+            let history = History::load();
+            if !history.is_empty() {
+                let mut pending = imp.pending_history.borrow_mut();
+                for (pane, key) in &restored.histories {
+                    if let Some(text) = history.get(key) {
+                        pending.insert(*pane, text.to_owned());
+                    }
+                }
+            }
+        }
+
+        // Read out before the model is handed over, so nothing below holds a
+        // borrow of it while the widgets are being built.
+        let selected = restored.workspace.selected_id();
+        let plan: Vec<(Id, Vec<Id>, Option<Id>)> = restored
+            .workspace
+            .projects()
+            .iter()
+            .map(|project| {
+                (
+                    project.id(),
+                    project.tabs().iter().map(Tab::id).collect(),
+                    project.selected_id(),
+                )
+            })
+            .collect();
+        imp.workspace.replace(restored.workspace);
+
+        for (project, tabs, chosen) in plan {
+            self.attach_project(project);
+            for (position, tab) in tabs.iter().enumerate() {
+                self.attach_tab(project, *tab, position as i32);
+            }
+            // Inserting pages moved the selection along with them; put it back
+            // where the session left it.
+            let view = imp.views.borrow().get(&project).cloned();
+            let page = chosen.and_then(|tab| imp.pages.borrow().get(&tab).cloned());
+            if let (Some(view), Some(page)) = (view, page) {
+                view.set_selected_page(&page);
+            }
+        }
+
+        if let Some(id) = selected {
+            imp.workspace.borrow_mut().select(id);
+        }
+        if let Some(show) = restored.sidebar
+            && let Some(split) = imp.split.borrow().as_ref()
+        {
+            split.set_show_sidebar(show);
+        }
+
+        self.rebuild_sidebar();
+        self.show_selected_project();
+        true
     }
 
     // --- projects ----------------------------------------------------------
 
     /// Opens a project with one terminal in it, and shows it.
     pub fn open_project(&self) -> Id {
-        let imp = self.imp();
-        let id = imp.workspace.borrow_mut().open_project();
+        let id = self.imp().workspace.borrow_mut().open_project();
+        self.attach_project(id);
+        self.rebuild_sidebar();
+        self.show_selected_project();
+        self.open_tab(id);
+        id
+    }
 
+    /// Builds the tab strip for a project the model already holds — the half of
+    /// opening one that a restored session needs too.
+    fn attach_project(&self, id: Id) {
+        let imp = self.imp();
         let view = adw::TabView::new();
         view.set_menu_model(Some(&tab_menu()));
         view.connect_setup_menu(glib::clone!(
@@ -485,11 +660,6 @@ impl TuniWindow {
         if let Some(stack) = imp.stack.borrow().as_ref() {
             stack.add_named(&view, Some(&id.raw().to_string()));
         }
-
-        self.rebuild_sidebar();
-        self.show_selected_project();
-        self.open_tab(id);
-        id
     }
 
     /// Closes a project and every shell in it. The sidebar falls to the
@@ -562,11 +732,8 @@ impl TuniWindow {
             return;
         };
 
-        let cwd = self.directory_for_new_shell(project);
         let tab = Tab::new();
         let tab_id = tab.id();
-        let pane = tab.layout().focused();
-        let name = tab.name().to_owned();
         let position = view
             .selected_page()
             .map_or_else(|| view.n_pages(), |page| view.page_position(&page) + 1);
@@ -575,17 +742,61 @@ impl TuniWindow {
             project.insert_tab(position.max(0) as usize, tab);
         }
 
-        let terminal = self.new_terminal(project, tab_id, pane);
-        let grid = self.new_grid(project, tab_id);
+        let Some(page) = self.attach_tab(project, tab_id, position) else {
+            return;
+        };
+        view.set_selected_page(&page);
+        self.refresh();
+    }
+
+    /// Builds the widgets for a tab the model already holds, and starts a shell
+    /// in every pane of it.
+    ///
+    /// One tab is one page holding one [`TuniGrid`]; a fresh tab has a single
+    /// pane in it and a restored one has however many it was saved with, which
+    /// is the only difference between opening a tab and restoring one.
+    fn attach_tab(&self, project: Id, tab: Id, position: i32) -> Option<adw::TabPage> {
+        let imp = self.imp();
+        let view = imp.views.borrow().get(&project).cloned()?;
+
+        // Read before the page is inserted: inserting into an empty strip
+        // selects the new tab, and the directory a new shell starts in is the
+        // one the *previous* tab's shell was in.
+        let fallback = self.directory_for_new_shell(project);
+        let (name, panes) = {
+            let workspace = imp.workspace.borrow();
+            let entry = workspace.project(project)?.tab(tab)?;
+            let panes: Vec<(Id, Option<String>)> = entry
+                .layout()
+                .panes()
+                .map(|pane| (pane.id(), pane.directory.clone()))
+                .collect();
+            (entry.name().to_owned(), panes)
+        };
+
+        let grid = self.new_grid(project, tab);
         let page = view.insert(&grid, position);
         page.set_title(&name);
         page.set_live_thumbnail(true);
-        imp.pages.borrow_mut().insert(tab_id, page.clone());
+        imp.pages.borrow_mut().insert(tab, page.clone());
 
-        self.rebuild_grid(project, tab_id);
-        view.set_selected_page(&page);
-        self.refresh();
-        self.start_terminal(&terminal, cwd);
+        // Every terminal exists before any of them is drawn, so the grid is
+        // laid out once rather than once per pane.
+        let started: Vec<(TuniTerminal, Id, Option<PathBuf>)> = panes
+            .into_iter()
+            .map(|(pane, directory)| {
+                let cwd = directory
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_dir())
+                    .or_else(|| fallback.clone());
+                (self.new_terminal(project, tab, pane), pane, cwd)
+            })
+            .collect();
+        self.rebuild_grid(project, tab);
+        for (terminal, pane, cwd) in started {
+            self.start_terminal(&terminal, pane, cwd);
+        }
+        Some(page)
     }
 
     /// Opens a pane beside the focused one, in the same tab.
@@ -611,7 +822,7 @@ impl TuniWindow {
         let terminal = self.new_terminal(project, tab, pane_id);
         self.rebuild_grid(project, tab);
         self.refresh();
-        self.start_terminal(&terminal, cwd);
+        self.start_terminal(&terminal, pane_id, cwd);
     }
 
     /// A terminal for one pane, themed and remembered.
@@ -620,7 +831,7 @@ impl TuniWindow {
         let terminal = TuniTerminal::new();
         terminal.set_hexpand(true);
         terminal.set_vexpand(true);
-        terminal.set_config(&imp.config.borrow());
+        terminal.set_config(&imp.settings.borrow().terminal);
         terminal.set_theme(&self.theme());
         imp.terminals.borrow_mut().insert(pane, terminal.clone());
         self.watch_terminal(&terminal, project, tab, pane);
@@ -631,7 +842,10 @@ impl TuniWindow {
     ///
     /// The shell learns its window size from that first allocation, so starting
     /// it any earlier opens it at 80x24 and corrects it under its own feet.
-    fn start_terminal(&self, terminal: &TuniTerminal, cwd: Option<PathBuf>) {
+    ///
+    /// A restored pane replays what it had printed once the shell is up, so the
+    /// old output sits above the new prompt rather than racing it.
+    fn start_terminal(&self, terminal: &TuniTerminal, pane: Id, cwd: Option<PathBuf>) {
         glib::idle_add_local_once(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -642,9 +856,15 @@ impl TuniWindow {
                     let dialog = adw::AlertDialog::new(Some("Cannot start shell"), Some(&error));
                     dialog.add_response("close", "Close");
                     dialog.present(Some(&this));
-                } else {
-                    terminal.grab_focus();
+                    return;
                 }
+                let history = this.imp().pending_history.borrow_mut().remove(&pane);
+                if let Some(text) = history {
+                    terminal.restore_history(&text);
+                }
+                // The keyboard goes where the model says it should, not to
+                // whichever shell happened to start last.
+                this.focus_terminal();
             }
         ));
     }
@@ -1506,6 +1726,29 @@ fn item(label: &str, action: &str, target: &glib::Variant) -> gio::MenuItem {
     item
 }
 
+/// The header bar's menu — everything reachable by keyboard that a pointer
+/// should be able to reach too.
+fn main_menu() -> gio::Menu {
+    let opening = gio::Menu::new();
+    opening.append(Some("New Tab"), Some("win.new-tab"));
+    opening.append(Some("New Project"), Some("win.new-project"));
+
+    let panes = gio::Menu::new();
+    panes.append(Some("Split Right"), Some("win.split-right"));
+    panes.append(Some("Split Down"), Some("win.split-down"));
+    panes.append(Some("Zoom Pane"), Some("win.zoom-pane"));
+    panes.append(Some("Even Out Panes"), Some("win.equalize-panes"));
+
+    let application = gio::Menu::new();
+    application.append(Some("Preferences"), Some("win.settings"));
+
+    let menu = gio::Menu::new();
+    menu.append_section(None, &opening);
+    menu.append_section(None, &panes);
+    menu.append_section(None, &application);
+    menu
+}
+
 /// The context menu on a tab. The strip tells us which tab it belongs to
 /// through `setup-menu`, so none of these carry a target.
 fn tab_menu() -> gio::Menu {
@@ -1551,6 +1794,31 @@ fn load_css() {
             provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    });
+}
+
+/// Whether this run reads and writes the saved session at all.
+///
+/// `TUNI_SESSION=off` opens an empty window and leaves the saved one exactly
+/// as it was, which is what the smoke captures want: a capture that restored
+/// yesterday's window would be a picture of yesterday, and one that saved its
+/// own would throw away a real session.
+#[must_use]
+pub fn session_enabled() -> bool {
+    !std::env::var("TUNI_SESSION")
+        .is_ok_and(|value| matches!(value.trim(), "0" | "off" | "no" | "false"))
+}
+
+/// Tell libadwaita which appearance was asked for.
+///
+/// `System` is [`adw::ColorScheme::Default`] rather than a guess at what the
+/// desktop currently wants: the desktop is allowed to change its mind, and
+/// `Default` is how an application says it will follow.
+pub fn apply_appearance(appearance: Appearance) {
+    adw::StyleManager::default().set_color_scheme(match appearance {
+        Appearance::System => adw::ColorScheme::Default,
+        Appearance::Light => adw::ColorScheme::ForceLight,
+        Appearance::Dark => adw::ColorScheme::ForceDark,
     });
 }
 

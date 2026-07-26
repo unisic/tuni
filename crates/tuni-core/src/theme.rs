@@ -218,6 +218,13 @@ pub fn theme(name: &str) -> Option<Theme> {
     Theme::parse(name, text)
 }
 
+/// Whether the catalog has a theme by this name — what a saved setting is
+/// checked against before it is believed.
+#[must_use]
+pub fn exists(name: &str) -> bool {
+    THEMES.binary_search_by_key(&name, |(name, _)| name).is_ok()
+}
+
 /// A bundled theme by name, falling back to the default for the desktop's
 /// light or dark setting, and to a plain built-in pair if even that is gone.
 pub fn theme_or_default(name: &str, dark: bool) -> Theme {

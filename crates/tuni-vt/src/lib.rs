@@ -694,6 +694,55 @@ impl Terminal {
         }
     }
 
+    // --- history -------------------------------------------------------------
+
+    /// Everything the terminal is holding — scrollback and screen — as the VT
+    /// bytes that reproduce it, capped to the last `max_lines` lines.
+    ///
+    /// Written to disk when the window closes and fed back into a fresh
+    /// terminal when it opens, so what scrolled past is still there to scroll
+    /// back to. Emitted in [`Format::Vt`] rather than as plain text: colors and
+    /// bold are most of what makes old output readable, and the terminal that
+    /// reads it back is a terminal.
+    ///
+    /// Soft-wrapped lines are rejoined, so a session saved from a wide window
+    /// re-wraps to fit a narrow one instead of restoring with the old width's
+    /// breaks baked in.
+    ///
+    /// `None` when there is nothing on screen worth keeping.
+    pub fn dump_history(&self, max_lines: usize) -> Result<Option<String>> {
+        // Not installed as the terminal's selection: this runs on a live
+        // terminal, and saving the session should not take away what the user
+        // had highlighted.
+        let Some(selection) = self.inner.select_all()? else {
+            return Ok(None);
+        };
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let text = loop {
+            let options = FormatOptions::new()
+                .with_emit_format(Format::Vt)
+                .with_selection(&selection)
+                .with_unwrap(true)
+                .with_trim(true);
+            match self.inner.format_selection_buf(options, &mut buf) {
+                Ok(None) => return Ok(None),
+                Ok(Some(len)) => break String::from_utf8_lossy(&buf[..len]).into_owned(),
+                // Grow and retry. A required size that would not actually grow
+                // the buffer would loop forever, so treat it as a failure.
+                Err(Error::OutOfSpace { required }) if required > buf.len() => {
+                    buf.resize(required, 0);
+                }
+                Err(err) => return Err(err),
+            }
+        };
+
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(last_lines(text, max_lines)))
+    }
+
     /// Flatten the current viewport into an owned grid.
     ///
     /// The upstream snapshot is a borrow chain (snapshot → row iteration →
@@ -814,6 +863,21 @@ impl Drop for Terminal {
         // here hands them back while the terminal is still alive.
         self.gesture.reset(&self.inner);
     }
+}
+
+/// The tail of `text`, at most `max_lines` lines of it.
+///
+/// Trimming a VT dump from the front can cut away the escape that turned a
+/// color on, so what survives starts with a reset rather than with whatever
+/// style the discarded lines happened to leave behind.
+fn last_lines(text: String, max_lines: usize) -> String {
+    if max_lines == 0 {
+        return String::new();
+    }
+    let Some((offset, _)) = text.rmatch_indices('\n').nth(max_lines - 1) else {
+        return text;
+    };
+    format!("\x1b[0m{}", &text[offset + 1..])
 }
 
 /// The local path a `file://` URI names, or `None` when it names another host.

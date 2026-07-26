@@ -26,6 +26,14 @@ for the file tree and the git panel to come. A new tab starts where the visible
 one is, opens next to it, and closes when its last shell exits; a project whose
 tabs are all closed stays in the sidebar until it is closed on purpose.
 
+Closing the window writes that arrangement down, and opening it again puts it
+back: the projects, their tabs, the columns and panes inside each one with the
+room they had, the names that were typed, and a fresh shell in each pane's last
+working directory. What those shells had printed is not restored unless it is
+asked for. A settings window under `Ctrl+,` edits the font, the two themes, the
+scrollback, and that last decision, writing each change to
+`~/.config/tuni/config.toml` as it is made.
+
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+Shift+D` / `Ctrl+Shift+E` | Split right, split down |
@@ -44,6 +52,7 @@ tabs are all closed stays in the sidebar until it is closed on purpose.
 | `Ctrl+Alt+Page Down` / `Ctrl+Alt+Page Up` | Next project, previous project |
 | `Ctrl+Shift+1` … `Ctrl+Shift+9` | Jump to a project |
 | `F9` | Show or hide the sidebar |
+| `Ctrl+,` | Preferences |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection, paste |
 | Middle click | Paste the primary selection |
 | `Ctrl+Shift+A` | Select everything, scrollback included |
@@ -55,8 +64,8 @@ tabs are all closed stays in the sidebar until it is closed on purpose.
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
 
-From here the work runs to full parity: session persistence, the file tree, the
-git panel, the editor, the diff viewer, the command palette, and packaging.
+From here the work runs to full parity: the file tree, the git panel, the
+editor, the diff viewer, the command palette, and packaging.
 
 Consuming a 200 MiB stream, measured with `scripts/throughput.sh` on this
 machine:
@@ -109,6 +118,20 @@ were nowhere near the pointer. Sizes are weights rather than pixels, and the
 arithmetic that turns weights into a row of tiles lives in the model beside its
 tests, not in a widget where nothing can reach it.
 
+The saved session is two files rather than one. `session.json` is the shape of
+the window — projects, tabs, columns, panes, weights, focus, names — and it is
+small, cheap to write, and safe to keep: a directory path and a title are what
+any shell already puts in the window title. `history.json` is what the
+terminals had printed, and it is a different kind of thing entirely, because a
+scrollback holds whatever was on screen when the window closed. So it is
+written only when it has been asked for, capped at 500 lines a pane the way
+kero caps it, and deleted outright the moment the setting is turned back off.
+Both are written beside themselves and renamed into place, so a crash mid-write
+costs the previous session rather than both. Every field the snapshot reads is
+optional and every unreadable tab is skipped, which is what lets a file written
+by an older build still open — and `TUNI_SESSION=0` turns the whole mechanism
+off, restore and save alike.
+
 Ghostty's theme catalog is vendored under `data/themes` and baked into the
 binary at build time, so a fresh checkout runs with all 574 and a packaged
 build needs no data directory beside the executable. The same theme drives the
@@ -153,6 +176,27 @@ underneath, and the URI is handed to the desktop only when it carries no control
 character and its scheme is one of `http`, `https`, `mailto`, `ftp`, `ftps`, or
 a `file://` that names this machine.
 
+## Configuration
+
+`~/.config/tuni/config.toml`, written by the settings window and readable
+without it. Only what differs from a default is written, so an empty file and a
+missing one mean the same thing. The names are Ghostty's where Ghostty has one.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `theme` | `"system"` | `system`, `light`, or `dark` — which of the two themes below is in use |
+| `theme-light` | `"GitHub Light Default"` | Any of the 574 bundled themes |
+| `theme-dark` | `"GitHub Dark Default"` | |
+| `font-family` | `"JetBrains Mono"` | |
+| `font-size` | `11` | Points |
+| `font-ligatures` | `false` | |
+| `line-height` | `0` | Extra pixels between rows |
+| `cursor-blink` | `true` | And then only if the desktop blinks its own cursor, and only while the program running has no opinion |
+| `terminal.scrollback-lines` | `10000` | Lines kept above the screen |
+| `terminal.restore-history` | `false` | Whether a restored pane replays what it had printed |
+
+The session itself lives under `~/.local/share/tuni`.
+
 ## Building
 
 Requires a Rust toolchain, GTK4 and libadwaita development headers, and Zig —
@@ -168,11 +212,12 @@ rustup-init -y
 cargo run --release
 ```
 
-Debugging aids, all off unless set: `TUNI_THEME` names one of the bundled
-themes for the run and `TUNI_FONT` a font the way Pango writes one
-(`"JetBrains Mono 13"`), with `TUNI_LIGATURES=1` to let them fire — which is
-how to look at any of them until there is a settings window;
-`TUNI_DEBUG_FRAME_TIME` prints draw-time percentiles;
+Debugging aids, all off unless set, and none of them written back to the
+configuration file: `TUNI_THEME` names one of the bundled themes for the run
+and `TUNI_FONT` a font the way Pango writes one (`"JetBrains Mono 13"`), with
+`TUNI_LIGATURES=1` to let them fire; `TUNI_SESSION=0` neither restores the
+saved session nor overwrites it; `TUNI_DEBUG_FRAME_TIME` prints draw-time
+percentiles;
 `TUNI_DEBUG_PTY_WRITE` logs what the terminal answers back to the shell; and
 `TUNI_CAPTURE_PNG` renders the widget to a file and exits — useful on
 compositors with no screenshot protocol.

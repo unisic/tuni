@@ -99,9 +99,33 @@ impl Column {
         }
     }
 
+    /// A column read back from a saved layout. Nothing when it held no panes,
+    /// which a hand-edited or truncated snapshot can say and the rest of the
+    /// model may not see.
+    #[must_use]
+    pub fn from_panes(panes: Vec<Pane>, weight: f64) -> Option<Self> {
+        if panes.is_empty() {
+            return None;
+        }
+        Some(Self {
+            panes,
+            weight: sane(weight),
+        })
+    }
+
     #[must_use]
     pub fn panes(&self) -> &[Pane] {
         &self.panes
+    }
+}
+
+/// A weight that came from outside: anything not a usable positive number
+/// falls back to an even share.
+fn sane(weight: f64) -> f64 {
+    if weight.is_finite() && weight > 0.0 {
+        weight
+    } else {
+        1.0
     }
 }
 
@@ -123,6 +147,26 @@ impl Layout {
             focused,
             zoomed: false,
         }
+    }
+
+    /// A layout read back from a saved one, focused at (`column`, `row`).
+    ///
+    /// Nothing when the snapshot holds no panes at all; a focus position that
+    /// no longer names a pane falls to the first one rather than rejecting the
+    /// whole layout, because losing a tab's contents is worse than losing which
+    /// half of it had the keyboard.
+    #[must_use]
+    pub fn from_columns(columns: Vec<Column>, column: usize, row: usize) -> Option<Self> {
+        let first = columns.first()?.panes.first()?.id;
+        let focused = columns
+            .get(column)
+            .and_then(|column| column.panes.get(row))
+            .map_or(first, |pane| pane.id);
+        Some(Self {
+            columns,
+            focused,
+            zoomed: false,
+        })
     }
 
     #[must_use]

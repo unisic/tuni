@@ -768,6 +768,41 @@ impl TuniTerminal {
         self.imp().session.replace(None);
     }
 
+    /// What this terminal is holding, as the VT bytes that reproduce it, for
+    /// the session file. `None` for a terminal that never ran or never
+    /// printed anything.
+    pub fn history(&self, max_lines: usize) -> Option<String> {
+        let guard = self.imp().session.borrow();
+        let session = guard.as_ref()?;
+        session.term.dump_history(max_lines).ok().flatten()
+    }
+
+    /// Replays a saved terminal above the prompt of the shell that just
+    /// started.
+    ///
+    /// Safe to call right after [`Self::start`]: the shell's own output comes
+    /// through a channel and so lands after this, however fast it prints.
+    ///
+    /// The rule is not just to restore output but to be honest about it. What
+    /// is on screen was not printed by the shell now running — no command in it
+    /// can be re-run by pressing up, and nothing it says about the working
+    /// directory is still true. The divider says where the old session ends,
+    /// the way kero's does.
+    pub fn restore_history(&self, text: &str) {
+        if self.imp().session.borrow().is_none() {
+            return;
+        }
+        let mut bytes = Vec::with_capacity(text.len() + 64);
+        bytes.extend_from_slice(text.as_bytes());
+        if !text.ends_with('\n') {
+            bytes.extend_from_slice(b"\r\n");
+        }
+        // Dim, on its own line, and not styled by anything the restored output
+        // left switched on.
+        bytes.extend_from_slice("\x1b[0m\x1b[2m── Session Contents Restored ──\x1b[0m\r\n".as_bytes());
+        self.feed(&bytes);
+    }
+
     fn feed(&self, bytes: &[u8]) {
         let imp = self.imp();
         let mut guard = imp.session.borrow_mut();

@@ -1,10 +1,12 @@
 //! Portable workspace models — no GTK, no libghostty.
 //!
 //! The terminal's own configuration and colors, the projects and tabs around
-//! them, and the pane layout inside a tab. Session persistence, the file tree,
-//! and git status land here next.
+//! them, the pane layout inside a tab, and what all of it is restored from. The
+//! file tree and git status land here next.
 
 pub mod panes;
+pub mod session;
+pub mod settings;
 pub mod theme;
 pub mod workspace;
 
@@ -13,9 +15,9 @@ pub mod workspace;
 pub const FONT_SIZE_MIN: f64 = 4.0;
 pub const FONT_SIZE_MAX: f64 = 96.0;
 
-/// Terminal appearance and behavior. Serialization and a settings UI arrive in
-/// Etap 4; until then the defaults are the whole story.
-#[derive(Clone, Debug)]
+/// Terminal appearance and behavior. Read from and written to the config file
+/// by [`settings::Settings`].
+#[derive(Clone, Debug, PartialEq)]
 pub struct TerminalConfig {
     pub font_family: String,
     /// Point size, as Pango understands it.

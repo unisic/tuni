@@ -4,6 +4,7 @@
 
 mod grid;
 mod keymap;
+mod preferences;
 mod terminal;
 mod tiles;
 mod window;
@@ -16,8 +17,8 @@ use window::TuniWindow;
 
 const APP_ID: &str = "dev.unisic.Tuni";
 
-/// What the keyboard does, as data rather than as scattered constants — Etap 4
-/// reads the same table out of a configuration file.
+/// What the keyboard does, as data rather than as scattered constants, so a
+/// configurable keymap has one table to read instead of a scattered set.
 ///
 /// A terminal cannot spend plain `Ctrl` on the application: `Ctrl+C` and
 /// `Ctrl+D` belong to the shell. So the application's own actions sit on
@@ -42,6 +43,7 @@ const ACCELS: &[(&str, &[&str])] = &[
     ("win.next-project", &["<Ctrl><Alt>Page_Down"]),
     ("win.previous-project", &["<Ctrl><Alt>Page_Up"]),
     ("win.toggle-sidebar", &["F9", "<Ctrl><Shift>b"]),
+    ("win.settings", &["<Ctrl>comma"]),
     ("win.split-right", &["<Ctrl><Shift>d"]),
     ("win.split-down", &["<Ctrl><Shift>e"]),
     ("win.focus-pane-left", &["<Ctrl><Alt>Left"]),
@@ -86,7 +88,9 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_window(app: &adw::Application) {
-    let window = TuniWindow::new(app, config());
+    let settings = settings();
+    window::apply_appearance(settings.appearance);
+    let window = TuniWindow::new(app, settings);
     window.present();
 
     // The first project's shell learns its size from the first allocation, so
@@ -95,7 +99,11 @@ fn build_window(app: &adw::Application) {
         #[weak]
         window,
         move || {
-            window.open_project();
+            // A saved session opens as it was left; anything else opens as a
+            // first run does.
+            if !window::session_enabled() || !window.restore_session() {
+                window.open_project();
+            }
             if let Some(terminal) = window.active_terminal() {
                 maybe_capture(&window, &terminal);
             }
@@ -103,26 +111,25 @@ fn build_window(app: &adw::Application) {
     ));
 }
 
-/// The configuration for this run.
+/// The settings for this run: the file, then the environment on top of it.
 ///
-/// Etap 4 reads this from disk and a settings window edits it. Until then the
-/// defaults are the whole story, except for the environment: `TUNI_THEME` names
-/// one of the bundled themes for both appearances, `TUNI_FONT` is a font the
-/// way Pango writes one, and `TUNI_LIGATURES` turns ligatures on. Enough to
-/// look at any of the 574 themes, and at any font, without a settings UI.
-fn config() -> tuni_core::TerminalConfig {
-    let mut config = tuni_core::TerminalConfig::default();
+/// `TUNI_THEME` names one of the bundled themes for both appearances,
+/// `TUNI_FONT` is a font the way Pango writes one, and `TUNI_LIGATURES` turns
+/// ligatures on. They override the file without writing to it, which is what
+/// makes them useful for looking at a theme rather than choosing one.
+fn settings() -> tuni_core::settings::Settings {
+    let mut settings = tuni_core::settings::Settings::load();
     if let Ok(name) = std::env::var("TUNI_THEME") {
-        config.theme_light = name.clone();
-        config.theme_dark = name;
+        settings.terminal.theme_light = name.clone();
+        settings.terminal.theme_dark = name;
     }
     if let Ok(font) = std::env::var("TUNI_FONT") {
-        config.set_font(&font);
+        settings.terminal.set_font(&font);
     }
     if let Ok(value) = std::env::var("TUNI_LIGATURES") {
-        config.font_ligatures = matches!(value.trim(), "1" | "true" | "yes" | "on");
+        settings.terminal.font_ligatures = matches!(value.trim(), "1" | "true" | "yes" | "on");
     }
-    config
+    settings
 }
 
 /// Debug capture: render the window to a PNG and quit.
