@@ -1,8 +1,8 @@
-//! The panel on the far side of the terminals: the files beside the shell,
-//! and the repository they belong to.
+//! The panel on the far side of the terminals: what the shell is running, the
+//! files beside it, and the repository they belong to.
 //!
-//! Two pages of one panel rather than two panels, because they answer the same
-//! question — what is in the directory the shell is working in — and a window
+//! Three pages of one panel rather than three panels, because they answer the
+//! same question — what is going on where the shell is working — and a window
 //! only has so many sides.
 
 use std::cell::RefCell;
@@ -14,18 +14,21 @@ use gtk::glib;
 
 use crate::files::TuniFiles;
 use crate::git::TuniGit;
+use crate::info::TuniInfo;
 
 /// The names the pages are addressed by, in the switcher and in `session.json`.
 pub const FILES: &str = "files";
 pub const GIT: &str = "git";
+pub const INFO: &str = "info";
 
 mod imp {
-    use super::{RefCell, TuniFiles, TuniGit, glib};
+    use super::{RefCell, TuniFiles, TuniGit, TuniInfo, glib};
     use adw::subclass::prelude::*;
 
     #[derive(Default)]
     pub struct TuniPanel {
         pub stack: RefCell<Option<adw::ViewStack>>,
+        pub info: RefCell<Option<TuniInfo>>,
         pub files: RefCell<Option<TuniFiles>>,
         pub git: RefCell<Option<TuniGit>>,
         pub git_page: RefCell<Option<adw::ViewStackPage>>,
@@ -70,9 +73,12 @@ impl TuniPanel {
     fn build(&self) {
         let imp = self.imp();
 
+        let info = TuniInfo::new();
         let files = TuniFiles::new();
         let git = TuniGit::new();
 
+        // Files first, since it is the page the panel opens on and the one a
+        // pane is opened from; Info last, as kero orders the same three.
         let stack = adw::ViewStack::new();
         stack.add_titled_with_icon(&files, Some(FILES), "Files", "folder-symbolic");
         // Adwaita has no icon for a repository, and a switcher page without one
@@ -80,6 +86,7 @@ impl TuniPanel {
         // page is, and it is an icon the theme actually has.
         let git_page =
             stack.add_titled_with_icon(&git, Some(GIT), "Git", "view-list-bullet-symbolic");
+        stack.add_titled_with_icon(&info, Some(INFO), "Info", "dialog-information-symbolic");
 
         // How many files have changed, on the tab, so the number is readable
         // while the Files page is the one showing.
@@ -108,9 +115,15 @@ impl TuniPanel {
         self.set_child(Some(&view));
 
         imp.stack.replace(Some(stack));
+        imp.info.replace(Some(info));
         imp.files.replace(Some(files));
         imp.git.replace(Some(git));
         imp.git_page.replace(Some(git_page));
+    }
+
+    #[must_use]
+    pub fn info(&self) -> Option<TuniInfo> {
+        self.imp().info.borrow().clone()
     }
 
     #[must_use]
@@ -123,12 +136,21 @@ impl TuniPanel {
         self.imp().git.borrow().clone()
     }
 
-    /// Points both pages at a directory.
+    /// Points every page at a directory.
     ///
-    /// Both, not only the one showing: the badge on the Git tab is part of
-    /// what the Files page is telling the user, and a page that only catches
-    /// up when it is looked at shows the previous directory for a frame.
-    pub fn sync(&self, directory: &Path) {
+    /// Every page, not only the one showing: the badge on the Git tab is part
+    /// of what the Files page is telling the user, and a page that only
+    /// catches up when it is looked at shows the previous directory for a
+    /// frame.
+    ///
+    /// The Info page is told more than a directory, because what it draws is
+    /// the shell rather than the tree: `cwd` is where that shell is working
+    /// and `directory` is what the other two anchored to, which are the same
+    /// path until a project pins one or a repository is found above it.
+    pub fn sync(&self, directory: &Path, cwd: &Path, shell_pid: Option<u32>, automatic: bool) {
+        if let Some(info) = self.info() {
+            info.sync(shell_pid, cwd, directory, automatic);
+        }
         if let Some(files) = self.files() {
             files.sync(directory);
         }
@@ -137,8 +159,15 @@ impl TuniPanel {
         }
     }
 
-    /// The timer's re-read.
+    /// The timer's re-read. The Info page is only read while it is showing:
+    /// walking `/proc` is cheap but not free, and nothing else on screen
+    /// depends on what it finds.
     pub fn poll(&self) {
+        if self.page() == INFO
+            && let Some(info) = self.info()
+        {
+            info.poll();
+        }
         if let Some(files) = self.files() {
             files.poll();
         }

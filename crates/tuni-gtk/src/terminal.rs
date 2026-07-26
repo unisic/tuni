@@ -491,6 +491,17 @@ impl TuniTerminal {
         self.imp().cwd.borrow().clone()
     }
 
+    /// The shell's process id. `None` before it starts and after it exits,
+    /// which is what the Info panel shows an empty page for.
+    #[must_use]
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.imp()
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|session| session.pty.shell_pid())
+    }
+
     // --- setup -------------------------------------------------------------
 
     fn setup_font(&self) {

@@ -9,6 +9,7 @@ pub mod editor;
 pub mod files;
 pub mod fuzzy;
 pub mod git;
+pub mod info;
 pub mod panes;
 pub mod session;
 pub mod settings;

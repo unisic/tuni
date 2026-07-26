@@ -153,6 +153,12 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "win.show-git",
     ),
     (
+        "Show Info",
+        "dialog-information-symbolic",
+        Some("Ctrl+Shift+I"),
+        "win.show-info",
+    ),
+    (
         "Preferences",
         "preferences-system-symbolic",
         Some("Ctrl+,"),
@@ -719,6 +725,16 @@ impl TuniWindow {
                 }
                 window.sync_files();
             }),
+            entry("show-info", None, |window, _| {
+                let imp = window.imp();
+                if let Some(panel) = imp.panel_view.borrow().as_ref() {
+                    panel.set_page(crate::panel::INFO);
+                }
+                if let Some(panel) = imp.panel.borrow().as_ref() {
+                    panel.set_show_sidebar(true);
+                }
+                window.sync_files();
+            }),
             entry("tab-rename", None, |window, _| window.rename_tab()),
             entry("tab-automatic-title", None, |window, _| {
                 let Some(page) = window.imp().menu_page.borrow().clone() else {
@@ -830,7 +846,7 @@ impl TuniWindow {
         preferences::present(self, &self.imp().settings.borrow().clone());
     }
 
-    // --- the Files and Git panel -------------------------------------------
+    // --- the Info, Files and Git panel --------------------------------------
 
     /// Points the panel at the project's directory.
     ///
@@ -838,6 +854,10 @@ impl TuniWindow {
     /// that `cd`s out of one repository and into another takes the tree and the
     /// repository with it; a pinned project directory is what stops that from
     /// happening.
+    ///
+    /// Info wants both halves: the shell's own directory, which is where a
+    /// command was typed, and the root the tree and the repository are anchored
+    /// to, which may be a directory above it.
     fn sync_files(&self) {
         let imp = self.imp();
         if !imp
@@ -851,20 +871,28 @@ impl TuniWindow {
         let Some(panel) = imp.panel_view.borrow().clone() else {
             return;
         };
-        let cwd = {
+        let directories = {
             let workspace = imp.workspace.borrow();
-            let Some(project) = workspace.selected_project() else {
-                return;
-            };
-            let cwd = project
-                .selected_tab()
-                .and_then(Tab::directory)
-                .map(PathBuf::from)
-                .or_else(|| std::env::current_dir().ok())
-                .unwrap_or_default();
-            project.panel_root(&cwd).0
+            workspace.selected_project().map(|project| {
+                let cwd = project
+                    .selected_tab()
+                    .and_then(Tab::directory)
+                    .map(PathBuf::from)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_default();
+                let (root, automatic) = project.panel_root(&cwd);
+                (cwd, root, automatic)
+            })
         };
-        panel.sync(&cwd);
+        let Some((cwd, root, automatic)) = directories else {
+            return;
+        };
+        // Whatever is focused right now, which is the shell whose children Info
+        // is about to list.
+        let shell = self
+            .active_terminal()
+            .and_then(|terminal| terminal.shell_pid());
+        panel.sync(&root, &cwd, shell, automatic);
     }
 
     /// The timer's half of that: the root cannot have moved without something
@@ -3020,6 +3048,7 @@ fn main_menu() -> gio::Menu {
     panels.append(Some("Projects"), Some("win.toggle-sidebar"));
     panels.append(Some("Files"), Some("win.toggle-panel"));
     panels.append(Some("Git"), Some("win.show-git"));
+    panels.append(Some("Info"), Some("win.show-info"));
 
     let file = gio::Menu::new();
     file.append(Some("Save File"), Some("win.save-file"));

@@ -1,7 +1,7 @@
 # Tuni
 
 A native terminal workspace for Linux: terminal panes, projects, a file tree, a
-git panel, an editor, and a diff viewer in one window.
+git panel, a session inspector, an editor, and a diff viewer in one window.
 
 Tuni is a ground-up Linux implementation of the workspace that
 [egoist/kero](https://github.com/egoist/kero) built for macOS. Kero's Swift
@@ -46,6 +46,16 @@ to undo it by. Discarding asks first, and what git would delete outright goes to
 the desktop's trash instead. The state of a file is spelled out, never carried
 by color alone: the two porcelain letters are on the row, and what they mean is
 in its tooltip.
+
+Its Info page, under `Ctrl+Shift+I`, is the session itself: the shell and its
+process id, the directory it is working in, the directory the other two pages
+anchor to and whether that was pinned or worked out, every process running under
+that shell with its share of a core and its resident memory, and every TCP port
+those processes are listening on. A port is a button that opens
+`http://localhost:<port>` in the browser, which is the reason to look — a dev
+server prints its port and then scrolls away. A process can be asked to quit, or
+made to. Nothing here shells out: it is `/proc`, read on a worker thread while
+the page is showing and no more often than that.
 
 A pane holds a file as readily as it holds a shell. Opening one from either page
 puts it where a terminal would have gone — syntax highlighting for whatever
@@ -107,6 +117,7 @@ scrollback, and that last decision, writing each change to
 | `F9` | Show or hide the sidebar |
 | `Ctrl+Shift+B` | Show or hide the panel |
 | `Ctrl+Shift+G` | Open the panel on the repository |
+| `Ctrl+Shift+I` | Open the panel on the session: processes and ports |
 | `Ctrl+,` | Preferences |
 | `Ctrl+S` | Save the file in the focused pane |
 | `Ctrl+Shift+P` | The command palette |
@@ -245,6 +256,21 @@ history and a checkout moves everything. What that model decides — whether a
 commit is possible, which paths a discard has to restore and which it has to
 delete — lives in `tuni-core` with tests against a real repository, and the
 widget only draws the answer.
+
+What Info knows, it reads out of `/proc` rather than out of `ps` and `lsof`.
+Both of those read `/proc` themselves, `lsof` is frequently not installed, and a
+pair of processes every two seconds is a cost worth not paying. The shell's own
+children are found by walking every `/proc/<pid>/stat` once and breadth-first
+descending from the shell's process id, which also catches a grandchild — the
+`node` a package script started. A listening port is `/proc/net/tcp` and
+`/proc/net/tcp6` filtered to state `0A`, which yields socket inodes; those are
+matched against the `socket:[…]` links in each process's `fd` directory, which
+is what turns a port into the process holding it. CPU is the lifetime average
+`ps` reports rather than an instantaneous sample: ticks over `_SC_CLK_TCK` over
+how long the process has been alive. All of that parsing is pure functions over
+the exact text a kernel writes, tested in `tuni-core` without a process tree to
+point them at, and the reads happen on a worker thread with the same generation
+stamp the git panel uses.
 
 The editor's keys belong to the pane rather than to the window, and that is the
 whole reason it can share a window with terminals: `Ctrl+S` is flow control to a

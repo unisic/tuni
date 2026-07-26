@@ -8,6 +8,7 @@ mod files;
 mod find;
 mod git;
 mod grid;
+mod info;
 mod keymap;
 mod notify;
 mod palette;
@@ -60,6 +61,9 @@ const ACCELS: &[(&str, &[&str])] = &[
     ("win.toggle-panel", &["<Ctrl><Shift>b"]),
     // And its key for the repository, which opens the panel on that page.
     ("win.show-git", &["<Ctrl><Shift>g"]),
+    // kero's ⇧⌘I, one modifier over: what the shell is running, and on which
+    // ports.
+    ("win.show-info", &["<Ctrl><Shift>i"]),
     ("win.settings", &["<Ctrl>comma"]),
     // Find in the terminal. `Ctrl+F` belongs to the shell — it is emacs-mode
     // forward-char, and readline would never see it again.
