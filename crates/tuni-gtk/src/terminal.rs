@@ -139,7 +139,20 @@ impl Default for Metrics {
 
 struct Session {
     term: tuni_vt::Terminal,
-    pty: Pty,
+    /// Gone once the program in front of it has exited. The screen it left
+    /// behind stays: the last thing a session printed is usually the reason it
+    /// ended, and for a connection that pane is the only place the reason is
+    /// written down.
+    pty: Option<Pty>,
+}
+
+/// Types at the program in front of a session, if there still is one. Free
+/// rather than a method, so the caller can hold the terminal state at the same
+/// time: encoding a key needs it, and the two are separate fields.
+fn send(pty: &mut Option<Pty>, bytes: &[u8]) {
+    if let Some(pty) = pty {
+        let _ = pty.write(bytes);
+    }
 }
 
 /// How many inline images are kept as textures at once. An image is uploaded
@@ -563,7 +576,7 @@ impl TuniTerminal {
     pub fn send_text(&self, text: &str) {
         let mut guard = self.imp().session.borrow_mut();
         if let Some(session) = guard.as_mut() {
-            let _ = session.pty.write(text.as_bytes());
+            send(&mut session.pty, text.as_bytes());
             session.term.scroll_to_bottom();
         }
     }
@@ -588,7 +601,19 @@ impl TuniTerminal {
             .session
             .borrow()
             .as_ref()
-            .and_then(|session| session.pty.shell_pid())
+            .and_then(|session| session.pty.as_ref()?.shell_pid())
+    }
+
+    /// Whether anything is running in here. False before the first session
+    /// starts and again after one ends, when what is on screen is the last
+    /// thing the dead one printed and nothing can be typed at it.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.imp()
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| session.pty.is_some())
     }
 
     // --- setup -------------------------------------------------------------
@@ -1009,7 +1034,10 @@ impl TuniTerminal {
         let pty = Pty::spawn(&config).map_err(|e| e.to_string())?;
 
         let events = pty.events();
-        imp.session.replace(Some(Session { term, pty }));
+        imp.session.replace(Some(Session {
+            term,
+            pty: Some(pty),
+        }));
         let cell = (m.cell_width.round() as u16, m.cell_height.round() as u16);
         imp.grid_size.set((cols, rows));
         imp.cell_size.set(cell);
@@ -1050,7 +1078,12 @@ impl TuniTerminal {
                             }
                         }
                         PtyEvent::Exited => {
-                            this.imp().session.replace(None);
+                            // The pty goes and the screen stays, so whatever
+                            // the session said on its way out is still there to
+                            // read. Scoped, because emitting reaches back in.
+                            if let Some(session) = this.imp().session.borrow_mut().as_mut() {
+                                session.pty = None;
+                            }
                             this.queue_draw();
                             this.emit_by_name::<()>("exited", &[]);
                             break;
@@ -1083,7 +1116,7 @@ impl TuniTerminal {
     /// program, which reads it as "redraw" — put its prompt back on the blank
     /// screen instead of leaving the eye nothing to look at.
     pub fn clear(&self) {
-        if self.imp().session.borrow().is_none() {
+        if !self.is_running() {
             return;
         }
         // Home, erase the screen, erase the scrollback: what `clear` sends on a
@@ -1124,7 +1157,7 @@ impl TuniTerminal {
     /// directory is still true. The divider says where the old session ends,
     /// the way kero's does.
     pub fn restore_history(&self, text: &str) {
-        if self.imp().session.borrow().is_none() {
+        if !self.is_running() {
             return;
         }
         let mut bytes = Vec::with_capacity(text.len() + 64);
@@ -1157,7 +1190,7 @@ impl TuniTerminal {
                     String::from_utf8_lossy(&effects.pty_write)
                 );
             }
-            let _ = session.pty.write(&effects.pty_write);
+            send(&mut session.pty, &effects.pty_write);
         }
         let title = effects
             .title_changed
@@ -1234,9 +1267,10 @@ impl TuniTerminal {
     /// exactly once.
     fn apply_size(&self, width: i32, height: i32) {
         let imp = self.imp();
-        // Nothing is running yet: the first allocation decides what size the
-        // shell is started at, and there is no output to disturb.
-        if imp.session.borrow().is_none() {
+        // Nothing is running: the first allocation decides what size the shell
+        // is started at, and a screen nobody is writing to has no reflow to
+        // debounce.
+        if !self.is_running() {
             self.commit_size(width, height, true);
             return;
         }
@@ -1327,8 +1361,8 @@ impl TuniTerminal {
                         .term
                         .resize(cols, rows, u32::from(cell.0), u32::from(cell.1));
                 }
-                if tell_shell {
-                    let _ = session.pty.resize(cols, rows, cell.0, cell.1);
+                if tell_shell && let Some(pty) = &session.pty {
+                    let _ = pty.resize(cols, rows, cell.0, cell.1);
                 }
             }
         }
@@ -1860,7 +1894,7 @@ impl TuniTerminal {
         if let Ok(bytes) = session.term.encode_mouse(&input, geometry)
             && !bytes.is_empty()
         {
-            let _ = session.pty.write(bytes);
+            send(&mut session.pty, bytes);
         }
     }
 
@@ -1875,7 +1909,7 @@ impl TuniTerminal {
         if let Ok(bytes) = session.term.encode_focus(gained)
             && !bytes.is_empty()
         {
-            let _ = session.pty.write(bytes);
+            send(&mut session.pty, bytes);
         }
     }
 
@@ -2294,7 +2328,7 @@ impl TuniTerminal {
             return;
         };
         if let Ok(bytes) = session.term.encode_paste(text) {
-            let _ = session.pty.write(bytes);
+            send(&mut session.pty, bytes);
             session.term.scroll_to_bottom();
         }
         drop(guard);
@@ -2493,7 +2527,7 @@ impl TuniTerminal {
 
         match session.term.encode_key(&input) {
             Ok(bytes) if !bytes.is_empty() => {
-                let _ = session.pty.write(bytes);
+                send(&mut session.pty, bytes);
                 // Typing pulls the viewport back down: the answer is about to
                 // arrive at the bottom.
                 session.term.scroll_to_bottom();
