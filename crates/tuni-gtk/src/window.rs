@@ -299,12 +299,15 @@ impl TuniWindow {
         let uint64 = Some(glib::VariantTy::UINT64);
         self.add_action_entries([
             entry("new-tab", None, |window, _| {
-                let project = window
-                    .imp()
-                    .workspace
-                    .borrow()
-                    .selected_id()
-                    .or_else(|| window.imp().workspace.borrow().projects().first().map(|p| p.id()));
+                let project = window.imp().workspace.borrow().selected_id().or_else(|| {
+                    window
+                        .imp()
+                        .workspace
+                        .borrow()
+                        .projects()
+                        .first()
+                        .map(|p| p.id())
+                });
                 match project {
                     Some(project) => window.open_tab(project),
                     None => {
@@ -322,10 +325,18 @@ impl TuniWindow {
             entry("split-down", None, |window, _| window.split(Edge::Down)),
             entry("split-left", None, |window, _| window.split(Edge::Left)),
             entry("split-up", None, |window, _| window.split(Edge::Up)),
-            entry("focus-pane-left", None, |window, _| window.focus_toward(Edge::Left)),
-            entry("focus-pane-right", None, |window, _| window.focus_toward(Edge::Right)),
-            entry("focus-pane-up", None, |window, _| window.focus_toward(Edge::Up)),
-            entry("focus-pane-down", None, |window, _| window.focus_toward(Edge::Down)),
+            entry("focus-pane-left", None, |window, _| {
+                window.focus_toward(Edge::Left)
+            }),
+            entry("focus-pane-right", None, |window, _| {
+                window.focus_toward(Edge::Right)
+            }),
+            entry("focus-pane-up", None, |window, _| {
+                window.focus_toward(Edge::Up)
+            }),
+            entry("focus-pane-down", None, |window, _| {
+                window.focus_toward(Edge::Down)
+            }),
             entry("next-pane", None, |window, _| {
                 window.navigate(Layout::focus_next);
             }),
@@ -336,17 +347,27 @@ impl TuniWindow {
             entry("equalize-panes", None, |window, _| {
                 window.reshape(Layout::equalize);
             }),
-            entry("resize-pane-left", None, |window, _| window.resize(Edge::Left)),
-            entry("resize-pane-right", None, |window, _| window.resize(Edge::Right)),
+            entry("resize-pane-left", None, |window, _| {
+                window.resize(Edge::Left)
+            }),
+            entry("resize-pane-right", None, |window, _| {
+                window.resize(Edge::Right)
+            }),
             entry("resize-pane-up", None, |window, _| window.resize(Edge::Up)),
-            entry("resize-pane-down", None, |window, _| window.resize(Edge::Down)),
+            entry("resize-pane-down", None, |window, _| {
+                window.resize(Edge::Down)
+            }),
             entry("next-tab", None, |window, _| window.shift_tab(1)),
             entry("previous-tab", None, |window, _| window.shift_tab(-1)),
-            entry("select-tab", Some(glib::VariantTy::INT32), |window, target| {
-                if let Some(index) = target.and_then(glib::Variant::get::<i32>) {
-                    window.select_tab_at(index);
-                }
-            }),
+            entry(
+                "select-tab",
+                Some(glib::VariantTy::INT32),
+                |window, target| {
+                    if let Some(index) = target.and_then(glib::Variant::get::<i32>) {
+                        window.select_tab_at(index);
+                    }
+                },
+            ),
             entry("new-project", None, |window, _| {
                 window.open_project();
             }),
@@ -358,15 +379,23 @@ impl TuniWindow {
                 window.imp().workspace.borrow_mut().select_previous();
                 window.show_selected_project();
             }),
-            entry("select-project", Some(glib::VariantTy::INT32), |window, target| {
-                if let Some(number) = target.and_then(glib::Variant::get::<i32>) {
-                    let count = window.imp().workspace.borrow().projects().len();
-                    if count > 0 {
-                        let index = if number >= 9 { count - 1 } else { (number as usize).saturating_sub(1).min(count - 1) };
-                        window.select_project_at(index);
+            entry(
+                "select-project",
+                Some(glib::VariantTy::INT32),
+                |window, target| {
+                    if let Some(number) = target.and_then(glib::Variant::get::<i32>) {
+                        let count = window.imp().workspace.borrow().projects().len();
+                        if count > 0 {
+                            let index = if number >= 9 {
+                                count - 1
+                            } else {
+                                (number as usize).saturating_sub(1).min(count - 1)
+                            };
+                            window.select_project_at(index);
+                        }
                     }
-                }
-            }),
+                },
+            ),
             entry("close-project", uint64, |window, target| {
                 if let Some(id) = project_target(target) {
                     window.close_project(id);
@@ -411,23 +440,26 @@ impl TuniWindow {
                 window.set_tab_name(&page, None);
             }),
             entry("tab-close", None, |window, _| {
-                if let (Some(view), Some(page)) =
-                    (window.selected_view(), window.imp().menu_page.borrow().clone())
-                {
+                if let (Some(view), Some(page)) = (
+                    window.selected_view(),
+                    window.imp().menu_page.borrow().clone(),
+                ) {
                     view.close_page(&page);
                 }
             }),
             entry("tab-close-others", None, |window, _| {
-                if let (Some(view), Some(page)) =
-                    (window.selected_view(), window.imp().menu_page.borrow().clone())
-                {
+                if let (Some(view), Some(page)) = (
+                    window.selected_view(),
+                    window.imp().menu_page.borrow().clone(),
+                ) {
                     view.close_other_pages(&page);
                 }
             }),
             entry("tab-close-right", None, |window, _| {
-                if let (Some(view), Some(page)) =
-                    (window.selected_view(), window.imp().menu_page.borrow().clone())
-                {
+                if let (Some(view), Some(page)) = (
+                    window.selected_view(),
+                    window.imp().menu_page.borrow().clone(),
+                ) {
                     view.close_pages_after(&page);
                 }
             }),
@@ -529,7 +561,11 @@ impl TuniWindow {
                 history.borrow_mut().insert(key.clone(), text);
                 Some(key)
             });
-            snapshot.sidebar = imp.split.borrow().as_ref().map(adw::OverlaySplitView::shows_sidebar);
+            snapshot.sidebar = imp
+                .split
+                .borrow()
+                .as_ref()
+                .map(adw::OverlaySplitView::shows_sidebar);
             snapshot
         };
 
@@ -959,7 +995,11 @@ impl TuniWindow {
                 self,
                 move |terminal: &TuniTerminal, _| {
                     let title = terminal.title();
-                    if let Some(entry) = this.imp().workspace.borrow_mut().project_mut(project)
+                    if let Some(entry) = this
+                        .imp()
+                        .workspace
+                        .borrow_mut()
+                        .project_mut(project)
                         .and_then(|project| project.pane_mut(tab, pane))
                     {
                         entry.title = title;
@@ -976,7 +1016,11 @@ impl TuniWindow {
                 self,
                 move |terminal: &TuniTerminal, _| {
                     let cwd = terminal.cwd();
-                    if let Some(entry) = this.imp().workspace.borrow_mut().project_mut(project)
+                    if let Some(entry) = this
+                        .imp()
+                        .workspace
+                        .borrow_mut()
+                        .project_mut(project)
                         .and_then(|project| project.pane_mut(tab, pane))
                     {
                         entry.directory = cwd;
@@ -1077,9 +1121,7 @@ impl TuniWindow {
 
         if !alive {
             let page = imp.pages.borrow().get(&tab).cloned();
-            if let (Some(view), Some(page)) =
-                (imp.views.borrow().get(&project).cloned(), page)
-            {
+            if let (Some(view), Some(page)) = (imp.views.borrow().get(&project).cloned(), page) {
                 view.close_page(&page);
             }
             return;
@@ -1263,7 +1305,11 @@ impl TuniWindow {
         if count == 0 {
             return;
         }
-        let index = if number >= 9 { count - 1 } else { (number - 1).clamp(0, count - 1) };
+        let index = if number >= 9 {
+            count - 1
+        } else {
+            (number - 1).clamp(0, count - 1)
+        };
         view.set_selected_page(&view.nth_page(index));
     }
 
@@ -1371,9 +1417,10 @@ impl TuniWindow {
         if let Some(content) = imp.content.borrow().as_ref() {
             content.set_visible_child_name(if tabs { "tabs" } else { "empty" });
         }
-        if let (Some(status), Some(button)) =
-            (imp.status.borrow().as_ref(), imp.status_button.borrow().as_ref())
-        {
+        if let (Some(status), Some(button)) = (
+            imp.status.borrow().as_ref(),
+            imp.status_button.borrow().as_ref(),
+        ) {
             if projects {
                 status.set_title("No Tabs Open");
                 status.set_description(Some("Every tab in this project is closed."));
@@ -1665,7 +1712,11 @@ impl TuniWindow {
 }
 
 /// One action, spelled the way `add_action_entries` wants it.
-fn entry<F>(name: &str, parameter: Option<&glib::VariantTy>, activate: F) -> gio::ActionEntry<TuniWindow>
+fn entry<F>(
+    name: &str,
+    parameter: Option<&glib::VariantTy>,
+    activate: F,
+) -> gio::ActionEntry<TuniWindow>
 where
     F: Fn(&TuniWindow, Option<&glib::Variant>) + 'static,
 {

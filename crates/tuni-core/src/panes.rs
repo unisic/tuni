@@ -380,9 +380,7 @@ impl Layout {
         if self.columns[col].panes.is_empty() {
             self.columns.remove(col);
         }
-        if was_focused
-            && let Some(id) = self.nearest(col, row)
-        {
+        if was_focused && let Some(id) = self.nearest(col, row) {
             self.focused = id;
         }
         // Losing the zoomed pane, or the split it was hiding, drops back to the
@@ -395,8 +393,12 @@ impl Layout {
 
     /// The pane closest to a slot that no longer exists.
     fn nearest(&self, col: usize, row: usize) -> Option<Id> {
-        let column = self.columns.get(col.min(self.columns.len().checked_sub(1)?))?;
-        let pane = column.panes.get(row.min(column.panes.len().checked_sub(1)?))?;
+        let column = self
+            .columns
+            .get(col.min(self.columns.len().checked_sub(1)?))?;
+        let pane = column
+            .panes
+            .get(row.min(column.panes.len().checked_sub(1)?))?;
         Some(pane.id())
     }
 
@@ -422,7 +424,11 @@ impl Layout {
             self.columns[divider].weight = first;
             self.columns[divider + 1].weight = second;
         } else {
-            let weights: Vec<f64> = self.columns[col].panes.iter().map(|pane| pane.weight).collect();
+            let weights: Vec<f64> = self.columns[col]
+                .panes
+                .iter()
+                .map(|pane| pane.weight)
+                .collect();
             let Some((divider, first, second)) = shifted(&weights, row, step) else {
                 return;
             };
@@ -482,7 +488,11 @@ fn shifted(weights: &[f64], index: usize, direction: isize) -> Option<(usize, f6
         return None;
     }
     let divider = if direction > 0 {
-        if index < weights.len() - 1 { index } else { index - 1 }
+        if index < weights.len() - 1 {
+            index
+        } else {
+            index - 1
+        }
     } else if index > 0 {
         index - 1
     } else {
@@ -503,7 +513,11 @@ fn shifted(weights: &[f64], index: usize, direction: isize) -> Option<(usize, f6
         return None;
     }
     let delta = step * direction as f64;
-    Some((divider, weights[divider] + delta, weights[divider + 1] - delta))
+    Some((
+        divider,
+        weights[divider] + delta,
+        weights[divider + 1] - delta,
+    ))
 }
 
 /// Hands `available` out in proportion to `weights` — the one piece of layout
@@ -517,7 +531,10 @@ pub fn shares(weights: &[f64], available: f64) -> Vec<f64> {
     if total <= 0.0 {
         return vec![available / weights.len() as f64; weights.len()];
     }
-    weights.iter().map(|weight| weight / total * available).collect()
+    weights
+        .iter()
+        .map(|weight| weight / total * available)
+        .collect()
 }
 
 /// Splits a drag across the divider between tiles `index` and `index + 1` into
@@ -578,7 +595,11 @@ mod tests {
     }
 
     fn shape(layout: &Layout) -> Vec<usize> {
-        layout.columns().iter().map(|column| column.panes().len()).collect()
+        layout
+            .columns()
+            .iter()
+            .map(|column| column.panes().len())
+            .collect()
     }
 
     #[test]
@@ -601,12 +622,20 @@ mod tests {
     fn a_split_pane_gives_up_half_of_what_it_had() {
         let mut layout = Layout::new(Pane::new());
         layout.split(Pane::new(), Edge::Right);
-        let weights: Vec<f64> = layout.columns().iter().map(|column| column.weight).collect();
+        let weights: Vec<f64> = layout
+            .columns()
+            .iter()
+            .map(|column| column.weight)
+            .collect();
         assert_eq!(weights, vec![0.5, 0.5]);
 
         // And the new column's own half splits again rather than the tab's.
         layout.split(Pane::new(), Edge::Right);
-        let weights: Vec<f64> = layout.columns().iter().map(|column| column.weight).collect();
+        let weights: Vec<f64> = layout
+            .columns()
+            .iter()
+            .map(|column| column.weight)
+            .collect();
         assert_eq!(weights, vec![0.5, 0.25, 0.25]);
     }
 
@@ -627,10 +656,18 @@ mod tests {
         layout.focus_toward(Edge::Down);
         assert_eq!(layout.focused(), ids[0][1]);
         layout.focus_toward(Edge::Down);
-        assert_eq!(layout.focused(), ids[0][1], "the bottom of a column is the bottom");
+        assert_eq!(
+            layout.focused(),
+            ids[0][1],
+            "the bottom of a column is the bottom"
+        );
 
         layout.focus_toward(Edge::Right);
-        assert_eq!(layout.focused(), ids[1][1], "and it lands at the height it left");
+        assert_eq!(
+            layout.focused(),
+            ids[1][1],
+            "and it lands at the height it left"
+        );
         layout.focus_toward(Edge::Right);
         assert_eq!(layout.focused(), ids[1][1]);
 
@@ -673,7 +710,10 @@ mod tests {
         assert_eq!(shape(&layout), vec![1]);
         assert_eq!(layout.focused(), ids[0][0]);
 
-        assert!(!layout.remove(ids[0][0]), "the last pane closing closes the tab");
+        assert!(
+            !layout.remove(ids[0][0]),
+            "the last pane closing closes the tab"
+        );
     }
 
     #[test]
@@ -692,7 +732,11 @@ mod tests {
         layout.move_pane(ids[0][1], Edge::Right, ids[1][0]);
         assert_eq!(shape(&layout), vec![1, 1, 1]);
         assert_eq!(layout.location(ids[0][1]), Some((2, 0)));
-        assert_eq!(layout.focused(), ids[0][1], "focus follows the pane that moved");
+        assert_eq!(
+            layout.focused(),
+            ids[0][1],
+            "focus follows the pane that moved"
+        );
 
         // And back, stacked above where it came from.
         layout.move_pane(ids[0][1], Edge::Up, ids[0][0]);
@@ -754,12 +798,26 @@ mod tests {
         layout.focus(ids[0][0]);
 
         layout.resize(Edge::Right);
-        let weights: Vec<f64> = layout.columns().iter().map(|column| column.weight).collect();
-        assert!(weights[0] > weights[1], "pushing right grows the left column");
+        let weights: Vec<f64> = layout
+            .columns()
+            .iter()
+            .map(|column| column.weight)
+            .collect();
+        assert!(
+            weights[0] > weights[1],
+            "pushing right grows the left column"
+        );
 
         layout.resize(Edge::Left);
-        let weights: Vec<f64> = layout.columns().iter().map(|column| column.weight).collect();
-        assert!((weights[0] - weights[1]).abs() < 1e-9, "and pushing back undoes it");
+        let weights: Vec<f64> = layout
+            .columns()
+            .iter()
+            .map(|column| column.weight)
+            .collect();
+        assert!(
+            (weights[0] - weights[1]).abs() < 1e-9,
+            "and pushing back undoes it"
+        );
     }
 
     #[test]
@@ -770,7 +828,11 @@ mod tests {
         // There is no divider to the right of the last column, so the one on
         // its left moves and the column shrinks.
         layout.resize(Edge::Right);
-        let weights: Vec<f64> = layout.columns().iter().map(|column| column.weight).collect();
+        let weights: Vec<f64> = layout
+            .columns()
+            .iter()
+            .map(|column| column.weight)
+            .collect();
         assert!(weights[1] < weights[0]);
     }
 
@@ -781,7 +843,11 @@ mod tests {
         for _ in 0..100 {
             layout.resize(Edge::Right);
         }
-        let weights: Vec<f64> = layout.columns().iter().map(|column| column.weight).collect();
+        let weights: Vec<f64> = layout
+            .columns()
+            .iter()
+            .map(|column| column.weight)
+            .collect();
         let total: f64 = weights.iter().sum();
         assert!(weights[1] / total >= MIN_SHARE - 1e-9);
     }
@@ -825,11 +891,19 @@ mod tests {
     fn weights_that_do_not_match_the_layout_are_dropped_rather_than_applied() {
         let (mut layout, _) = layout(&[1, 1]);
         layout.set_column_weights(&[9.0]);
-        let weights: Vec<f64> = layout.columns().iter().map(|column| column.weight).collect();
+        let weights: Vec<f64> = layout
+            .columns()
+            .iter()
+            .map(|column| column.weight)
+            .collect();
         assert_eq!(weights, vec![0.5, 0.5]);
 
         layout.set_column_weights(&[3.0, 1.0]);
-        let weights: Vec<f64> = layout.columns().iter().map(|column| column.weight).collect();
+        let weights: Vec<f64> = layout
+            .columns()
+            .iter()
+            .map(|column| column.weight)
+            .collect();
         assert_eq!(weights, vec![3.0, 1.0]);
     }
 }

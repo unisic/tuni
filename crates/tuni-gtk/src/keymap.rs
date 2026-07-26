@@ -539,6 +539,8 @@ mod tests {
     fn num_lock_is_reported_because_the_keypad_encoding_turns_on_it() {
         let none = gdk::ModifierType::empty();
         assert!(mods_for_key(none, Key::Numpad7, KeyAction::Press, true).contains(Mods::NUM_LOCK));
-        assert!(!mods_for_key(none, Key::NumpadHome, KeyAction::Press, false).contains(Mods::NUM_LOCK));
+        assert!(
+            !mods_for_key(none, Key::NumpadHome, KeyAction::Press, false).contains(Mods::NUM_LOCK)
+        );
     }
 }

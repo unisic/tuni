@@ -320,9 +320,7 @@ mod imp {
                 frames.sort_unstable();
                 eprintln!(
                     "frame: p50 {:?}  p95 {:?}  max {:?}",
-                    frames[60],
-                    frames[114],
-                    frames[119]
+                    frames[60], frames[114], frames[119]
                 );
                 frames.clear();
             }
@@ -548,9 +546,7 @@ impl TuniTerminal {
             #[weak(rename_to = this)]
             self,
             move |_, text| {
-                this.imp()
-                    .pending_commit
-                    .replace(Some(text.to_owned()));
+                this.imp().pending_commit.replace(Some(text.to_owned()));
             }
         ));
         self.imp().im.replace(Some(im));
@@ -561,7 +557,8 @@ impl TuniTerminal {
             self,
             #[upgrade_or]
             glib::Propagation::Proceed,
-            move |controller, keyval, keycode, state| this.on_key(controller, keyval, keycode, state)
+            move |controller, keyval, keycode, state| this
+                .on_key(controller, keyval, keycode, state)
         ));
         keys.connect_modifiers(glib::clone!(
             #[weak(rename_to = this)]
@@ -799,7 +796,9 @@ impl TuniTerminal {
         }
         // Dim, on its own line, and not styled by anything the restored output
         // left switched on.
-        bytes.extend_from_slice("\x1b[0m\x1b[2m── Session Contents Restored ──\x1b[0m\r\n".as_bytes());
+        bytes.extend_from_slice(
+            "\x1b[0m\x1b[2m── Session Contents Restored ──\x1b[0m\r\n".as_bytes(),
+        );
         self.feed(&bytes);
     }
 
@@ -815,7 +814,10 @@ impl TuniTerminal {
         let effects = session.term.take_effects();
         if !effects.pty_write.is_empty() {
             if std::env::var_os("TUNI_DEBUG_PTY_WRITE").is_some() {
-                eprintln!("pty_write: {:?}", String::from_utf8_lossy(&effects.pty_write));
+                eprintln!(
+                    "pty_write: {:?}",
+                    String::from_utf8_lossy(&effects.pty_write)
+                );
             }
             let _ = session.pty.write(&effects.pty_write);
         }
@@ -871,8 +873,10 @@ impl TuniTerminal {
     fn apply_size(&self, width: i32, height: i32) {
         let imp = self.imp();
         let m = imp.metrics.get();
-        let cols = ((width as f32 / m.cell_width).floor() as i32).clamp(1, i32::from(u16::MAX)) as u16;
-        let rows = ((height as f32 / m.cell_height).floor() as i32).clamp(1, i32::from(u16::MAX)) as u16;
+        let cols =
+            ((width as f32 / m.cell_width).floor() as i32).clamp(1, i32::from(u16::MAX)) as u16;
+        let rows =
+            ((height as f32 / m.cell_height).floor() as i32).clamp(1, i32::from(u16::MAX)) as u16;
         let cell = (
             (m.cell_width.round() as i32).clamp(1, i32::from(u16::MAX)) as u16,
             (m.cell_height.round() as i32).clamp(1, i32::from(u16::MAX)) as u16,
@@ -908,7 +912,8 @@ impl TuniTerminal {
     /// every text field on the desktop.
     fn blink_settings(&self) -> (bool, Duration, Option<Duration>) {
         let settings = gtk::Settings::for_display(&self.display());
-        let cycle = Duration::from_millis(u64::from(settings.gtk_cursor_blink_time().max(100) as u32));
+        let cycle =
+            Duration::from_millis(u64::from(settings.gtk_cursor_blink_time().max(100) as u32));
         let timeout = settings.gtk_cursor_blink_timeout();
         (
             settings.is_gtk_cursor_blink(),
@@ -997,7 +1002,8 @@ impl TuniTerminal {
         if track <= 0.0 {
             return None;
         }
-        let height = (track * scroll.proportion() as f32).clamp(SCROLLBAR_MIN_THUMB.min(track), track);
+        let height =
+            (track * scroll.proportion() as f32).clamp(SCROLLBAR_MIN_THUMB.min(track), track);
         let width = if imp.bar_hover.get() || imp.bar_drag.get().is_some() {
             8.0
         } else {
@@ -1033,7 +1039,10 @@ impl TuniTerminal {
         let imp = self.imp();
         let held = imp.bar_hover.get()
             || imp.bar_drag.get().is_some()
-            || imp.bar_until.get().is_some_and(|until| Instant::now() < until);
+            || imp
+                .bar_until
+                .get()
+                .is_some_and(|until| Instant::now() < until);
         let target: f32 = if held && imp.scroll.get().is_scrollable() {
             1.0
         } else {
@@ -1158,7 +1167,14 @@ impl TuniTerminal {
             .is_some_and(|session| session.term.is_mouse_tracking())
     }
 
-    fn report_mouse(&self, action: MouseAction, button: Option<MouseButton>, mods: Mods, x: f64, y: f64) {
+    fn report_mouse(
+        &self,
+        action: MouseAction,
+        button: Option<MouseButton>,
+        mods: Mods,
+        x: f64,
+        y: f64,
+    ) {
         let geometry = self.geometry();
         let imp = self.imp();
         let any_button_pressed = imp.buttons_down.get() > 0;
@@ -1275,7 +1291,9 @@ impl TuniTerminal {
         if uri.is_empty() || uri.chars().any(char::is_control) {
             return;
         }
-        let allowed = SCHEMES.iter().any(|scheme| starts_with_ignore_case(uri, scheme))
+        let allowed = SCHEMES
+            .iter()
+            .any(|scheme| starts_with_ignore_case(uri, scheme))
             || (starts_with_ignore_case(uri, "file://") && tuni_vt::local_file_path(uri).is_some());
         if !allowed {
             return;
@@ -1297,7 +1315,8 @@ impl TuniTerminal {
         self.grab_focus_self();
 
         let imp = self.imp();
-        imp.buttons_down.set(imp.buttons_down.get().saturating_add(1));
+        imp.buttons_down
+            .set(imp.buttons_down.get().saturating_add(1));
         imp.pointer_pos.set((x, y));
 
         let mods = keymap::mods_from_state(gesture.current_event_state());
@@ -1384,7 +1403,8 @@ impl TuniTerminal {
 
     fn on_pointer_release(&self, gesture: &gtk::GestureClick, x: f64, y: f64) {
         let imp = self.imp();
-        imp.buttons_down.set(imp.buttons_down.get().saturating_sub(1));
+        imp.buttons_down
+            .set(imp.buttons_down.get().saturating_sub(1));
         imp.pointer_pos.set((x, y));
 
         if imp.bar_drag.take().is_some() {
@@ -1400,10 +1420,18 @@ impl TuniTerminal {
                 // Between press and release the pointer may have slid off and
                 // output may have moved the link. Opening only when the same
                 // URI is still underneath covers both.
-                let pressed = imp.link_hover.borrow().as_ref().map(|hover| hover.uri.clone());
+                let pressed = imp
+                    .link_hover
+                    .borrow()
+                    .as_ref()
+                    .map(|hover| hover.uri.clone());
                 imp.link_valid.set(false);
                 self.refresh_links(mods);
-                let released = imp.link_hover.borrow().as_ref().map(|hover| hover.uri.clone());
+                let released = imp
+                    .link_hover
+                    .borrow()
+                    .as_ref()
+                    .map(|hover| hover.uri.clone());
                 if let Some(uri) = released.filter(|uri| pressed.as_deref() == Some(uri.as_str())) {
                     self.open_uri(&uri);
                 }
@@ -1752,7 +1780,9 @@ impl TuniTerminal {
         let height = self.height() as f32;
 
         let mut guard = imp.session.borrow_mut();
-        let grid = guard.as_mut().and_then(|session| session.term.snapshot().ok());
+        let grid = guard
+            .as_mut()
+            .and_then(|session| session.term.snapshot().ok());
 
         // The page color: whatever the terminal is actually using, which is the
         // theme unless an application overrode it with OSC 11. Falling back to
@@ -2136,10 +2166,9 @@ impl Painter<'_> {
                 }
             }
             CursorShape::BlockHollow => self.draw_hollow(x, y, color),
-            CursorShape::Bar => self.snapshot.append_color(
-                &rgba(color),
-                &graphene::Rect::new(x, y, 2.0, m.cell_height),
-            ),
+            CursorShape::Bar => self
+                .snapshot
+                .append_color(&rgba(color), &graphene::Rect::new(x, y, 2.0, m.cell_height)),
             CursorShape::Underline => self.snapshot.append_color(
                 &rgba(color),
                 &graphene::Rect::new(x, y + m.cell_height - 2.0, m.cell_width, 2.0),

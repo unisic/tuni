@@ -290,7 +290,10 @@ fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
 }
 
 fn parse_point(spec: &str) -> Option<(f64, f64)> {
-    let values: Vec<f64> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    let values: Vec<f64> = spec
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
     match values[..] {
         [x, y] => Some((x, y)),
         _ => None,
@@ -298,7 +301,10 @@ fn parse_point(spec: &str) -> Option<(f64, f64)> {
 }
 
 fn parse_select(spec: &str) -> Option<(f64, f64, f64, f64)> {
-    let values: Vec<f64> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    let values: Vec<f64> = spec
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
     match values[..] {
         [x1, y1, x2, y2] => Some((x1, y1, x2, y2)),
         _ => None,

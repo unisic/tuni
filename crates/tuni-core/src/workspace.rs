@@ -514,7 +514,10 @@ mod tests {
         tab.layout_mut().focus_previous();
         assert_eq!(tab.name(), "server");
         assert_eq!(tab.directory(), Some("/srv"));
-        assert_eq!(tab.layout().focused(), tab.layout().columns()[0].panes()[0].id());
+        assert_eq!(
+            tab.layout().focused(),
+            tab.layout().columns()[0].panes()[0].id()
+        );
         assert_ne!(tab.layout().focused(), second);
     }
 
@@ -580,7 +583,11 @@ mod tests {
         let third = workspace.open_project();
 
         assert_eq!(
-            workspace.projects().iter().map(Project::id).collect::<Vec<_>>(),
+            workspace
+                .projects()
+                .iter()
+                .map(Project::id)
+                .collect::<Vec<_>>(),
             vec![first, third, second]
         );
         assert_eq!(workspace.selected_id(), Some(third));
@@ -651,7 +658,11 @@ mod tests {
 
         workspace.move_project(third, 0);
         assert_eq!(
-            workspace.projects().iter().map(Project::id).collect::<Vec<_>>(),
+            workspace
+                .projects()
+                .iter()
+                .map(Project::id)
+                .collect::<Vec<_>>(),
             vec![third, first, second]
         );
         assert_eq!(workspace.selected_id(), Some(third));

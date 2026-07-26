@@ -359,9 +359,12 @@ impl Terminal {
     /// selection and cursor-text colors are ours, because selection and cursor
     /// drawing are ours.
     pub fn set_colors(&mut self, colors: &Colors) -> Result<()> {
-        self.inner.set_default_fg_color(Some(colors.foreground.into()))?;
-        self.inner.set_default_bg_color(Some(colors.background.into()))?;
-        self.inner.set_default_cursor_color(colors.cursor.map(Into::into))?;
+        self.inner
+            .set_default_fg_color(Some(colors.foreground.into()))?;
+        self.inner
+            .set_default_bg_color(Some(colors.background.into()))?;
+        self.inner
+            .set_default_cursor_color(colors.cursor.map(Into::into))?;
 
         // Only the first sixteen slots are theme data; the rest of the cube has
         // to survive, so the palette is read back and patched rather than built.
@@ -382,7 +385,13 @@ impl Terminal {
         self.inner.vt_write(data);
     }
 
-    pub fn resize(&mut self, cols: u16, rows: u16, cell_width_px: u32, cell_height_px: u32) -> Result<()> {
+    pub fn resize(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> Result<()> {
         self.inner
             .resize(cols.max(1), rows.max(1), cell_width_px, cell_height_px)
     }
@@ -507,7 +516,13 @@ impl Terminal {
     /// third click at the same spot select a word and a line without the widget
     /// having to know anything about word boundaries. `time` is a monotonic
     /// event timestamp; without it only single clicks are possible.
-    pub fn select_press(&mut self, x: f64, y: f64, geometry: Geometry, time: Duration) -> Result<()> {
+    pub fn select_press(
+        &mut self,
+        x: f64,
+        y: f64,
+        geometry: Geometry,
+        time: Duration,
+    ) -> Result<()> {
         let grid_ref = self.inner.grid_ref(geometry.point(x, y))?;
         self.press_event.set_position(x, y)?.set_time(time)?;
         let selection = self
@@ -529,13 +544,12 @@ impl Terminal {
         rectangle: bool,
     ) -> Result<()> {
         let grid_ref = self.inner.grid_ref(geometry.point(x, y))?;
-        self.drag_event.set_position(x, y)?.set_rectangle(rectangle)?;
-        let selection = self.drag_event.apply(
-            &mut self.gesture,
-            &self.inner,
-            grid_ref,
-            geometry.into(),
-        )?;
+        self.drag_event
+            .set_position(x, y)?
+            .set_rectangle(rectangle)?;
+        let selection =
+            self.drag_event
+                .apply(&mut self.gesture, &self.inner, grid_ref, geometry.into())?;
         if let Some(selection) = selection {
             self.inner.set_selection(Some(&selection))?;
         }
@@ -575,7 +589,10 @@ impl Terminal {
                 .with_emit_format(Format::Plain)
                 .with_unwrap(true)
                 .with_trim(true);
-            match self.inner.format_selection_buf(options, &mut self.selection_buf) {
+            match self
+                .inner
+                .format_selection_buf(options, &mut self.selection_buf)
+            {
                 Ok(None) => return Ok(None),
                 Ok(Some(len)) => {
                     let text = String::from_utf8_lossy(&self.selection_buf[..len]).into_owned();

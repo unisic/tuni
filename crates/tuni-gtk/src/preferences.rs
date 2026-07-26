@@ -32,7 +32,10 @@ pub fn present(window: &crate::window::TuniWindow, settings: &Settings) {
     dialog.present(Some(window));
 }
 
-fn appearance_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw::PreferencesPage {
+fn appearance_page(
+    window: &crate::window::TuniWindow,
+    settings: &Settings,
+) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Appearance")
         .icon_name("applications-graphics-symbolic")

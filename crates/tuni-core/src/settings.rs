@@ -94,10 +94,16 @@ impl Settings {
         }
         // A theme name that no longer exists would otherwise leave the settings
         // window showing a selection it cannot honor.
-        if let Some(name) = table.string("theme-light").filter(|name| theme::exists(name)) {
+        if let Some(name) = table
+            .string("theme-light")
+            .filter(|name| theme::exists(name))
+        {
             settings.terminal.theme_light = name.to_owned();
         }
-        if let Some(name) = table.string("theme-dark").filter(|name| theme::exists(name)) {
+        if let Some(name) = table
+            .string("theme-dark")
+            .filter(|name| theme::exists(name))
+        {
             settings.terminal.theme_dark = name.to_owned();
         }
         if let Some(family) = table.string("font-family").filter(|f| !f.trim().is_empty()) {
@@ -140,13 +146,25 @@ impl Settings {
             let _ = writeln!(out, "theme = {}", toml::quote(self.appearance.name()));
         }
         if self.terminal.theme_light != default.terminal.theme_light {
-            let _ = writeln!(out, "theme-light = {}", toml::quote(&self.terminal.theme_light));
+            let _ = writeln!(
+                out,
+                "theme-light = {}",
+                toml::quote(&self.terminal.theme_light)
+            );
         }
         if self.terminal.theme_dark != default.terminal.theme_dark {
-            let _ = writeln!(out, "theme-dark = {}", toml::quote(&self.terminal.theme_dark));
+            let _ = writeln!(
+                out,
+                "theme-dark = {}",
+                toml::quote(&self.terminal.theme_dark)
+            );
         }
         if self.terminal.font_family != default.terminal.font_family {
-            let _ = writeln!(out, "font-family = {}", toml::quote(&self.terminal.font_family));
+            let _ = writeln!(
+                out,
+                "font-family = {}",
+                toml::quote(&self.terminal.font_family)
+            );
         }
         if self.terminal.font_size != default.terminal.font_size {
             let _ = writeln!(out, "font-size = {}", toml::number(self.terminal.font_size));
@@ -397,7 +415,10 @@ mod tests {
         let default = Settings::default();
         assert!((settings.terminal.font_size - default.terminal.font_size).abs() < f64::EPSILON);
         assert_eq!(settings.terminal.theme_dark, default.terminal.theme_dark);
-        assert_eq!(settings.terminal.cursor_blink, default.terminal.cursor_blink);
+        assert_eq!(
+            settings.terminal.cursor_blink,
+            default.terminal.cursor_blink
+        );
     }
 
     #[test]

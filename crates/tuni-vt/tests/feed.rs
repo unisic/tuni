@@ -65,7 +65,10 @@ fn inverse_video_swaps_foreground_and_background() {
 
     let grid = terminal.snapshot().expect("snapshot");
     let cell = grid.cell(0, 0).expect("cell");
-    assert_eq!(cell.fg, grid.bg, "inverse should paint text in the background color");
+    assert_eq!(
+        cell.fg, grid.bg,
+        "inverse should paint text in the background color"
+    );
     assert_eq!(cell.bg, Some(grid.fg));
 }
 
@@ -299,7 +302,10 @@ fn dragging_selects_the_dragged_over_text() {
     terminal.select_release().expect("release");
 
     assert!(terminal.has_selection());
-    assert_eq!(terminal.selection_text().expect("text").as_deref(), Some("hello"));
+    assert_eq!(
+        terminal.selection_text().expect("text").as_deref(),
+        Some("hello")
+    );
 }
 
 #[test]
@@ -317,7 +323,10 @@ fn a_double_click_selects_a_word() {
         .select_press(x, y, geometry, Duration::from_millis(100))
         .expect("second press");
 
-    assert_eq!(terminal.selection_text().expect("text").as_deref(), Some("world"));
+    assert_eq!(
+        terminal.selection_text().expect("text").as_deref(),
+        Some("world")
+    );
 }
 
 #[test]
@@ -350,7 +359,10 @@ fn select_all_covers_the_scrollback() {
 
     terminal.select_all().expect("select all");
     let text = terminal.selection_text().expect("text").expect("some text");
-    assert!(text.contains("one"), "scrolled-off line should be selected: {text:?}");
+    assert!(
+        text.contains("one"),
+        "scrolled-off line should be selected: {text:?}"
+    );
     assert!(text.contains("three"));
 }
 
@@ -369,7 +381,12 @@ fn mouse_is_reported_only_when_the_application_asks() {
     };
 
     assert!(!terminal.is_mouse_tracking());
-    assert!(terminal.encode_mouse(&press, geometry).expect("encode").is_empty());
+    assert!(
+        terminal
+            .encode_mouse(&press, geometry)
+            .expect("encode")
+            .is_empty()
+    );
 
     // Normal tracking plus SGR reporting, the combination every modern
     // application enables.
@@ -446,13 +463,41 @@ fn osc_seven_ignores_a_directory_on_another_machine() {
 
 fn test_colors() -> Colors {
     Colors {
-        foreground: Rgb { r: 0xe0, g: 0xe0, b: 0xe0 },
-        background: Rgb { r: 0x10, g: 0x12, b: 0x14 },
-        cursor: Some(Rgb { r: 0xff, g: 0xa0, b: 0x00 }),
-        cursor_text: Some(Rgb { r: 0x00, g: 0x00, b: 0x00 }),
-        selection_background: Some(Rgb { r: 0x30, g: 0x40, b: 0x50 }),
-        selection_foreground: Some(Rgb { r: 0xff, g: 0xff, b: 0xff }),
-        palette: [Rgb { r: 0x01, g: 0x02, b: 0x03 }; 16],
+        foreground: Rgb {
+            r: 0xe0,
+            g: 0xe0,
+            b: 0xe0,
+        },
+        background: Rgb {
+            r: 0x10,
+            g: 0x12,
+            b: 0x14,
+        },
+        cursor: Some(Rgb {
+            r: 0xff,
+            g: 0xa0,
+            b: 0x00,
+        }),
+        cursor_text: Some(Rgb {
+            r: 0x00,
+            g: 0x00,
+            b: 0x00,
+        }),
+        selection_background: Some(Rgb {
+            r: 0x30,
+            g: 0x40,
+            b: 0x50,
+        }),
+        selection_foreground: Some(Rgb {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+        }),
+        palette: [Rgb {
+            r: 0x01,
+            g: 0x02,
+            b: 0x03,
+        }; 16],
     }
 }
 
@@ -461,7 +506,11 @@ fn a_theme_repaints_the_page_the_palette_and_the_cursor() {
     let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
     let mut colors = test_colors();
     // A distinguishable ANSI red, so the SGR below has something to prove.
-    colors.palette[1] = Rgb { r: 0xd0, g: 0x20, b: 0x20 };
+    colors.palette[1] = Rgb {
+        r: 0xd0,
+        g: 0x20,
+        b: 0x20,
+    };
     terminal.set_colors(&colors).expect("set colors");
 
     // SGR 31 is "ANSI red", which the palette now defines.
@@ -530,16 +579,28 @@ fn an_application_that_sets_a_color_outranks_the_theme() {
     terminal.feed(b"\x1b]11;#123456\x07");
     assert_eq!(
         terminal.snapshot().expect("snapshot").bg,
-        Rgb { r: 0x12, g: 0x34, b: 0x56 }
+        Rgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56
+        }
     );
 
     // And a theme change while that override stands leaves it alone.
     let mut later = test_colors();
-    later.background = Rgb { r: 0xff, g: 0xff, b: 0xff };
+    later.background = Rgb {
+        r: 0xff,
+        g: 0xff,
+        b: 0xff,
+    };
     terminal.set_colors(&later).expect("set colors");
     assert_eq!(
         terminal.snapshot().expect("snapshot").bg,
-        Rgb { r: 0x12, g: 0x34, b: 0x56 }
+        Rgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56
+        }
     );
 }
 
@@ -566,7 +627,10 @@ fn a_hyperlink_reports_its_uri_and_its_extent() {
         terminal.hyperlink_at(2, 0).expect("uri"),
         Some("https://example.com/one".to_owned())
     );
-    let hover = terminal.hyperlink_hover(2, 0).expect("hover").expect("a link");
+    let hover = terminal
+        .hyperlink_hover(2, 0)
+        .expect("hover")
+        .expect("a link");
     assert_eq!(hover.uri, "https://example.com/one");
     assert_eq!(hover.cells, vec![(0, 0), (1, 0), (2, 0), (3, 0)]);
 }
@@ -590,11 +654,17 @@ fn two_hyperlinks_are_told_apart_by_their_uris() {
     );
     let _ = terminal.snapshot().expect("snapshot");
 
-    let first = terminal.hyperlink_hover(0, 0).expect("hover").expect("a link");
+    let first = terminal
+        .hyperlink_hover(0, 0)
+        .expect("hover")
+        .expect("a link");
     assert_eq!(first.uri, "https://one.example");
     assert_eq!(first.cells, vec![(0, 0), (1, 0)]);
 
-    let second = terminal.hyperlink_hover(3, 0).expect("hover").expect("a link");
+    let second = terminal
+        .hyperlink_hover(3, 0)
+        .expect("hover")
+        .expect("a link");
     assert_eq!(second.uri, "https://two.example");
     assert_eq!(second.cells, vec![(3, 0), (4, 0)]);
 }

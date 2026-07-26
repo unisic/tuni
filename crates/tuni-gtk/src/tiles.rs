@@ -152,8 +152,14 @@ mod imp {
         fn size_allocate(&self, width: i32, height: i32, _baseline: i32) {
             let children = self.children.borrow();
             let horizontal = self.orientation.get() == gtk::Orientation::Horizontal;
-            let (along, across) = if horizontal { (width, height) } else { (height, width) };
-            let available = f64::from(along - GAP * i32::try_from(children.len().saturating_sub(1)).unwrap_or(0));
+            let (along, across) = if horizontal {
+                (width, height)
+            } else {
+                (height, width)
+            };
+            let available = f64::from(
+                along - GAP * i32::try_from(children.len().saturating_sub(1)).unwrap_or(0),
+            );
 
             let sizes = shares(&self.weights.borrow(), available.max(0.0));
             let mut bounds = Vec::with_capacity(children.len());
@@ -209,7 +215,11 @@ impl TuniTiles {
     /// Which divider a press at (`x`, `y`) grabs: the gap it landed in.
     fn divider_at(&self, x: f64, y: f64) -> Option<usize> {
         let imp = self.imp();
-        let along = if imp.orientation.get() == gtk::Orientation::Horizontal { x } else { y };
+        let along = if imp.orientation.get() == gtk::Orientation::Horizontal {
+            x
+        } else {
+            y
+        };
         let bounds = imp.bounds.borrow();
         (0..bounds.len().saturating_sub(1)).find(|index| {
             let (start, size) = bounds[*index];

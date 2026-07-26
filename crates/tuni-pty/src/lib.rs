@@ -144,7 +144,10 @@ impl Pty {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            if tx.send_blocking(PtyEvent::Output(buf[..n].to_vec())).is_err() {
+                            if tx
+                                .send_blocking(PtyEvent::Output(buf[..n].to_vec()))
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -177,7 +180,13 @@ impl Pty {
         Ok(())
     }
 
-    pub fn resize(&self, cols: u16, rows: u16, cell_width_px: u16, cell_height_px: u16) -> Result<()> {
+    pub fn resize(
+        &self,
+        cols: u16,
+        rows: u16,
+        cell_width_px: u16,
+        cell_height_px: u16,
+    ) -> Result<()> {
         self.master
             .resize(PtySize {
                 rows: rows.max(1),

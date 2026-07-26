@@ -116,7 +116,8 @@ impl Grid {
     pub(crate) fn resize_and_clear(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
-        self.cells.resize(usize::from(cols) * usize::from(rows), Cell::default());
+        self.cells
+            .resize(usize::from(cols) * usize::from(rows), Cell::default());
         for cell in &mut self.cells {
             cell.reset();
         }

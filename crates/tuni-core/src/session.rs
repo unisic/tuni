@@ -106,16 +106,20 @@ impl Snapshot {
             .map(|project| ProjectSnapshot {
                 custom_name: project.custom_name.clone(),
                 custom_directory: project.custom_directory.clone(),
-                selected_tab: project
-                    .selected_id()
-                    .and_then(|id| project.index_of(id)),
-                tabs: project.tabs().iter().map(|tab| snap_tab(tab, &history)).collect(),
+                selected_tab: project.selected_id().and_then(|id| project.index_of(id)),
+                tabs: project
+                    .tabs()
+                    .iter()
+                    .map(|tab| snap_tab(tab, &history))
+                    .collect(),
             })
             .collect();
 
         Self {
             projects,
-            selected_project: workspace.selected_id().and_then(|id| workspace.index_of(id)),
+            selected_project: workspace
+                .selected_id()
+                .and_then(|id| workspace.index_of(id)),
             sidebar: None,
         }
     }

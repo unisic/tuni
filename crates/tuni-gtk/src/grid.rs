@@ -127,7 +127,9 @@ impl TuniGrid {
             // One pane on screen: either the tab was never split, or the zoom
             // is showing the focused pane alone. Full bleed, and no grip —
             // there is nothing on screen to drop onto.
-            let id = if split { layout.focused() } else {
+            let id = if split {
+                layout.focused()
+            } else {
                 layout.columns()[0].panes()[0].id()
             };
             let pane = self.build_pane(id, terminals, split, false);
@@ -351,11 +353,9 @@ fn thumbnail(pane: &gtk::Box) -> Option<(gdk::Texture, i32, i32)> {
     snapshot.scale(scale as f32, scale as f32);
     paintable.snapshot(&snapshot, width / scale, height / scale);
     let node = snapshot.to_node()?;
-    let texture = renderer.render_texture(&node, Some(&graphene::Rect::new(
-        0.0,
-        0.0,
-        width as f32,
-        height as f32,
-    )));
+    let texture = renderer.render_texture(
+        &node,
+        Some(&graphene::Rect::new(0.0, 0.0, width as f32, height as f32)),
+    );
     Some((texture, width as i32, height as i32))
 }

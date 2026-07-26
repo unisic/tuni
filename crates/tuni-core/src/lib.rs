@@ -45,7 +45,11 @@ pub struct TerminalConfig {
 impl TerminalConfig {
     /// The colors for one desktop appearance.
     pub fn theme(&self, dark: bool) -> theme::Theme {
-        let name = if dark { &self.theme_dark } else { &self.theme_light };
+        let name = if dark {
+            &self.theme_dark
+        } else {
+            &self.theme_light
+        };
         theme::theme_or_default(name, dark)
     }
 
