@@ -41,8 +41,13 @@ Needs a Rust toolchain, GTK4, libadwaita and GtkSourceView headers, and Zig
 
 ```sh
 sudo dnf install rustup gtk4-devel libadwaita-devel gtksourceview5-devel
+make zig
 cargo run --release
 ```
+
+`make zig` fetches the official 0.15.2 tarball into `~/.local` — the
+distribution's own package is 0.16 by now, and the pinned Ghostty commit does
+not build against it.
 
 ## Configuration
 

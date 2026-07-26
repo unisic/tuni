@@ -11,8 +11,10 @@ to carry.
 Two things beyond the usual GTK development headers:
 
 - **Zig 0.15.2.** `libghostty-vt` is Zig source compiled during the build.
-  Newer Zig does not build the pinned Ghostty commit; Fedora's own package is
-  already too new.
+  Newer Zig does not build the pinned Ghostty commit: the standard library
+  moved in 0.16, which is what Fedora 44 ships. Every build path here fetches
+  the official tarball by URL and checksum rather than trusting `zig` on PATH,
+  and `make zig` does the same thing for a working copy, into `~/.local`.
 - **Network**, unless it is given a way not to. `libghostty-vt-sys`'s build
   script fetches the pinned Ghostty source, and cargo fetches the registry.
 

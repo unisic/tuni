@@ -409,10 +409,17 @@ the executable.
 sudo make install PREFIX=/usr
 ```
 
+`make install-data` is the same thing without the binary, for a Tuni run out of
+the build directory: the window names its icon rather than carrying one, so the
+desktop draws a fallback until the entry and the icon are somewhere the
+compositor looks — `make install-data PREFIX=$HOME/.local`.
+
 `packaging/` holds a Flatpak manifest and an RPM spec that both call into that
 same target, and [packaging/README.md](../packaging/README.md) says what each one
 needs — mainly Zig 0.15.2 and, unless it is given the offline paths, network
-during the build.
+during the build. `make zig` fetches that Zig into `~/.local`, because every
+distribution's package has moved past the version the pinned Ghostty commit
+builds with.
 
 ## Configuration
 
