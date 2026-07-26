@@ -404,6 +404,31 @@ impl Terminal {
             Ok(())
         })?;
 
+        // Say, once, that the shell redraws its own prompt.
+        //
+        // A resize reflows the rows it is given, and a row a shell wrote to the
+        // full old width becomes two rows at a narrower one. A shell that draws
+        // a prompt then repaints it on SIGWINCH — fish, zsh, anything with a
+        // right-hand prompt — counts the rows it wrote, moves up that many, and
+        // overwrites. Reflow has already turned one of those rows into two, so
+        // the move lands one row low and the head of the old prompt is left
+        // behind. One resize leaves one stranded prompt; a drag leaves a
+        // screenful.
+        //
+        // Ghostty answers this by clearing the prompt rows instead of reflowing
+        // them, which is what its `shell_redraws_prompt` does and what it
+        // defaults to. libghostty-vt turns that default off, because an
+        // embedder cannot assume the shell marks its prompts at all — the
+        // clearing only ever fires for a shell that emits OSC 133 in the first
+        // place. This is that opt-in, in the one form the C API exposes: the
+        // `redraw=1` option of a semantic-prompt start.
+        //
+        // The `C` behind it hands the cursor back to output, so the marker sets
+        // the flag and leaves no prompt region of its own for the resize to
+        // find. Both are written into an empty screen with the cursor at the
+        // origin, where a fresh-line is a no-op, so nothing on screen moves.
+        inner.vt_write(b"\x1b]133;A;redraw=1\x1b\\\x1b]133;C\x1b\\");
+
         // Click repeat is untimed until told otherwise, which would leave
         // double- and triple-click dead. These are the GTK defaults
         // (gtk-double-click-time, gtk-double-click-distance).

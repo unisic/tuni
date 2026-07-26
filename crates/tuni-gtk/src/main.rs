@@ -230,7 +230,7 @@ fn settings() -> tuni_core::settings::Settings {
 /// `TUNI_CAPTURE_STAGE`, `TUNI_CAPTURE_FIND`, `TUNI_CAPTURE_SEARCH`,
 /// `TUNI_CAPTURE_PALETTE`, `TUNI_CAPTURE_SWITCHER`,
 /// `TUNI_CAPTURE_EDIT`, `TUNI_CAPTURE_ZOOM`, `TUNI_CAPTURE_SCROLL`,
-/// `TUNI_CAPTURE_HOVER`, and `TUNI_CAPTURE_SELECT`.
+/// `TUNI_CAPTURE_RESIZE`, `TUNI_CAPTURE_HOVER`, and `TUNI_CAPTURE_SELECT`.
 fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
     let Ok(path) = std::env::var("TUNI_CAPTURE_PNG") else {
         return;
@@ -583,6 +583,34 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                 move || terminal.scroll_lines(lines)
             ),
         );
+    }
+
+    // A scripted window resize: "1100x700,700x700" walks the window through
+    // each size in turn, a frame apart, which is the stream of widths a drag on
+    // the window edge produces. The point of driving it from here is that a
+    // drag cannot be injected on a locked-down Wayland session, and a resize is
+    // where a shell's prompt redraw and the terminal's reflow have to agree.
+    if let Ok(spec) = std::env::var("TUNI_CAPTURE_RESIZE") {
+        // Far enough apart that GTK allocates between them and the shell has a
+        // chance to answer, close enough together to stay inside one drag.
+        const STEP: u64 = 250;
+        for (step, size) in spec.split(',').map(str::trim).enumerate() {
+            let Some((width, height)) = size
+                .split_once('x')
+                .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+            else {
+                eprintln!("TUNI_CAPTURE_RESIZE wants WIDTHxHEIGHT, comma-separated");
+                break;
+            };
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(600 + STEP * step as u64),
+                glib::clone!(
+                    #[weak]
+                    window,
+                    move || window.set_default_size(width, height)
+                ),
+            );
+        }
     }
 
     // A scripted Ctrl-hover, in surface pixels: "x,y". Prints the hyperlink
