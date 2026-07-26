@@ -18,6 +18,11 @@ pub struct Process {
     pub pid: u32,
     /// What to call it in a list: the executable's file name.
     pub name: String,
+    /// What the process calls itself: the `comm` field, which keeps the name
+    /// it was launched under. Claude Code is a symlink to a file named after
+    /// its version, so its executable is `2.1.220` while its comm is `claude`,
+    /// and recognising it takes the comm.
+    pub comm: String,
     /// The full path, for a tooltip and for the context menu to copy.
     pub executable: String,
     /// Percent of one CPU, averaged over the process's life, which is what
@@ -110,6 +115,7 @@ pub fn snapshot(shell_pid: u32) -> Snapshot {
             Some(Process {
                 pid: *pid,
                 name,
+                comm: stat.comm.clone(),
                 executable: executable
                     .map(|path| path.to_string_lossy().into_owned())
                     .unwrap_or_default(),

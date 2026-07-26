@@ -42,16 +42,21 @@ impl Agent {
     ///
     /// The process list is the one the Info page already polls, so recognising
     /// an agent costs nothing beyond a walk of names that were read anyway.
+    /// The comm is checked as well as the executable's name, because Claude
+    /// Code's executable is a file named after its version and the comm is
+    /// where `claude` survives.
     #[must_use]
     pub fn running(processes: &[Process]) -> Option<Self> {
-        processes
-            .iter()
-            .find_map(|process| match process.name.as_str() {
-                "claude" => Some(Self::Claude),
-                "codex" => Some(Self::Codex),
-                "opencode" => Some(Self::OpenCode),
-                _ => None,
-            })
+        processes.iter().find_map(|process| {
+            [process.comm.as_str(), process.name.as_str()]
+                .into_iter()
+                .find_map(|name| match name {
+                    "claude" => Some(Self::Claude),
+                    "codex" => Some(Self::Codex),
+                    "opencode" => Some(Self::OpenCode),
+                    _ => None,
+                })
+        })
     }
 
     #[must_use]
