@@ -51,10 +51,15 @@ impl TerminalConfig {
     /// without the configured face lands on the Nerd Font symbols — the
     /// powerline glyphs a prompt is likely to use — and then on whatever
     /// fontconfig calls monospace, rather than on a proportional default.
+    ///
+    /// No space after the commas: Pango splits the list on commas and looks up
+    /// the pieces as they stand, and a leading space is part of the name it
+    /// asks fontconfig for. `" monospace"` is not `"monospace"` and resolves to
+    /// a different face.
     #[must_use]
     pub fn font_stack(&self) -> String {
         format!(
-            "{}, Symbols Nerd Font Mono, monospace",
+            "{},Symbols Nerd Font Mono,monospace",
             self.font_family.trim()
         )
     }
@@ -144,7 +149,7 @@ mod tests {
         let config = TerminalConfig::default();
         assert_eq!(
             config.font_stack(),
-            "JetBrains Mono, Symbols Nerd Font Mono, monospace"
+            "JetBrains Mono,Symbols Nerd Font Mono,monospace"
         );
     }
 }

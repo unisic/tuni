@@ -81,13 +81,18 @@ Text is drawn with Pango rather than a GPU glyph atlas. Pango brings fontconfig
 fallback, subpixel antialiasing, and input methods, and text quality is what a
 terminal is judged on.
 
-The cell width is measured from a real run of glyphs rather than read off the
-font's own `approximate_char_width` hint, and every run is placed on the row's
-baseline rather than in its own box, so a character that falls back to another
-face lands on its column and on the line instead of near them. Runs of plain
-ASCII share one layout; anything wide, combining, or borrowed from a fallback
-face gets a layout of its own. Ligatures are off by default for the same
-reason — a ligature is one glyph where the terminal still counts several cells.
+The cell width is measured from real glyphs rather than read off the font's own
+`approximate_char_width` hint — the widest printable ASCII character, because a
+face that calls itself monospace is not obliged to prove it — and it is rounded
+to whole pixels, with glyph positions rounded to match. Both are what keeps the
+eightieth column drawn where the eightieth background was filled. Every run is
+placed on the row's baseline rather than in its own box, so a character that
+falls back to another face lands on its column and on the line instead of near
+them. Runs of plain ASCII share one layout; anything wide, combining, or
+borrowed from a fallback face gets a layout of its own. Ligatures are off by
+default, which is a deliberate divergence from Ghostty and kero: a ligature is
+one glyph where the terminal still counts several cells. `TUNI_LIGATURES=1`
+turns them back on.
 
 A letter key is named by where it is rather than by what it types: the hardware
 keycode a GDK event carries is the XKB one, which is the evdev scancode plus

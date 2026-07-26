@@ -71,15 +71,15 @@ impl Thumb {
 /// every terminal on this desktop uses.
 const FONT_STEP: f64 = 1.0;
 
-/// The sample the cell width is measured from: digits and letters of a width a
-/// monospace face is obliged to share. Long enough that rounding in a single
-/// advance cannot skew the average.
-const WIDTH_SAMPLE: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
+/// What the cell width is measured over: every printable ASCII character,
+/// because a face that calls itself monospace is not obliged to prove it and
+/// the widest of them is what has to fit.
+const WIDTH_SAMPLE: std::ops::RangeInclusive<char> = ' '..='~';
 
 /// Cell geometry derived from the font. Everything on screen is placed off
 /// these numbers, so a terminal stays a grid even when the font lies about
 /// being monospace.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Metrics {
     cell_width: f32,
     cell_height: f32,
@@ -119,6 +119,10 @@ mod imp {
         /// configured one and put back.
         pub(super) font_size: Cell<f64>,
         pub(super) metrics: Cell<Metrics>,
+        /// The context text is measured and drawn through, and the serial of
+        /// the widget's own context when it was made. See `text_context`.
+        pub(super) pango: RefCell<Option<pango::Context>>,
+        pub(super) pango_serial: Cell<u32>,
         /// Grid size last pushed to the VT and the PTY, so a resize that does
         /// not cross a cell boundary costs nothing. The cell's pixel size goes
         /// with it, because zooming changes that without changing the grid.
@@ -185,6 +189,8 @@ mod imp {
                 config: RefCell::new(TerminalConfig::default()),
                 font: RefCell::new(pango::FontDescription::new()),
                 metrics: Cell::new(Metrics::default()),
+                pango: RefCell::new(None),
+                pango_serial: Cell::new(0),
                 grid_size: Cell::new((0, 0)),
                 cell_size: Cell::new((0, 0)),
                 im: RefCell::new(None),
@@ -250,6 +256,7 @@ mod imp {
             obj.set_focus_on_click(true);
             obj.setup_font();
             obj.setup_input();
+            obj.watch_display();
         }
 
         fn dispose(&self) {
@@ -362,24 +369,86 @@ impl TuniTerminal {
         self.update_metrics();
     }
 
+    /// The Pango context every measurement and every run is drawn through.
+    ///
+    /// Not the widget's own: GTK leaves glyph positions unrounded there when
+    /// the desktop asks for unhinted text, and a face that then advances
+    /// 8.7998 px per cell would put the eightieth column two pixels away from
+    /// the background that was filled for it. A terminal is a grid, so this
+    /// context rounds. The widget's context still decides everything else —
+    /// DPI, font options, text direction — so a fresh copy is taken whenever
+    /// its serial says any of that moved.
+    fn text_context(&self) -> pango::Context {
+        let imp = self.imp();
+        let serial = self.pango_context().serial();
+        let mut cached = imp.pango.borrow_mut();
+        if cached.is_none() || imp.pango_serial.get() != serial {
+            let context = self.create_pango_context();
+            context.set_round_glyph_positions(true);
+            imp.pango_serial.set(serial);
+            *cached = Some(context);
+        }
+        cached.clone().expect("context was just put there")
+    }
+
+    /// Watch what the desktop can change under a running terminal: the monitor
+    /// scale, the font DPI, and how the desktop asks for text to be rendered.
+    /// All three change what a point is worth in pixels, and the grid is built
+    /// out of pixels.
+    fn watch_display(&self) {
+        self.connect_scale_factor_notify(|this| this.remeasure());
+
+        let Some(settings) = gtk::Settings::default() else {
+            return;
+        };
+        for property in ["gtk-xft-dpi", "gtk-font-rendering", "gtk-xft-antialias"] {
+            settings.connect_notify_local(
+                Some(property),
+                glib::clone!(
+                    #[weak(rename_to = this)]
+                    self,
+                    move |_, _| this.remeasure()
+                ),
+            );
+        }
+    }
+
     fn update_metrics(&self) {
         let imp = self.imp();
-        let context = self.pango_context();
+        let context = self.text_context();
         let font = imp.font.borrow();
         let metrics = context.metrics(Some(&font), None);
 
         let scale = pango::SCALE as f32;
         let ascent = metrics.ascent() as f32 / scale;
         let descent = metrics.descent() as f32 / scale;
+        // The font's own line height where it states one, which is ascent and
+        // descent plus the leading the designer asked for. Pango answers zero
+        // for a face that states none, and then the two halves are all there
+        // is to go on.
+        let line = match metrics.height() {
+            0 => ascent + descent,
+            height => height as f32 / scale,
+        };
 
         // Measured rather than taken from `approximate_char_width`: that number
         // is a hint the font supplies, and a face whose hint disagrees with its
         // own advances would draw a grid that drifts a fraction of a pixel per
-        // column. Laying out a real run asks the question the renderer will.
+        // column. Laying out real glyphs asks the question the renderer will.
+        //
+        // The widest of them, not the average: a face that calls itself
+        // monospace can still advance one character wider than the rest, and a
+        // cell built on the average would let that one spill into its
+        // neighbour. Ghostty measures the same way.
         let layout = pango::Layout::new(&context);
         layout.set_font_description(Some(&font));
-        layout.set_text(WIDTH_SAMPLE);
-        let measured = layout.size().0 as f32 / scale / WIDTH_SAMPLE.chars().count() as f32;
+        let mut widest = 0;
+        let mut sample = [0u8; 4];
+        for ch in WIDTH_SAMPLE {
+            layout.set_text(ch.encode_utf8(&mut sample));
+            widest = widest.max(layout.size().0);
+        }
+        let measured = widest as f32 / scale;
         let cell_width = if measured >= 1.0 {
             measured
         } else {
@@ -387,12 +456,32 @@ impl TuniTerminal {
         };
         drop(font);
 
+        // Whole pixels, because every column and every row is placed off these
+        // two numbers: a cell a fraction of a pixel wide would have the
+        // eightieth column drawn where the seventy-ninth was filled.
         let extra = imp.config.borrow().line_height_extra as f32;
+        let cell_width = cell_width.max(1.0).ceil();
+        let cell_height = (line + extra).max(1.0).ceil();
         imp.metrics.set(Metrics {
-            cell_width: cell_width.max(1.0),
-            cell_height: (ascent + descent + extra).max(1.0),
-            ascent: ascent + extra / 2.0,
+            cell_width,
+            cell_height,
+            // Whatever the rounding and the configured extra leading added
+            // goes half above the text and half below, so a line sits in the
+            // middle of its cell rather than riding the top of it.
+            ascent: (ascent + (cell_height - ascent - descent) / 2.0).round(),
         });
+    }
+
+    /// Take the font's measurements again and rebuild the grid from them.
+    /// The desktop changing its scale factor or its font settings changes what
+    /// a point is worth in pixels, and every cell on screen is placed off that.
+    fn remeasure(&self) {
+        let before = self.imp().metrics.get();
+        self.update_metrics();
+        if self.imp().metrics.get() != before {
+            self.apply_size(self.width(), self.height());
+            self.queue_draw();
+        }
     }
 
     // --- font size -----------------------------------------------------------
@@ -1617,15 +1706,29 @@ impl TuniTerminal {
             return;
         };
 
-        let context = self.pango_context();
+        let context = self.text_context();
         let font = imp.font.borrow();
         let layout = pango::Layout::new(&context);
         layout.set_font_description(Some(&font));
+
+        // The attributes every run shares, built once a frame rather than once
+        // a run: a full viewport is hundreds of runs and a fresh attribute list
+        // for each of them is measurable against a 16.7 ms budget.
+        let plain = pango::AttrList::new();
+        if !imp.config.borrow().font_ligatures {
+            // A ligature is one glyph where the terminal still counts several
+            // cells, so it is off unless the configuration asks for it. These
+            // four features are what a coding font joins characters with.
+            plain.insert(pango::AttrFontFeatures::new(
+                "liga 0, clig 0, dlig 0, calt 0",
+            ));
+        }
+
         let painter = Painter {
             snapshot,
             layout: &layout,
             font: &font,
-            ligatures: imp.config.borrow().font_ligatures,
+            plain,
             m,
         };
 
@@ -1858,7 +1961,9 @@ struct Painter<'a> {
     snapshot: &'a gtk::Snapshot,
     layout: &'a pango::Layout,
     font: &'a pango::FontDescription,
-    ligatures: bool,
+    /// What every run carries: ligature suppression, unless the configuration
+    /// wanted ligatures, in which case nothing at all.
+    plain: pango::AttrList,
     m: Metrics,
 }
 
@@ -1886,15 +1991,6 @@ impl Painter<'_> {
         self.layout.set_font_description(Some(&desc));
         self.layout.set_text(text);
 
-        let attrs = pango::AttrList::new();
-        if !self.ligatures {
-            // A ligature is one glyph where the terminal still counts several
-            // cells, so it is off unless the configuration asks for it. These
-            // four features are what a coding font joins characters with.
-            attrs.insert(pango::AttrFontFeatures::new(
-                "liga 0, clig 0, dlig 0, calt 0",
-            ));
-        }
         // A hovered hyperlink is underlined; over text that was underlined
         // already, the line doubles, so the highlight still reads as one.
         // Ghostty draws it the same way.
@@ -1903,12 +1999,21 @@ impl Painter<'_> {
             (true, false) | (false, true) => Some(pango::Underline::Single),
             (false, false) => None,
         };
-        if let Some(underline) = underline {
-            attrs.insert(pango::AttrInt::new_underline(underline));
-        }
-        if style.strikethrough {
-            attrs.insert(pango::AttrInt::new_strikethrough(true));
-        }
+
+        // Most runs are plain text and share the frame's own list; only a run
+        // that is lined through or under pays for a list of its own.
+        let attrs = if underline.is_none() && !style.strikethrough {
+            self.plain.clone()
+        } else {
+            let attrs = self.plain.copy().unwrap_or_default();
+            if let Some(underline) = underline {
+                attrs.insert(pango::AttrInt::new_underline(underline));
+            }
+            if style.strikethrough {
+                attrs.insert(pango::AttrInt::new_strikethrough(true));
+            }
+            attrs
+        };
         self.layout.set_attributes(Some(&attrs));
 
         self.snapshot.save();
