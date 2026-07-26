@@ -29,10 +29,11 @@ shell calls itself until you rename it, and a project directory can be pinned
 for the file tree and the git panel to stay on. A new tab starts where the
 visible one is, opens next to it, and closes when its last shell exits; a
 project whose tabs are all closed stays in the sidebar until it is closed on
-purpose. The sidebar and the panel are both dragged to a width by their inner
-edge, and one dragged to a width keeps it — until then each is a fraction of the
-window, which is what a split view sizes by and what an undragged one should go
-on doing.
+purpose: by its own button, by its menu, or by a middle click anywhere on the
+row, which is how a tab closes everywhere else. The sidebar and the panel are
+both dragged to a width by their inner edge, and one dragged to a width keeps
+it. Until then each is a fraction of the window, which is what a split view
+sizes by and what an undragged one should go on doing.
 
 On the other side, a panel under `Ctrl+Shift+B` shows the directory the focused
 shell is working in, or the project's own if one is pinned, and follows it as

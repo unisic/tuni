@@ -2983,6 +2983,25 @@ impl TuniWindow {
         ));
         row.add_controller(press);
 
+        // Middle click closes the project, the way it closes a tab in every
+        // browser and in the tab bar above: the button on the row is a small
+        // target, and reaching for it is a pause in something else.
+        let middle = gtk::GestureClick::new();
+        middle.set_button(gdk::BUTTON_MIDDLE);
+        middle.connect_released(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            row,
+            move |_, _, x, y| {
+                // A press that ends somewhere else is a press taken back.
+                if row.contains(x, y) {
+                    this.close_project(id);
+                }
+            }
+        ));
+        row.add_controller(middle);
+
         // Dragging a row up or down reorders the sidebar, as it does in kero.
         let source = gtk::DragSource::builder()
             .actions(gdk::DragAction::MOVE)
