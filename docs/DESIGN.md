@@ -334,6 +334,13 @@ build needs no data directory beside the executable. The same theme drives the
 window: libadwaita builds its stylesheet out of named colors, so overriding
 those recolors the header bar and dialogs along with the terminal.
 
+Both header bars drop the `icon` element out of whatever decoration layout the
+desktop asks for, and follow the setting so a later change keeps dropping it.
+KDE's default layout puts one there, and the window icon it draws is not a
+button. It is a picture of the application that answers nothing when clicked,
+and that shows the theme's missing-icon glyph on any machine running the binary
+without having installed its icon.
+
 Text is drawn with Pango rather than a GPU glyph atlas. Pango brings fontconfig
 fallback, subpixel antialiasing, and input methods, and text quality is what a
 terminal is judged on.

@@ -447,6 +447,7 @@ impl TuniWindow {
             .show_end_title_buttons(false)
             .title_widget(&adw::WindowTitle::new("Projects", ""))
             .build();
+        drop_window_icon(&sidebar_header);
         let sidebar_view = adw::ToolbarView::new();
         sidebar_view.add_top_bar(&sidebar_header);
         sidebar_view.add_bottom_bar(&footer);
@@ -463,6 +464,7 @@ impl TuniWindow {
             .show_start_title_buttons(false)
             .title_widget(&title)
             .build();
+        drop_window_icon(&header);
         header.pack_start(&toggle);
 
         let menu = gtk::MenuButton::builder()
@@ -3370,6 +3372,44 @@ fn add_sidebar_grip(
 
 /// Whether a split view's sidebar is the one on the left of the screen, which
 /// is what its packing says until a right-to-left desktop says otherwise.
+/// Keeps the desktop's window buttons and drops the window icon beside them.
+///
+/// A KDE session lays its decorations out as `icon:minimize,maximize,close`,
+/// and GTK draws that `icon` from the icon theme, which on a Tuni that has
+/// never been installed is a missing-icon glyph in the corner of every window.
+/// It is not a button either, so the one thing it tells anyone is that
+/// something is wrong. The rest of the layout is the desktop's to decide, so
+/// only the icon is taken out, and it is taken out again whenever the desktop
+/// changes its mind about the layout.
+fn drop_window_icon(header: &adw::HeaderBar) {
+    let settings = header.settings();
+    let apply = |header: &adw::HeaderBar, settings: &gtk::Settings| {
+        let layout = settings.gtk_decoration_layout().unwrap_or_default();
+        header.set_decoration_layout(Some(&without_icon(&layout)));
+    };
+    apply(header, &settings);
+    settings.connect_gtk_decoration_layout_notify(glib::clone!(
+        #[weak]
+        header,
+        move |settings| apply(&header, settings)
+    ));
+}
+
+/// A GTK decoration layout without its `icon` element: two comma-separated
+/// lists of elements, split by the colon that says which side each is on.
+fn without_icon(layout: &str) -> String {
+    let side = |side: &str| {
+        side.split(',')
+            .filter(|element| element.trim() != "icon")
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    match layout.split_once(':') {
+        Some((start, end)) => format!("{}:{}", side(start), side(end)),
+        None => side(layout),
+    }
+}
+
 fn sidebar_on_left(split: &adw::OverlaySplitView) -> bool {
     (split.sidebar_position() == gtk::PackType::Start)
         != (split.direction() == gtk::TextDirection::Rtl)
