@@ -11,9 +11,20 @@ iOS. Kero is GPLv3 and so is Tuni.
 
 ## Status
 
-Feasibility spike. One window, one terminal, keyboard input, Pango rendering.
-`ls`, `vi`, and `top` all render correctly. Not usable as a daily terminal yet:
-no selection, no clipboard, no scrollbar, no themes, no tabs.
+One window, one terminal: keyboard input, Pango rendering, mouse selection with
+word and line clicks, clipboard and bracketed paste, and SGR mouse reporting for
+applications that ask for it. `ls`, `vi`, and `top` all render correctly. Still
+missing before it is a daily terminal: scrollbar, cursor blinking, themes, font
+configuration, hyperlinks, tabs.
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection, paste |
+| Middle click | Paste the primary selection |
+| `Ctrl+Shift+A` | Select everything, scrollback included |
+| Drag, double click, triple click | Select by character, word, line |
+| `Alt`+drag | Block selection |
+| `Shift`+click | Select even while an application is tracking the mouse |
 
 From here the work runs to full parity: a complete standalone terminal, then
 projects and tabs, the niri-style pane layout, session persistence, the file

@@ -7,6 +7,7 @@
 //! this keeps up under a firehose is exactly what the Etap 0 benchmark decides.
 
 use std::cell::{Cell, RefCell};
+use std::time::Duration;
 
 use gtk::gdk;
 use gtk::glib;
@@ -18,9 +19,22 @@ use unicode_width::UnicodeWidthStr;
 
 use tuni_core::TerminalConfig;
 use tuni_pty::{Pty, PtyConfig, PtyEvent};
-use tuni_vt::{CursorShape, KeyAction, KeyInput, Mods, Rgb};
+use tuni_vt::{
+    ClipboardTarget, CursorShape, Geometry, KeyAction, KeyInput, Mods, MouseAction, MouseButton,
+    MouseInput, Rgb,
+};
 
 use crate::keymap;
+
+/// What the pointer is doing between press and release. A drag either paints a
+/// selection or is reported to the application; never both.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Pointer {
+    #[default]
+    Idle,
+    Selecting,
+    Reporting,
+}
 
 /// Cell geometry derived from the font. Everything on screen is placed off
 /// these two numbers, so a terminal stays a grid even when the font lies about
@@ -60,6 +74,13 @@ mod imp {
         /// Text the input method committed during the current key press.
         pub(super) pending_commit: RefCell<Option<String>>,
         pub(super) title: RefCell<Option<String>>,
+        pub(super) pointer: Cell<Pointer>,
+        /// How many mouse buttons are down, which mouse reporting needs in
+        /// order to decide whether motion is worth sending.
+        pub(super) buttons_down: Cell<u8>,
+        /// Last known pointer position, because scroll events carry no
+        /// coordinates but the application still expects them in the report.
+        pub(super) pointer_pos: Cell<(f64, f64)>,
         /// Draw timings, collected only when TUNI_DEBUG_FRAME_TIME is set.
         /// This is the measurement that decides whether Pango can keep up.
         pub(super) frame_timing: bool,
@@ -77,6 +98,9 @@ mod imp {
                 im: RefCell::new(None),
                 pending_commit: RefCell::new(None),
                 title: RefCell::new(None),
+                pointer: Cell::new(Pointer::default()),
+                buttons_down: Cell::new(0),
+                pointer_pos: Cell::new((0.0, 0.0)),
                 frame_timing: std::env::var_os("TUNI_DEBUG_FRAME_TIME").is_some(),
                 frame_times: RefCell::new(Vec::with_capacity(120)),
             }
@@ -296,12 +320,28 @@ impl TuniTerminal {
         self.add_controller(focus);
 
         let click = gtk::GestureClick::new();
+        // Every button, not just the primary one: middle pastes the primary
+        // selection and applications want the others reported.
+        click.set_button(0);
         click.connect_pressed(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |_, _, _, _| this.grab_focus_self()
+            move |gesture, _, x, y| this.on_pointer_press(gesture, x, y)
+        ));
+        click.connect_released(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |gesture, _, x, y| this.on_pointer_release(gesture, x, y)
         ));
         self.add_controller(click);
+
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_motion(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |controller, x, y| this.on_pointer_motion(controller, x, y)
+        ));
+        self.add_controller(motion);
 
         let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         scroll.connect_scroll(glib::clone!(
@@ -309,8 +349,8 @@ impl TuniTerminal {
             self,
             #[upgrade_or]
             glib::Propagation::Proceed,
-            move |_, _, dy| {
-                this.scroll_by(dy);
+            move |controller, _, dy| {
+                this.on_scroll(controller, dy);
                 glib::Propagation::Stop
             }
         ));
@@ -399,6 +439,23 @@ impl TuniTerminal {
         if effects.bell {
             self.error_bell();
         }
+        for request in &effects.clipboard_writes {
+            if std::env::var_os("TUNI_DEBUG_CLIPBOARD").is_some() {
+                eprintln!(
+                    "clipboard write: {:?} {:?}",
+                    request.target,
+                    request.text.chars().take(40).collect::<String>()
+                );
+            }
+            // OSC 52. Reads are refused by the VT itself, so nothing here can
+            // leak the clipboard back to a remote shell.
+            match request.target {
+                ClipboardTarget::Standard => self.clipboard().set_text(&request.text),
+                ClipboardTarget::Selection | ClipboardTarget::Primary => {
+                    self.primary_clipboard().set_text(&request.text);
+                }
+            }
+        }
         self.queue_draw();
     }
 
@@ -431,8 +488,187 @@ impl TuniTerminal {
         );
     }
 
-    fn scroll_by(&self, dy: f64) {
+    // --- mouse ---------------------------------------------------------------
+
+    /// Pixel geometry of the grid as drawn, which both the selection gesture and
+    /// the mouse encoder work in.
+    fn geometry(&self) -> Geometry {
         let imp = self.imp();
+        let m = imp.metrics.get();
+        let (cols, rows) = imp.grid_size.get();
+        Geometry {
+            cols: cols.max(1),
+            rows: rows.max(1),
+            cell_width_px: (m.cell_width.round() as u32).max(1),
+            cell_height_px: (m.cell_height.round() as u32).max(1),
+            screen_width_px: self.width().max(1) as u32,
+            screen_height_px: self.height().max(1) as u32,
+        }
+    }
+
+    /// Whether this event belongs to the application rather than to selection.
+    /// Shift is the standard override: it takes the mouse back even while an
+    /// application is tracking it.
+    fn reports_mouse(&self, mods: Mods) -> bool {
+        if mods.contains(Mods::SHIFT) {
+            return false;
+        }
+        self.imp()
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| session.term.is_mouse_tracking())
+    }
+
+    fn report_mouse(&self, action: MouseAction, button: Option<MouseButton>, mods: Mods, x: f64, y: f64) {
+        let geometry = self.geometry();
+        let imp = self.imp();
+        let any_button_pressed = imp.buttons_down.get() > 0;
+
+        let mut guard = imp.session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        let input = MouseInput {
+            action,
+            button,
+            mods,
+            x,
+            y,
+            any_button_pressed,
+        };
+        if let Ok(bytes) = session.term.encode_mouse(&input, geometry)
+            && !bytes.is_empty()
+        {
+            let _ = session.pty.write(bytes);
+        }
+    }
+
+    fn on_pointer_press(&self, gesture: &gtk::GestureClick, x: f64, y: f64) {
+        self.grab_focus_self();
+
+        let imp = self.imp();
+        imp.buttons_down.set(imp.buttons_down.get().saturating_add(1));
+        imp.pointer_pos.set((x, y));
+
+        let mods = keymap::mods_from_state(gesture.current_event_state());
+        let button = gesture.current_button();
+
+        if self.reports_mouse(mods) {
+            imp.pointer.set(Pointer::Reporting);
+            self.report_mouse(MouseAction::Press, mouse_button(button), mods, x, y);
+            return;
+        }
+
+        match button {
+            gdk::BUTTON_MIDDLE => {
+                // The primary selection, pasted by middle click: the X11
+                // convention Wayland kept.
+                self.paste_from(&self.primary_clipboard());
+            }
+            gdk::BUTTON_PRIMARY => {
+                imp.pointer.set(Pointer::Selecting);
+                let time = Duration::from_millis(u64::from(gesture.current_event_time()));
+                self.selection_press(x, y, time);
+            }
+            _ => {}
+        }
+    }
+
+    /// Anchor a selection at a surface position. Public to the crate so the
+    /// debug capture harness can drive the same path a real click takes.
+    pub(crate) fn selection_press(&self, x: f64, y: f64, time: Duration) {
+        let geometry = self.geometry();
+        let mut guard = self.imp().session.borrow_mut();
+        if let Some(session) = guard.as_mut() {
+            let _ = session.term.select_press(x, y, geometry, time);
+        }
+        drop(guard);
+        self.queue_draw();
+    }
+
+    pub(crate) fn selection_drag(&self, x: f64, y: f64, rectangle: bool) {
+        let geometry = self.geometry();
+        let mut guard = self.imp().session.borrow_mut();
+        if let Some(session) = guard.as_mut() {
+            let _ = session.term.select_drag(x, y, geometry, rectangle);
+        }
+        drop(guard);
+        self.queue_draw();
+    }
+
+    /// End the gesture and return what is selected.
+    pub(crate) fn selection_finish(&self) -> Option<String> {
+        let mut guard = self.imp().session.borrow_mut();
+        let text = guard.as_mut().and_then(|session| {
+            let _ = session.term.select_release();
+            session.term.selection_text().ok().flatten()
+        });
+        drop(guard);
+        text.filter(|text| !text.is_empty())
+    }
+
+    fn on_pointer_release(&self, gesture: &gtk::GestureClick, x: f64, y: f64) {
+        let imp = self.imp();
+        imp.buttons_down.set(imp.buttons_down.get().saturating_sub(1));
+
+        let mods = keymap::mods_from_state(gesture.current_event_state());
+        match imp.pointer.replace(Pointer::Idle) {
+            Pointer::Reporting => {
+                self.report_mouse(
+                    MouseAction::Release,
+                    mouse_button(gesture.current_button()),
+                    mods,
+                    x,
+                    y,
+                );
+            }
+            Pointer::Selecting => {
+                // Selecting fills the primary selection, so a middle click in
+                // any other window pastes what was just highlighted.
+                if let Some(text) = self.selection_finish() {
+                    self.primary_clipboard().set_text(&text);
+                }
+            }
+            Pointer::Idle => {}
+        }
+    }
+
+    fn on_pointer_motion(&self, controller: &gtk::EventControllerMotion, x: f64, y: f64) {
+        let imp = self.imp();
+        imp.pointer_pos.set((x, y));
+        let mods = keymap::mods_from_state(controller.current_event_state());
+
+        match imp.pointer.get() {
+            // Alt turns the drag into a block selection, as in Ghostty.
+            Pointer::Selecting => self.selection_drag(x, y, mods.contains(Mods::ALT)),
+            _ => {
+                if self.reports_mouse(mods) {
+                    self.report_mouse(MouseAction::Motion, None, mods, x, y);
+                }
+            }
+        }
+    }
+
+    fn on_scroll(&self, controller: &gtk::EventControllerScroll, dy: f64) {
+        let imp = self.imp();
+        let mods = keymap::mods_from_state(controller.current_event_state());
+
+        if self.reports_mouse(mods) {
+            // Wheel up and down are reported as buttons four and five.
+            let button = if dy < 0.0 {
+                MouseButton::Four
+            } else {
+                MouseButton::Five
+            };
+            let (x, y) = imp.pointer_pos.get();
+            let notches = (dy.abs().round() as u32).clamp(1, 8);
+            for _ in 0..notches {
+                self.report_mouse(MouseAction::Press, Some(button), mods, x, y);
+            }
+            return;
+        }
+
         let mut guard = imp.session.borrow_mut();
         let Some(session) = guard.as_mut() else {
             return;
@@ -444,6 +680,60 @@ impl TuniTerminal {
             drop(guard);
             self.queue_draw();
         }
+    }
+
+    // --- clipboard -----------------------------------------------------------
+
+    /// Copy the selection to the system clipboard. Does nothing without one.
+    pub fn copy_selection(&self) -> bool {
+        let mut guard = self.imp().session.borrow_mut();
+        let text = guard
+            .as_mut()
+            .and_then(|session| session.term.selection_text().ok().flatten());
+        drop(guard);
+
+        match text.filter(|t| !t.is_empty()) {
+            Some(text) => {
+                self.clipboard().set_text(&text);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn paste_clipboard(&self) {
+        self.paste_from(&self.clipboard());
+    }
+
+    fn paste_from(&self, clipboard: &gdk::Clipboard) {
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[strong]
+            clipboard,
+            async move {
+                if let Ok(text) = clipboard.read_text_future().await
+                    && let Some(text) = text
+                {
+                    this.paste_text(&text);
+                }
+            }
+        ));
+    }
+
+    /// Write pasted text to the shell, bracketed when the application asked for
+    /// it so a multi-line paste cannot run itself.
+    fn paste_text(&self, text: &str) {
+        let mut guard = self.imp().session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        if let Ok(bytes) = session.term.encode_paste(text) {
+            let _ = session.pty.write(bytes);
+            session.term.scroll_to_bottom();
+        }
+        drop(guard);
+        self.queue_draw();
     }
 
     // --- input -------------------------------------------------------------
@@ -469,6 +759,35 @@ impl TuniTerminal {
         }
 
         let mods = keymap::mods_from_state(state);
+
+        // Application shortcuts live on Ctrl+Shift, because Ctrl+C and Ctrl+V
+        // belong to the shell.
+        if mods.contains(Mods::CTRL) && mods.contains(Mods::SHIFT) {
+            match keyval.to_unicode().map(|c| c.to_ascii_lowercase()) {
+                Some('c') => {
+                    // With nothing selected, fall through so Ctrl+Shift+C still
+                    // reaches the application.
+                    if self.copy_selection() {
+                        return glib::Propagation::Stop;
+                    }
+                }
+                Some('v') => {
+                    self.paste_clipboard();
+                    return glib::Propagation::Stop;
+                }
+                Some('a') => {
+                    let mut guard = imp.session.borrow_mut();
+                    if let Some(session) = guard.as_mut() {
+                        let _ = session.term.select_all();
+                    }
+                    drop(guard);
+                    self.queue_draw();
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
+            }
+        }
+
         let key = keymap::key_from_keyval(keyval);
         let text = committed.or_else(|| {
             keyval
@@ -615,6 +934,17 @@ struct StyleKey {
     italic: bool,
     underline: bool,
     strikethrough: bool,
+}
+
+fn mouse_button(button: u32) -> Option<MouseButton> {
+    match button {
+        gdk::BUTTON_PRIMARY => Some(MouseButton::Left),
+        gdk::BUTTON_MIDDLE => Some(MouseButton::Middle),
+        gdk::BUTTON_SECONDARY => Some(MouseButton::Right),
+        8 => Some(MouseButton::Four),
+        9 => Some(MouseButton::Five),
+        _ => None,
+    }
 }
 
 fn style_key(cell: &tuni_vt::Cell) -> StyleKey {

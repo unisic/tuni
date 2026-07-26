@@ -92,7 +92,7 @@ fn maybe_capture(window: &adw::ApplicationWindow, terminal: &TuniTerminal) {
     let Ok(path) = std::env::var("TUNI_CAPTURE_PNG") else {
         return;
     };
-    let delay = std::env::var("TUNI_CAPTURE_DELAY_MS")
+    let delay: u64 = std::env::var("TUNI_CAPTURE_DELAY_MS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(1500);
@@ -104,6 +104,27 @@ fn maybe_capture(window: &adw::ApplicationWindow, terminal: &TuniTerminal) {
                 #[weak]
                 terminal,
                 move || terminal.send_text(&input)
+            ),
+        );
+    }
+
+    // A scripted selection, in surface pixels: "x1,y1,x2,y2". Runs the same
+    // widget path a real drag takes and prints what came out, because no
+    // pointer injection tool exists on a locked-down Wayland session.
+    if let Ok(spec) = std::env::var("TUNI_CAPTURE_SELECT") {
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(delay.saturating_sub(200)),
+            glib::clone!(
+                #[weak]
+                terminal,
+                move || match parse_select(&spec) {
+                    Some((x1, y1, x2, y2)) => {
+                        terminal.selection_press(x1, y1, std::time::Duration::ZERO);
+                        terminal.selection_drag(x2, y2, false);
+                        println!("selection: {:?}", terminal.selection_finish());
+                    }
+                    None => eprintln!("TUNI_CAPTURE_SELECT wants x1,y1,x2,y2"),
+                }
             ),
         );
     }
@@ -123,6 +144,14 @@ fn maybe_capture(window: &adw::ApplicationWindow, terminal: &TuniTerminal) {
             }
         ),
     );
+}
+
+fn parse_select(spec: &str) -> Option<(f64, f64, f64, f64)> {
+    let values: Vec<f64> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    match values[..] {
+        [x1, y1, x2, y2] => Some((x1, y1, x2, y2)),
+        _ => None,
+    }
 }
 
 fn capture(terminal: &TuniTerminal, path: &str) -> Result<(), String> {
