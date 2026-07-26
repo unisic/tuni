@@ -8,7 +8,7 @@
 
 A native terminal workspace for Linux.
 
-<img width="1100" height="700" alt="Unisic_2026-07-26_13-50-33" src="https://github.com/user-attachments/assets/abfcaab6-c2a8-45b4-a826-a0d3ec6e614d" />
+<img width="1100" height="700" alt="Unisic_2026-07-26_13-52-51" src="https://github.com/user-attachments/assets/06b27e07-bb6e-43b6-9cdf-5e6fadaa5434" />
 
 ## Features
 
