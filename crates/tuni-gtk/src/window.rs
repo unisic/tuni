@@ -224,6 +224,7 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         Some("Ctrl+,"),
         "win.settings",
     ),
+    ("About Tuni", "help-about-symbolic", None, "win.about"),
 ];
 
 mod imp {
@@ -865,6 +866,7 @@ impl TuniWindow {
                 }
             }),
             entry("settings", None, |window, _| window.show_preferences()),
+            entry("about", None, |window, _| window.show_about()),
             entry("toggle-sidebar", None, |window, _| {
                 if let Some(split) = window.imp().split.borrow().as_ref() {
                     split.set_show_sidebar(!split.shows_sidebar());
@@ -1016,6 +1018,33 @@ impl TuniWindow {
 
     fn show_preferences(&self) {
         preferences::present(self, &self.imp().settings.borrow().clone());
+    }
+
+    /// What this is, who wrote it, and where to report it. `AdwAboutDialog`
+    /// draws all of that, including the Troubleshooting page the debug info
+    /// goes on, so the only work here is telling it the truth.
+    fn show_about(&self) {
+        let about = adw::AboutDialog::builder()
+            .application_name("Tuni")
+            // An installed Tuni has its icon in the theme; one run out of the
+            // build directory has not, and a missing-icon glyph the size of an
+            // about dialog is worse than the terminal the empty window uses.
+            .application_icon(
+                if gtk::IconTheme::for_display(&WidgetExt::display(self)).has_icon(crate::APP_ID) {
+                    crate::APP_ID
+                } else {
+                    "utilities-terminal-symbolic"
+                },
+            )
+            .developer_name("Unisic")
+            .version(env!("CARGO_PKG_VERSION"))
+            .comments("Terminals, projects, files, and Git in one window.")
+            .website("https://github.com/unisic/tuni")
+            .issue_url("https://github.com/unisic/tuni/issues")
+            .license_type(gtk::License::Gpl30)
+            .debug_info(debug_info())
+            .build();
+        about.present(Some(self));
     }
 
     // --- the Info, Files and Git panel --------------------------------------
@@ -3356,6 +3385,7 @@ fn main_menu() -> gio::Menu {
 
     let application = gio::Menu::new();
     application.append(Some("Preferences"), Some("win.settings"));
+    application.append(Some("About Tuni"), Some("win.about"));
 
     let menu = gio::Menu::new();
     menu.append_section(None, &opening);
@@ -3482,6 +3512,26 @@ fn add_sidebar_grip(
 /// something is wrong. The rest of the layout is the desktop's to decide, so
 /// only the icon is taken out, and it is taken out again whenever the desktop
 /// changes its mind about the layout.
+/// What a bug report wants pasted into it. The library versions are the ones
+/// running rather than the ones this was built against, and the two variables
+/// are the ones that change what gets drawn — a Wayland session and an X11 one
+/// do not have the same window to report about.
+fn debug_info() -> String {
+    let variable = |name: &str| std::env::var(name).unwrap_or_else(|_| "unset".to_owned());
+    format!(
+        "Tuni {}\nGTK {}.{}.{}\nlibadwaita {}.{}.{}\nXDG_SESSION_TYPE {}\nGSK_RENDERER {}",
+        env!("CARGO_PKG_VERSION"),
+        gtk::major_version(),
+        gtk::minor_version(),
+        gtk::micro_version(),
+        adw::major_version(),
+        adw::minor_version(),
+        adw::micro_version(),
+        variable("XDG_SESSION_TYPE"),
+        variable("GSK_RENDERER"),
+    )
+}
+
 fn drop_window_icon(header: &adw::HeaderBar) {
     let settings = header.settings();
     let apply = |header: &adw::HeaderBar, settings: &gtk::Settings| {
