@@ -102,11 +102,11 @@ fn appearance_page(
     ));
     window_group.add(&tab_bar);
 
-    let padding = adw::SpinRow::builder()
-        .title("Padding")
+    let padding_x = adw::SpinRow::builder()
+        .title("Side padding")
         .subtitle("Pixels of nothing between the window and the grid")
         .adjustment(&gtk::Adjustment::new(
-            settings.terminal.padding,
+            settings.terminal.padding_x,
             0.0,
             PADDING_MAX,
             1.0,
@@ -114,15 +114,36 @@ fn appearance_page(
             0.0,
         ))
         .build();
-    padding.connect_value_notify(glib::clone!(
+    padding_x.connect_value_notify(glib::clone!(
         #[weak]
         window,
         move |row| {
             let pixels = row.value();
-            edit(&window, |settings| settings.terminal.padding = pixels);
+            edit(&window, |settings| settings.terminal.padding_x = pixels);
         }
     ));
-    window_group.add(&padding);
+    window_group.add(&padding_x);
+
+    let padding_y = adw::SpinRow::builder()
+        .title("Top and bottom padding")
+        .adjustment(&gtk::Adjustment::new(
+            settings.terminal.padding_y,
+            0.0,
+            PADDING_MAX,
+            1.0,
+            4.0,
+            0.0,
+        ))
+        .build();
+    padding_y.connect_value_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let pixels = row.value();
+            edit(&window, |settings| settings.terminal.padding_y = pixels);
+        }
+    ));
+    window_group.add(&padding_y);
     page.add(&window_group);
 
     let background_group = adw::PreferencesGroup::builder()

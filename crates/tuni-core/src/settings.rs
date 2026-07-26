@@ -104,7 +104,12 @@ impl Settings {
         let mut settings = Self::default();
 
         if let Some(name) = table.string("theme") {
-            settings.appearance = Appearance::parse(name).unwrap_or_default();
+            match Appearance::parse(name) {
+                Some(appearance) => settings.appearance = appearance,
+                // Ghostty's `theme` names a theme rather than an appearance,
+                // either one for both appearances or the `light:a,dark:b` pair.
+                None => themes(name, &mut settings.terminal),
+            }
         }
         // A theme name that no longer exists would otherwise leave the settings
         // window showing a selection it cannot honor.
@@ -135,13 +140,22 @@ impl Settings {
         if let Some(extra) = table.number("line-height").filter(|extra| *extra >= 0.0) {
             settings.terminal.line_height_extra = extra;
         }
-        if let Some(on) = table.boolean("cursor-blink") {
+        if let Some(on) = table
+            .boolean("cursor-blink")
+            .or_else(|| table.boolean("cursor-style-blink"))
+        {
             settings.terminal.cursor_blink = on;
         }
         if let Some(style) = table.string("cursor-style").and_then(CursorStyle::parse) {
             settings.terminal.cursor_style = style;
         }
-        if let Some(on) = table.boolean("copy-on-select") {
+        // Ghostty writes `clipboard` for the selection going to the clipboard
+        // proper rather than to the middle-click one, which is where a Wayland
+        // selection lands anyway.
+        if let Some(on) = table
+            .boolean("copy-on-select")
+            .or_else(|| table.string("copy-on-select").map(|to| to == "clipboard"))
+        {
             settings.terminal.copy_on_select = on;
         }
         if let Some(on) = table.boolean("bell") {
@@ -168,14 +182,25 @@ impl Settings {
         {
             settings.terminal.background_opacity = opacity;
         }
-        if let Some(on) = table.boolean("background-blur") {
+        // A number is Ghostty's blur intensity. KWin has one blur of its own
+        // and no way to be told how strong to make it for one window, so any
+        // intensity above zero means the same thing here: blur it.
+        if let Some(on) = table
+            .boolean("background-blur")
+            .or_else(|| table.number("background-blur").map(|blur| blur > 0.0))
+        {
             settings.background_blur = on;
         }
-        if let Some(padding) = table
-            .number("window-padding")
-            .filter(|padding| (0.0..=PADDING_MAX).contains(padding))
-        {
-            settings.terminal.padding = padding;
+        let padding = |key| {
+            table
+                .number(key)
+                .filter(|padding| (0.0..=PADDING_MAX).contains(padding))
+        };
+        if let Some(across) = padding("window-padding-x") {
+            settings.terminal.padding_x = across;
+        }
+        if let Some(down) = padding("window-padding-y") {
+            settings.terminal.padding_y = down;
         }
         if let Some(on) = table.boolean("window.auto-hide-tab-bar") {
             settings.auto_hide_tab_bar = on;
@@ -268,11 +293,18 @@ impl Settings {
         if self.background_blur != default.background_blur {
             let _ = writeln!(out, "background-blur = {}", self.background_blur);
         }
-        if self.terminal.padding != default.terminal.padding {
+        if self.terminal.padding_x != default.terminal.padding_x {
             let _ = writeln!(
                 out,
-                "window-padding = {}",
-                toml::number(self.terminal.padding)
+                "window-padding-x = {}",
+                toml::number(self.terminal.padding_x)
+            );
+        }
+        if self.terminal.padding_y != default.terminal.padding_y {
+            let _ = writeln!(
+                out,
+                "window-padding-y = {}",
+                toml::number(self.terminal.padding_y)
             );
         }
         if self.auto_hide_tab_bar != default.auto_hide_tab_bar {
@@ -293,6 +325,30 @@ impl Settings {
         let temporary = path.with_extension("toml.new");
         fs::write(&temporary, self.to_toml())?;
         fs::rename(&temporary, &path)
+    }
+}
+
+/// Reads Ghostty's `theme`, which names themes rather than an appearance:
+/// `theme = Catppuccin Mocha` for both, or `theme = light:a,dark:b` for one
+/// each. A name no bundled theme answers to is left alone, the same as any
+/// other value this file cannot honor.
+fn themes(value: &str, terminal: &mut TerminalConfig) {
+    for part in value.split(',') {
+        let (light, dark, name) = match part.split_once(':') {
+            Some(("light", name)) => (true, false, name),
+            Some(("dark", name)) => (false, true, name),
+            _ => (true, true, part),
+        };
+        let name = name.trim();
+        if !theme::exists(name) {
+            continue;
+        }
+        if light {
+            terminal.theme_light = name.to_owned();
+        }
+        if dark {
+            terminal.theme_dark = name.to_owned();
+        }
     }
 }
 
@@ -393,7 +449,10 @@ mod toml {
             } else {
                 format!("{section}.{key}")
             };
-            table.0.insert(key, value);
+            // The first of a repeated key wins. A Ghostty configuration lists
+            // `font-family` once per fallback, primary first, and the primary
+            // is the one this has a use for.
+            table.0.entry(key).or_insert(value);
         }
         table
     }
@@ -407,7 +466,13 @@ mod toml {
         match bare {
             "true" => Some(Value::Boolean(true)),
             "false" => Some(Value::Boolean(false)),
-            _ => bare.parse().ok().map(Value::Number),
+            // TOML would want the quotes. Ghostty's configuration file does
+            // not have them, and `font-family = JetBrains Mono` is a sentence
+            // both spellings can mean the same thing by.
+            _ => Some(
+                bare.parse()
+                    .map_or_else(|_| Value::String(bare.to_owned()), Value::Number),
+            ),
         }
     }
 
@@ -535,7 +600,8 @@ mod tests {
                 command: "/usr/bin/fish".to_owned(),
                 scrollback_lines: 50_000,
                 background_opacity: 0.85,
-                padding: 8.0,
+                padding_x: 8.0,
+                padding_y: 4.0,
                 ..TerminalConfig::default()
             },
             appearance: Appearance::Dark,
@@ -557,12 +623,52 @@ mod tests {
         assert_eq!(read.terminal.command, "/usr/bin/fish");
         assert_eq!(read.terminal.scrollback_lines, 50_000);
         assert!((read.terminal.background_opacity - 0.85).abs() < f64::EPSILON);
-        assert!((read.terminal.padding - 8.0).abs() < f64::EPSILON);
+        assert!((read.terminal.padding_x - 8.0).abs() < f64::EPSILON);
+        assert!((read.terminal.padding_y - 4.0).abs() < f64::EPSILON);
         assert!(read.background_blur);
         assert_eq!(read.appearance, Appearance::Dark);
         assert!(read.restore_history);
         assert!(read.wrap_lines);
         assert!(read.auto_hide_tab_bar);
+    }
+
+    #[test]
+    fn a_ghostty_configuration_is_read_as_one_of_these() {
+        let settings = Settings::parse(
+            "# The one real gap in the Nerd Font is color emoji.\n\
+             font-family = JetBrainsMono Nerd Font\n\
+             font-family = Noto Color Emoji\n\
+             font-size = 12\n\
+             theme = light:GitHub Light Default,dark:GitHub Dark Default\n\
+             cursor-style-blink = false\n\
+             copy-on-select = clipboard\n\
+             background-opacity = 0.92\n\
+             background-blur = 20\n\
+             window-padding-x = 10\n\
+             window-padding-y = 8\n\
+             window-padding-balance = true\n",
+        );
+
+        // The first family is the one being asked for; the rest are Ghostty's
+        // fallbacks, which fontconfig picks here.
+        assert_eq!(settings.terminal.font_family, "JetBrainsMono Nerd Font");
+        assert!((settings.terminal.font_size - 12.0).abs() < f64::EPSILON);
+        assert_eq!(settings.terminal.theme_light, "GitHub Light Default");
+        assert_eq!(settings.terminal.theme_dark, "GitHub Dark Default");
+        assert!(!settings.terminal.cursor_blink);
+        assert!(settings.terminal.copy_on_select);
+        assert!((settings.terminal.background_opacity - 0.92).abs() < f64::EPSILON);
+        assert!(settings.background_blur);
+        assert!((settings.terminal.padding_x - 10.0).abs() < f64::EPSILON);
+        assert!((settings.terminal.padding_y - 8.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn one_theme_name_covers_both_appearances() {
+        let settings = Settings::parse("theme = GitHub Dark Default\n");
+        assert_eq!(settings.terminal.theme_light, "GitHub Dark Default");
+        assert_eq!(settings.terminal.theme_dark, "GitHub Dark Default");
+        assert_eq!(settings.appearance, Appearance::System);
     }
 
     #[test]

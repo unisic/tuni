@@ -868,11 +868,11 @@ impl TuniTerminal {
         // here is the grid's own, from a click to a selection to an image
         // placement, and an origin that was not 0,0 would have to be taken back
         // out of each of them.
-        let padding = config.padding as i32;
-        self.set_margin_start(padding);
-        self.set_margin_end(padding);
-        self.set_margin_top(padding);
-        self.set_margin_bottom(padding);
+        let (across, down) = (config.padding_x as i32, config.padding_y as i32);
+        self.set_margin_start(across);
+        self.set_margin_end(across);
+        self.set_margin_top(down);
+        self.set_margin_bottom(down);
 
         self.setup_font();
         self.apply_size(self.width(), self.height());

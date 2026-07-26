@@ -113,9 +113,12 @@ pub struct TerminalConfig {
     /// black. That is the same deal Ghostty's `background-opacity` offers.
     pub background_opacity: f64,
     /// Blank space between the edges of the terminal and the grid, in pixels,
-    /// up to [`PADDING_MAX`]. Zero, because the grid is the terminal and the
-    /// space around it is a preference rather than a default.
-    pub padding: f64,
+    /// up to [`PADDING_MAX`], across and down. Zero, because the grid is the
+    /// terminal and the space around it is a preference rather than a default.
+    /// Two numbers rather than one, which is how Ghostty spells it: a line of
+    /// text has more room to spare above it than beside it.
+    pub padding_x: f64,
+    pub padding_y: f64,
     /// Bundled theme names, one per desktop appearance. The desktop decides
     /// which of the two is in use, so both are configured, as Ghostty and kero
     /// both do.
@@ -191,7 +194,8 @@ impl Default for TerminalConfig {
             bell: true,
             command: String::new(),
             background_opacity: 1.0,
-            padding: 0.0,
+            padding_x: 0.0,
+            padding_y: 0.0,
             theme_light: theme::DEFAULT_LIGHT.to_owned(),
             theme_dark: theme::DEFAULT_DARK.to_owned(),
         }

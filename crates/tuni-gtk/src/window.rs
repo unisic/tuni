@@ -376,11 +376,24 @@ impl TuniWindow {
         let opacity = imp.settings.borrow().terminal.background_opacity;
         apply_chrome(&window.theme(), opacity);
         // There is no surface to ask about until the window is realized, and
-        // the setting was read before there was a window at all.
+        // the setting was read before there was a window at all. The blurred
+        // region is the window's own rectangle, so it is asked for again every
+        // time the window is laid out at a new size.
         window.connect_realize(|window| {
             let on = window.imp().settings.borrow().background_blur;
             crate::blur::apply(window, on);
+            if let Some(surface) = window.surface() {
+                surface.connect_layout(glib::clone!(
+                    #[weak]
+                    window,
+                    move |_, _, _| {
+                        let on = window.imp().settings.borrow().background_blur;
+                        crate::blur::apply(&window, on);
+                    }
+                ));
+            }
         });
+        window.connect_unrealize(crate::blur::forget);
         window
     }
 

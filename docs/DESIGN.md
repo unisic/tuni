@@ -457,8 +457,9 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `cursor-blink` | `true` | And then only if the desktop blinks its own cursor, and only while the program running has no opinion |
 | `cursor-style` | `"block"` | `block`, `bar`, `underline`, or `block_hollow`, the shape until the program running asks for another |
 | `background-opacity` | `1` | How much of the desktop shows through the window, down to `0.2` |
-| `background-blur` | `false` | Whether the compositor blurs what shows through. KDE is asked in its own language; other desktops do not hear the question |
-| `window-padding` | `0` | Pixels of nothing between the window and the grid, up to `40` |
+| `background-blur` | `false` | Whether the compositor blurs what shows through, over `ext-background-effect-v1`. A number is read as Ghostty's blur intensity, which KWin decides for itself: any of them above zero means the same thing here |
+| `window-padding-x` | `0` | Pixels of nothing between the sides of the window and the grid, up to `40` |
+| `window-padding-y` | `0` | The same above and below |
 | `copy-on-select` | `false` | Whether releasing a selection puts it on the clipboard |
 | `bell` | `true` | Whether `\a` rings the desktop's own bell |
 | `command` | `""` | The shell to run; empty means the login shell |
@@ -466,6 +467,14 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `terminal.restore-history` | `false` | Whether a restored pane replays what it had printed |
 | `editor.wrap-lines` | `false` | Whether a file pane folds a long line rather than scrolling sideways |
 | `window.auto-hide-tab-bar` | `false` | Whether the tab bar goes away while a window has one tab |
+
+A Ghostty configuration can be pasted in whole. Values do not need the quotes
+TOML would want, `theme` may name a theme instead of an appearance, in either
+the `theme = Catppuccin Mocha` or the `theme = light:a,dark:b` form, and a key
+Ghostty repeats for its fallbacks, `font-family`, is read from the first one.
+`cursor-style-blink` is read as `cursor-blink`, and `copy-on-select =
+clipboard` as `true`. Keys for what tuni does not do are ignored rather than
+refused, so what is left of the file keeps working.
 
 The session itself lives under `~/.local/share/tuni`. A file pane comes back
 holding the file it held, with the cursor where it was left; unsaved edits are

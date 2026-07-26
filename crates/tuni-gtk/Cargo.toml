@@ -22,4 +22,4 @@ unicode-width = "0.2"
 sourceview5 = { version = "0.10", features = ["v5_10"] }
 gdk4-wayland = { version = "0.10", features = ["wayland_crate"] }
 wayland-client = "0.31"
-wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
