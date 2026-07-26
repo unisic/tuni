@@ -24,7 +24,7 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             cargo rust rustfmt clippy gcc make git-core curl tar xz \
-            gtk4-devel libadwaita-devel gtksourceview5-devel \
+            gtk4-devel libadwaita-devel gtksourceview5-devel sqlite-devel \
             desktop-file-utils libappstream-glib
 
       - uses: actions/checkout@v4
