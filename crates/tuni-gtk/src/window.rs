@@ -40,15 +40,20 @@ use crate::preferences;
 use crate::switcher::{Card, TuniSwitcher};
 use crate::terminal::TuniTerminal;
 
-/// Sidebar width, and the range a narrow or a wide window may take it to.
+/// Sidebar width, and the range a narrow or a wide window may take it to. The
+/// maximum is kero's own default width rather than a fraction of a wide screen:
+/// a list of project names does not read better for being 400px of it, and a
+/// split view sizes by fraction where kero's sidebar is dragged to a width and
+/// remembers it.
 const SIDEBAR_FRACTION: f64 = 0.2;
-const SIDEBAR_MIN: i32 = 180;
-const SIDEBAR_MAX: i32 = 400;
+const SIDEBAR_MIN: i32 = 160;
+const SIDEBAR_MAX: i32 = 220;
 
-/// The Files and Git panel, on the other side.
+/// The Files and Git panel, on the other side. kero's default is 240; the
+/// minimum is what its three pages measure at their narrowest.
 const PANEL_FRACTION: f64 = 0.22;
-const PANEL_MIN: i32 = 240;
-const PANEL_MAX: i32 = 560;
+const PANEL_MIN: i32 = 200;
+const PANEL_MAX: i32 = 240;
 
 /// How often the panel re-reads the directories and the repository it is
 /// showing. kero's own interval, and for the same reason: a watch on every open

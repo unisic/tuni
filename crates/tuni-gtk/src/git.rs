@@ -64,7 +64,9 @@ mod imp {
         pub commit: RefCell<Option<gtk::Button>>,
         pub sections: RefCell<Vec<super::Section>>,
         pub history: RefCell<Option<gtk::ListBox>>,
-        pub stash_pop: RefCell<Option<gtk::Button>>,
+        /// The stash half of the header menu, rebuilt when the number of
+        /// stashes changes: a menu item's label cannot be edited in place.
+        pub stash_menu: RefCell<Option<gio::Menu>>,
         pub placeholder: RefCell<Option<adw::StatusPage>>,
         pub actions: RefCell<Option<gio::SimpleActionGroup>>,
         pub changed: RefCell<Option<Handler>>,
@@ -134,6 +136,9 @@ impl TuniGit {
             .tooltip_text("Branch")
             .build();
         branch.add_css_class("flat");
+        // A branch name is as long as whoever named it made it, and the panel
+        // is not; the label gives way rather than holding the page open.
+        branch.set_can_shrink(true);
         let distance = gtk::Label::builder()
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .hexpand(true)
@@ -149,6 +154,25 @@ impl TuniGit {
             .build();
         refresh.add_css_class("flat");
 
+        // What the repository can be told to do, in a menu rather than a row of
+        // buttons: five labelled buttons are wider than the panel is meant to
+        // be, and kero keeps the same commands behind one header menu.
+        let remotes = gio::Menu::new();
+        remotes.append(Some("Fetch"), Some("git.fetch"));
+        remotes.append(Some("Pull (fast-forward only)"), Some("git.pull"));
+        remotes.append(Some("Push"), Some("git.push"));
+        let stash_menu = gio::Menu::new();
+        fill_stash_menu(&stash_menu, 0);
+        let repository_menu = gio::Menu::new();
+        repository_menu.append_section(None, &remotes);
+        repository_menu.append_section(None, &stash_menu);
+        let more = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("Repository")
+            .menu_model(&repository_menu)
+            .build();
+        more.add_css_class("flat");
+
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         header.set_margin_start(6);
         header.set_margin_end(6);
@@ -156,6 +180,7 @@ impl TuniGit {
         header.append(&branch);
         header.append(&distance);
         header.append(&refresh);
+        header.append(&more);
 
         let banner = adw::Banner::builder().button_label("Dismiss").build();
         banner.connect_button_clicked(|banner| banner.set_revealed(false));
@@ -187,14 +212,19 @@ impl TuniGit {
             .hexpand(true)
             .build();
         commit.add_css_class("suggested-action");
-        let commit_all = gtk::Button::builder()
-            .label("Stage all and commit")
-            .action_name("git.commit-all")
+        // The other way to commit is a menu beside the button rather than a
+        // second button: the label is longer than the panel is wide.
+        let commit_menu = gio::Menu::new();
+        commit_menu.append(Some("Stage all and commit"), Some("git.commit-all"));
+        let commit_more = gtk::MenuButton::builder()
+            .icon_name("pan-down-symbolic")
+            .tooltip_text("Commit options")
+            .menu_model(&commit_menu)
             .build();
 
         let commit_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         commit_row.append(&commit);
-        commit_row.append(&commit_all);
+        commit_row.append(&commit_more);
 
         let commit_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
         commit_box.set_margin_start(6);
@@ -217,14 +247,14 @@ impl TuniGit {
             self.section(
                 Kind::Staged,
                 "Staged",
-                &[("Unstage all", "git.unstage-all")],
+                &[("list-remove-symbolic", "Unstage all", "git.unstage-all")],
             ),
             self.section(
                 Kind::Changed,
                 "Changes",
                 &[
-                    ("Stage all", "git.stage-all"),
-                    ("Discard all", "git.discard-all"),
+                    ("list-add-symbolic", "Stage all", "git.stage-all"),
+                    ("edit-undo-symbolic", "Discard all", "git.discard-all"),
                 ],
             ),
         ];
@@ -255,44 +285,9 @@ impl TuniGit {
             .child(&content)
             .build();
 
-        // --- what the repository can be told to do
-
-        let stash = gtk::Button::builder()
-            .label("Stash")
-            .tooltip_text("Stash every change, untracked files included")
-            .action_name("git.stash")
-            .build();
-        let stash_pop = gtk::Button::builder()
-            .label("Pop")
-            .tooltip_text("Restore the newest stash")
-            .action_name("git.stash-pop")
-            .build();
-        let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        toolbar.set_margin_start(6);
-        toolbar.set_margin_end(6);
-        toolbar.set_margin_top(6);
-        toolbar.set_margin_bottom(6);
-        toolbar.set_homogeneous(true);
-        for (label, action, tooltip) in [
-            ("Fetch", "git.fetch", "Fetch every remote"),
-            ("Pull", "git.pull", "Pull, fast-forward only"),
-            ("Push", "git.push", "Push the current branch"),
-        ] {
-            let button = gtk::Button::builder()
-                .label(label)
-                .tooltip_text(tooltip)
-                .action_name(action)
-                .build();
-            toolbar.append(&button);
-        }
-        toolbar.append(&stash);
-        toolbar.append(&stash_pop);
-
         let repository = gtk::Box::new(gtk::Orientation::Vertical, 0);
         repository.append(&banner);
         repository.append(&scroller);
-        repository.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        repository.append(&toolbar);
 
         // A directory that is not a repository is not a failure, so it gets an
         // offer rather than an error.
@@ -300,8 +295,15 @@ impl TuniGit {
             .icon_name("folder-symbolic")
             .title("Not a repository")
             .build();
-        let start = gtk::Button::builder()
+        // The label wraps rather than holding the page open at its own width:
+        // the panel is narrow, and this is the widest sentence in it.
+        let start_label = gtk::Label::builder()
             .label("Start a Repository Here")
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .build();
+        let start = gtk::Button::builder()
+            .child(&start_label)
             .action_name("git.init")
             .halign(gtk::Align::Center)
             .build();
@@ -330,13 +332,13 @@ impl TuniGit {
         imp.commit.replace(Some(commit));
         imp.sections.replace(sections);
         imp.history.replace(Some(history));
-        imp.stash_pop.replace(Some(stash_pop));
+        imp.stash_menu.replace(Some(stash_menu));
         imp.placeholder.replace(Some(placeholder));
 
         self.refresh_commit_button();
     }
 
-    fn section(&self, kind: Kind, title: &str, actions: &[(&str, &str)]) -> Section {
+    fn section(&self, kind: Kind, title: &str, actions: &[(&str, &str, &str)]) -> Section {
         let name = gtk::Label::builder().label(title).xalign(0.0).build();
         name.add_css_class("heading");
         let count = gtk::Label::builder().hexpand(true).xalign(0.0).build();
@@ -346,13 +348,16 @@ impl TuniGit {
         let heading = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         heading.append(&name);
         heading.append(&count);
-        for (label, action) in actions {
+        // An icon each, with what it does in the tooltip: the words are wider
+        // than the heading they sit beside, and this is the shape kero's own
+        // section headings have.
+        for (icon, tooltip, action) in actions {
             let button = gtk::Button::builder()
-                .label(*label)
+                .icon_name(*icon)
+                .tooltip_text(*tooltip)
                 .action_name(*action)
                 .build();
             button.add_css_class("flat");
-            button.add_css_class("caption");
             heading.append(&button);
         }
 
@@ -574,13 +579,17 @@ impl TuniGit {
             banner.set_title(operation);
             banner.set_revealed(true);
         }
-        if let Some(button) = imp.stash_pop.borrow().as_ref() {
-            button.set_sensitive(status.stashes > 0);
-            button.set_label(&if status.stashes > 0 {
-                format!("Pop ({})", status.stashes)
-            } else {
-                "Pop".to_owned()
-            });
+        if let Some(menu) = imp.stash_menu.borrow().as_ref() {
+            fill_stash_menu(menu, status.stashes);
+        }
+        // Nothing to pop is a menu item that cannot be clicked rather than one
+        // that reports the mistake afterwards.
+        if let Some(actions) = imp.actions.borrow().as_ref()
+            && let Some(pop) = actions
+                .lookup_action("stash-pop")
+                .and_downcast::<gio::SimpleAction>()
+        {
+            pop.set_enabled(status.stashes > 0);
         }
 
         for section in imp.sections.borrow().iter() {
@@ -1021,6 +1030,21 @@ fn branch_menu(status: &Status) -> gio::Menu {
     create.append(Some("New Branch…"), Some("git.new-branch"));
     menu.append_section(None, &create);
     menu
+}
+
+/// The stash section of the header menu, with however many stashes there are
+/// on the item that pops one.
+fn fill_stash_menu(menu: &gio::Menu, stashes: usize) {
+    menu.remove_all();
+    menu.append(Some("Stash all changes"), Some("git.stash"));
+    menu.append(
+        Some(&if stashes > 0 {
+            format!("Pop stash ({stashes})")
+        } else {
+            "Pop stash".to_owned()
+        }),
+        Some("git.stash-pop"),
+    );
 }
 
 fn commit_row(commit: &git::Commit) -> gtk::ListBoxRow {

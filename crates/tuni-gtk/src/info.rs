@@ -210,15 +210,29 @@ impl TuniInfo {
         path.add_css_class("caption");
         path.add_css_class("dim-label");
 
+        // An icon and a word each, with the whole sentence in the tooltip: two
+        // spelled-out labels are wider than the panel is meant to be.
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         buttons.set_homogeneous(true);
         let show = gtk::Button::builder()
-            .label("Show in Files")
+            .child(
+                &adw::ButtonContent::builder()
+                    .icon_name("folder-symbolic")
+                    .label("Files")
+                    .build(),
+            )
+            .tooltip_text("Show in Files")
             .action_name(open)
             .build();
         show.add_css_class("flat");
         let copy = gtk::Button::builder()
-            .label("Copy Path")
+            .child(
+                &adw::ButtonContent::builder()
+                    .icon_name("edit-copy-symbolic")
+                    .label("Copy")
+                    .build(),
+            )
+            .tooltip_text("Copy Path")
             .action_name(copy)
             .build();
         copy.add_css_class("flat");
@@ -255,7 +269,11 @@ impl TuniInfo {
         list.set_selection_mode(gtk::SelectionMode::None);
         list.add_css_class("boxed-list");
 
-        let empty = gtk::Label::builder().label(empty_text).xalign(0.0).build();
+        let empty = gtk::Label::builder()
+            .label(empty_text)
+            .xalign(0.0)
+            .wrap(true)
+            .build();
         empty.add_css_class("caption");
         empty.add_css_class("dim-label");
 
