@@ -49,6 +49,10 @@ pub struct Cell {
     pub italic: bool,
     pub underline: bool,
     pub strikethrough: bool,
+    /// Whether an OSC 8 hyperlink covers this cell. The URI itself is not here:
+    /// it is a separate lookup, and carrying a copy per cell would cost more
+    /// than every link on screen is worth.
+    pub link: bool,
 }
 
 impl Cell {
@@ -59,7 +63,19 @@ impl Cell {
         self.italic = false;
         self.underline = false;
         self.strikethrough = false;
+        self.link = false;
     }
+}
+
+/// One hyperlink as the pointer found it: where to go, and which cells to
+/// underline while the pointer is on it.
+///
+/// The cells are viewport coordinates, so anything that moves the viewport —
+/// output, a scroll, a resize — invalidates them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkHover {
+    pub uri: String,
+    pub cells: Vec<(u16, u16)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -46,6 +46,10 @@ enum Pointer {
     Idle,
     Selecting,
     Reporting,
+    /// Pressed on a hyperlink. Nothing happens until the release, which is
+    /// where Ghostty opens it and where a press that slid off can still be
+    /// taken back.
+    Link,
 }
 
 /// The overlay scrollbar's thumb, in widget pixels.
@@ -134,6 +138,16 @@ mod imp {
         /// Last known pointer position, because scroll events carry no
         /// coordinates but the application still expects them in the report.
         pub(super) pointer_pos: Cell<(f64, f64)>,
+        /// Modifiers as of the last event, so pressing Ctrl with a stationary
+        /// pointer can light up the hyperlink under it.
+        pub(super) mods: Cell<Mods>,
+        /// The hyperlink under the pointer, the cell it was found on, and
+        /// whether that answer still stands. Output, scrolling, and resizing
+        /// all move what a viewport coordinate means, so each of them retires
+        /// the answer rather than the highlight.
+        pub(super) link_hover: RefCell<Option<tuni_vt::LinkHover>>,
+        pub(super) link_probe: Cell<Option<(u16, u16)>>,
+        pub(super) link_valid: Cell<bool>,
         /// Scroll state as of the last feed. Upstream raises no notification
         /// when the viewport moves, so this is polled and diffed.
         pub(super) scroll: Cell<ScrollPosition>,
@@ -180,6 +194,10 @@ mod imp {
                 pointer: Cell::new(Pointer::default()),
                 buttons_down: Cell::new(0),
                 pointer_pos: Cell::new((0.0, 0.0)),
+                mods: Cell::new(Mods::empty()),
+                link_hover: RefCell::new(None),
+                link_probe: Cell::new(None),
+                link_valid: Cell::new(false),
                 scroll: Cell::new(ScrollPosition::default()),
                 bar_alpha: Cell::new(0.0),
                 bar_until: Cell::new(None),
@@ -415,6 +433,10 @@ impl TuniTerminal {
     }
 
     fn setup_input(&self) {
+        // An I-beam over text, so the hand over a hyperlink is a change the eye
+        // catches rather than the only cursor the widget ever shows.
+        self.set_cursor_from_name(Some("text"));
+
         let im = gtk::IMMulticontext::new();
         im.set_client_widget(Some(self));
 
@@ -436,6 +458,20 @@ impl TuniTerminal {
             #[upgrade_or]
             glib::Propagation::Proceed,
             move |controller, keyval, _keycode, state| this.on_key(controller, keyval, state)
+        ));
+        keys.connect_modifiers(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, state| {
+                // Ctrl pressed under a stationary pointer arms the hyperlink
+                // beneath it, and releasing Ctrl puts it out again.
+                let mods = keymap::mods_from_state(state);
+                this.imp().mods.set(mods);
+                this.refresh_links(mods);
+                glib::Propagation::Proceed
+            }
         ));
         keys.connect_key_released(glib::clone!(
             #[weak(rename_to = this)]
@@ -498,6 +534,11 @@ impl TuniTerminal {
             #[weak(rename_to = this)]
             self,
             move |controller, x, y| this.on_pointer_motion(controller, x, y)
+        ));
+        motion.connect_leave(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.clear_links()
         ));
         self.add_controller(motion);
 
@@ -676,6 +717,7 @@ impl TuniTerminal {
                 }
             }
         }
+        self.invalidate_links();
         self.queue_draw();
     }
 
@@ -698,14 +740,17 @@ impl TuniTerminal {
         imp.grid_size.set((cols, rows));
         imp.cell_size.set(cell);
 
-        let mut guard = imp.session.borrow_mut();
-        let Some(session) = guard.as_mut() else {
-            return;
-        };
-        let _ = session
-            .term
-            .resize(cols, rows, u32::from(cell.0), u32::from(cell.1));
-        let _ = session.pty.resize(cols, rows, cell.0, cell.1);
+        {
+            let mut guard = imp.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                let _ = session
+                    .term
+                    .resize(cols, rows, u32::from(cell.0), u32::from(cell.1));
+                let _ = session.pty.resize(cols, rows, cell.0, cell.1);
+            }
+        }
+        // Reflow moves every viewport coordinate, the hover's cells among them.
+        self.invalidate_links();
     }
 
     // --- cursor blinking -----------------------------------------------------
@@ -929,6 +974,7 @@ impl TuniTerminal {
         imp.scroll.set(session.term.scroll_position());
         drop(guard);
 
+        self.invalidate_links();
         self.reveal_scrollbar();
         self.queue_draw();
     }
@@ -989,6 +1035,117 @@ impl TuniTerminal {
         }
     }
 
+    // --- hyperlinks ----------------------------------------------------------
+
+    /// Work out what the pointer is on and light it up.
+    ///
+    /// Ghostty arms hyperlinks on Ctrl and leaves the mouse to an application
+    /// that is tracking it, so both gate the probe. The probe itself crosses
+    /// into libghostty, which is why an answer already taken at the same cell
+    /// is reused rather than asked for again.
+    fn refresh_links(&self, mods: Mods) {
+        let imp = self.imp();
+        let armed = mods.contains(Mods::CTRL) && !self.reports_mouse(mods);
+        let cell = armed
+            .then(|| {
+                let (x, y) = imp.pointer_pos.get();
+                self.geometry().cell_at(x, y)
+            })
+            .flatten();
+
+        if imp.link_valid.get() && imp.link_probe.get() == cell {
+            return;
+        }
+        imp.link_valid.set(true);
+        imp.link_probe.set(cell);
+
+        let hover = cell.and_then(|(col, row)| {
+            let mut guard = imp.session.borrow_mut();
+            guard
+                .as_mut()?
+                .term
+                .hyperlink_hover(col, row)
+                .ok()
+                .flatten()
+        });
+
+        if *imp.link_hover.borrow() == hover {
+            return;
+        }
+        self.set_cursor_from_name(Some(if hover.is_some() { "pointer" } else { "text" }));
+        imp.link_hover.replace(hover);
+        self.queue_draw();
+    }
+
+    /// Arm and probe a hyperlink at a surface position, as Ctrl-hovering does,
+    /// and answer with what was found. Public to the crate so the debug capture
+    /// harness drives the same path a real pointer takes.
+    pub(crate) fn hover_link(&self, x: f64, y: f64) -> Option<String> {
+        let imp = self.imp();
+        imp.pointer_pos.set((x, y));
+        imp.mods.set(Mods::CTRL);
+        imp.link_valid.set(false);
+        self.refresh_links(Mods::CTRL);
+        let hover = imp.link_hover.borrow();
+        hover.as_ref().map(|hover| hover.uri.clone())
+    }
+
+    /// Retire the answer and take it again.
+    ///
+    /// A hover names viewport cells, so output, a scroll, and a resize all
+    /// change what it points at even though the pointer has not moved.
+    fn invalidate_links(&self) {
+        let imp = self.imp();
+        if imp.link_hover.borrow().is_none() && imp.link_probe.get().is_none() {
+            return;
+        }
+        imp.link_valid.set(false);
+        self.refresh_links(imp.mods.get());
+    }
+
+    /// Drop the highlight outright, for when the pointer leaves and no motion
+    /// event will arrive to say where it went.
+    fn clear_links(&self) {
+        let imp = self.imp();
+        imp.link_valid.set(false);
+        imp.link_probe.set(None);
+        if imp.link_hover.replace(None).is_some() {
+            self.set_cursor_from_name(Some("text"));
+            self.queue_draw();
+        }
+    }
+
+    /// Hand a hyperlink to the desktop, if it is one worth handing over.
+    ///
+    /// An OSC 8 URI is written by whatever holds the PTY, which over ssh is not
+    /// the person at the keyboard. So a control character anywhere in the
+    /// string disqualifies it, and only a short list of schemes is opened at
+    /// all — `file://` among them only when it names this machine, which is
+    /// what `local_file_path` checks.
+    fn open_uri(&self, uri: &str) {
+        const SCHEMES: [&str; 5] = ["http://", "https://", "mailto:", "ftp://", "ftps://"];
+
+        if uri.is_empty() || uri.chars().any(char::is_control) {
+            return;
+        }
+        let allowed = SCHEMES.iter().any(|scheme| starts_with_ignore_case(uri, scheme))
+            || (starts_with_ignore_case(uri, "file://") && tuni_vt::local_file_path(uri).is_some());
+        if !allowed {
+            return;
+        }
+
+        let parent = self.root().and_downcast::<gtk::Window>();
+        gtk::UriLauncher::new(uri).launch(
+            parent.as_ref(),
+            None::<&gtk::gio::Cancellable>,
+            |result| {
+                if let Err(error) = result {
+                    eprintln!("could not open the link: {error}");
+                }
+            },
+        );
+    }
+
     fn on_pointer_press(&self, gesture: &gtk::GestureClick, x: f64, y: f64) {
         self.grab_focus_self();
 
@@ -997,6 +1154,7 @@ impl TuniTerminal {
         imp.pointer_pos.set((x, y));
 
         let mods = keymap::mods_from_state(gesture.current_event_state());
+        imp.mods.set(mods);
         let button = gesture.current_button();
 
         if button == gdk::BUTTON_PRIMARY
@@ -1012,6 +1170,14 @@ impl TuniTerminal {
             };
             imp.bar_drag.set(Some(offset));
             self.drag_scrollbar(y);
+            return;
+        }
+
+        // A press on a link neither selects nor reports: it waits for the
+        // release, which is where the link is opened or taken back.
+        self.refresh_links(mods);
+        if button == gdk::BUTTON_PRIMARY && imp.link_hover.borrow().is_some() {
+            imp.pointer.set(Pointer::Link);
             return;
         }
 
@@ -1072,6 +1238,7 @@ impl TuniTerminal {
     fn on_pointer_release(&self, gesture: &gtk::GestureClick, x: f64, y: f64) {
         let imp = self.imp();
         imp.buttons_down.set(imp.buttons_down.get().saturating_sub(1));
+        imp.pointer_pos.set((x, y));
 
         if imp.bar_drag.take().is_some() {
             self.reveal_scrollbar();
@@ -1080,7 +1247,20 @@ impl TuniTerminal {
         }
 
         let mods = keymap::mods_from_state(gesture.current_event_state());
+        imp.mods.set(mods);
         match imp.pointer.replace(Pointer::Idle) {
+            Pointer::Link => {
+                // Between press and release the pointer may have slid off and
+                // output may have moved the link. Opening only when the same
+                // URI is still underneath covers both.
+                let pressed = imp.link_hover.borrow().as_ref().map(|hover| hover.uri.clone());
+                imp.link_valid.set(false);
+                self.refresh_links(mods);
+                let released = imp.link_hover.borrow().as_ref().map(|hover| hover.uri.clone());
+                if let Some(uri) = released.filter(|uri| pressed.as_deref() == Some(uri.as_str())) {
+                    self.open_uri(&uri);
+                }
+            }
             Pointer::Reporting => {
                 self.report_mouse(
                     MouseAction::Release,
@@ -1105,6 +1285,7 @@ impl TuniTerminal {
         let imp = self.imp();
         imp.pointer_pos.set((x, y));
         let mods = keymap::mods_from_state(controller.current_event_state());
+        imp.mods.set(mods);
 
         if imp.bar_drag.get().is_some() {
             self.drag_scrollbar(y);
@@ -1121,6 +1302,7 @@ impl TuniTerminal {
             // Alt turns the drag into a block selection, as in Ghostty.
             Pointer::Selecting => self.selection_drag(x, y, mods.contains(Mods::ALT)),
             _ => {
+                self.refresh_links(mods);
                 if self.reports_mouse(mods) {
                     self.report_mouse(MouseAction::Motion, None, mods, x, y);
                 }
@@ -1231,6 +1413,7 @@ impl TuniTerminal {
         }
 
         let mods = keymap::mods_from_state(state);
+        imp.mods.set(mods);
 
         // Scrollback navigation sits on plain Shift, where every terminal on
         // this desktop puts it.
@@ -1394,11 +1577,30 @@ impl TuniTerminal {
             m,
         };
 
+        // The hovered link as a bitmap, built once: a link can cover the whole
+        // viewport, and scanning its cell list per cell would be quadratic.
+        let hovered = imp.link_hover.borrow();
+        let hot: Vec<bool> = match hovered.as_ref() {
+            Some(hover) => {
+                let mut mask = vec![false; usize::from(grid.cols) * usize::from(grid.rows)];
+                for &(col, row) in &hover.cells {
+                    let index = usize::from(row) * usize::from(grid.cols) + usize::from(col);
+                    if let Some(slot) = mask.get_mut(index) {
+                        *slot = true;
+                    }
+                }
+                mask
+            }
+            None => Vec::new(),
+        };
+
         let mut text = String::with_capacity(256);
 
         for row in 0..grid.rows {
             let cells = grid.row(row);
             let y = row as f32 * m.cell_height;
+            let base = usize::from(row) * usize::from(grid.cols);
+            let hot = |col: usize| hot.get(base + col).copied().unwrap_or(false);
 
             // Backgrounds first, batched into runs of equal color, so a full
             // reverse-video line is one rectangle rather than eighty.
@@ -1430,12 +1632,12 @@ impl TuniTerminal {
                 }
 
                 let start = col;
-                let style = style_key(&cells[col]);
+                let style = style_key(&cells[col], hot(col));
                 text.clear();
 
                 while col < cells.len() {
                     let cell = &cells[col];
-                    if cell.text.is_empty() || style_key(cell) != style {
+                    if cell.text.is_empty() || style_key(cell, hot(col)) != style {
                         break;
                     }
                     // Anything that is not one plain ASCII character is laid
@@ -1455,9 +1657,10 @@ impl TuniTerminal {
                     }
                 }
 
-                painter.draw_run(start, y, &text, &cells[start]);
+                painter.draw_run(start, y, &text, &cells[start], hot(start));
             }
         }
+        drop(hovered);
 
         let cursor = grid.cursor;
         if let Some(cursor) = cursor {
@@ -1512,6 +1715,9 @@ struct StyleKey {
     italic: bool,
     underline: bool,
     strikethrough: bool,
+    /// Whether the hovered hyperlink covers this cell. Part of the key so a run
+    /// breaks where the highlight does.
+    link: bool,
 }
 
 fn mouse_button(button: u32) -> Option<MouseButton> {
@@ -1536,14 +1742,22 @@ fn is_simple(text: &str) -> bool {
     matches!(chars.next(), Some(c) if c == ' ' || c.is_ascii_graphic()) && chars.next().is_none()
 }
 
-fn style_key(cell: &tuni_vt::Cell) -> StyleKey {
+fn style_key(cell: &tuni_vt::Cell, link: bool) -> StyleKey {
     StyleKey {
         fg: cell.fg,
         bold: cell.bold,
         italic: cell.italic,
         underline: cell.underline,
         strikethrough: cell.strikethrough,
+        link,
     }
+}
+
+/// Case-insensitive prefix test over bytes. A URI arrives as arbitrary text, and
+/// slicing a `str` at a byte offset that is not a character boundary panics.
+fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
+    text.len() >= prefix.len()
+        && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
 fn rgba(color: Rgb) -> gdk::RGBA {
@@ -1601,7 +1815,7 @@ impl Painter<'_> {
 
     /// One run of text sharing a style, placed at its own column origin so
     /// per-run advance drift cannot accumulate across the line.
-    fn draw_run(&self, start: usize, y: f32, text: &str, style: &tuni_vt::Cell) {
+    fn draw_run(&self, start: usize, y: f32, text: &str, style: &tuni_vt::Cell, link: bool) {
         let mut desc = self.font.clone();
         if style.bold {
             desc.set_weight(pango::Weight::Bold);
@@ -1621,8 +1835,16 @@ impl Painter<'_> {
                 "liga 0, clig 0, dlig 0, calt 0",
             ));
         }
-        if style.underline {
-            attrs.insert(pango::AttrInt::new_underline(pango::Underline::Single));
+        // A hovered hyperlink is underlined; over text that was underlined
+        // already, the line doubles, so the highlight still reads as one.
+        // Ghostty draws it the same way.
+        let underline = match (style.underline, link) {
+            (true, true) => Some(pango::Underline::Double),
+            (true, false) | (false, true) => Some(pango::Underline::Single),
+            (false, false) => None,
+        };
+        if let Some(underline) = underline {
+            attrs.insert(pango::AttrInt::new_underline(underline));
         }
         if style.strikethrough {
             attrs.insert(pango::AttrInt::new_strikethrough(true));

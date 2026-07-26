@@ -268,6 +268,22 @@ fn maybe_capture(window: &adw::ApplicationWindow, terminal: &TuniTerminal) {
         );
     }
 
+    // A scripted Ctrl-hover, in surface pixels: "x,y". Prints the hyperlink
+    // found there, and leaves it highlighted for the capture.
+    if let Ok(spec) = std::env::var("TUNI_CAPTURE_HOVER") {
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(delay.saturating_sub(200)),
+            glib::clone!(
+                #[weak]
+                terminal,
+                move || match parse_point(&spec) {
+                    Some((x, y)) => println!("hover: {:?}", terminal.hover_link(x, y)),
+                    None => eprintln!("TUNI_CAPTURE_HOVER wants x,y"),
+                }
+            ),
+        );
+    }
+
     // A scripted selection, in surface pixels: "x1,y1,x2,y2". Runs the same
     // widget path a real drag takes and prints what came out, because no
     // pointer injection tool exists on a locked-down Wayland session.
@@ -304,6 +320,14 @@ fn maybe_capture(window: &adw::ApplicationWindow, terminal: &TuniTerminal) {
             }
         ),
     );
+}
+
+fn parse_point(spec: &str) -> Option<(f64, f64)> {
+    let values: Vec<f64> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    match values[..] {
+        [x, y] => Some((x, y)),
+        _ => None,
+    }
 }
 
 fn parse_select(spec: &str) -> Option<(f64, f64, f64, f64)> {

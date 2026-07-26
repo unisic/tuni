@@ -15,10 +15,10 @@ One window, one terminal: keyboard input, Pango rendering, mouse selection with
 word and line clicks, clipboard and bracketed paste, SGR mouse reporting for
 applications that ask for it, an overlay scrollbar that fades when idle, a
 cursor that blinks by the desktop's own preference, a window title and subtitle
-that follow OSC 0/2 and OSC 7, a configurable font with live zoom, and
-Ghostty's 574 color themes, which paint the window chrome as well as the
-terminal. `ls`, `vi`, and `top` all render correctly. Still missing before it
-is a daily terminal: hyperlinks, tabs.
+that follow OSC 0/2 and OSC 7, OSC 8 hyperlinks opened with `Ctrl`+click, a
+configurable font with live zoom, and Ghostty's 574 color themes, which paint
+the window chrome as well as the terminal. `ls`, `vi`, and `top` all render
+correctly. Still missing before it is a daily terminal: tabs.
 
 | Shortcut | Action |
 | --- | --- |
@@ -28,6 +28,7 @@ is a daily terminal: hyperlinks, tabs.
 | Drag, double click, triple click | Select by character, word, line |
 | `Alt`+drag | Block selection |
 | `Shift`+click | Select even while an application is tracking the mouse |
+| `Ctrl`+click | Open the hyperlink under the pointer |
 | `Shift+Page Up` / `Shift+Page Down` | Scroll the viewport by a page |
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
@@ -87,6 +88,13 @@ face lands on its column and on the line instead of near them. Runs of plain
 ASCII share one layout; anything wide, combining, or borrowed from a fallback
 face gets a layout of its own. Ligatures are off by default for the same
 reason — a ligature is one glyph where the terminal still counts several cells.
+
+A hyperlink is whatever the program holding the PTY says it is, which over ssh
+is not the person at the keyboard. So `Ctrl` has to be held before one lights up
+at all, the press only opens on release and only if the same link is still
+underneath, and the URI is handed to the desktop only when it carries no control
+character and its scheme is one of `http`, `https`, `mailto`, `ftp`, `ftps`, or
+a `file://` that names this machine.
 
 ## Building
 

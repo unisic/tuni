@@ -518,3 +518,59 @@ fn an_application_that_sets_a_color_outranks_the_theme() {
         Rgb { r: 0x12, g: 0x34, b: 0x56 }
     );
 }
+
+#[test]
+fn osc_8_marks_the_cells_it_covers() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    terminal.feed(b"a\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\b");
+
+    let grid = terminal.snapshot().expect("snapshot");
+    assert!(!grid.cell(0, 0).expect("cell").link, "the 'a' before it");
+    for col in 1..5 {
+        assert!(grid.cell(col, 0).expect("cell").link, "column {col}");
+    }
+    assert!(!grid.cell(5, 0).expect("cell").link, "the 'b' after it");
+}
+
+#[test]
+fn a_hyperlink_reports_its_uri_and_its_extent() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    terminal.feed(b"\x1b]8;;https://example.com/one\x1b\\link\x1b]8;;\x1b\\");
+    let _ = terminal.snapshot().expect("snapshot");
+
+    assert_eq!(
+        terminal.hyperlink_at(2, 0).expect("uri"),
+        Some("https://example.com/one".to_owned())
+    );
+    let hover = terminal.hyperlink_hover(2, 0).expect("hover").expect("a link");
+    assert_eq!(hover.uri, "https://example.com/one");
+    assert_eq!(hover.cells, vec![(0, 0), (1, 0), (2, 0), (3, 0)]);
+}
+
+#[test]
+fn a_cell_with_no_hyperlink_reports_none() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    terminal.feed(b"plain");
+    let _ = terminal.snapshot().expect("snapshot");
+
+    assert_eq!(terminal.hyperlink_at(0, 0).expect("uri"), None);
+    assert_eq!(terminal.hyperlink_hover(0, 0).expect("hover"), None);
+}
+
+#[test]
+fn two_hyperlinks_are_told_apart_by_their_uris() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    terminal.feed(
+        b"\x1b]8;;https://one.example\x1b\\aa\x1b]8;;\x1b\\ \
+          \x1b]8;;https://two.example\x1b\\bb\x1b]8;;\x1b\\",
+    );
+    let _ = terminal.snapshot().expect("snapshot");
+
+    let first = terminal.hyperlink_hover(0, 0).expect("hover").expect("a link");
+    assert_eq!(first.uri, "https://one.example");
+    assert_eq!(first.cells, vec![(0, 0), (1, 0)]);
+
+    let second = terminal.hyperlink_hover(3, 0).expect("hover").expect("a link");
+    assert_eq!(second.uri, "https://two.example");
+    assert_eq!(second.cells, vec![(3, 0), (4, 0)]);
+}

@@ -10,7 +10,7 @@
 
 mod grid;
 
-pub use grid::{Cell, Cursor, CursorShape, Grid, Rgb};
+pub use grid::{Cell, Cursor, CursorShape, Grid, LinkHover, Rgb};
 pub use libghostty_vt::Error;
 pub use libghostty_vt::key::{Action as KeyAction, Key, Mods};
 pub use libghostty_vt::mouse::{Action as MouseAction, Button as MouseButton};
@@ -164,6 +164,25 @@ impl Geometry {
             y: row.clamp(0.0, f64::from(self.rows.saturating_sub(1))) as u32,
         })
     }
+
+    /// The viewport cell under a surface-space position, or `None` when the
+    /// position falls outside the grid.
+    ///
+    /// Unlike selection this does not clamp: a pointer past the last column is
+    /// over nothing, and clamping would light up a hyperlink that is not under
+    /// it.
+    #[must_use]
+    pub fn cell_at(&self, x: f64, y: f64) -> Option<(u16, u16)> {
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let col = (x / f64::from(self.cell_width_px.max(1))).floor();
+        let row = (y / f64::from(self.cell_height_px.max(1))).floor();
+        if col >= f64::from(self.cols) || row >= f64::from(self.rows) {
+            return None;
+        }
+        Some((col as u16, row as u16))
+    }
 }
 
 impl From<Geometry> for GestureGeometry {
@@ -229,6 +248,9 @@ pub struct Terminal {
     encoded: Vec<u8>,
     /// Scratch buffer for formatted selection text.
     selection_buf: Vec<u8>,
+    /// Scratch buffer for a hyperlink URI, reused so hovering a link does not
+    /// allocate once per cell of the viewport.
+    link_buf: Vec<u8>,
     /// Selection colors, which the library does not own: selection is drawn by
     /// us, over cells the library only marks.
     selection_colors: Option<(Option<Rgb>, Option<Rgb>)>,
@@ -315,6 +337,7 @@ impl Terminal {
             grid: Grid::default(),
             encoded: Vec::with_capacity(64),
             selection_buf: Vec::new(),
+            link_buf: Vec::new(),
             selection_colors: None,
             cursor_text: None,
         })
@@ -557,6 +580,84 @@ impl Terminal {
         }
     }
 
+    // --- hyperlinks ----------------------------------------------------------
+
+    /// Read one viewport cell's OSC 8 URI into [`Self::link_buf`], returning its
+    /// length. `None` means the cell carries no hyperlink.
+    ///
+    /// The grid reference is built and consumed inside this call: upstream
+    /// documents one as valid only until the next terminal update, so none may
+    /// be held across a feed.
+    fn read_hyperlink(&mut self, col: u16, row: u16) -> Result<Option<usize>> {
+        if self.link_buf.is_empty() {
+            self.link_buf.resize(256, 0);
+        }
+        loop {
+            let point = Point::Viewport(PointCoordinate {
+                x: col,
+                y: u32::from(row),
+            });
+            let grid_ref = self.inner.grid_ref(point)?;
+            match grid_ref.hyperlink_uri(&mut self.link_buf) {
+                Ok(0) => return Ok(None),
+                Ok(len) => return Ok(Some(len)),
+                // Grow and retry. A required size that would not actually grow
+                // the buffer would loop forever, so treat it as a failure.
+                Err(Error::OutOfSpace { required }) if required > self.link_buf.len() => {
+                    self.link_buf.resize(required, 0);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// The OSC 8 URI on one viewport cell, if it carries one.
+    pub fn hyperlink_at(&mut self, col: u16, row: u16) -> Result<Option<String>> {
+        let Some(len) = self.read_hyperlink(col, row)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            String::from_utf8_lossy(&self.link_buf[..len]).into_owned(),
+        ))
+    }
+
+    /// The whole link under one cell: its URI and every visible cell that
+    /// belongs to it.
+    ///
+    /// Cells are gathered by comparing URIs across the viewport rather than by
+    /// contiguity, which is what Ghostty does — a link wrapped across lines, or
+    /// split by a repaint, still highlights as one. Ghostty compares the
+    /// hyperlink's identity first and its URI second; the C API exposes no
+    /// identity, so two adjacent links that differ only by an `id=` parameter
+    /// highlight here as one. The URI that opens is still the right one.
+    ///
+    /// Costs nothing on a cell with no link, which is nearly every call: the
+    /// flattened grid answers that without crossing into the library.
+    pub fn hyperlink_hover(&mut self, col: u16, row: u16) -> Result<Option<LinkHover>> {
+        if !self.grid.cell(col, row).is_some_and(|cell| cell.link) {
+            return Ok(None);
+        }
+        let Some(len) = self.read_hyperlink(col, row)? else {
+            return Ok(None);
+        };
+        let uri = String::from_utf8_lossy(&self.link_buf[..len]).into_owned();
+
+        let mut cells = Vec::new();
+        for y in 0..self.grid.rows {
+            for x in 0..self.grid.cols {
+                if !self.grid.cell(x, y).is_some_and(|cell| cell.link) {
+                    continue;
+                }
+                if let Some(len) = self.read_hyperlink(x, y)?
+                    && self.link_buf[..len] == *uri.as_bytes()
+                {
+                    cells.push((x, y));
+                }
+            }
+        }
+        Ok(Some(LinkHover { uri, cells }))
+    }
+
     /// Encode text for pasting, wrapping it in bracketed paste markers when the
     /// application asked for them. Control bytes are stripped upstream, so a
     /// paste cannot smuggle an escape sequence through.
@@ -620,12 +721,26 @@ impl Terminal {
         let mut row_it = self.rows.update(&snapshot)?;
         let mut y: u16 = 0;
         while let Some(row) = row_it.next() {
+            // A row-level flag, tolerant of false positives, that saves an FFI
+            // call per cell on the overwhelming majority of rows, which carry
+            // no hyperlink at all.
+            let row_links = row
+                .raw_row()
+                .and_then(libghostty_vt::screen::Row::has_hyperlink)
+                .unwrap_or(false);
+
             let mut cell_it = self.cells.update(row)?;
             let mut x: u16 = 0;
             while let Some(cell) = cell_it.next() {
                 let Some(out) = self.grid.cell_mut(x, y) else {
                     break;
                 };
+
+                out.link = row_links
+                    && cell
+                        .raw_cell()
+                        .and_then(libghostty_vt::screen::Cell::has_hyperlink)
+                        .unwrap_or(false);
 
                 let selected = cell.is_selected().unwrap_or(false);
                 let mut fg = cell.fg_color()?.map_or(colors.foreground, |c| c);
@@ -688,6 +803,16 @@ impl Drop for Terminal {
         // here hands them back while the terminal is still alive.
         self.gesture.reset(&self.inner);
     }
+}
+
+/// The local path a `file://` URI names, or `None` when it names another host.
+///
+/// Exported because a `file://` hyperlink deserves the same question OSC 7
+/// asks: a path from a machine at the far end of an SSH session means nothing
+/// here, and opening it would open some unrelated local file.
+#[must_use]
+pub fn local_file_path(uri: &str) -> Option<String> {
+    local_path(uri)
 }
 
 /// The local path a `file://` URI names, or `None` if it names another host.
