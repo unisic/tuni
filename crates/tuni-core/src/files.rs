@@ -187,11 +187,19 @@ fn read_directory(directory: &Path) -> Vec<Item> {
             if name == ".git" {
                 return None;
             }
+            let path = entry.path();
+            // Still follows symlinks, so a link to a directory opens like one —
+            // but only a link pays for the `stat` that answers it. Every other
+            // entry is already typed by the directory read that found it, and
+            // this runs for every visible row on a two-second timer.
+            let is_directory = match entry.file_type() {
+                Ok(kind) if !kind.is_symlink() => kind.is_dir(),
+                _ => path.is_dir(),
+            };
             Some(Item {
-                // Follows symlinks, so a link to a directory opens like one.
-                is_directory: entry.path().is_dir(),
+                is_directory,
                 name,
-                path: entry.path(),
+                path,
                 depth: 0,
             })
         })
