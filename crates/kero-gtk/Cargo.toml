@@ -1,0 +1,21 @@
+[package]
+name = "kero-gtk"
+description = "GTK4/libadwaita front end"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "kero"
+path = "src/main.rs"
+
+[dependencies]
+kero-core.workspace = true
+kero-pty.workspace = true
+kero-vt.workspace = true
+
+adw = { package = "libadwaita", version = "0.8", features = ["v1_6"] }
+gtk = { package = "gtk4", version = "0.10", features = ["v4_12"] }
+unicode-width = "0.2"

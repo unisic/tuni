@@ -1,0 +1,13 @@
+[package]
+name = "kero-pty"
+description = "PTY spawning and I/O pumping for terminal sessions"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-channel = "2"
+nix = { version = "0.31", features = ["user"] }
+portable-pty = "0.9"

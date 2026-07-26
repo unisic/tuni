@@ -1,0 +1,10 @@
+[package]
+name = "kero-core"
+description = "Portable workspace models: config, projects, panes, session persistence, git"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
