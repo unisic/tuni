@@ -46,7 +46,11 @@ fn dump(term: &mut Terminal, label: &str) {
     for row in 0..grid.rows {
         let mut line = String::new();
         for cell in grid.row(row) {
-            line.push_str(if cell.text.is_empty() { " " } else { &cell.text });
+            line.push_str(if cell.text.is_empty() {
+                " "
+            } else {
+                &cell.text
+            });
         }
         let line = line.trim_end();
         if !line.is_empty() {
@@ -102,7 +106,11 @@ fn main() {
     // Anything but `1` is taken as the command itself, so a shell with other
     // syntax than zsh can be driven too.
     if let Ok(cmd) = std::env::var("REPRO_OUTPUT") {
-        let cmd = if cmd == "1" { "printf 'y%.0s' {1..150}; echo".to_owned() } else { cmd };
+        let cmd = if cmd == "1" {
+            "printf 'y%.0s' {1..150}; echo".to_owned()
+        } else {
+            cmd
+        };
         pty.write(format!("{cmd}\n").as_bytes()).expect("write");
         drain(&mut term, &mut pty, &events, Duration::from_millis(1500));
     }

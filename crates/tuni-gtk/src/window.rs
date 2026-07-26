@@ -3650,6 +3650,14 @@ pub fn apply_chrome(theme: &Theme, opacity: f64) {
          @define-color sidebar_fg_color {fg};\n\
          @define-color sidebar_border_color {border};\n\
          @define-color sidebar_backdrop_color {clear};\n\
+         /* The Files panel is a sidebar inside the projects sidebar's\n\
+            content, which libadwaita paints as a secondary sidebar: its own\n\
+            gray unless these say otherwise, and solid where everything else\n\
+            went translucent. */\n\
+         @define-color secondary_sidebar_bg_color {sidebar};\n\
+         @define-color secondary_sidebar_fg_color {fg};\n\
+         @define-color secondary_sidebar_border_color {border};\n\
+         @define-color secondary_sidebar_backdrop_color {clear};\n\
          @define-color popover_bg_color {raised};\n\
          @define-color popover_fg_color {fg};\n\
          @define-color dialog_bg_color {raised};\n\

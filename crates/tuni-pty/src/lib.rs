@@ -264,7 +264,11 @@ impl Pty {
             .name("tuni-pty-writer".to_owned())
             .spawn(move || {
                 while let Ok(chunk) = pending.recv_blocking() {
-                    if writer.write_all(&chunk).and_then(|()| writer.flush()).is_err() {
+                    if writer
+                        .write_all(&chunk)
+                        .and_then(|()| writer.flush())
+                        .is_err()
+                    {
                         break;
                     }
                 }

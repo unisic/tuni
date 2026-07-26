@@ -41,8 +41,15 @@ fn profile(name: &str, unit: &[u8]) {
 }
 
 fn main() {
-    println!("{} KiB per chunk, {} MiB total\n", CHUNK / 1024, TOTAL / 1048576);
-    profile("plain text", b"alpha beta gamma delta epsilon zeta eta theta\n");
+    println!(
+        "{} KiB per chunk, {} MiB total\n",
+        CHUNK / 1024,
+        TOTAL / 1048576
+    );
+    profile(
+        "plain text",
+        b"alpha beta gamma delta epsilon zeta eta theta\n",
+    );
     profile("sgr-dense", b"\x1b[31mab\x1b[0m");
     profile("raw esc", b"\x1b");
     profile("esc + printable", b"\x1ba");

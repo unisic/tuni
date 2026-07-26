@@ -20,7 +20,10 @@ fn main() {
         window.present();
         let display = gtk::prelude::WidgetExt::display(&window);
         let settings = gtk::Settings::for_display(&display);
-        println!("gtk-cursor-blink         = {}", settings.is_gtk_cursor_blink());
+        println!(
+            "gtk-cursor-blink         = {}",
+            settings.is_gtk_cursor_blink()
+        );
         println!(
             "gtk-cursor-blink-time    = {} ms",
             settings.gtk_cursor_blink_time()
