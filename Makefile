@@ -14,6 +14,15 @@ bindir = $(DESTDIR)$(PREFIX)/bin
 datadir = $(DESTDIR)$(PREFIX)/share
 icondir = $(datadir)/icons/hicolor
 
+# Where cargo actually put the binary. Usually ./target, but CARGO_TARGET_DIR
+# or a build.target-dir in .cargo/config.toml moves it — a checkout on a
+# filesystem without symlinks has to move it, since the libghostty-vt build
+# links libghostty-vt.so.0 inside the target directory. Ask cargo rather than
+# assume.
+CARGO_TARGET_DIR := $(shell $(CARGO) metadata --format-version 1 --no-deps 2>/dev/null \
+	| sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+CARGO_TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
+
 # libghostty-vt is Zig source compiled during the build, and the pinned Ghostty
 # commit builds with exactly this Zig: the standard library changed under it in
 # 0.16, which is already what Fedora ships. Distributions move faster than the
@@ -63,7 +72,7 @@ zig:
 # Themes are baked into the binary at build time, so an installed Tuni needs
 # nothing beside the executable but its desktop integration.
 install: build install-data
-	install -Dm755 target/release/tuni $(bindir)/tuni
+	install -Dm755 $(CARGO_TARGET_DIR)/release/tuni $(bindir)/tuni
 
 # The window names its icon rather than carrying one, so a Tuni run straight
 # out of the build directory shows the desktop's fallback icon until the entry
