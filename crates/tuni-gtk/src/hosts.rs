@@ -25,7 +25,11 @@ use gtk::gio;
 use gtk::glib;
 
 use tuni_core::fuzzy;
-use tuni_core::ssh::{self, Host, Hosts};
+use tuni_core::ssh::{self, Host, Hosts, Meta, Notes, Source};
+
+/// How many hosts the Recent section holds before the rest of them are just the
+/// list underneath it.
+const RECENT: usize = 5;
 
 /// How wide the column gets before the space around it grows instead. A
 /// launcher on a wide monitor is a column, not a field of whitespace with three
@@ -43,7 +47,7 @@ enum Choice {
 }
 
 mod imp {
-    use super::{Cell, Choice, Hosts, Rc, RefCell, glib};
+    use super::{Cell, Choice, Hosts, Notes, Rc, RefCell, glib};
     use adw::prelude::*;
     use adw::subclass::prelude::*;
 
@@ -59,9 +63,9 @@ mod imp {
         ConnectInTab(String),
         /// Put a plain shell in this pane instead.
         LocalShell,
-        /// Open a file for editing, which is how the real configuration is
-        /// reached from a list that only reads it.
-        OpenFile(std::path::PathBuf),
+        /// Open a file for editing at a line, which is how the real
+        /// configuration is reached from a list that only reads it.
+        OpenFile(std::path::PathBuf, usize),
     }
 
     #[derive(Default)]
@@ -69,10 +73,14 @@ mod imp {
         /// Everything the configuration names, and the files it was read from,
         /// which is what answers whether the list has gone stale.
         pub hosts: RefCell<Hosts>,
+        /// Labels, tags and when each host was last connected to, which is what
+        /// the Recent section is sorted on.
+        pub notes: RefCell<Notes>,
         /// What each row on screen stands for, in the order they are in. The
         /// widgets are rebuilt on every keystroke and this with them.
         pub(super) rows: RefCell<Vec<(gtk::ListBoxRow, Choice)>>,
         pub search: RefCell<Option<gtk::SearchEntry>>,
+        pub banner: RefCell<Option<adw::Banner>>,
         pub list: RefCell<Option<gtk::ListBox>>,
         pub scroller: RefCell<Option<gtk::ScrolledWindow>>,
         pub stack: RefCell<Option<gtk::Stack>>,
@@ -171,6 +179,14 @@ impl TuniHosts {
         names.append(&heading);
         names.append(&count);
 
+        let add = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Add a host")
+            .action_name("hosts.add")
+            .valign(gtk::Align::Center)
+            .build();
+        add.add_css_class("flat");
+
         let more = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
             .tooltip_text("More")
@@ -185,7 +201,12 @@ impl TuniHosts {
         header.set_margin_top(8);
         header.set_margin_bottom(8);
         header.append(&names);
+        header.append(&add);
         header.append(&more);
+
+        // Only ever holds the reason a write failed. A host list that cannot be
+        // read is an empty list, which says so by being empty.
+        let banner = adw::Banner::new("");
 
         let search = gtk::SearchEntry::builder()
             .placeholder_text("Search hosts, or type an address")
@@ -216,6 +237,14 @@ impl TuniHosts {
                  Type an address to connect to a machine that is not saved.",
             )
             .build();
+        let first = gtk::Button::builder()
+            .label("Add a Host")
+            .action_name("hosts.add")
+            .halign(gtk::Align::Center)
+            .build();
+        first.add_css_class("pill");
+        first.add_css_class("suggested-action");
+        nothing.set_child(Some(&first));
         let no_match = adw::StatusPage::builder()
             .icon_name("edit-find-symbolic")
             .title("No Matches")
@@ -229,6 +258,7 @@ impl TuniHosts {
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&header);
+        content.append(&banner);
         content.append(&search);
         content.append(&stack);
 
@@ -244,6 +274,7 @@ impl TuniHosts {
         menu.set_halign(gtk::Align::Start);
         menu.set_parent(self);
 
+        imp.banner.replace(Some(banner));
         imp.search.replace(Some(search.clone()));
         imp.list.replace(Some(list.clone()));
         imp.scroller.replace(Some(scroller));
@@ -359,8 +390,32 @@ impl TuniHosts {
             }),
             entry("local-shell", self, |hosts| hosts.send(Message::LocalShell)),
             entry("refresh", self, TuniHosts::reload),
+            entry("add", self, |hosts| hosts.edit_host(None, false)),
+            entry("edit", self, |hosts| {
+                let target = hosts.imp().target.borrow().clone();
+                hosts.edit_host(target.as_deref(), false);
+            }),
+            entry("duplicate", self, |hosts| {
+                let target = hosts.imp().target.borrow().clone();
+                hosts.edit_host(target.as_deref(), true);
+            }),
+            entry("delete", self, TuniHosts::confirm_delete),
             entry("open-config", self, |hosts| {
-                hosts.send(Message::OpenFile(ssh::config_path()));
+                hosts.send(Message::OpenFile(ssh::config_path(), 1));
+            }),
+            entry("open-origin", self, |hosts| {
+                let Some(alias) = hosts.imp().target.borrow().clone() else {
+                    return;
+                };
+                let origin = hosts
+                    .imp()
+                    .hosts
+                    .borrow()
+                    .get(&alias)
+                    .and_then(|host| host.origin.clone());
+                if let Some(origin) = origin {
+                    hosts.send(Message::OpenFile(origin.path, origin.line));
+                }
             }),
         ]);
         self.insert_action_group("hosts", Some(&actions));
@@ -376,17 +431,19 @@ impl TuniHosts {
         let Some(Choice::Host(alias)) = choice else {
             return;
         };
-        let origin = self.imp().hosts.borrow().get(&alias).and_then(|host| {
-            host.origin
-                .as_ref()
-                .map(|origin| origin.path.to_string_lossy().into_owned())
-        });
+        let known = self
+            .imp()
+            .hosts
+            .borrow()
+            .get(&alias)
+            .map(|host| (host.source, host.origin.is_some()));
         self.imp().target.replace(Some(alias));
 
         let Some(menu) = self.imp().menu.borrow().clone() else {
             return;
         };
-        menu.set_menu_model(Some(&row_menu(origin.is_some())));
+        let (source, declared) = known.unwrap_or((Source::Adhoc, false));
+        menu.set_menu_model(Some(&row_menu(source, declared)));
         // The gesture measures from the list; the popover hangs off this
         // widget, and the two are a header and a search entry apart.
         let point = gtk::graphene::Point::new(x as f32, y as f32);
@@ -401,7 +458,135 @@ impl TuniHosts {
         let Some(alias) = self.imp().target.borrow().clone() else {
             return;
         };
+        self.remember(&alias);
         self.send(wher.message(alias));
+    }
+
+    /// Puts a host at the top of the list next time. An address typed once is
+    /// not a host, so it gets no history: the file would fill up with lines
+    /// nobody can act on.
+    fn remember(&self, alias: &str) {
+        let imp = self.imp();
+        if imp.hosts.borrow().get(alias).is_none() {
+            return;
+        }
+        imp.notes.borrow_mut().used(alias);
+        let notes = imp.notes.borrow().clone();
+        glib::spawn_future_local(async move {
+            let _ = gio::spawn_blocking(move || notes.save()).await;
+        });
+    }
+
+    // --- writing -----------------------------------------------------------
+
+    /// Opens the editor on a host, or on nothing, which is how one is added.
+    /// A duplicate opens the same dialog under a name that is free, so saving
+    /// it cannot quietly replace what it was copied from.
+    fn edit_host(&self, alias: Option<&str>, duplicate: bool) {
+        let imp = self.imp();
+        let mut host = alias.and_then(|alias| imp.hosts.borrow().get(alias).cloned());
+        let mut meta = alias
+            .map(|alias| imp.notes.borrow().get(alias))
+            .unwrap_or_default();
+        let jumps: Vec<String> = imp
+            .hosts
+            .borrow()
+            .all()
+            .iter()
+            .map(|host| host.alias.clone())
+            .collect();
+
+        if duplicate && let Some(host) = host.as_mut() {
+            host.alias = free_alias(&host.alias, &jumps);
+            host.origin = None;
+            host.shadowed = false;
+            meta = Meta {
+                label: meta.label,
+                tags: meta.tags,
+                ..Meta::default()
+            };
+        }
+
+        crate::host_editor::present(
+            self,
+            host,
+            meta,
+            jumps,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |edited| this.store(edited)
+            ),
+        );
+    }
+
+    /// Writes the store, off this thread: it renders the file, hands it to
+    /// `ssh` to be checked, and renames it into place.
+    fn store(&self, edited: crate::host_editor::Edited) {
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let written = gio::spawn_blocking(move || write(edited)).await;
+                this.report(written.unwrap_or_else(|_| Err("The write did not finish".to_owned())));
+            }
+        ));
+    }
+
+    fn confirm_delete(&self) {
+        let Some(alias) = self.imp().target.borrow().clone() else {
+            return;
+        };
+        let dialog = adw::AlertDialog::new(
+            Some(&format!("Delete {alias}?")),
+            Some(
+                "The host is removed from the file tuni keeps. Nothing on the machine it names is touched.",
+            ),
+        );
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("delete", "Delete");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(
+            None,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_, response| {
+                    if response != "delete" {
+                        return;
+                    }
+                    let alias = alias.clone();
+                    glib::spawn_future_local(glib::clone!(
+                        #[weak]
+                        this,
+                        async move {
+                            let removed = gio::spawn_blocking(move || remove(&alias)).await;
+                            this.report(
+                                removed
+                                    .unwrap_or_else(|_| Err("The write did not finish".to_owned())),
+                            );
+                        }
+                    ));
+                }
+            ),
+        );
+        dialog.present(Some(self));
+    }
+
+    /// Shows what went wrong, or reads the list again because something
+    /// changed.
+    fn report(&self, outcome: Result<(), String>) {
+        if let Some(banner) = self.imp().banner.borrow().as_ref() {
+            banner.set_revealed(outcome.is_err());
+            if let Err(message) = &outcome {
+                banner.set_title(message);
+            }
+        }
+        if outcome.is_ok() {
+            self.reload();
+        }
     }
 
     // --- reading -----------------------------------------------------------
@@ -421,16 +606,17 @@ impl TuniHosts {
                 // Files and no subprocess, but files on a network share are
                 // files that block, and this pane is the whole window's
                 // keyboard while it is up.
-                let read = gio::spawn_blocking(Hosts::load).await;
+                let read = gio::spawn_blocking(|| (Hosts::load(), Notes::load())).await;
                 let imp = this.imp();
                 imp.loading.set(false);
-                let Ok(hosts) = read else {
+                let Ok((hosts, notes)) = read else {
                     return;
                 };
                 if imp.generation.get() != generation {
                     return;
                 }
                 imp.hosts.replace(hosts);
+                imp.notes.replace(notes);
                 this.fill();
             }
         ));
@@ -457,6 +643,7 @@ impl TuniHosts {
         }
 
         let hosts = imp.hosts.borrow();
+        let notes = imp.notes.borrow();
         if let Some(label) = imp.count.borrow().as_ref() {
             label.set_text(&count(hosts.all().len()));
         }
@@ -468,33 +655,63 @@ impl TuniHosts {
             list.append(&row);
             rows.push((row, Choice::Local));
 
-            let mut sorted: Vec<&Host> = hosts.all().iter().collect();
+            // Last connected first, and then everything else by name. A host
+            // in the first group is not repeated in the second: two rows for
+            // one machine is two answers to the question of where to click.
+            let mut recent: Vec<(&Host, u64)> = hosts
+                .all()
+                .iter()
+                .filter_map(|host| Some((host, notes.get(&host.alias).last_used?)))
+                .collect();
+            recent.sort_by_key(|(_, when)| std::cmp::Reverse(*when));
+            recent.truncate(RECENT);
+            if !recent.is_empty() {
+                list.append(&header("Recent"));
+            }
+            for (host, _) in &recent {
+                let row = host_row(host, &notes.get(&host.alias));
+                list.append(&row);
+                rows.push((row, Choice::Host(host.alias.clone())));
+            }
+
+            let mut sorted: Vec<&Host> = hosts
+                .all()
+                .iter()
+                .filter(|host| !recent.iter().any(|(shown, _)| shown.alias == host.alias))
+                .collect();
             sorted.sort_by(|left, right| left.alias.cmp(&right.alias));
             if !sorted.is_empty() {
                 list.append(&header("Hosts"));
             }
             for host in sorted {
-                let row = host_row(host);
+                let row = host_row(host, &notes.get(&host.alias));
                 list.append(&row);
                 rows.push((row, Choice::Host(host.alias.clone())));
             }
         } else {
-            let mut ranked: Vec<(&Host, i32)> = hosts
+            let mut ranked: Vec<(&Host, Meta, i32)> = hosts
                 .all()
                 .iter()
                 .filter_map(|host| {
-                    fuzzy::score(&format!("{} {}", host.alias, host.address()), &query)
-                        .map(|score| (host, score))
+                    let meta = notes.get(&host.alias);
+                    let searchable = format!(
+                        "{} {} {} {}",
+                        host.alias,
+                        host.address(),
+                        meta.label,
+                        meta.tags.join(" ")
+                    );
+                    fuzzy::score(&searchable, &query).map(|score| (host, meta, score))
                 })
                 .collect();
             ranked.sort_by(|left, right| {
                 right
-                    .1
-                    .cmp(&left.1)
+                    .2
+                    .cmp(&left.2)
                     .then_with(|| left.0.alias.cmp(&right.0.alias))
             });
-            for (host, _) in ranked {
-                let row = host_row(host);
+            for (host, meta, _) in &ranked {
+                let row = host_row(host, meta);
                 list.append(&row);
                 rows.push((row, Choice::Host(host.alias.clone())));
             }
@@ -524,6 +741,7 @@ impl TuniHosts {
         if let Some((row, _)) = rows.first() {
             list.select_row(Some(row));
         }
+        drop(notes);
         drop(hosts);
         imp.rows.replace(rows);
     }
@@ -569,7 +787,10 @@ impl TuniHosts {
             // A local shell is this pane whichever key asked for it: nobody
             // means "open a second empty terminal somewhere else" by it.
             Some(Choice::Local) => self.send(Message::LocalShell),
-            Some(Choice::Host(alias)) => self.send(wher.message(alias)),
+            Some(Choice::Host(alias)) => {
+                self.remember(&alias);
+                self.send(wher.message(alias));
+            }
             None => (),
         }
     }
@@ -617,7 +838,9 @@ fn header_menu() -> gio::Menu {
     menu
 }
 
-fn row_menu(saved: bool) -> gio::Menu {
+/// The menu for one row. What it offers depends on which file the host came
+/// out of: tuni rewrites its own, and points at the user's.
+fn row_menu(source: Source, declared: bool) -> gio::Menu {
     let menu = gio::Menu::new();
 
     let open = gio::Menu::new();
@@ -626,10 +849,20 @@ fn row_menu(saved: bool) -> gio::Menu {
     open.append(Some("Connect in a New Tab"), Some("hosts.connect-in-tab"));
     menu.append_section(None, &open);
 
+    if source != Source::Adhoc {
+        let change = gio::Menu::new();
+        change.append(Some("Edit"), Some("hosts.edit"));
+        change.append(Some("Duplicate"), Some("hosts.duplicate"));
+        if source == Source::Tuni {
+            change.append(Some("Delete"), Some("hosts.delete"));
+        }
+        menu.append_section(None, &change);
+    }
+
     let rest = gio::Menu::new();
     rest.append(Some("Copy ssh Command"), Some("hosts.copy-command"));
-    if saved {
-        rest.append(Some("Open ~/.ssh/config"), Some("hosts.open-config"));
+    if declared && source == Source::SshConfig {
+        rest.append(Some("Edit in ~/.ssh/config"), Some("hosts.open-origin"));
     }
     menu.append_section(None, &rest);
 
@@ -659,16 +892,22 @@ fn local_row() -> gtk::ListBoxRow {
     row("utilities-terminal-symbolic", "Local shell", "", "")
 }
 
-fn host_row(host: &Host) -> gtk::ListBoxRow {
-    let row = row(
-        "network-server-symbolic",
-        &host.alias,
-        &host.address(),
-        // First value obtained wins, so of two blocks naming one alias only
-        // the first is doing anything. A list that shows both without saying
-        // so is a list that lies about which one an edit would change.
-        if host.shadowed { "declared twice" } else { "" },
-    );
+fn host_row(host: &Host, meta: &Meta) -> gtk::ListBoxRow {
+    let name = if meta.label.is_empty() {
+        &host.alias
+    } else {
+        &meta.label
+    };
+    // First value obtained wins, so of two blocks naming one alias only the
+    // first is doing anything. A list that shows both without saying so is a
+    // list that lies about which one an edit would change, and that is worth
+    // the space the tags would have had.
+    let note = if host.shadowed {
+        "declared twice".to_owned()
+    } else {
+        meta.tags.join(", ")
+    };
+    let row = row("network-server-symbolic", name, &host.address(), &note);
     if let Some(origin) = &host.origin {
         row.set_tooltip_text(Some(&format!(
             "{}:{}",
@@ -729,6 +968,58 @@ fn row(icon: &str, name: &str, address: &str, note: &str) -> gtk::ListBoxRow {
     gtk::ListBoxRow::builder().child(&line).build()
 }
 
+/// Puts a host in the file tuni owns, and makes sure `ssh` reads that file.
+///
+/// The whole file is rewritten from the hosts already in it, so an edit made
+/// here and an edit made in a text editor cannot half-merge. Without the
+/// `Include` the block would be written and then never read, and connecting to
+/// the alias would try to reach a machine of that name.
+fn write(edited: crate::host_editor::Edited) -> Result<(), String> {
+    let crate::host_editor::Edited {
+        original,
+        host,
+        meta,
+    } = edited;
+    let mut hosts = ssh::saved();
+    hosts.retain(|kept| kept.alias != host.alias && Some(&kept.alias) != original.as_ref());
+    hosts.push(host.clone());
+    hosts.sort_by(|left, right| left.alias.cmp(&right.alias));
+    ssh::save(&hosts)?;
+    ssh::ensure_include()?;
+
+    let mut notes = Notes::load();
+    // A rename leaves the tags filed under a name nothing answers to.
+    if let Some(original) = &original
+        && *original != host.alias
+    {
+        notes.set(original, Meta::default());
+    }
+    notes.set(&host.alias, meta);
+    notes.save().map_err(|error| error.to_string())
+}
+
+fn remove(alias: &str) -> Result<(), String> {
+    let mut hosts = ssh::saved();
+    hosts.retain(|kept| kept.alias != alias);
+    ssh::save(&hosts)?;
+
+    let mut notes = Notes::load();
+    notes.set(alias, Meta::default());
+    notes.save().map_err(|error| error.to_string())
+}
+
+/// A name like `alias` that nothing else answers to yet.
+fn free_alias(alias: &str, taken: &[String]) -> String {
+    let candidate = format!("{alias} copy");
+    if !taken.contains(&candidate) {
+        return candidate;
+    }
+    (2..)
+        .map(|number| format!("{candidate} {number}"))
+        .find(|candidate| !taken.contains(candidate))
+        .unwrap_or(candidate)
+}
+
 fn count(hosts: usize) -> String {
     match hosts {
         0 => "No hosts".to_owned(),
@@ -759,6 +1050,13 @@ fn reveal(scroller: &gtk::ScrolledWindow, row: &gtk::ListBoxRow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_copy_is_never_named_after_something_that_exists() {
+        let taken = ["web".to_owned(), "web copy".to_owned()];
+        assert_eq!(free_alias("db", &taken), "db copy");
+        assert_eq!(free_alias("web", &taken), "web copy 2");
+    }
 
     #[test]
     fn the_count_reads_as_a_sentence_at_every_size() {

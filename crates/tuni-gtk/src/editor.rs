@@ -595,6 +595,19 @@ impl TuniEditor {
         });
     }
 
+    /// Puts the cursor on the start of a line, counting from one, which is how
+    /// every other program that points at a place in a file counts.
+    pub fn set_line(&self, line: usize) {
+        let Some(buffer) = self.imp().buffer.borrow().clone() else {
+            return;
+        };
+        let line = i32::try_from(line.saturating_sub(1)).unwrap_or(i32::MAX);
+        let iter = buffer.iter_at_line(line.min(buffer.line_count() - 1));
+        if let Some(iter) = iter {
+            self.set_cursor(usize::try_from(iter.offset()).unwrap_or_default());
+        }
+    }
+
     /// Opens the find bar with a query already in it, as Ctrl+F and typing
     /// would. The entry drives the search itself, so the matches arrive the
     /// same way they do for a reader.

@@ -10,6 +10,7 @@ mod files;
 mod find;
 mod git;
 mod grid;
+mod host_editor;
 mod hosts;
 mod info;
 mod keymap;
@@ -288,25 +289,34 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                             None => (action.clone(), None),
                         };
                         let target = target.map(|value| value.to_variant());
-                        let (widget, name) =
-                            match (name.strip_prefix("editor."), name.strip_prefix("diff.")) {
-                                (Some(rest), _) => match window.active_editor() {
-                                    Some(editor) => {
-                                        (editor.upcast::<gtk::Widget>(), format!("editor.{rest}"))
-                                    }
-                                    None => return eprintln!("no file is open: {name}"),
-                                },
-                                (_, Some(rest)) => match window.active_diff() {
-                                    Some(diff) => {
-                                        (diff.upcast::<gtk::Widget>(), format!("diff.{rest}"))
-                                    }
-                                    None => return eprintln!("no diff is open: {name}"),
-                                },
-                                _ => {
-                                    let name = name.strip_prefix("win.").unwrap_or(&name);
-                                    (window.clone().upcast(), format!("win.{name}"))
+                        let (widget, name) = match (
+                            name.strip_prefix("editor."),
+                            name.strip_prefix("diff."),
+                            name.strip_prefix("hosts."),
+                        ) {
+                            (Some(rest), _, _) => match window.active_editor() {
+                                Some(editor) => {
+                                    (editor.upcast::<gtk::Widget>(), format!("editor.{rest}"))
                                 }
-                            };
+                                None => return eprintln!("no file is open: {name}"),
+                            },
+                            (_, Some(rest), _) => match window.active_diff() {
+                                Some(diff) => {
+                                    (diff.upcast::<gtk::Widget>(), format!("diff.{rest}"))
+                                }
+                                None => return eprintln!("no diff is open: {name}"),
+                            },
+                            (_, _, Some(rest)) => match window.active_hosts() {
+                                Some(hosts) => {
+                                    (hosts.upcast::<gtk::Widget>(), format!("hosts.{rest}"))
+                                }
+                                None => return eprintln!("no host list is open: {name}"),
+                            },
+                            _ => {
+                                let name = name.strip_prefix("win.").unwrap_or(&name);
+                                (window.clone().upcast(), format!("win.{name}"))
+                            }
+                        };
                         gtk::prelude::WidgetExt::activate_action(&widget, &name, target.as_ref())
                             .unwrap_or_else(|_| eprintln!("no such action: {name}"));
                     }

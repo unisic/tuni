@@ -1683,7 +1683,7 @@ impl TuniWindow {
                 Message::LocalShell => this.replace_pane(project, tab, pane, Pane::new()),
                 Message::ConnectToSide(alias) => this.open_pane_to_side(Pane::ssh(alias)),
                 Message::ConnectInTab(alias) => this.open_pane(Pane::ssh(alias)),
-                Message::OpenFile(path) => this.open_file(&path),
+                Message::OpenFile(path, line) => this.open_file_at(&path, line),
             }
         ));
         self.imp().hosts.borrow_mut().insert(pane, hosts.clone());
@@ -1806,6 +1806,16 @@ impl TuniWindow {
     /// Opens a file in a tab of its own, next to the selected one.
     pub fn open_file(&self, path: &Path) {
         self.open_pane(Pane::file(path.to_path_buf()));
+    }
+
+    /// The same, landing on one line: what "this host is declared here" means
+    /// when the file it points into is a hundred blocks long. The pane that
+    /// opens takes the focus, so it is the one to ask.
+    pub fn open_file_at(&self, path: &Path, line: usize) {
+        self.open_file(path);
+        if let Some(editor) = self.active_editor() {
+            editor.set_line(line);
+        }
     }
 
     /// Opens what changed in a file the same way: the working tree against the
@@ -3264,6 +3274,11 @@ impl TuniWindow {
     pub(crate) fn active_editor(&self) -> Option<TuniEditor> {
         let pane = self.focused_pane()?;
         self.imp().editors.borrow().get(&pane).cloned()
+    }
+
+    pub(crate) fn active_hosts(&self) -> Option<TuniHosts> {
+        let pane = self.focused_pane()?;
+        self.imp().hosts.borrow().get(&pane).cloned()
     }
 
     // --- rendering the model -----------------------------------------------
