@@ -29,6 +29,7 @@ use tuni_core::settings::{Appearance, HISTORY_LINE_LIMIT, Settings};
 use tuni_core::theme::Theme;
 use tuni_core::workspace::{Id, Tab, Workspace};
 
+use crate::files::TuniFiles;
 use crate::grid::{Message, TuniGrid};
 use crate::preferences;
 use crate::terminal::TuniTerminal;
@@ -38,8 +39,21 @@ const SIDEBAR_FRACTION: f64 = 0.2;
 const SIDEBAR_MIN: i32 = 180;
 const SIDEBAR_MAX: i32 = 400;
 
+/// The Files panel, on the other side.
+const PANEL_FRACTION: f64 = 0.22;
+const PANEL_MIN: i32 = 200;
+const PANEL_MAX: i32 = 500;
+
+/// How often the Files panel re-reads the directories it is showing. kero's
+/// own interval, and for the same reason: a watch on every open directory is
+/// a descriptor per directory and a debounce to write, where a read of what is
+/// already in the page cache costs nothing anyone can measure.
+const PANEL_POLL_SECONDS: u32 = 2;
+
 mod imp {
-    use super::{Cell, HashMap, Id, RefCell, Settings, TuniGrid, TuniTerminal, Workspace, glib};
+    use super::{
+        Cell, HashMap, Id, RefCell, Settings, TuniFiles, TuniGrid, TuniTerminal, Workspace, glib,
+    };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
 
@@ -61,6 +75,9 @@ mod imp {
 
         pub split: RefCell<Option<adw::OverlaySplitView>>,
         pub sidebar: RefCell<Option<gtk::ListBox>>,
+        /// The Files panel and the split it lives in, on the other side.
+        pub panel: RefCell<Option<adw::OverlaySplitView>>,
+        pub files: RefCell<Option<TuniFiles>>,
         /// Project name labels, in sidebar order.
         pub labels: RefCell<Vec<gtk::Label>>,
         /// Shared context menu for the sidebar rows, parented once.
@@ -222,6 +239,12 @@ impl TuniWindow {
             .build();
         header.pack_end(&menu);
 
+        let show_files = gtk::ToggleButton::builder()
+            .icon_name("view-list-symbolic")
+            .tooltip_text("Files (Ctrl+Shift+B)")
+            .build();
+        header.pack_end(&show_files);
+
         let stack = gtk::Stack::new();
         stack.set_hexpand(true);
         stack.set_vexpand(true);
@@ -255,10 +278,40 @@ impl TuniWindow {
             .end_action_widget(&new_tab)
             .build();
 
+        // --- the Files panel, on the far side of the terminals
+
+        let files = TuniFiles::new();
+        files.connect_message(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |message| this.files_message(&message)
+        ));
+        let panel = adw::OverlaySplitView::builder()
+            .sidebar(&files)
+            .sidebar_position(gtk::PackType::End)
+            .content(&content_stack)
+            .show_sidebar(false)
+            .sidebar_width_fraction(PANEL_FRACTION)
+            .min_sidebar_width(f64::from(PANEL_MIN))
+            .max_sidebar_width(f64::from(PANEL_MAX))
+            .build();
+        show_files
+            .bind_property("active", &panel, "show-sidebar")
+            .bidirectional()
+            .sync_create()
+            .build();
+        // Opening it is the moment its contents matter, and until then it is
+        // not reading the disk at all.
+        panel.connect_show_sidebar_notify(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.sync_files()
+        ));
+
         let content_view = adw::ToolbarView::new();
         content_view.add_top_bar(&header);
         content_view.add_top_bar(&tab_bar);
-        content_view.set_content(Some(&content_stack));
+        content_view.set_content(Some(&panel));
 
         let split = adw::OverlaySplitView::builder()
             .sidebar(&sidebar_view)
@@ -284,8 +337,26 @@ impl TuniWindow {
 
         self.set_content(Some(&split));
 
+        // Re-reads the open directories while the panel is showing, so a file
+        // written by the shell beside it appears without being asked for.
+        glib::timeout_add_seconds_local(
+            PANEL_POLL_SECONDS,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    this.poll_files();
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
+
         imp.split.replace(Some(split));
         imp.sidebar.replace(Some(sidebar));
+        imp.panel.replace(Some(panel));
+        imp.files.replace(Some(files));
         imp.row_menu.replace(Some(row_menu));
         imp.stack.replace(Some(stack));
         imp.content.replace(Some(content_stack));
@@ -432,6 +503,21 @@ impl TuniWindow {
                     split.set_show_sidebar(!split.shows_sidebar());
                 }
             }),
+            entry("toggle-panel", None, |window, _| {
+                let showing = {
+                    let panel = window.imp().panel.borrow();
+                    let Some(panel) = panel.as_ref() else {
+                        return;
+                    };
+                    panel.set_show_sidebar(!panel.shows_sidebar());
+                    panel.shows_sidebar()
+                };
+                // Closing it hands the keyboard back to the terminal, which is
+                // where it was before the panel took it.
+                if !showing {
+                    window.focus_terminal();
+                }
+            }),
             entry("tab-rename", None, |window, _| window.rename_tab()),
             entry("tab-automatic-title", None, |window, _| {
                 let Some(page) = window.imp().menu_page.borrow().clone() else {
@@ -532,6 +618,74 @@ impl TuniWindow {
         preferences::present(self, &self.imp().settings.borrow().clone());
     }
 
+    // --- the Files panel ---------------------------------------------------
+
+    /// Points the panel at the project's directory.
+    ///
+    /// The root is re-derived on every call rather than remembered, so a shell
+    /// that `cd`s out of one repository and into another takes the tree with
+    /// it; a pinned project directory is what stops that from happening.
+    fn sync_files(&self) {
+        let imp = self.imp();
+        if !imp
+            .panel
+            .borrow()
+            .as_ref()
+            .is_some_and(adw::OverlaySplitView::shows_sidebar)
+        {
+            return;
+        }
+        let Some(files) = imp.files.borrow().clone() else {
+            return;
+        };
+        let cwd = {
+            let workspace = imp.workspace.borrow();
+            let Some(project) = workspace.selected_project() else {
+                return;
+            };
+            let cwd = project
+                .selected_tab()
+                .and_then(Tab::directory)
+                .map(PathBuf::from)
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            project.panel_root(&cwd).0
+        };
+        files.sync(&cwd);
+    }
+
+    /// The timer's half of that: the root cannot have moved without something
+    /// else having said so, but what is inside it can.
+    fn poll_files(&self) {
+        let imp = self.imp();
+        if !imp
+            .panel
+            .borrow()
+            .as_ref()
+            .is_some_and(adw::OverlaySplitView::shows_sidebar)
+        {
+            return;
+        }
+        // Cheap when the root has not moved, and it is what catches a `cd`
+        // into a different repository.
+        self.sync_files();
+        if let Some(files) = imp.files.borrow().as_ref() {
+            files.poll();
+        }
+    }
+
+    fn files_message(&self, message: &crate::files::Message) {
+        match message {
+            crate::files::Message::Cd(path) => {
+                let Some(terminal) = self.active_terminal() else {
+                    return;
+                };
+                terminal.send_text(&format!("cd {}\n", tuni_core::files::shell_quote(path)));
+                terminal.grab_focus();
+            }
+        }
+    }
+
     // --- the session ------------------------------------------------------
 
     /// Writes the window's shape, and the scrollback if that was asked for.
@@ -563,6 +717,11 @@ impl TuniWindow {
             });
             snapshot.sidebar = imp
                 .split
+                .borrow()
+                .as_ref()
+                .map(adw::OverlaySplitView::shows_sidebar);
+            snapshot.panel = imp
+                .panel
                 .borrow()
                 .as_ref()
                 .map(adw::OverlaySplitView::shows_sidebar);
@@ -638,6 +797,11 @@ impl TuniWindow {
             && let Some(split) = imp.split.borrow().as_ref()
         {
             split.set_show_sidebar(show);
+        }
+        if let Some(show) = restored.panel
+            && let Some(panel) = imp.panel.borrow().as_ref()
+        {
+            panel.set_show_sidebar(show);
         }
 
         self.rebuild_sidebar();
@@ -755,6 +919,7 @@ impl TuniWindow {
         }
 
         self.refresh();
+        self.sync_files();
         self.focus_terminal();
     }
 
@@ -1099,6 +1264,9 @@ impl TuniWindow {
             grid.set_focused(pane);
         }
         self.refresh();
+        // The panel follows whichever pane is being worked in, so moving
+        // between two shells in different repositories moves the tree.
+        self.sync_files();
     }
 
     /// Closes one pane, and the tab with it when it was the last one.
@@ -1275,6 +1443,7 @@ impl TuniWindow {
             entry.select(selected);
         }
         self.refresh();
+        self.sync_files();
         self.focus_terminal();
     }
 
@@ -1790,12 +1959,17 @@ fn main_menu() -> gio::Menu {
     panes.append(Some("Zoom Pane"), Some("win.zoom-pane"));
     panes.append(Some("Even Out Panes"), Some("win.equalize-panes"));
 
+    let panels = gio::Menu::new();
+    panels.append(Some("Projects"), Some("win.toggle-sidebar"));
+    panels.append(Some("Files"), Some("win.toggle-panel"));
+
     let application = gio::Menu::new();
     application.append(Some("Preferences"), Some("win.settings"));
 
     let menu = gio::Menu::new();
     menu.append_section(None, &opening);
     menu.append_section(None, &panes);
+    menu.append_section(None, &panels);
     menu.append_section(None, &application);
     menu
 }

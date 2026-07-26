@@ -1,0 +1,740 @@
+//! The Files panel: the project's directory tree, beside the terminal.
+//!
+//! The rows come from [`tuni_core::files::Tree`], which is a flat list already,
+//! so this is a `GtkListView` over a store rebuilt whenever that list changes —
+//! and only when it changes, because the panel re-reads the disk on a timer and
+//! most of those reads find nothing new.
+//!
+//! What the tree cannot do it hands off: the trash, the clipboard, and the
+//! desktop's own file manager and default applications are all reached through
+//! GIO, which routes them through the portal in a sandbox and through the
+//! session bus outside one.
+
+use std::cell::RefCell;
+use std::path::Path;
+use std::rc::Rc;
+
+use adw::prelude::*;
+use adw::subclass::prelude::*;
+use gtk::gdk;
+use gtk::gio;
+use gtk::glib;
+
+use tuni_core::files::{Failure, Item, Tree};
+
+/// Pixels of indent per level of depth.
+const INDENT: i32 = 12;
+
+/// One row of the list, wrapped so a `GListModel` can hold it.
+mod row {
+    use std::cell::{Cell, RefCell};
+
+    use gtk::glib;
+    use gtk::subclass::prelude::*;
+
+    use tuni_core::files::Item;
+
+    mod imp {
+        use super::{Cell, Item, RefCell, glib};
+        use gtk::subclass::prelude::*;
+
+        #[derive(Default)]
+        pub struct Row {
+            pub item: RefCell<Option<Item>>,
+            pub expanded: Cell<bool>,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for Row {
+            const NAME: &'static str = "TuniFileRow";
+            type Type = super::Row;
+        }
+
+        impl ObjectImpl for Row {}
+    }
+
+    glib::wrapper! {
+        pub struct Row(ObjectSubclass<imp::Row>);
+    }
+
+    impl Row {
+        pub fn new(item: Item, expanded: bool) -> Self {
+            let row: Self = glib::Object::new();
+            row.imp().item.replace(Some(item));
+            row.imp().expanded.set(expanded);
+            row
+        }
+
+        pub fn item(&self) -> Option<Item> {
+            self.imp().item.borrow().clone()
+        }
+
+        pub fn is_expanded(&self) -> bool {
+            self.imp().expanded.get()
+        }
+    }
+}
+
+use row::Row;
+
+mod imp {
+    use super::{Item, Rc, RefCell, Tree, gio, glib};
+    use adw::prelude::*;
+    use adw::subclass::prelude::*;
+
+    pub type Handler = Rc<dyn Fn(Message)>;
+
+    /// What the panel cannot do itself, on its way to the window.
+    pub enum Message {
+        /// Type a `cd` into the terminal that has the keyboard.
+        Cd(std::path::PathBuf),
+    }
+
+    #[derive(Default)]
+    pub struct TuniFiles {
+        pub tree: RefCell<Tree>,
+        pub rows: RefCell<Option<gio::ListStore>>,
+        pub list: RefCell<Option<gtk::ListView>>,
+        pub title: RefCell<Option<gtk::Label>>,
+        pub subtitle: RefCell<Option<gtk::Label>>,
+        pub menu: RefCell<Option<gtk::PopoverMenu>>,
+        /// The row whose context menu is open, and so the one every action in
+        /// it acts on.
+        pub target: RefCell<Option<Item>>,
+        pub message: RefCell<Option<Handler>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for TuniFiles {
+        const NAME: &'static str = "TuniFiles";
+        type Type = super::TuniFiles;
+        type ParentType = adw::Bin;
+    }
+
+    impl ObjectImpl for TuniFiles {
+        fn constructed(&self) {
+            self.parent_constructed();
+            self.obj().build();
+        }
+
+        fn dispose(&self) {
+            // Parented rather than packed, so it has to be taken off by hand.
+            if let Some(menu) = self.menu.take() {
+                menu.unparent();
+            }
+        }
+    }
+
+    impl WidgetImpl for TuniFiles {}
+    impl BinImpl for TuniFiles {}
+}
+
+pub use imp::Message;
+
+glib::wrapper! {
+    pub struct TuniFiles(ObjectSubclass<imp::TuniFiles>)
+        @extends adw::Bin, gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl Default for TuniFiles {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TuniFiles {
+    #[must_use]
+    pub fn new() -> Self {
+        glib::Object::new()
+    }
+
+    pub fn connect_message<F: Fn(Message) + 'static>(&self, callback: F) {
+        self.imp().message.replace(Some(Rc::new(callback)));
+    }
+
+    fn send(&self, message: Message) {
+        let callback = self.imp().message.borrow().clone();
+        if let Some(callback) = callback {
+            callback(message);
+        }
+    }
+
+    // --- construction ------------------------------------------------------
+
+    fn build(&self) {
+        let imp = self.imp();
+
+        let title = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        title.add_css_class("heading");
+        let subtitle = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::Start)
+            .build();
+        subtitle.add_css_class("caption");
+        subtitle.add_css_class("dim-label");
+        let names = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        names.set_hexpand(true);
+        names.append(&title);
+        names.append(&subtitle);
+
+        let add = gtk::MenuButton::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("New File or Folder")
+            .menu_model(&root_menu())
+            .valign(gtk::Align::Center)
+            .build();
+        add.add_css_class("flat");
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        header.set_margin_start(12);
+        header.set_margin_end(6);
+        header.set_margin_top(8);
+        header.set_margin_bottom(8);
+        header.append(&names);
+        header.append(&add);
+
+        let rows = gio::ListStore::new::<Row>();
+        let selection = gtk::SingleSelection::builder()
+            .model(&rows)
+            .autoselect(false)
+            .can_unselect(true)
+            .build();
+
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, object| this.setup_row(object)
+        ));
+        factory.connect_bind(move |_, object| bind_row(object));
+
+        let list = gtk::ListView::builder()
+            .model(&selection)
+            .factory(&factory)
+            .vexpand(true)
+            .build();
+        list.add_css_class("navigation-sidebar");
+        list.connect_activate(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |list, position| {
+                let row = list
+                    .model()
+                    .and_then(|model| model.item(position))
+                    .and_downcast::<Row>();
+                if let Some(item) = row.and_then(|row| row.item()) {
+                    this.activate(&item);
+                }
+            }
+        ));
+
+        let menu = gtk::PopoverMenu::from_model(None::<&gio::Menu>);
+        menu.set_has_arrow(false);
+        menu.set_halign(gtk::Align::Start);
+        menu.set_parent(&list);
+
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&list)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&header);
+        content.append(&scroller);
+        self.set_child(Some(&content));
+
+        self.install_actions();
+
+        imp.rows.replace(Some(rows));
+        imp.list.replace(Some(list));
+        imp.title.replace(Some(title));
+        imp.subtitle.replace(Some(subtitle));
+        imp.menu.replace(Some(menu));
+    }
+
+    /// One row's widgets. Built once and handed back a row at a time, so
+    /// everything that depends on which row it is happens in [`bind_row`] —
+    /// except the gestures, which read the list item they were given when they
+    /// fire rather than when they were attached.
+    fn setup_row(&self, object: &glib::Object) {
+        let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+
+        let expander = gtk::Image::from_icon_name("pan-end-symbolic");
+        expander.set_pixel_size(12);
+        let icon = gtk::Image::new();
+        let label = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        content.append(&expander);
+        content.append(&icon);
+        content.append(&label);
+
+        // One click on the chevron opens or closes a directory, which is
+        // quicker than the double click the row itself asks for.
+        let toggle = gtk::GestureClick::new();
+        toggle.connect_released(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            list_item,
+            move |gesture, _, _, _| {
+                let Some(item) = list_item
+                    .item()
+                    .and_downcast::<Row>()
+                    .and_then(|row| row.item())
+                else {
+                    return;
+                };
+                if item.is_directory {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    this.toggle(&item.path);
+                }
+            }
+        ));
+        expander.add_controller(toggle);
+
+        let press = gtk::GestureClick::new();
+        press.set_button(gdk::BUTTON_SECONDARY);
+        press.connect_pressed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            list_item,
+            #[weak]
+            content,
+            move |_, _, x, y| {
+                let Some(item) = list_item
+                    .item()
+                    .and_downcast::<Row>()
+                    .and_then(|row| row.item())
+                else {
+                    return;
+                };
+                this.popup_menu(&content, &item, list_item.position(), x, y);
+            }
+        ));
+        content.add_controller(press);
+
+        list_item.set_child(Some(&content));
+    }
+
+    /// The context menu's actions. Every one of them acts on the row the menu
+    /// was opened over, except the three the header's own menu uses, which act
+    /// on the root.
+    fn install_actions(&self) {
+        let actions = gio::SimpleActionGroup::new();
+        actions.add_action_entries([
+            entry("open", self, |files| {
+                if let Some(item) = files.target() {
+                    files.activate(&item);
+                }
+            }),
+            entry("reveal", self, |files| {
+                if let Some(item) = files.target() {
+                    files.reveal(&item.path);
+                }
+            }),
+            entry("copy-path", self, |files| {
+                if let Some(item) = files.target() {
+                    files.clipboard().set_text(&item.path.to_string_lossy());
+                }
+            }),
+            entry("cd", self, |files| {
+                if let Some(item) = files.target() {
+                    files.send(Message::Cd(item.path));
+                }
+            }),
+            entry("new-file", self, |files| {
+                if let Some(item) = files.target() {
+                    files.create_in(&item.path, false);
+                }
+            }),
+            entry("new-folder", self, |files| {
+                if let Some(item) = files.target() {
+                    files.create_in(&item.path, true);
+                }
+            }),
+            entry("new-file-here", self, |files| {
+                let root = files.imp().tree.borrow().root().to_path_buf();
+                files.create_in(&root, false);
+            }),
+            entry("new-folder-here", self, |files| {
+                let root = files.imp().tree.borrow().root().to_path_buf();
+                files.create_in(&root, true);
+            }),
+            entry("reveal-here", self, |files| {
+                let root = files.imp().tree.borrow().root().to_path_buf();
+                files.reveal(&root);
+            }),
+            entry("rename", self, |files| {
+                if let Some(item) = files.target() {
+                    files.rename(&item);
+                }
+            }),
+            entry("trash", self, |files| {
+                if let Some(item) = files.target() {
+                    files.trash(&item);
+                }
+            }),
+        ]);
+        self.insert_action_group("files", Some(&actions));
+    }
+
+    // --- what the tree says ------------------------------------------------
+
+    /// Points the panel at a directory and draws it.
+    pub fn sync(&self, root: &Path) {
+        let changed = self.imp().tree.borrow_mut().sync(root);
+        if changed {
+            self.reload();
+        }
+        self.refresh_header();
+    }
+
+    /// Re-reads what is open. Draws nothing when nothing moved, which is the
+    /// usual answer.
+    pub fn poll(&self) {
+        if self.imp().tree.borrow_mut().rebuild() {
+            self.reload();
+        }
+    }
+
+    fn toggle(&self, path: &Path) {
+        if self.imp().tree.borrow_mut().toggle(path) {
+            self.reload();
+        }
+    }
+
+    /// A directory opens; anything else is handed to whatever the desktop
+    /// opens it with. The editor takes files over when there is one.
+    fn activate(&self, item: &Item) {
+        if item.is_directory {
+            self.toggle(&item.path);
+            return;
+        }
+        let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&item.path)));
+        launcher.launch(self.window().as_ref(), gio::Cancellable::NONE, |_result| ());
+    }
+
+    fn reload(&self) {
+        let imp = self.imp();
+        let Some(rows) = imp.rows.borrow().clone() else {
+            return;
+        };
+        let tree = imp.tree.borrow();
+        let built: Vec<Row> = tree
+            .items()
+            .iter()
+            .map(|item| Row::new(item.clone(), tree.is_expanded(&item.path)))
+            .collect();
+        // Replaced in one go: a store emitting one signal per row makes the
+        // list view rebind every widget below each insertion.
+        rows.splice(0, rows.n_items(), &built);
+    }
+
+    fn refresh_header(&self) {
+        let imp = self.imp();
+        let tree = imp.tree.borrow();
+        if let Some(title) = imp.title.borrow().as_ref() {
+            title.set_text(tree.root_name());
+        }
+        if let Some(subtitle) = imp.subtitle.borrow().as_ref() {
+            subtitle.set_text(&tree.root().to_string_lossy());
+        }
+    }
+
+    // --- the menu ----------------------------------------------------------
+
+    fn target(&self) -> Option<Item> {
+        self.imp().target.borrow().clone()
+    }
+
+    fn popup_menu(&self, widget: &gtk::Box, item: &Item, position: u32, x: f64, y: f64) {
+        let imp = self.imp();
+        let (Some(menu), Some(list)) = (imp.menu.borrow().clone(), imp.list.borrow().clone())
+        else {
+            return;
+        };
+        // Selecting it first, so it is plain which row the menu belongs to.
+        if let Some(selection) = list.model().and_downcast::<gtk::SingleSelection>() {
+            selection.set_selected(position);
+        }
+        imp.target.replace(Some(item.clone()));
+        menu.set_menu_model(Some(&row_menu(item)));
+
+        let point = widget
+            .compute_point(&list, &gtk::graphene::Point::new(x as f32, y as f32))
+            .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
+        menu.set_pointing_to(Some(&gdk::Rectangle::new(
+            point.x() as i32,
+            point.y() as i32,
+            1,
+            1,
+        )));
+        menu.popup();
+    }
+
+    // --- acting on a file --------------------------------------------------
+
+    /// Shows a file where it lives, in whatever the desktop uses for that.
+    fn reveal(&self, path: &Path) {
+        let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
+        launcher.open_containing_folder(
+            self.window().as_ref(),
+            gio::Cancellable::NONE,
+            |_result| (),
+        );
+    }
+
+    fn rename(&self, item: &Item) {
+        let path = item.path.clone();
+        self.ask(
+            "Rename",
+            &format!("Rename “{}”", item.name),
+            &item.name,
+            "Rename",
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |name: String| {
+                    match tuni_core::files::rename(&path, &name) {
+                        Ok(Some(moved)) => {
+                            this.imp().tree.borrow_mut().remap(&path, &moved);
+                            this.reload();
+                        }
+                        Ok(None) => {}
+                        Err(failure) => this.report(&failure),
+                    }
+                }
+            ),
+        );
+    }
+
+    fn create_in(&self, directory: &Path, folder: bool) {
+        let directory = directory.to_path_buf();
+        let heading = if folder { "New Folder" } else { "New File" };
+        self.ask(
+            heading,
+            &format!("Inside “{}”", short(&directory)),
+            "",
+            "Create",
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |name: String| {
+                    match tuni_core::files::create(&directory, &name, folder) {
+                        Ok(Some(_)) => {
+                            // Opened, so the thing that was just made is
+                            // visible rather than hidden in a closed folder.
+                            this.imp().tree.borrow_mut().expand(&directory);
+                            this.reload();
+                        }
+                        Ok(None) => {}
+                        Err(failure) => this.report(&failure),
+                    }
+                }
+            ),
+        );
+    }
+
+    /// Moves a file to the desktop's trash, which is recoverable — deleting
+    /// outright is not something a file tree should offer.
+    fn trash(&self, item: &Item) {
+        let file = gio::File::for_path(&item.path);
+        match file.trash(gio::Cancellable::NONE) {
+            Ok(()) => {
+                self.imp().tree.borrow_mut().forget(&item.path);
+                self.reload();
+            }
+            Err(error) => self.report(&Failure {
+                message: format!("Couldn't move “{}” to the trash.", item.name),
+                detail: error.to_string(),
+            }),
+        }
+    }
+
+    // --- dialogs -----------------------------------------------------------
+
+    fn ask(
+        &self,
+        heading: &str,
+        body: &str,
+        current: &str,
+        confirm: &str,
+        apply: impl Fn(String) + 'static,
+    ) {
+        let entry = gtk::Entry::builder()
+            .text(current)
+            .activates_default(true)
+            .build();
+        let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+        dialog.set_extra_child(Some(&entry));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("confirm", confirm);
+        dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("confirm"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, move |_, response| {
+            if response == "confirm" {
+                apply(entry.text().to_string());
+            }
+        });
+        dialog.present(Some(self));
+    }
+
+    /// What went wrong, in the two lines the model wrote it in.
+    fn report(&self, failure: &Failure) {
+        let dialog = adw::AlertDialog::new(Some(&failure.message), Some(&failure.detail));
+        dialog.add_response("close", "Close");
+        dialog.set_default_response(Some("close"));
+        dialog.set_close_response("close");
+        dialog.present(Some(self));
+    }
+
+    fn window(&self) -> Option<gtk::Window> {
+        self.root().and_downcast::<gtk::Window>()
+    }
+}
+
+/// Draws one row: the indent, the chevron, the icon, and the name.
+fn bind_row(object: &glib::Object) {
+    let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
+        return;
+    };
+    let Some(row) = list_item.item().and_downcast::<Row>() else {
+        return;
+    };
+    let Some(item) = row.item() else {
+        return;
+    };
+    let Some(content) = list_item.child().and_downcast::<gtk::Box>() else {
+        return;
+    };
+    let mut children = content.first_child();
+    let mut widgets = Vec::new();
+    while let Some(child) = children {
+        children = child.next_sibling();
+        widgets.push(child);
+    }
+    let [expander, icon, label] = widgets.as_slice() else {
+        return;
+    };
+
+    content.set_margin_start(item.depth as i32 * INDENT);
+
+    if let Some(expander) = expander.downcast_ref::<gtk::Image>() {
+        // Emptied rather than hidden: a file has no chevron, but it keeps the
+        // space one would take, so names at the same depth start in the same
+        // column whether or not they can be opened.
+        expander.set_icon_name(if item.is_directory {
+            Some(if row.is_expanded() {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            })
+        } else {
+            None
+        });
+    }
+    if let Some(icon) = icon.downcast_ref::<gtk::Image>() {
+        icon.set_icon_name(Some(if item.is_directory {
+            "folder-symbolic"
+        } else {
+            "text-x-generic-symbolic"
+        }));
+    }
+    if let Some(label) = label.downcast_ref::<gtk::Label>() {
+        label.set_text(&item.name);
+        label.set_tooltip_text(Some(&item.path.to_string_lossy()));
+        // A name the shell hides is shown, but shown quietly.
+        if item.is_hidden() {
+            label.add_css_class("dim-label");
+        } else {
+            label.remove_css_class("dim-label");
+        }
+    }
+}
+
+/// One action, holding the panel weakly: the group is inserted into the panel,
+/// so anything stronger than this would be a cycle the panel never leaves.
+fn entry<F>(name: &str, files: &TuniFiles, activate: F) -> gio::ActionEntry<gio::SimpleActionGroup>
+where
+    F: Fn(&TuniFiles) + 'static,
+{
+    let weak = files.downgrade();
+    gio::ActionEntry::builder(name)
+        .activate(move |_: &gio::SimpleActionGroup, _, _| {
+            if let Some(files) = weak.upgrade() {
+                activate(&files);
+            }
+        })
+        .build()
+}
+
+fn row_menu(item: &Item) -> gio::Menu {
+    let menu = gio::Menu::new();
+
+    let open = gio::Menu::new();
+    if item.is_directory {
+        open.append(Some("cd Here"), Some("files.cd"));
+    } else {
+        open.append(Some("Open"), Some("files.open"));
+    }
+    open.append(Some("Show in Files"), Some("files.reveal"));
+    open.append(Some("Copy Path"), Some("files.copy-path"));
+    menu.append_section(None, &open);
+
+    if item.is_directory {
+        let create = gio::Menu::new();
+        create.append(Some("New File…"), Some("files.new-file"));
+        create.append(Some("New Folder…"), Some("files.new-folder"));
+        menu.append_section(None, &create);
+    }
+
+    let edit = gio::Menu::new();
+    edit.append(Some("Rename…"), Some("files.rename"));
+    edit.append(Some("Move to Trash"), Some("files.trash"));
+    menu.append_section(None, &edit);
+
+    menu
+}
+
+/// The header's menu, which acts on the root rather than on a row.
+fn root_menu() -> gio::Menu {
+    let menu = gio::Menu::new();
+    let create = gio::Menu::new();
+    create.append(Some("New File…"), Some("files.new-file-here"));
+    create.append(Some("New Folder…"), Some("files.new-folder-here"));
+    menu.append_section(None, &create);
+    let open = gio::Menu::new();
+    open.append(Some("Show in Files"), Some("files.reveal-here"));
+    menu.append_section(None, &open);
+    menu
+}
+
+/// A directory as a dialog can afford to show it: the last two components,
+/// which is enough to tell two `src` directories apart.
+fn short(path: &Path) -> String {
+    let mut parts: Vec<&str> = path
+        .components()
+        .rev()
+        .take(2)
+        .filter_map(|part| part.as_os_str().to_str())
+        .collect();
+    parts.reverse();
+    if parts.is_empty() {
+        return path.to_string_lossy().into_owned();
+    }
+    parts.join("/")
+}

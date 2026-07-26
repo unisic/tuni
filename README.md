@@ -26,6 +26,13 @@ for the file tree and the git panel to come. A new tab starts where the visible
 one is, opens next to it, and closes when its last shell exits; a project whose
 tabs are all closed stays in the sidebar until it is closed on purpose.
 
+On the other side, a Files panel under `Ctrl+Shift+B` shows the directory the
+focused shell is working in, or the project's own if one is pinned, and follows
+it as the focus moves. Directories open in place, files open in whatever the
+desktop opens them with, and a right click renames, creates, copies a path,
+shows a file in the desktop's file manager, moves one to the trash, or types a
+`cd` into the terminal that has the keyboard.
+
 Closing the window writes that arrangement down, and opening it again puts it
 back: the projects, their tabs, the columns and panes inside each one with the
 room they had, the names that were typed, and a fresh shell in each pane's last
@@ -52,6 +59,7 @@ scrollback, and that last decision, writing each change to
 | `Ctrl+Alt+Page Down` / `Ctrl+Alt+Page Up` | Next project, previous project |
 | `Ctrl+Shift+1` … `Ctrl+Shift+9` | Jump to a project |
 | `F9` | Show or hide the sidebar |
+| `Ctrl+Shift+B` | Show or hide the Files panel |
 | `Ctrl+,` | Preferences |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection, paste |
 | Middle click | Paste the primary selection |
@@ -64,8 +72,8 @@ scrollback, and that last decision, writing each change to
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
 
-From here the work runs to full parity: the file tree, the git panel, the
-editor, the diff viewer, the command palette, and packaging.
+From here the work runs to full parity: the git panel, the editor, the diff
+viewer, the command palette, and packaging.
 
 Consuming a 200 MiB stream, measured with `scripts/throughput.sh` on this
 machine:
@@ -131,6 +139,23 @@ costs the previous session rather than both. Every field the snapshot reads is
 optional and every unreadable tab is skipped, which is what lets a file written
 by an older build still open — and `TUNI_SESSION=0` turns the whole mechanism
 off, restore and save alike.
+
+The file tree is a flat list rather than a tree of nodes. What a list view
+wants is rows, and what an expandable tree costs is a second structure that has
+to be kept in step with them; a list of `(name, path, depth)` rebuilt from the
+set of open directories is the same information with nothing to keep in step.
+Only open directories are read, each read is sorted directories-first and then
+naturally, so `file10` follows `file9`, and depth is capped at 32 so a symlink
+that points at its own parent runs out rather than forever. `.git` is hidden
+and every other dotfile is shown, dimmed — kero hides only `.git` too, and a
+file tree that disagrees with `ls` is worse than one that shows build output.
+The disk is re-read every two seconds instead of watched with inotify, which is
+what kero does: a watch per open directory costs a descriptor and a debounce,
+and a cached directory read costs nothing measurable. The panel redraws only
+when the rows actually differ, so most of those reads change nothing on screen.
+Deleting is `GFile.trash`, which is recoverable, and revealing a file goes
+through `GtkFileLauncher` so it reaches the portal in a sandbox and the session
+bus outside one. Whether the panel was showing is part of `session.json`.
 
 Ghostty's theme catalog is vendored under `data/themes` and baked into the
 binary at build time, so a fresh checkout runs with all 574 and a packaged

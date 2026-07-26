@@ -1,9 +1,10 @@
 //! Portable workspace models — no GTK, no libghostty.
 //!
 //! The terminal's own configuration and colors, the projects and tabs around
-//! them, the pane layout inside a tab, and what all of it is restored from. The
-//! file tree and git status land here next.
+//! them, the pane layout inside a tab, what all of it is restored from, and the
+//! directory tree beside it. Git status lands here next.
 
+pub mod files;
 pub mod panes;
 pub mod session;
 pub mod settings;

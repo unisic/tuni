@@ -79,6 +79,9 @@ pub struct Snapshot {
     /// the window remembered this leaves it at the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar: Option<bool>,
+    /// Whether the Files panel was showing, on the same terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel: Option<bool>,
 }
 
 fn one() -> f64 {
@@ -92,6 +95,7 @@ pub struct Restored {
     /// have one appear.
     pub histories: HashMap<Id, String>,
     pub sidebar: Option<bool>,
+    pub panel: Option<bool>,
 }
 
 impl Snapshot {
@@ -121,6 +125,7 @@ impl Snapshot {
                 .selected_id()
                 .and_then(|id| workspace.index_of(id)),
             sidebar: None,
+            panel: None,
         }
     }
 
@@ -172,6 +177,7 @@ impl Snapshot {
             workspace,
             histories,
             sidebar: self.sidebar,
+            panel: self.panel,
         }
     }
 

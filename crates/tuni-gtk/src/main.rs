@@ -2,6 +2,7 @@
 //!
 //! Everything the window does lives in `window.rs`; this file is the process.
 
+mod files;
 mod grid;
 mod keymap;
 mod preferences;
@@ -42,7 +43,9 @@ const ACCELS: &[(&str, &[&str])] = &[
     ("win.new-project", &["<Ctrl><Shift>n"]),
     ("win.next-project", &["<Ctrl><Alt>Page_Down"]),
     ("win.previous-project", &["<Ctrl><Alt>Page_Up"]),
-    ("win.toggle-sidebar", &["F9", "<Ctrl><Shift>b"]),
+    ("win.toggle-sidebar", &["F9"]),
+    // kero's own key for the panel on the other side.
+    ("win.toggle-panel", &["<Ctrl><Shift>b"]),
     ("win.settings", &["<Ctrl>comma"]),
     ("win.split-right", &["<Ctrl><Shift>d"]),
     ("win.split-down", &["<Ctrl><Shift>e"]),
