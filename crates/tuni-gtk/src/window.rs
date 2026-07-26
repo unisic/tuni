@@ -679,6 +679,7 @@ impl TuniWindow {
 
     fn install_actions(&self) {
         let uint64 = Some(glib::VariantTy::UINT64);
+        let string = Some(glib::VariantTy::STRING);
         self.add_action_entries([
             entry("new-tab", None, |window, _| {
                 let project = window.imp().workspace.borrow().selected_id().or_else(|| {
@@ -869,6 +870,14 @@ impl TuniWindow {
             entry("reveal-pane", uint64, |window, target| {
                 if let Some(id) = project_target(target) {
                     window.reveal_pane(id);
+                }
+            }),
+            // Opens a connection in a tab of its own. The target is the name
+            // `ssh` is given, which is either a saved alias or an address
+            // somebody typed.
+            entry("connect", string, |window, target| {
+                if let Some(alias) = target.and_then(glib::Variant::str) {
+                    window.open_pane(Pane::ssh(alias.to_owned()));
                 }
             }),
             entry("settings", None, |window, _| window.show_preferences()),
@@ -1499,10 +1508,10 @@ impl TuniWindow {
 
         // Every pane's widget exists before any of them is drawn, so the grid
         // is laid out once rather than once per pane.
-        let started: Vec<(TuniTerminal, Id, Launch)> = panes
+        let started: Vec<(TuniTerminal, Id, Content, Option<PathBuf>)> = panes
             .into_iter()
             .filter_map(|(pane, directory, content)| {
-                if content != Content::Terminal {
+                if !matches!(content, Content::Terminal | Content::Ssh { .. }) {
                     self.new_content(project, tab, pane, &content);
                     return None;
                 }
@@ -1510,16 +1519,12 @@ impl TuniWindow {
                     .map(PathBuf::from)
                     .filter(|path| path.is_dir())
                     .or_else(|| fallback.clone());
-                let launch = Launch {
-                    cwd,
-                    ..Launch::default()
-                };
-                Some((self.new_terminal(project, tab, pane), pane, launch))
+                Some((self.new_terminal(project, tab, pane), pane, content, cwd))
             })
             .collect();
         self.rebuild_grid(project, tab);
-        for (terminal, pane, launch) in started {
-            self.start_terminal(&terminal, pane, launch);
+        for (terminal, pane, content, cwd) in started {
+            self.start_session(&terminal, pane, &content, cwd);
         }
         Some(page)
     }
@@ -1719,11 +1724,11 @@ impl TuniWindow {
     }
 
     /// Builds whatever a pane holds, for a pane already in the layout. Not a
-    /// terminal: that needs a directory to start in and a shell to start,
-    /// which only the caller knows.
+    /// terminal or a connection: those need a directory to start in and
+    /// something to start, which only the caller knows.
     fn new_content(&self, project: Id, tab: Id, pane: Id, content: &Content) {
         match content {
-            Content::Terminal => (),
+            Content::Terminal | Content::Ssh { .. } => (),
             Content::File(path) => {
                 self.new_editor(project, tab, pane, path);
             }
@@ -1736,6 +1741,9 @@ impl TuniWindow {
     /// Brings a pane already open in this project back on screen. `false` when
     /// nothing in it is showing that.
     fn show_pane(&self, content: &Content) -> bool {
+        if is_remote(content) {
+            return false;
+        }
         let imp = self.imp();
         let found = {
             let workspace = imp.workspace.borrow();
@@ -1764,6 +1772,9 @@ impl TuniWindow {
     /// The same, for one tab: what splitting to the side checks before it
     /// splits.
     fn show_pane_in(&self, tab: Id, content: &Content) -> bool {
+        if is_remote(content) {
+            return false;
+        }
         let found = {
             let workspace = self.imp().workspace.borrow();
             workspace
@@ -1811,6 +1822,56 @@ impl TuniWindow {
     ///
     /// A restored pane replays what it had printed once the shell is up, so the
     /// old output sits above the new prompt rather than racing it.
+    /// Starts what a pane holds: a shell straight away, or a connection once
+    /// `ssh` has been asked what its command line should be. That question is
+    /// a subprocess, so it is not asked on this thread and the pane sits empty
+    /// until the answer comes back.
+    fn start_session(
+        &self,
+        terminal: &TuniTerminal,
+        pane: Id,
+        content: &Content,
+        cwd: Option<PathBuf>,
+    ) {
+        let Content::Ssh { alias } = content else {
+            self.start_terminal(
+                terminal,
+                pane,
+                Launch {
+                    cwd,
+                    ..Launch::default()
+                },
+            );
+            return;
+        };
+        let alias = alias.clone();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            terminal,
+            async move {
+                let Ok(argv) = gio::spawn_blocking(move || {
+                    let host = tuni_core::ssh::host(&alias);
+                    tuni_core::ssh::command(&host, &tuni_core::ssh::Control::new(true))
+                })
+                .await
+                else {
+                    return;
+                };
+                this.start_terminal(
+                    &terminal,
+                    pane,
+                    Launch {
+                        argv,
+                        env: vec![("TERM".to_owned(), tuni_core::ssh::REMOTE_TERM.to_owned())],
+                        ..Launch::default()
+                    },
+                );
+            }
+        ));
+    }
+
     fn start_terminal(&self, terminal: &TuniTerminal, pane: Id, launch: Launch) {
         glib::idle_add_local_once(glib::clone!(
             #[weak(rename_to = this)]
@@ -1978,6 +2039,14 @@ impl TuniWindow {
                         .project_mut(project)
                         .and_then(|project| project.pane_mut(tab, pane))
                     {
+                        // A remote shell's OSC 7 names a directory on the
+                        // machine it is running on, and a bare path carries no
+                        // host to tell it apart from one here. Taking it would
+                        // drag the file tree and everything beside it to a
+                        // local directory that happens to have the same name.
+                        if is_remote(&entry.content) {
+                            return;
+                        }
                         entry.directory = cwd;
                     }
                     this.refresh();
@@ -2044,9 +2113,29 @@ impl TuniWindow {
             glib::closure_local!(
                 #[weak(rename_to = this)]
                 self,
-                move |_: TuniTerminal| this.close_pane(project, tab, pane)
+                move |_: TuniTerminal| this.session_ended(project, tab, pane)
             ),
         );
+    }
+
+    /// A pane's session ended.
+    ///
+    /// A shell that exits closes its pane, because that is what typing `exit`
+    /// asks for. A connection that ends does not: a mistyped hostname, a
+    /// refused key or a dropped link leaves an explanation on the screen, and
+    /// closing the pane throws the explanation away with it.
+    fn session_ended(&self, project: Id, tab: Id, pane: Id) {
+        let remote = self
+            .imp()
+            .workspace
+            .borrow()
+            .project(project)
+            .and_then(|project| project.tab(tab))
+            .and_then(|tab| tab.layout().panes().find(|entry| entry.id() == pane))
+            .is_some_and(|entry| is_remote(&entry.content));
+        if !remote {
+            self.close_pane(project, tab, pane);
+        }
     }
 
     /// A pane took the keyboard: move the ring, and rename the tab, which is
@@ -2758,6 +2847,14 @@ impl TuniWindow {
                     .map(|terminal| terminal.preview(28))
                     .unwrap_or_default(),
             ),
+            Content::Ssh { alias } => (
+                "network-server-symbolic",
+                imp.terminals
+                    .borrow()
+                    .get(&pane)
+                    .map(|terminal| terminal.preview(28))
+                    .unwrap_or_else(|| alias.clone()),
+            ),
             Content::File(path) => ("text-x-generic-symbolic", shorten(&path.to_string_lossy())),
             Content::Diff { path, staged } => (
                 "media-record-symbolic",
@@ -2863,8 +2960,9 @@ impl TuniWindow {
         crate::palette::present(self, self.palette_entries());
     }
 
-    /// What the palette lists: the window's own actions, the projects around
-    /// this one, and every terminal in the workspace.
+    /// What the palette lists: the window's own actions, every host ssh knows
+    /// about, the projects around this one, and every terminal in the
+    /// workspace.
     fn palette_entries(&self) -> Vec<palette::Entry> {
         use palette::Entry;
 
@@ -2872,6 +2970,24 @@ impl TuniWindow {
             .iter()
             .map(|(title, icon, shortcut, action)| Entry::command(title, icon, *shortcut, action))
             .collect();
+
+        // Reading the configuration is files and no subprocess, and the
+        // palette opens on a keystroke rather than on a timer, so this stays
+        // on this thread.
+        for host in tuni_core::ssh::Hosts::load().all() {
+            entries.push(palette::Entry {
+                // Widened so that typing the address finds the alias, and so
+                // that "ssh" alone lists everything connectable.
+                search: format!("{} {} ssh connect", host.alias, host.address()),
+                title: host.alias.clone(),
+                subtitle: Some(host.address()),
+                icon: "network-server-symbolic",
+                shortcut: None,
+                action: "win.connect",
+                target: Some(host.alias.to_variant()),
+                terminal: false,
+            });
+        }
 
         let workspace = self.imp().workspace.borrow();
         let selected = workspace.selected_id();
@@ -2907,7 +3023,7 @@ impl TuniWindow {
                     // Only shells: a file pane is reached through the tree
                     // beside it, and it is the terminals that scatter across
                     // projects until nobody can find them.
-                    if pane.content != Content::Terminal {
+                    if !matches!(pane.content, Content::Terminal | Content::Ssh { .. }) {
                         continue;
                     }
                     let title = pane
@@ -2924,7 +3040,11 @@ impl TuniWindow {
                         ),
                         title,
                         subtitle: directory,
-                        icon: "utilities-terminal-symbolic",
+                        icon: if is_remote(&pane.content) {
+                            "network-server-symbolic"
+                        } else {
+                            "utilities-terminal-symbolic"
+                        },
                         shortcut: None,
                         action: "win.reveal-pane",
                         target: Some(pane.id().raw().to_variant()),
@@ -3317,6 +3437,16 @@ where
         Some(ty) => builder.parameter_type(Some(ty)).build(),
         None => builder.build(),
     }
+}
+
+/// Whether a pane holds a connection rather than something local.
+///
+/// The two places this decides are the ones that answer a request with a pane
+/// that is already open. That is right for a file, where opening it twice is
+/// two views of one buffer, and wrong for a host: two shells on one machine is
+/// an ordinary thing to want, and it is what a second tab is for.
+fn is_remote(content: &Content) -> bool {
+    matches!(content, Content::Ssh { .. })
 }
 
 fn project_target(target: Option<&glib::Variant>) -> Option<Id> {

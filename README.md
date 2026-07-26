@@ -17,6 +17,8 @@ A native terminal workspace for Linux.
 - File tree, git panel, and a session inspector: processes and listening ports
 - Source editor and a hunk-staging diff viewer, in panes beside the shells
 - Command palette, tab switcher, find in whatever pane has the keyboard
+- SSH from the palette: the hosts in `~/.ssh/config`, opened by OpenSSH itself,
+  so tuni never holds a password or a passphrase
 - Kitty graphics, OSC 8 hyperlinks, desktop notifications, progress bars
 - Ghostty's 574 themes, which paint the window chrome as well as the terminal
 - The window comes back as it was left

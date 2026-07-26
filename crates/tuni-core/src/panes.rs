@@ -61,6 +61,11 @@ pub enum Content {
     /// What changed in a file: the worktree against the index, or the index
     /// against HEAD when `staged`.
     Diff { path: PathBuf, staged: bool },
+    /// A shell on another machine, held by the name `ssh` was given. Only the
+    /// alias, because everything else about the host lives in the
+    /// configuration under that name, and a copy here would go stale the
+    /// moment anybody edited `~/.ssh/config`.
+    Ssh { alias: String },
 }
 
 /// One tile: what it holds, and what that last said about itself.
@@ -109,6 +114,21 @@ impl Pane {
         }
     }
 
+    /// A pane holding a connection. Named for the host from the instant it
+    /// opens, so a tab reads `prod-db` before anything has authenticated;
+    /// the remote prompt's own OSC 0/2 takes the title over from there.
+    ///
+    /// No directory: the shell that is about to start is on another machine,
+    /// and every panel that reads `directory` would be wrong about it.
+    #[must_use]
+    pub fn ssh(alias: String) -> Self {
+        Self {
+            title: Some(alias.clone()),
+            content: Content::Ssh { alias },
+            ..Self::new()
+        }
+    }
+
     /// A pane holding what changed in a file, named for the file with the side
     /// of the comparison after it, since both sides can be open at once.
     #[must_use]
@@ -137,7 +157,7 @@ impl Pane {
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         match &self.content {
-            Content::Terminal => None,
+            Content::Terminal | Content::Ssh { .. } => None,
             Content::File(path) | Content::Diff { path, .. } => Some(path),
         }
     }

@@ -78,6 +78,160 @@ pub fn run<S: AsRef<OsStr>>(args: &[S]) -> Output {
     }
 }
 
+/// What an ssh pane calls itself at the far end.
+///
+/// Tuni describes itself with terminfo that is on *this* machine, and `ssh`
+/// forwards `TERM` unchanged, so a remote without that entry renders garbage.
+/// This is the name every machine has had for twenty years.
+pub const REMOTE_TERM: &str = "xterm-256color";
+
+/// How long a shared connection outlives the last pane using it, in seconds.
+const CONTROL_PERSIST: u32 = 600;
+
+/// How long to wait for a connection that is not answering, in seconds.
+const CONNECT_TIMEOUT: u32 = 10;
+
+/// How often a master asks the far end whether it is still there, in seconds,
+/// and how many unanswered asks it takes to give up.
+const ALIVE_INTERVAL: u32 = 15;
+const ALIVE_COUNT: u32 = 3;
+
+/// Where tuni's shared connections keep their sockets.
+#[derive(Clone, Debug)]
+pub struct Control {
+    directory: PathBuf,
+    enabled: bool,
+}
+
+impl Control {
+    #[must_use]
+    pub fn new(enabled: bool) -> Self {
+        // `$XDG_RUNTIME_DIR` is the right home for a socket: tmpfs, 0700,
+        // per-user, and emptied at logout, so a stale one cannot survive a
+        // reboot. `~/.cache` is the fallback and the reason a sweep has to
+        // exist at all.
+        let directory = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| crate::settings::home().join(".cache"))
+            .join("tuni/ssh");
+        Self { directory, enabled }
+    }
+
+    /// The `-o` settings every `ssh` tuni runs for `destination` carries,
+    /// without the `-o`s themselves.
+    ///
+    /// Nothing in here is a preference. Every option tuni adds overrides one
+    /// the user set on purpose, so the list is the shortest that makes sharing
+    /// work and keeps a dropped link from reading as a hung window: no
+    /// ciphers, no compression, no `StrictHostKeyChecking`.
+    ///
+    /// Runs `ssh -G`, so the caller belongs off the main thread.
+    #[must_use]
+    pub fn options(&self, destination: &str) -> Vec<String> {
+        let reported = describe(destination);
+        let value = |keyword: &str| {
+            reported
+                .iter()
+                .find(|(key, _)| key == keyword)
+                .map(|(_, value)| value.as_str())
+        };
+        let mut options = Vec::new();
+
+        // Adopt rather than override. A command-line `-o` is obtained first
+        // and wins, so tuni *can* always override, which is exactly why it has
+        // to decide not to: overriding a ControlMaster that works means two
+        // logins to a host that may cap them, and two 2FA prompts.
+        //
+        // The one thing `ssh -G` will not say is the difference between an
+        // unset `ControlPath` and an explicit `ControlPath none`, since both
+        // leave the keyword out of the report. Somebody who turned sharing off
+        // that way gets it back here, and turning it off in tuni is how they
+        // say so again.
+        let theirs = value("controlpath").is_some() && value("controlmaster") != Some("false");
+        if self.enabled && !theirs && self.prepare() {
+            // `%C` is ssh's own hash of `%l%h%p%r%j`: 40 hex characters, jump
+            // host included, so a host reached through a different `ProxyJump`
+            // gets its own socket without tuni ever implementing the hash.
+            // Read this before "fixing" the length: `/run/user/1000/tuni/ssh/`
+            // and 40 characters is 64 bytes against the 108 Linux allows in
+            // `sun_path`.
+            options.push("ControlMaster=auto".to_owned());
+            options.push(format!(
+                "ControlPath={}",
+                self.directory.join("%C").display()
+            ));
+            options.push(format!("ControlPersist={CONTROL_PERSIST}"));
+        }
+
+        // The one option that earns its place on merit. Without it a suspended
+        // laptop's connection hangs for the kernel's retransmit timeout, about
+        // fifteen minutes on Linux, and every pane on that host looks frozen.
+        // With it the master gives up in about forty-five seconds, exits, and
+        // unlinks its own socket, which reads as a disconnection instead.
+        // Skipped when the user has an interval of their own.
+        if value("serveraliveinterval").is_none_or(|interval| interval == "0") {
+            options.push(format!("ServerAliveInterval={ALIVE_INTERVAL}"));
+            options.push(format!("ServerAliveCountMax={ALIVE_COUNT}"));
+        }
+        if value("connecttimeout").is_none_or(|timeout| timeout == "none") {
+            options.push(format!("ConnectTimeout={CONNECT_TIMEOUT}"));
+        }
+        options
+    }
+
+    /// Whether the socket directory is there, making it if it is not. No
+    /// directory means no sharing, which costs an authentication per pane and
+    /// breaks nothing.
+    fn prepare(&self) -> bool {
+        use std::os::unix::fs::DirBuilderExt;
+        self.directory.is_dir()
+            || fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&self.directory)
+                .is_ok()
+    }
+}
+
+/// The host an alias names: a saved one when the configuration knows it, an
+/// address when somebody typed one, and otherwise the bare name, which is what
+/// `ssh` would make of it too.
+#[must_use]
+pub fn host(alias: &str) -> Host {
+    if let Some(host) = Hosts::load().get(alias) {
+        return host.clone();
+    }
+    Host::adhoc(alias).unwrap_or_else(|| Host {
+        alias: alias.to_owned(),
+        ..Host::default()
+    })
+}
+
+/// The command line that opens `host`.
+///
+/// Runs `ssh -G` by way of [`Control::options`], so the caller belongs off the
+/// main thread.
+#[must_use]
+pub fn command(host: &Host, control: &Control) -> Vec<String> {
+    let destination = host.target();
+    let mut argv = vec!["ssh".to_owned()];
+    for option in control.options(&destination) {
+        argv.push("-o".to_owned());
+        argv.push(option);
+    }
+    // A saved host's port is already in the configuration `ssh` is about to
+    // read for itself. One typed by hand has nowhere else to carry it.
+    if host.source == Source::Adhoc && host.port != 0 {
+        argv.push("-p".to_owned());
+        argv.push(host.port.to_string());
+    }
+    // `--`, because a destination may begin with a dash.
+    argv.push("--".to_owned());
+    argv.push(destination);
+    argv
+}
+
 /// Where a host came from, which is what decides whether it may be changed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Source {
@@ -1023,6 +1177,27 @@ mod tests {
             .set_modified(later)
             .expect("touch");
         assert!(hosts.stale());
+    }
+
+    #[test]
+    fn a_connection_ends_in_the_host_it_opens() {
+        let control = Control::new(false);
+        let host = Host {
+            alias: "tuni-no-such-alias".to_owned(),
+            ..Host::default()
+        };
+        let argv = command(&host, &control);
+        assert_eq!(argv[0], "ssh");
+        assert_eq!(argv[argv.len() - 2], "--");
+        assert_eq!(argv[argv.len() - 1], "tuni-no-such-alias");
+        assert!(!argv.iter().any(|arg| arg.starts_with("ControlPath")));
+
+        // A port the configuration has never heard of has to travel on the
+        // command line.
+        let typed = Host::adhoc("deploy@10.0.0.1:2222").expect("host");
+        let argv = command(&typed, &control);
+        assert!(argv.windows(2).any(|pair| pair == ["-p", "2222"]));
+        assert_eq!(argv[argv.len() - 1], "deploy@10.0.0.1");
     }
 
     #[test]
