@@ -48,8 +48,44 @@ pub enum PtyEvent {
     Exited,
 }
 
+/// The executable a configured shell name refers to, or `None` for one this
+/// machine has no such program for.
+///
+/// A path, meaning anything with a separator in it, is taken as written and has to
+/// be a file that can be run. A bare name is looked up on `PATH`, the way a
+/// shell would look it up, so `fish` in the settings means the `fish` a command
+/// line would have started.
+#[must_use]
+pub fn resolve_shell(name: &str) -> Option<PathBuf> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if name.contains('/') {
+        let path = PathBuf::from(name);
+        return executable(&path).then_some(path);
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|directory| directory.join(name))
+        .find(|path| executable(path))
+}
+
+/// Whether a path names something this user can actually run: a regular file
+/// with an execute bit they hold. A directory named `fish` on `PATH` is not a
+/// shell, and neither is one that is only executable by root.
+fn executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
 pub struct PtyConfig {
     /// Shell to run. Defaults to `$SHELL`, then the passwd entry, then `/bin/sh`.
+    /// Resolve a configured name with [`resolve_shell`] before putting it here:
+    /// this is the path that gets run.
     pub shell: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     /// Extra environment on top of the inherited one.
@@ -202,5 +238,31 @@ impl Pty {
     #[must_use]
     pub fn shell_pid(&self) -> Option<u32> {
         self.child.process_id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_name_is_looked_up_on_path() {
+        // /bin/sh is the one program a POSIX machine is required to have, and
+        // whichever directory it lives in is on PATH by definition.
+        let found = resolve_shell("sh").expect("sh is on PATH");
+        assert!(found.ends_with("sh"));
+        assert!(executable(&found));
+    }
+
+    #[test]
+    fn a_path_is_taken_as_written() {
+        assert_eq!(resolve_shell("/bin/sh"), Some(PathBuf::from("/bin/sh")));
+    }
+
+    #[test]
+    fn nothing_runnable_resolves_to_nothing() {
+        assert_eq!(resolve_shell("tuni-no-such-shell"), None);
+        assert_eq!(resolve_shell("/etc/hostname"), None);
+        assert_eq!(resolve_shell("   "), None);
     }
 }

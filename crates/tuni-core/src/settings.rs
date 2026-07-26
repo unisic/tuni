@@ -15,7 +15,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use crate::{FONT_SIZE_MAX, FONT_SIZE_MIN, TerminalConfig, theme};
+use crate::{CursorStyle, FONT_SIZE_MAX, FONT_SIZE_MIN, TerminalConfig, theme};
 
 /// Which appearance the window takes. `System` is the desktop's own choice,
 /// which is what a GNOME application is expected to follow; the other two are
@@ -64,6 +64,10 @@ pub struct Settings {
     /// sideways. Off, as it is in kero and in every editor's own default: a
     /// wrapped line and a real line stop being the same thing.
     pub wrap_lines: bool,
+    /// Whether the tab bar goes away while a window has a single tab. Off: a
+    /// bar that appears when a second tab opens moves the terminal under the
+    /// pointer, and the row it costs is the row it is worth.
+    pub auto_hide_tab_bar: bool,
 }
 
 /// How many lines of a pane's scrollback are kept for the replay. kero's own
@@ -128,6 +132,18 @@ impl Settings {
         if let Some(on) = table.boolean("cursor-blink") {
             settings.terminal.cursor_blink = on;
         }
+        if let Some(style) = table.string("cursor-style").and_then(CursorStyle::parse) {
+            settings.terminal.cursor_style = style;
+        }
+        if let Some(on) = table.boolean("copy-on-select") {
+            settings.terminal.copy_on_select = on;
+        }
+        if let Some(on) = table.boolean("bell") {
+            settings.terminal.bell = on;
+        }
+        if let Some(command) = table.string("command") {
+            settings.terminal.command = command.trim().to_owned();
+        }
         if let Some(lines) = table
             .number("terminal.scrollback-lines")
             .filter(|lines| *lines >= 0.0)
@@ -139,6 +155,9 @@ impl Settings {
         }
         if let Some(on) = table.boolean("editor.wrap-lines") {
             settings.wrap_lines = on;
+        }
+        if let Some(on) = table.boolean("window.auto-hide-tab-bar") {
+            settings.auto_hide_tab_bar = on;
         }
         settings
     }
@@ -189,6 +208,22 @@ impl Settings {
         if self.terminal.cursor_blink != default.terminal.cursor_blink {
             let _ = writeln!(out, "cursor-blink = {}", self.terminal.cursor_blink);
         }
+        if self.terminal.cursor_style != default.terminal.cursor_style {
+            let _ = writeln!(
+                out,
+                "cursor-style = {}",
+                toml::quote(self.terminal.cursor_style.name())
+            );
+        }
+        if self.terminal.copy_on_select != default.terminal.copy_on_select {
+            let _ = writeln!(out, "copy-on-select = {}", self.terminal.copy_on_select);
+        }
+        if self.terminal.bell != default.terminal.bell {
+            let _ = writeln!(out, "bell = {}", self.terminal.bell);
+        }
+        if self.terminal.command != default.terminal.command {
+            let _ = writeln!(out, "command = {}", toml::quote(&self.terminal.command));
+        }
         if self.terminal.scrollback_lines != default.terminal.scrollback_lines {
             let _ = writeln!(
                 out,
@@ -201,6 +236,9 @@ impl Settings {
         }
         if self.wrap_lines != default.wrap_lines {
             let _ = writeln!(out, "editor.wrap-lines = {}", self.wrap_lines);
+        }
+        if self.auto_hide_tab_bar != default.auto_hide_tab_bar {
+            let _ = writeln!(out, "window.auto-hide-tab-bar = {}", self.auto_hide_tab_bar);
         }
         out
     }
@@ -453,12 +491,17 @@ mod tests {
                 font_ligatures: true,
                 line_height_extra: 2.0,
                 cursor_blink: false,
+                cursor_style: CursorStyle::Bar,
+                copy_on_select: true,
+                bell: false,
+                command: "/usr/bin/fish".to_owned(),
                 scrollback_lines: 50_000,
                 ..TerminalConfig::default()
             },
             appearance: Appearance::Dark,
             restore_history: true,
             wrap_lines: true,
+            auto_hide_tab_bar: true,
         };
         let read = Settings::parse(&settings.to_toml());
 
@@ -467,10 +510,31 @@ mod tests {
         assert!(read.terminal.font_ligatures);
         assert!((read.terminal.line_height_extra - 2.0).abs() < f64::EPSILON);
         assert!(!read.terminal.cursor_blink);
+        assert_eq!(read.terminal.cursor_style, CursorStyle::Bar);
+        assert!(read.terminal.copy_on_select);
+        assert!(!read.terminal.bell);
+        assert_eq!(read.terminal.command, "/usr/bin/fish");
         assert_eq!(read.terminal.scrollback_lines, 50_000);
         assert_eq!(read.appearance, Appearance::Dark);
         assert!(read.restore_history);
         assert!(read.wrap_lines);
+        assert!(read.auto_hide_tab_bar);
+    }
+
+    #[test]
+    fn a_cursor_style_nobody_spells_that_way_leaves_the_default() {
+        assert_eq!(
+            Settings::parse("cursor-style = \"beam\"")
+                .terminal
+                .cursor_style,
+            CursorStyle::Block
+        );
+        assert_eq!(
+            Settings::parse("cursor-style = \"underline\"")
+                .terminal
+                .cursor_style,
+            CursorStyle::Underline
+        );
     }
 
     #[test]

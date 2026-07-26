@@ -852,6 +852,18 @@ impl TuniTerminal {
         imp.config.replace(config.clone());
         imp.font_size.set(config.font_size);
 
+        // The cursor is the one thing here a running screen already holds a
+        // copy of, so a session that is open is told again rather than left
+        // showing what it was started with.
+        if let Some(session) = imp.session.borrow_mut().as_mut() {
+            let _ = session
+                .term
+                .set_default_cursor_blink(Some(config.cursor_blink));
+            let _ = session
+                .term
+                .set_default_cursor_style(Some(cursor_style(config.cursor_style)));
+        }
+
         self.setup_font();
         self.apply_size(self.width(), self.height());
         self.queue_resize();
@@ -873,9 +885,15 @@ impl TuniTerminal {
         let mut term = tuni_vt::Terminal::new(cols, rows, imp.config.borrow().scrollback_lines)
             .map_err(|e| e.to_string())?;
         let _ = term.set_default_cursor_blink(Some(imp.config.borrow().cursor_blink));
+        let _ = term.set_default_cursor_style(Some(cursor_style(imp.config.borrow().cursor_style)));
         let _ = term.set_colors(&colors(&imp.theme.borrow()));
 
+        // A configured shell this machine has no program for falls back to the
+        // login shell rather than failing to open a terminal at all. The
+        // settings window says so where the name was typed.
+        let shell = tuni_pty::resolve_shell(&imp.config.borrow().command);
         let pty = Pty::spawn(&PtyConfig {
+            shell,
             cwd,
             cols,
             rows,
@@ -1033,7 +1051,10 @@ impl TuniTerminal {
             imp.cwd.replace(Some(cwd));
             self.notify("cwd");
         }
-        if effects.bell {
+        // A silenced bell is silenced everywhere it would have been heard: the
+        // widget's alert, the tab's mark, and the notification a background tab
+        // raises all hang off this.
+        if effects.bell && imp.config.borrow().bell {
             self.error_bell();
             self.emit_by_name::<()>("bell", &[]);
         }
@@ -1935,6 +1956,9 @@ impl TuniTerminal {
                 // any other window pastes what was just highlighted.
                 if let Some(text) = self.selection_finish() {
                     self.primary_clipboard().set_text(&text);
+                    if imp.config.borrow().copy_on_select {
+                        self.clipboard().set_text(&text);
+                    }
                 }
             }
             Pointer::Idle => {}
@@ -2768,6 +2792,18 @@ fn colors(theme: &Theme) -> Colors {
         selection_background: theme.selection_background.map(theme_rgb),
         selection_foreground: theme.selection_foreground.map(theme_rgb),
         palette: theme.palette.map(theme_rgb),
+    }
+}
+
+/// The configured cursor shape in the terms the VT understands, for the same
+/// reason `colors` exists: `tuni-core` names the shapes without knowing whose
+/// enum they end up in.
+fn cursor_style(style: tuni_core::CursorStyle) -> tuni_vt::CursorStyle {
+    match style {
+        tuni_core::CursorStyle::Block => tuni_vt::CursorStyle::Block,
+        tuni_core::CursorStyle::Bar => tuni_vt::CursorStyle::Bar,
+        tuni_core::CursorStyle::Underline => tuni_vt::CursorStyle::Underline,
+        tuni_core::CursorStyle::BlockHollow => tuni_vt::CursorStyle::BlockHollow,
     }
 }
 

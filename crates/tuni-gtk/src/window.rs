@@ -362,7 +362,14 @@ impl TuniWindow {
             .property("default-width", 1100)
             .property("default-height", 700)
             .build();
-        window.imp().settings.replace(settings);
+        // The widgets were built by `constructed`, before there were any
+        // settings to build them from, so the ones a widget holds a copy of are
+        // handed over here rather than read during construction.
+        let imp = window.imp();
+        if let Some(bar) = imp.tab_bar.borrow().as_ref() {
+            bar.set_autohide(settings.auto_hide_tab_bar);
+        }
+        imp.settings.replace(settings);
         window
     }
 
@@ -518,6 +525,8 @@ impl TuniWindow {
             .action_name("win.new-tab")
             .build();
         new_tab.add_css_class("flat");
+        // Autohide is a setting, and settings arrive after construction; see
+        // `TuniWindow::new`.
         let tab_bar = adw::TabBar::builder()
             .autohide(false)
             .expand_tabs(false)
@@ -940,6 +949,9 @@ impl TuniWindow {
         }
         for editor in imp.editors.borrow().values() {
             editor.set_wrap(settings.wrap_lines);
+        }
+        if let Some(bar) = imp.tab_bar.borrow().as_ref() {
+            bar.set_autohide(settings.auto_hide_tab_bar);
         }
         crate::editor::apply_font(&settings.terminal);
         crate::diff::apply_colors(&theme);

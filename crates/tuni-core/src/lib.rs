@@ -21,6 +21,45 @@ pub mod workspace;
 pub const FONT_SIZE_MIN: f64 = 4.0;
 pub const FONT_SIZE_MAX: f64 = 96.0;
 
+/// The shape the cursor takes until the program running in the terminal asks
+/// for another one. DECSCUSR is the application's to send, so this is only what
+/// a screen nobody has asked anything of shows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CursorStyle {
+    #[default]
+    Block,
+    /// A vertical line between cells, which is what most editors show.
+    Bar,
+    Underline,
+    /// A block drawn as an outline, which reads as a cursor without hiding the
+    /// character under it.
+    BlockHollow,
+}
+
+impl CursorStyle {
+    /// Ghostty's spellings, since this is Ghostty's `cursor-style` key.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim() {
+            "block" => Some(Self::Block),
+            "bar" => Some(Self::Bar),
+            "underline" => Some(Self::Underline),
+            "block_hollow" => Some(Self::BlockHollow),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Bar => "bar",
+            Self::Underline => "underline",
+            Self::BlockHollow => "block_hollow",
+        }
+    }
+}
+
 /// Terminal appearance and behavior. Read from and written to the config file
 /// by [`settings::Settings`].
 #[derive(Clone, Debug, PartialEq)]
@@ -41,6 +80,21 @@ pub struct TerminalConfig {
     /// Whether the cursor blinks when the application has not asked for a
     /// particular style. The desktop's own blink preference still wins.
     pub cursor_blink: bool,
+    /// The shape it takes under the same condition.
+    pub cursor_style: CursorStyle,
+    /// Whether highlighting text also puts it on the clipboard. Off by default:
+    /// the primary selection already carries it to a middle click, and a
+    /// terminal that overwrites the clipboard on every drag loses whatever was
+    /// copied to paste into it.
+    pub copy_on_select: bool,
+    /// Whether `BEL` reaches the desktop at all. The widget's own alert sound
+    /// and the notification a background tab raises. On, because a bell is a
+    /// program asking for attention; a knob, because a build that ends in one
+    /// is not always worth a sound.
+    pub bell: bool,
+    /// What to run instead of the login shell. Empty is the login shell, which
+    /// is `$SHELL`, then the passwd entry. A bare name is looked up on `PATH`.
+    pub command: String,
     /// Bundled theme names, one per desktop appearance. The desktop decides
     /// which of the two is in use, so both are configured, as Ghostty and kero
     /// both do.
@@ -111,6 +165,10 @@ impl Default for TerminalConfig {
             scrollback_lines: 10_000,
             line_height_extra: 0.0,
             cursor_blink: true,
+            cursor_style: CursorStyle::Block,
+            copy_on_select: false,
+            bell: true,
+            command: String::new(),
             theme_light: theme::DEFAULT_LIGHT.to_owned(),
             theme_dark: theme::DEFAULT_DARK.to_owned(),
         }

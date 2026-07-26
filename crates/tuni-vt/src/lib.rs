@@ -17,6 +17,7 @@ pub use image::{ImageKey, Layer, Pixels, Placement};
 pub use libghostty_vt::Error;
 pub use libghostty_vt::key::{Action as KeyAction, Key, Mods};
 pub use libghostty_vt::mouse::{Action as MouseAction, Button as MouseButton};
+pub use libghostty_vt::terminal::CursorStyle;
 pub use osc::{Notification, Progress};
 
 use libghostty_vt::mouse::EncoderSize;
@@ -558,6 +559,13 @@ impl Terminal {
     /// terminal on this desktop blinks, and DECSCUSR still overrides this.
     pub fn set_default_cursor_blink(&mut self, blink: Option<bool>) -> Result<()> {
         self.inner.set_default_cursor_blink(blink)?;
+        Ok(())
+    }
+
+    /// The shape it takes under the same condition, and with the same override:
+    /// a program that sends DECSCUSR has said what it wants, and gets it.
+    pub fn set_default_cursor_style(&mut self, style: Option<CursorStyle>) -> Result<()> {
+        self.inner.set_default_cursor_style(style)?;
         Ok(())
     }
 

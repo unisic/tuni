@@ -18,13 +18,21 @@ use gtk::pango;
 
 use tuni_core::settings::{Appearance, Settings};
 use tuni_core::theme;
-use tuni_core::{FONT_SIZE_MAX, FONT_SIZE_MIN};
+use tuni_core::{CursorStyle, FONT_SIZE_MAX, FONT_SIZE_MIN};
 
 /// Appearances, in the order the dropdown lists them.
 const APPEARANCES: [(Appearance, &str); 3] = [
     (Appearance::System, "Follow the Desktop"),
     (Appearance::Light, "Light"),
     (Appearance::Dark, "Dark"),
+];
+
+/// Cursor shapes, in the order the dropdown lists them.
+const CURSOR_STYLES: [(CursorStyle, &str); 4] = [
+    (CursorStyle::Block, "Block"),
+    (CursorStyle::Bar, "Bar"),
+    (CursorStyle::Underline, "Underline"),
+    (CursorStyle::BlockHollow, "Hollow Block"),
 ];
 
 /// What repaints the preview when a setting is written.
@@ -78,6 +86,21 @@ fn appearance_page(
         }
     ));
     window_group.add(&appearance);
+
+    let tab_bar = adw::SwitchRow::builder()
+        .title("Hide the Tab Bar for a Single Tab")
+        .subtitle("The bar comes back with the second tab, and takes a row of terminal with it")
+        .active(settings.auto_hide_tab_bar)
+        .build();
+    tab_bar.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.auto_hide_tab_bar = on);
+        }
+    ));
+    window_group.add(&tab_bar);
     page.add(&window_group);
 
     // Two themes rather than one: the desktop decides between light and dark
@@ -147,53 +170,79 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
     // --- font
 
     let font_group = adw::PreferencesGroup::builder().title("Font").build();
+    if let Some(warning) = missing_symbols(&font_group) {
+        font_group.set_description(Some(&warning));
+    }
 
-    let chooser = gtk::FontDialogButton::new(Some(gtk::FontDialog::new()));
-    chooser.set_level(gtk::FontLevel::Font);
-    chooser.set_valign(gtk::Align::Center);
-    chooser.set_font_desc(&pango::FontDescription::from_string(&format!(
-        "{} {}",
-        settings.terminal.font_family, settings.terminal.font_size
+    // The families this machine actually has, rather than a name typed into a
+    // box. Monospaced first, because that is what a terminal is drawn on, and
+    // then everything else, because a font that fontconfig has not labelled is
+    // still a font someone installed on purpose.
+    let mut families = font_families(&font_group);
+    let current = settings.terminal.font_family.trim().to_owned();
+    // Whatever is configured stays selectable even when this machine has no
+    // such face, so opening the settings on a machine missing the font does not
+    // quietly change what is configured to the first name in the list.
+    if !current.is_empty()
+        && !families
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&current))
+    {
+        families.insert(0, current.clone());
+    }
+    let family = adw::ComboRow::builder()
+        .title("Family")
+        .subtitle(font_subtitle(&font_group, &current))
+        .model(&list(families.iter().map(String::as_str)))
+        .selected(
+            families
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(&current))
+                .unwrap_or(0) as u32,
+        )
+        .enable_search(true)
+        .build();
+    // Search needs to be told what part of the model to match against.
+    family.set_expression(Some(gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        None::<gtk::Expression>,
+        "string",
     )));
-    chooser.connect_font_desc_notify(glib::clone!(
+    family.connect_selected_notify(glib::clone!(
         #[weak]
         window,
-        move |chooser| {
-            let Some(desc) = chooser.font_desc() else {
+        move |row| {
+            let Some(name) = families.get(row.selected() as usize).cloned() else {
                 return;
             };
-            let family = desc.family().map(|family| family.to_string());
-            let size = f64::from(desc.size()) / f64::from(pango::SCALE);
-            edit(&window, move |settings| {
-                if let Some(family) = family.filter(|family| !family.trim().is_empty()) {
-                    settings.terminal.font_family = family;
-                }
-                if (FONT_SIZE_MIN..=FONT_SIZE_MAX).contains(&size) {
-                    settings.terminal.font_size = size;
-                }
-            });
+            row.set_subtitle(&font_subtitle(row, &name));
+            edit(&window, |settings| settings.terminal.font_family = name);
         }
     ));
-    let font = adw::ActionRow::builder()
-        .title("Font")
-        .subtitle(font_subtitle(&chooser, &settings.terminal.font_family))
-        .activatable_widget(&chooser)
+    font_group.add(&family);
+
+    let size = adw::SpinRow::builder()
+        .title("Size")
+        .subtitle("Points, the same scale Ctrl+= and Ctrl+- move")
+        .digits(1)
+        .adjustment(&gtk::Adjustment::new(
+            settings.terminal.font_size,
+            FONT_SIZE_MIN,
+            FONT_SIZE_MAX,
+            0.5,
+            1.0,
+            0.0,
+        ))
         .build();
-    // The chooser shows "None" for a family fontconfig cannot find, which says
-    // nothing about which family that was or what is being drawn instead.
-    chooser.connect_font_desc_notify(glib::clone!(
+    size.connect_value_notify(glib::clone!(
         #[weak]
-        font,
-        move |chooser| {
-            let family = chooser
-                .font_desc()
-                .and_then(|desc| desc.family())
-                .map_or_else(String::new, |family| family.to_string());
-            font.set_subtitle(&font_subtitle(chooser, &family));
+        window,
+        move |row| {
+            let points = row.value();
+            edit(&window, |settings| settings.terminal.font_size = points);
         }
     ));
-    font.add_suffix(&chooser);
-    font_group.add(&font);
+    font_group.add(&size);
 
     let ligatures = adw::SwitchRow::builder()
         .title("Ligatures")
@@ -255,6 +304,59 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
     ));
     behavior.add(&blink);
 
+    let cursor = adw::ComboRow::builder()
+        .title("Cursor")
+        .subtitle("The shape it takes until a program asks for another")
+        .model(&list(CURSOR_STYLES.iter().map(|(_, label)| *label)))
+        .selected(
+            CURSOR_STYLES
+                .iter()
+                .position(|(style, _)| *style == settings.terminal.cursor_style)
+                .unwrap_or(0) as u32,
+        )
+        .build();
+    cursor.connect_selected_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let Some((chosen, _)) = CURSOR_STYLES.get(row.selected() as usize) else {
+                return;
+            };
+            edit(&window, |settings| settings.terminal.cursor_style = *chosen);
+        }
+    ));
+    behavior.add(&cursor);
+
+    let copy_on_select = adw::SwitchRow::builder()
+        .title("Copy on Select")
+        .subtitle("Highlighting also takes the clipboard, not only the middle-click selection")
+        .active(settings.terminal.copy_on_select)
+        .build();
+    copy_on_select.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.terminal.copy_on_select = on);
+        }
+    ));
+    behavior.add(&copy_on_select);
+
+    let bell = adw::SwitchRow::builder()
+        .title("Bell")
+        .subtitle("A program ringing the bell makes a sound and marks its tab")
+        .active(settings.terminal.bell)
+        .build();
+    bell.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.terminal.bell = on);
+        }
+    ));
+    behavior.add(&bell);
+
     let scrollback = adw::SpinRow::builder()
         .title("Scrollback")
         .subtitle("Lines kept above the screen")
@@ -295,6 +397,31 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
     behavior.add(&wrap);
     page.add(&behavior);
 
+    // --- the shell
+
+    let shell_group = adw::PreferencesGroup::builder()
+        .title("Shell")
+        .description(shell_description(&settings.terminal.command))
+        .build();
+    let command = adw::EntryRow::builder()
+        .title("Command")
+        .text(&settings.terminal.command)
+        .show_apply_button(true)
+        .build();
+    command.connect_apply(glib::clone!(
+        #[weak]
+        window,
+        #[weak]
+        shell_group,
+        move |row| {
+            let command = row.text().trim().to_owned();
+            shell_group.set_description(Some(&shell_description(&command)));
+            edit(&window, |settings| settings.terminal.command = command);
+        }
+    ));
+    shell_group.add(&command);
+    page.add(&shell_group);
+
     // --- the session
 
     let session = adw::PreferencesGroup::builder()
@@ -334,18 +461,46 @@ fn edit(window: &crate::window::TuniWindow, change: impl FnOnce(&mut Settings)) 
     }
 }
 
-/// What the font row says under its title: the family and size, or the truth
-/// when the family named is not on this machine. Tuni bundles no fonts, so the
-/// default is a family a fresh install may well not have, and the terminal
-/// falls back through the Nerd Font symbols to whatever fontconfig calls
-/// monospace rather than showing nothing.
+/// What the shell group says under its title: which program a new tab will
+/// start, or why the one named will not be it. A shell is a name someone types,
+/// and a typed name that resolves to nothing is worth saying out loud rather
+/// than discovering when the next tab opens on something else.
+fn shell_description(command: &str) -> String {
+    let command = command.trim();
+    if command.is_empty() {
+        return "Empty runs the login shell. Tabs already open keep the shell they started with."
+            .to_owned();
+    }
+    match tuni_pty::resolve_shell(command) {
+        Some(path) => format!("New tabs run {}", path.display()),
+        None => format!("{command} is not on PATH, so new tabs fall back to the login shell"),
+    }
+}
+
+/// What the font row says under its title: how the list is ordered, or the
+/// truth about the family that is chosen. Tuni bundles no fonts, so the default
+/// is a family a fresh install may well not have, and the terminal falls back
+/// through the Nerd Font symbols to whatever fontconfig calls monospace rather
+/// than showing nothing.
 fn font_subtitle(widget: &impl IsA<gtk::Widget>, family: &str) -> String {
     let family = family.trim();
-    if family.is_empty() || installed(widget, family) {
-        return "Family and size".to_owned();
+    if family.is_empty() {
+        return ORDERING.to_owned();
     }
-    format!("{family} is not installed — falling back to monospace")
+    if !installed(widget, family) {
+        return format!("{family} is not installed, so the terminal falls back to monospace");
+    }
+    // Measured rather than read off fontconfig's label, and only for the one
+    // family that was picked: the label is missing from faces that are fixed
+    // width and wrong on a few that are not.
+    if fixed_width(widget, family) {
+        return ORDERING.to_owned();
+    }
+    format!("{family} is not monospaced, so its columns will not line up")
 }
+
+/// What the font row says when there is nothing else to say about the family.
+const ORDERING: &str = "The families installed on this machine, monospaced first";
 
 fn installed(widget: &impl IsA<gtk::Widget>, family: &str) -> bool {
     let Some(map) = widget.as_ref().pango_context().font_map() else {
@@ -354,6 +509,95 @@ fn installed(widget: &impl IsA<gtk::Widget>, family: &str) -> bool {
     map.list_families()
         .iter()
         .any(|known| known.name().eq_ignore_ascii_case(family))
+}
+
+/// Every family this machine has that can draw a line of text, monospaced ones
+/// first and the rest after, each alphabetical.
+///
+/// Not monospaced only. Fontconfig's `spacing` is a label a font either carries
+/// or does not, plenty of faces people install for a terminal are missing it,
+/// and a list that hides them reads as a list of the fonts that are installed.
+/// so the ordering says which are which and the row says so under its title,
+/// rather than the list deciding on someone's behalf.
+fn font_families(widget: &impl IsA<gtk::Widget>) -> Vec<String> {
+    let context = widget.as_ref().pango_context();
+    let Some(map) = context.font_map() else {
+        return Vec::new();
+    };
+
+    let mut monospaced: Vec<String> = Vec::new();
+    let mut rest: Vec<String> = Vec::new();
+    for family in map.list_families() {
+        let name = family.name().to_string();
+        if family.is_monospace() {
+            // Only here: an emoji or symbol face is what carries the label
+            // without carrying letters, and it is the monospaced half of the
+            // list it would otherwise sit at the top of.
+            if writes_text(&map, &context, &name) {
+                monospaced.push(name);
+            }
+        } else {
+            rest.push(name);
+        }
+    }
+
+    for names in [&mut monospaced, &mut rest] {
+        names.sort_by_key(|name| name.to_lowercase());
+        names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    }
+    monospaced.extend(rest);
+    monospaced
+}
+
+/// Whether every glyph in a family advances the same width, measured on the
+/// characters that differ most in a proportional face.
+fn fixed_width(widget: &impl IsA<gtk::Widget>, family: &str) -> bool {
+    let context = widget.as_ref().pango_context();
+    let layout = pango::Layout::new(&context);
+    let mut description = pango::FontDescription::new();
+    description.set_family(family);
+    layout.set_font_description(Some(&description));
+
+    let width = |text: &str| {
+        layout.set_text(text);
+        layout.pixel_size().0
+    };
+    let m = width("M");
+    m > 0 && ["i", "W", "0"].into_iter().all(|text| width(text) == m)
+}
+
+/// What the Font group says above its rows when this machine has no Nerd Font.
+///
+/// The icons a prompt and a `neofetch` print live in a private use area, which
+/// means no font is obliged to have them and every font is free to draw a box
+/// instead. The chain in [`tuni_core::TerminalConfig::font_stack`] asks for the
+/// symbols-only face by the name its own release carries, so saying which font
+/// is missing is the whole fix.
+fn missing_symbols(widget: &impl IsA<gtk::Widget>) -> Option<String> {
+    let map = widget.as_ref().pango_context().font_map()?;
+    let has_nerd_font = map
+        .list_families()
+        .iter()
+        .any(|family| family.name().to_lowercase().contains("nerd font"));
+    (!has_nerd_font).then(|| {
+        "No Nerd Font is installed, so the icons a prompt draws come out as \
+         boxes. Symbols Nerd Font Mono, in ~/.local/share/fonts, is enough."
+            .to_owned()
+    })
+}
+
+/// Whether a family can draw the characters a shell prints. An emoji or symbol
+/// face answers yes to `is_monospace`, since every glyph in it is the same width,
+/// and has no letters at all, and a list that offers one as a terminal font is
+/// offering a mistake.
+fn writes_text(map: &pango::FontMap, context: &pango::Context, family: &str) -> bool {
+    let mut description = pango::FontDescription::new();
+    description.set_family(family);
+    map.load_font(context, &description).is_some_and(|font| {
+        ['M', '0', 'g']
+            .into_iter()
+            .all(|glyph| font.has_char(glyph))
+    })
 }
 
 /// A line of terminal, drawn in the font and the theme that are being chosen —

@@ -105,13 +105,20 @@ room they had, the names that were typed, and a fresh shell in each pane's last
 working directory. What those shells had printed is not restored unless it is
 asked for. A second window can be opened for a scratch project on another
 screen; it starts empty and never writes the session, so the arrangement that
-comes back is the one the first window was left in. A settings window under `Ctrl+,` edits the font, the two themes, the
-scrollback, whether a file pane wraps its long lines, and that last decision,
+comes back is the one the first window was left in. A settings window under
+`Ctrl+,` edits the font, the two themes, the cursor, the scrollback, the shell
+to run, whether a file pane wraps its long lines, and that last decision,
 writing each change to `~/.config/tuni/config.toml` as it is made. There is no
 OK button; a line of terminal beside the font rows is drawn in whatever has
 just been chosen, since that is the only way a font or a palette is actually
-picked. It also says so when the family named is not installed on the machine,
-rather than leaving the chooser reading "None".
+picked. The family is chosen from what this machine has, asked of the font map
+rather than typed: the monospaced faces first and every other family after,
+since fontconfig's `spacing` is a label plenty of coding fonts are missing and a
+list that hides them reads as a list of what is installed. The row says under
+its title when the family picked is proportional, and when it is not installed
+at all. Whatever is configured stays in the list either way, rather than the
+dialog quietly selecting something else. It also says when no Nerd Font is
+installed, which is the whole of why a prompt's icons come out as boxes.
 
 | Shortcut | Action |
 | --- | --- |
@@ -447,9 +454,14 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `font-ligatures` | `false` | |
 | `line-height` | `0` | Extra pixels between rows |
 | `cursor-blink` | `true` | And then only if the desktop blinks its own cursor, and only while the program running has no opinion |
+| `cursor-style` | `"block"` | `block`, `bar`, `underline`, or `block_hollow`, the shape until the program running asks for another |
+| `copy-on-select` | `false` | Whether releasing a selection puts it on the clipboard |
+| `bell` | `true` | Whether `\a` rings the desktop's own bell |
+| `command` | `""` | The shell to run; empty means the login shell |
 | `terminal.scrollback-lines` | `10000` | Lines kept above the screen |
 | `terminal.restore-history` | `false` | Whether a restored pane replays what it had printed |
 | `editor.wrap-lines` | `false` | Whether a file pane folds a long line rather than scrolling sideways |
+| `window.auto-hide-tab-bar` | `false` | Whether the tab bar goes away while a window has one tab |
 
 The session itself lives under `~/.local/share/tuni`. A file pane comes back
 holding the file it held, with the cursor where it was left; unsaved edits are
