@@ -37,9 +37,11 @@ BuildRequires:  desktop-file-utils
 BuildRequires:  libappstream-glib
 
 # Everything the panels shell out to. curl fetches the plan bars the Info
-# page shows next to a running Claude Code.
+# page shows next to a running Claude Code, and the host list is read with the
+# same ssh that opens a connection.
 Requires:       git-core
 Requires:       /usr/bin/curl
+Requires:       openssh-clients
 Requires:       hicolor-icon-theme
 
 %description

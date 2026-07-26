@@ -24,6 +24,10 @@ finish-args:
   - --socket=fallback-x11
   - --share=ipc
   - --device=dri
+  # The host's ssh-agent. `ssh` runs inside the sandbox, so without this the
+  # agent it would authenticate with is simply not reachable and every
+  # connection falls back to asking for the key's passphrase.
+  - --socket=ssh-auth
   # A terminal workspace whose file tree and Git panel only reached its own
   # sandbox would be a terminal that cannot see the code in it.
   - --filesystem=host

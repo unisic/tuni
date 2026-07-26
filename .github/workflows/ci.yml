@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           dnf install -y --setopt=install_weak_deps=False \
-            cargo rust rustfmt clippy gcc make git-core curl tar xz \
+            cargo rust rustfmt clippy gcc make git-core curl tar xz openssh-clients \
             gtk4-devel libadwaita-devel gtksourceview5-devel sqlite-devel \
             desktop-file-utils libappstream-glib
 
