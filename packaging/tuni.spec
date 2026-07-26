@@ -6,7 +6,7 @@
 # GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
 # populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-0.1.0/ -o tuni-0.1.0.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.0.0/ -o tuni-1.0.0.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.15.2
 
 Name:           tuni
-Version:        0.1.0
+Version:        1.0.0
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -75,5 +75,5 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/symbolic/apps/%{app_id}-symbolic.svg
 
 %changelog
-* Sun Jul 26 2026 Unisic <hello@unisic.dev> - 0.1.0-1
+* Sun Jul 26 2026 Unisic <hello@unisic.dev> - 1.0.0-1
 - First release.
