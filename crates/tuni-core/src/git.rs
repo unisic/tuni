@@ -1001,7 +1001,7 @@ pub fn diff(path: &Path, staged: bool) -> Result<FileDiff, String> {
 
     // `--no-index` reports a difference the way `diff(1)` does, with an exit
     // status of one. Everywhere else that would be a failure.
-    if !output.is_ok() && !(untracked && output.code == 1) {
+    if !(output.is_ok() || untracked && output.code == 1) {
         return Err(output.message("Couldn't read the diff."));
     }
     Ok(FileDiff {
