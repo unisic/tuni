@@ -473,6 +473,23 @@ a label, tags, when a host was last opened, lives in
 `~/.config/tuni/ssh/meta.json` keyed by alias, which is what lets a hand-written
 host carry them without tuni putting a byte in the file that declares it.
 
+A forwarded port is two different things under one name. A `LocalForward` in the
+host's own block belongs to ssh, which brings it up with the connection, and
+there is nothing in the window that could start or stop it. One kept in
+`meta.json` is tuni's, opened and closed against a running master with
+`ssh -O forward` and `-O cancel`, which is what the switch in the session
+inspector does. Whether it is up is not a question the mux client answers, so a
+local or dynamic forward is confirmed by a listening socket in `/proc/net/tcp`,
+found by the same reader the Ports section already runs. A remote forward cannot
+be confirmed from this machine at all; what ssh said when it was asked is all
+there is, and the row claims no more than that. Asking for port zero has the far
+end pick one and ssh prints the number, which is worth remembering because a
+cancel has to be spelled the way the master recorded the request. Before any of
+it, the port is tried here by binding it, so a clash names the process holding
+it rather than returning the mux client's error, which nobody can act on. That
+is a race, and the real failure path is still there: the check only makes the
+ordinary case readable.
+
 An SSH library was the obvious alternative and it is ruled out by the same
 constraint everything else here follows. `russh` and `libssh2` bring their own
 authentication, so keys, passphrases and keyboard-interactive answers would

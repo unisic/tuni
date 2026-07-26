@@ -31,7 +31,8 @@ always been answered. Tuni stores no secret and has nowhere to put one: keys,
 `ssh-agent` and the desktop's keyring already do that job. It is also why hosts
 will never sync to a cloud account: syncing a credential means storing one.
 Panes on one machine share a single authenticated connection, so the second tab
-does not ask again.
+does not ask again. The session inspector lists what a connection forwards, and
+switches tuni's own ports on and off against it without reconnecting.
 
 Tuni is a ground-up Linux implementation of the workspace
 [egoist/kero](https://github.com/egoist/kero) built for macOS. Kero's Swift
