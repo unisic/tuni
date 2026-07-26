@@ -64,6 +64,52 @@ pub struct ClipboardRequest {
     pub text: String,
 }
 
+/// Where the viewport sits in the scrollable area, in rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScrollPosition {
+    /// Rows in the whole scrollable area, scrollback included.
+    pub total: usize,
+    /// First visible row, counted from the top of the scrollback.
+    pub offset: usize,
+    /// Rows the viewport shows.
+    pub len: usize,
+}
+
+impl ScrollPosition {
+    /// Whether there is anything above the viewport to scroll to.
+    #[must_use]
+    pub fn is_scrollable(&self) -> bool {
+        self.total > self.len
+    }
+
+    /// How far down the scrollable area the viewport sits: 0 at the top of the
+    /// scrollback, 1 at the bottom.
+    #[must_use]
+    pub fn fraction(&self) -> f64 {
+        let travel = self.total.saturating_sub(self.len);
+        if travel == 0 {
+            return 1.0;
+        }
+        (self.offset as f64 / travel as f64).clamp(0.0, 1.0)
+    }
+
+    /// Visible share of the scrollable area — the scrollbar thumb's length.
+    #[must_use]
+    pub fn proportion(&self) -> f64 {
+        if self.total == 0 {
+            return 1.0;
+        }
+        (self.len as f64 / self.total as f64).clamp(0.0, 1.0)
+    }
+
+    /// The row that puts the viewport at `fraction` down the scrollable area.
+    #[must_use]
+    pub fn row_at(&self, fraction: f64) -> usize {
+        let travel = self.total.saturating_sub(self.len);
+        (fraction.clamp(0.0, 1.0) * travel as f64).round() as usize
+    }
+}
+
 /// Pixel geometry of the rendered grid.
 ///
 /// Pointer positions are in surface pixels for both selection and mouse
@@ -268,6 +314,41 @@ impl Terminal {
         self.inner.scroll_viewport(ScrollViewport::Bottom);
     }
 
+    /// Whether the cursor blinks when the application has not asked for a
+    /// particular style. Upstream's built-in default is a solid cursor; every
+    /// terminal on this desktop blinks, and DECSCUSR still overrides this.
+    pub fn set_default_cursor_blink(&mut self, blink: Option<bool>) -> Result<()> {
+        self.inner.set_default_cursor_blink(blink)?;
+        Ok(())
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.inner.scroll_viewport(ScrollViewport::Top);
+    }
+
+    /// Put `row` at the top of the viewport, counted from the top of the
+    /// scrollback. Same row space as [`ScrollPosition::offset`].
+    pub fn scroll_to_row(&mut self, row: usize) {
+        self.inner.scroll_viewport(ScrollViewport::Row(row));
+    }
+
+    /// Where the viewport sits in the scrollable area.
+    ///
+    /// Upstream raises no notification when this changes, so a scrollbar has to
+    /// poll it once per frame and diff — which is what Ghostty's own renderer
+    /// does.
+    #[must_use]
+    pub fn scroll_position(&self) -> ScrollPosition {
+        self.inner
+            .scrollbar()
+            .map(|bar| ScrollPosition {
+                total: bar.total as usize,
+                offset: bar.offset as usize,
+                len: bar.len as usize,
+            })
+            .unwrap_or_default()
+    }
+
     /// Take everything the terminal raised since the last call.
     pub fn take_effects(&mut self) -> Effects {
         std::mem::take(&mut *self.effects.borrow_mut())
@@ -277,8 +358,14 @@ impl Terminal {
         self.inner.title().ok().filter(|t| !t.is_empty())
     }
 
-    pub fn pwd(&self) -> Option<&str> {
-        self.inner.pwd().ok().filter(|p| !p.is_empty())
+    /// The shell's working directory, as OSC 7 last reported it.
+    ///
+    /// The sequence carries a `file://` URI, so this returns the local path it
+    /// names — and nothing at all when the URI names another machine, whose
+    /// paths mean nothing here.
+    pub fn pwd(&self) -> Option<String> {
+        let raw = self.inner.pwd().ok().filter(|p| !p.is_empty())?;
+        local_path(raw)
     }
 
     pub fn is_mouse_tracking(&self) -> bool {
@@ -533,4 +620,63 @@ impl Drop for Terminal {
         // here hands them back while the terminal is still alive.
         self.gesture.reset(&self.inner);
     }
+}
+
+/// The local path a `file://` URI names, or `None` if it names another host.
+///
+/// Shells send OSC 7 as a URI with the hostname attached, which is how a
+/// terminal knows an SSH session's directory is not one it can open. Bare
+/// paths are accepted too: some shells send them despite the specification.
+fn local_path(raw: &str) -> Option<String> {
+    let Some(rest) = raw.strip_prefix("file://") else {
+        return raw.starts_with('/').then(|| raw.to_owned());
+    };
+
+    // "file://host" with no path at all says nothing useful.
+    let (host, path) = rest.split_at(rest.find('/')?);
+    let local = host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || hostname().is_some_and(|name| host.eq_ignore_ascii_case(&name));
+
+    local.then(|| percent_decode(path))
+}
+
+fn hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+fn percent_decode(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
+                    .ok()
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+                match hex {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    // Not an escape after all; a literal '%' in a file name.
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&out).into_owned()
 }

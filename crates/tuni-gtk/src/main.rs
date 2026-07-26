@@ -60,6 +60,20 @@ fn build_window(app: &adw::Application) {
         ),
     );
 
+    // And the subtitle tracks OSC 7, so the window says where the shell is.
+    terminal.connect_notify_local(
+        Some("cwd"),
+        glib::clone!(
+            #[weak]
+            title,
+            move |terminal: &TuniTerminal, _| {
+                if let Some(cwd) = terminal.cwd() {
+                    title.set_subtitle(&shorten(&cwd));
+                }
+            }
+        ),
+    );
+
     window.present();
 
     // Spawn after presenting, so the first allocation has already sized the
@@ -80,6 +94,17 @@ fn build_window(app: &adw::Application) {
             }
         }
     ));
+}
+
+/// A path as a person would write it: `/home/me/src` is `~/src`.
+fn shorten(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match path.strip_prefix(&home) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+            format!("~{rest}")
+        }
+        _ => path.to_owned(),
+    }
 }
 
 /// Debug capture: render the terminal to a PNG and quit.
@@ -104,6 +129,21 @@ fn maybe_capture(window: &adw::ApplicationWindow, terminal: &TuniTerminal) {
                 #[weak]
                 terminal,
                 move || terminal.send_text(&input)
+            ),
+        );
+    }
+
+    // A scripted scroll, in lines, negative for back into the scrollback.
+    // Exercises the same path the wheel takes, overlay scrollbar included.
+    if let Ok(lines) = std::env::var("TUNI_CAPTURE_SCROLL")
+        && let Ok(lines) = lines.trim().parse::<isize>()
+    {
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(delay.saturating_sub(200)),
+            glib::clone!(
+                #[weak]
+                terminal,
+                move || terminal.scroll_lines(lines)
             ),
         );
     }

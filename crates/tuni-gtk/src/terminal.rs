@@ -7,7 +7,7 @@
 //! this keeps up under a firehose is exactly what the Etap 0 benchmark decides.
 
 use std::cell::{Cell, RefCell};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk::gdk;
 use gtk::glib;
@@ -21,10 +21,21 @@ use tuni_core::TerminalConfig;
 use tuni_pty::{Pty, PtyConfig, PtyEvent};
 use tuni_vt::{
     ClipboardTarget, CursorShape, Geometry, KeyAction, KeyInput, Mods, MouseAction, MouseButton,
-    MouseInput, Rgb,
+    MouseInput, Rgb, ScrollPosition,
 };
 
 use crate::keymap;
+
+/// Width of the strip along the trailing edge that the scrollbar owns. Wider
+/// than the thumb, so grabbing it does not demand pixel precision.
+const SCROLLBAR_STRIP: f32 = 14.0;
+const SCROLLBAR_INSET: f32 = 3.0;
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+/// How long the thumb stays up after the last scroll, and how long it takes to
+/// fade afterwards. Both from the reference implementation.
+const SCROLLBAR_LINGER: Duration = Duration::from_millis(1100);
+const SCROLLBAR_FADE: Duration = Duration::from_millis(400);
+const SCROLLBAR_REVEAL: Duration = Duration::from_millis(100);
 
 /// What the pointer is doing between press and release. A drag either paints a
 /// selection or is reported to the application; never both.
@@ -34,6 +45,21 @@ enum Pointer {
     Idle,
     Selecting,
     Reporting,
+}
+
+/// The overlay scrollbar's thumb, in widget pixels.
+#[derive(Clone, Copy, Debug)]
+struct Thumb {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl Thumb {
+    fn contains(&self, y: f32) -> bool {
+        y >= self.y && y <= self.y + self.height
+    }
 }
 
 /// Cell geometry derived from the font. Everything on screen is placed off
@@ -74,6 +100,9 @@ mod imp {
         /// Text the input method committed during the current key press.
         pub(super) pending_commit: RefCell<Option<String>>,
         pub(super) title: RefCell<Option<String>>,
+        /// Working directory as last reported by OSC 7. Etap 2 infers a
+        /// project's directory from this; for now it names the window.
+        pub(super) cwd: RefCell<Option<String>>,
         pub(super) pointer: Cell<Pointer>,
         /// How many mouse buttons are down, which mouse reporting needs in
         /// order to decide whether motion is worth sending.
@@ -81,6 +110,26 @@ mod imp {
         /// Last known pointer position, because scroll events carry no
         /// coordinates but the application still expects them in the report.
         pub(super) pointer_pos: Cell<(f64, f64)>,
+        /// Scroll state as of the last feed. Upstream raises no notification
+        /// when the viewport moves, so this is polled and diffed.
+        pub(super) scroll: Cell<ScrollPosition>,
+        /// Overlay scrollbar: opacity, when the fade may begin, and the grab
+        /// offset inside the thumb while it is being dragged.
+        pub(super) bar_alpha: Cell<f32>,
+        pub(super) bar_until: Cell<Option<Instant>>,
+        pub(super) bar_hover: Cell<bool>,
+        pub(super) bar_drag: Cell<Option<f32>>,
+        pub(super) bar_tick: RefCell<Option<gtk::TickCallbackId>>,
+        /// Frame-clock time of the previous fade step, in microseconds.
+        pub(super) bar_frame: Cell<i64>,
+        /// Cursor blink phase, its timer, and whether the cursor drawn last
+        /// frame asked to blink at all.
+        pub(super) blink_on: Cell<bool>,
+        pub(super) blink_source: RefCell<Option<glib::SourceId>>,
+        pub(super) blink_wanted: Cell<bool>,
+        /// When the user last typed. GTK stops blinking a while after input,
+        /// so an idle terminal does not animate forever.
+        pub(super) last_input: Cell<Option<Instant>>,
         /// Draw timings, collected only when TUNI_DEBUG_FRAME_TIME is set.
         /// This is the measurement that decides whether Pango can keep up.
         pub(super) frame_timing: bool,
@@ -98,9 +147,21 @@ mod imp {
                 im: RefCell::new(None),
                 pending_commit: RefCell::new(None),
                 title: RefCell::new(None),
+                cwd: RefCell::new(None),
                 pointer: Cell::new(Pointer::default()),
                 buttons_down: Cell::new(0),
                 pointer_pos: Cell::new((0.0, 0.0)),
+                scroll: Cell::new(ScrollPosition::default()),
+                bar_alpha: Cell::new(0.0),
+                bar_until: Cell::new(None),
+                bar_hover: Cell::new(false),
+                bar_drag: Cell::new(None),
+                bar_tick: RefCell::new(None),
+                bar_frame: Cell::new(0),
+                blink_on: Cell::new(true),
+                blink_source: RefCell::new(None),
+                blink_wanted: Cell::new(false),
+                last_input: Cell::new(None),
                 frame_timing: std::env::var_os("TUNI_DEBUG_FRAME_TIME").is_some(),
                 frame_times: RefCell::new(Vec::with_capacity(120)),
             }
@@ -119,13 +180,17 @@ mod imp {
             static PROPERTIES: std::sync::OnceLock<Vec<glib::ParamSpec>> =
                 std::sync::OnceLock::new();
             PROPERTIES.get_or_init(|| {
-                vec![glib::ParamSpecString::builder("title").read_only().build()]
+                vec![
+                    glib::ParamSpecString::builder("title").read_only().build(),
+                    glib::ParamSpecString::builder("cwd").read_only().build(),
+                ]
             })
         }
 
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
             match pspec.name() {
                 "title" => self.title.borrow().to_value(),
+                "cwd" => self.cwd.borrow().to_value(),
                 other => unimplemented!("unknown property {other}"),
             }
         }
@@ -141,6 +206,12 @@ mod imp {
         }
 
         fn dispose(&self) {
+            if let Some(source) = self.blink_source.take() {
+                source.remove();
+            }
+            if let Some(tick) = self.bar_tick.take() {
+                tick.remove();
+            }
             // Drop the session before the widget so the reader thread's channel
             // closes and the shell gets its SIGHUP.
             self.session.replace(None);
@@ -221,6 +292,13 @@ impl TuniTerminal {
     #[must_use]
     pub fn title(&self) -> Option<String> {
         self.imp().title.borrow().clone()
+    }
+
+    /// The shell's working directory, as last reported by OSC 7. `None` until
+    /// a shell that sends it does.
+    #[must_use]
+    pub fn cwd(&self) -> Option<String> {
+        self.imp().cwd.borrow().clone()
     }
 
     // --- setup -------------------------------------------------------------
@@ -304,6 +382,7 @@ impl TuniTerminal {
                 if let Some(im) = this.imp().im.borrow().as_ref() {
                     im.focus_in();
                 }
+                this.start_blink();
                 this.queue_draw();
             }
         ));
@@ -314,6 +393,9 @@ impl TuniTerminal {
                 if let Some(im) = this.imp().im.borrow().as_ref() {
                     im.focus_out();
                 }
+                // An unfocused terminal draws a hollow cursor, which must not
+                // also blink.
+                this.stop_blink();
                 this.queue_draw();
             }
         ));
@@ -373,8 +455,9 @@ impl TuniTerminal {
             if c == 0 || r == 0 { (80, 24) } else { (c, r) }
         };
 
-        let term = tuni_vt::Terminal::new(cols, rows, imp.config.borrow().scrollback_lines)
+        let mut term = tuni_vt::Terminal::new(cols, rows, imp.config.borrow().scrollback_lines)
             .map_err(|e| e.to_string())?;
+        let _ = term.set_default_cursor_blink(Some(imp.config.borrow().cursor_blink));
 
         let pty = Pty::spawn(&PtyConfig {
             cwd,
@@ -430,11 +513,25 @@ impl TuniTerminal {
             .title_changed
             .then(|| session.term.title().map(str::to_owned))
             .flatten();
+        let cwd = effects.pwd_changed.then(|| session.term.pwd()).flatten();
+        let scroll = session.term.scroll_position();
         drop(guard);
+
+        // Output grows the scrollback every frame, so only a change in where
+        // the viewport sits counts as scroll activity worth showing a thumb
+        // for. Otherwise a long build would keep the scrollbar lit throughout.
+        let moved = scroll.fraction() != imp.scroll.replace(scroll).fraction();
+        if moved {
+            self.reveal_scrollbar();
+        }
 
         if let Some(title) = title {
             imp.title.replace(Some(title));
             self.notify("title");
+        }
+        if let Some(cwd) = cwd {
+            imp.cwd.replace(Some(cwd));
+            self.notify("cwd");
         }
         if effects.bell {
             self.error_bell();
@@ -486,6 +583,231 @@ impl TuniTerminal {
             m.cell_width.round() as u16,
             m.cell_height.round() as u16,
         );
+    }
+
+    // --- cursor blinking -----------------------------------------------------
+
+    /// Desktop blink preferences: whether to blink at all, the full cycle, and
+    /// how long after the last input blinking stops. Following GtkSettings
+    /// rather than a private default keeps the terminal's cursor in step with
+    /// every text field on the desktop.
+    fn blink_settings(&self) -> (bool, Duration, Option<Duration>) {
+        let settings = gtk::Settings::for_display(&self.display());
+        let cycle = Duration::from_millis(u64::from(settings.gtk_cursor_blink_time().max(100) as u32));
+        let timeout = settings.gtk_cursor_blink_timeout();
+        (
+            settings.is_gtk_cursor_blink(),
+            cycle,
+            // GTK spells "never stop" as a timeout larger than any real one.
+            (timeout < i32::MAX / 2).then(|| Duration::from_secs(u64::from(timeout.max(1) as u32))),
+        )
+    }
+
+    fn start_blink(&self) {
+        self.stop_blink();
+
+        let (enabled, cycle, _) = self.blink_settings();
+        if !enabled {
+            return;
+        }
+        self.imp().blink_on.set(true);
+
+        let id = glib::timeout_add_local(
+            cycle / 2,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || this.blink_tick()
+            ),
+        );
+        self.imp().blink_source.replace(Some(id));
+    }
+
+    fn stop_blink(&self) {
+        if let Some(source) = self.imp().blink_source.take() {
+            source.remove();
+        }
+        self.imp().blink_on.set(true);
+    }
+
+    fn blink_tick(&self) -> glib::ControlFlow {
+        let imp = self.imp();
+
+        // Nothing to animate if the cursor asked to stay solid, or if the
+        // terminal has been idle long enough that GTK would have stopped.
+        let idle = match (imp.last_input.get(), self.blink_settings().2) {
+            (Some(last), Some(timeout)) => last.elapsed() > timeout,
+            _ => false,
+        };
+        if !imp.blink_wanted.get() || idle || !self.has_focus() {
+            if !imp.blink_on.replace(true) {
+                self.queue_draw();
+            }
+            return glib::ControlFlow::Continue;
+        }
+
+        imp.blink_on.set(!imp.blink_on.get());
+        self.queue_draw();
+        glib::ControlFlow::Continue
+    }
+
+    /// Restart the blink phase, so the cursor is solid while the user types.
+    fn note_input(&self) {
+        let imp = self.imp();
+        imp.last_input.set(Some(Instant::now()));
+        if !imp.blink_on.replace(true) {
+            self.queue_draw();
+        }
+        if imp.blink_source.borrow().is_none() && self.has_focus() {
+            self.start_blink();
+        }
+    }
+
+    // --- overlay scrollbar ---------------------------------------------------
+
+    /// The thumb as drawn, or `None` when there is nothing to scroll.
+    ///
+    /// The thumb floats over the content with no track, which is why it has to
+    /// fade: a permanent one would cover a column of text.
+    fn thumb(&self) -> Option<Thumb> {
+        let imp = self.imp();
+        let scroll = imp.scroll.get();
+        if !scroll.is_scrollable() {
+            return None;
+        }
+
+        let track = self.height() as f32 - 2.0 * SCROLLBAR_INSET;
+        if track <= 0.0 {
+            return None;
+        }
+        let height = (track * scroll.proportion() as f32).clamp(SCROLLBAR_MIN_THUMB.min(track), track);
+        let width = if imp.bar_hover.get() || imp.bar_drag.get().is_some() {
+            8.0
+        } else {
+            5.0
+        };
+
+        Some(Thumb {
+            x: self.width() as f32 - width - SCROLLBAR_INSET,
+            y: SCROLLBAR_INSET + (track - height) * scroll.fraction() as f32,
+            width,
+            height,
+        })
+    }
+
+    /// Show the thumb and restart its fade timer.
+    fn reveal_scrollbar(&self) {
+        let imp = self.imp();
+        if !imp.scroll.get().is_scrollable() {
+            return;
+        }
+        imp.bar_until.set(Some(Instant::now() + SCROLLBAR_LINGER));
+
+        if imp.bar_tick.borrow().is_some() {
+            return;
+        }
+        let tick = self.add_tick_callback(|this, clock| this.fade_scrollbar(clock));
+        imp.bar_tick.replace(Some(tick));
+    }
+
+    /// One frame of the fade animation. Runs only while the opacity is moving,
+    /// and takes itself off the frame clock once the thumb is gone.
+    fn fade_scrollbar(&self, clock: &gdk::FrameClock) -> glib::ControlFlow {
+        let imp = self.imp();
+        let held = imp.bar_hover.get()
+            || imp.bar_drag.get().is_some()
+            || imp.bar_until.get().is_some_and(|until| Instant::now() < until);
+        let target: f32 = if held && imp.scroll.get().is_scrollable() {
+            1.0
+        } else {
+            0.0
+        };
+
+        let interval = clock.frame_time() - imp.bar_frame.replace(clock.frame_time());
+        // A missing or absurd interval (first frame, resumed clock) gets one
+        // frame's worth rather than a jump.
+        let dt = if (1..500_000).contains(&interval) {
+            interval as f32 / 1_000_000.0
+        } else {
+            1.0 / 60.0
+        };
+        let span = if target > imp.bar_alpha.get() {
+            SCROLLBAR_REVEAL
+        } else {
+            SCROLLBAR_FADE
+        };
+
+        let step = dt / span.as_secs_f32();
+        let alpha = if target > imp.bar_alpha.get() {
+            (imp.bar_alpha.get() + step).min(target)
+        } else {
+            (imp.bar_alpha.get() - step).max(target)
+        };
+        imp.bar_alpha.set(alpha);
+        self.queue_draw();
+
+        if alpha <= 0.0 && target <= 0.0 {
+            imp.bar_tick.replace(None);
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    }
+
+    /// Whether a press at `x` belongs to the scrollbar. An invisible thumb is
+    /// transparent to the pointer, so a click lands in the terminal instead.
+    fn scrollbar_hit(&self, x: f64) -> bool {
+        let imp = self.imp();
+        imp.bar_alpha.get() > 0.01
+            && imp.scroll.get().is_scrollable()
+            && x as f32 >= self.width() as f32 - SCROLLBAR_STRIP
+    }
+
+    /// Scroll so the thumb's top lands at `y` minus the grab offset.
+    fn drag_scrollbar(&self, y: f64) {
+        let imp = self.imp();
+        let (Some(offset), Some(thumb)) = (imp.bar_drag.get(), self.thumb()) else {
+            return;
+        };
+        let travel = self.height() as f32 - 2.0 * SCROLLBAR_INSET - thumb.height;
+        if travel <= 0.0 {
+            return;
+        }
+
+        let fraction = f64::from((y as f32 - offset - SCROLLBAR_INSET) / travel);
+        let row = imp.scroll.get().row_at(fraction);
+
+        let mut guard = imp.session.borrow_mut();
+        if let Some(session) = guard.as_mut() {
+            session.term.scroll_to_row(row);
+            imp.scroll.set(session.term.scroll_position());
+        }
+        drop(guard);
+
+        self.reveal_scrollbar();
+        self.queue_draw();
+    }
+
+    /// Move the viewport and keep the cached scroll state in step. Public to
+    /// the crate so the debug capture harness drives the same path the wheel
+    /// does.
+    pub(crate) fn scroll_lines(&self, lines: isize) {
+        self.scroll_by(lines);
+    }
+
+    fn scroll_by(&self, lines: isize) {
+        let imp = self.imp();
+        let mut guard = imp.session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        session.term.scroll_lines(lines);
+        imp.scroll.set(session.term.scroll_position());
+        drop(guard);
+
+        self.reveal_scrollbar();
+        self.queue_draw();
     }
 
     // --- mouse ---------------------------------------------------------------
@@ -554,6 +876,22 @@ impl TuniTerminal {
         let mods = keymap::mods_from_state(gesture.current_event_state());
         let button = gesture.current_button();
 
+        if button == gdk::BUTTON_PRIMARY
+            && self.scrollbar_hit(x)
+            && let Some(thumb) = self.thumb()
+        {
+            // On the thumb, keep the grab point; beside it, jump so the thumb
+            // centers on the pointer and carry on as a drag.
+            let offset = if thumb.contains(y as f32) {
+                y as f32 - thumb.y
+            } else {
+                thumb.height / 2.0
+            };
+            imp.bar_drag.set(Some(offset));
+            self.drag_scrollbar(y);
+            return;
+        }
+
         if self.reports_mouse(mods) {
             imp.pointer.set(Pointer::Reporting);
             self.report_mouse(MouseAction::Press, mouse_button(button), mods, x, y);
@@ -612,6 +950,12 @@ impl TuniTerminal {
         let imp = self.imp();
         imp.buttons_down.set(imp.buttons_down.get().saturating_sub(1));
 
+        if imp.bar_drag.take().is_some() {
+            self.reveal_scrollbar();
+            self.queue_draw();
+            return;
+        }
+
         let mods = keymap::mods_from_state(gesture.current_event_state());
         match imp.pointer.replace(Pointer::Idle) {
             Pointer::Reporting => {
@@ -638,6 +982,17 @@ impl TuniTerminal {
         let imp = self.imp();
         imp.pointer_pos.set((x, y));
         let mods = keymap::mods_from_state(controller.current_event_state());
+
+        if imp.bar_drag.get().is_some() {
+            self.drag_scrollbar(y);
+            return;
+        }
+        // Hovering only widens a thumb that is already up; it never summons one.
+        let hover = self.scrollbar_hit(x);
+        if imp.bar_hover.replace(hover) != hover {
+            self.reveal_scrollbar();
+            self.queue_draw();
+        }
 
         match imp.pointer.get() {
             // Alt turns the drag into a block selection, as in Ghostty.
@@ -669,16 +1024,10 @@ impl TuniTerminal {
             return;
         }
 
-        let mut guard = imp.session.borrow_mut();
-        let Some(session) = guard.as_mut() else {
-            return;
-        };
         // Three lines per notch, the X11 convention every toolkit inherited.
         let lines = (dy * 3.0).round() as isize;
         if lines != 0 {
-            session.term.scroll_lines(lines);
-            drop(guard);
-            self.queue_draw();
+            self.scroll_by(lines);
         }
     }
 
@@ -760,6 +1109,38 @@ impl TuniTerminal {
 
         let mods = keymap::mods_from_state(state);
 
+        // Scrollback navigation sits on plain Shift, where every terminal on
+        // this desktop puts it.
+        if mods.contains(Mods::SHIFT) && !mods.contains(Mods::CTRL) {
+            let page = imp.grid_size.get().1.max(1) as isize;
+            match keyval {
+                gdk::Key::Page_Up => {
+                    self.scroll_by(-page);
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::Page_Down => {
+                    self.scroll_by(page);
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::Home | gdk::Key::End => {
+                    let mut guard = imp.session.borrow_mut();
+                    if let Some(session) = guard.as_mut() {
+                        if keyval == gdk::Key::Home {
+                            session.term.scroll_to_top();
+                        } else {
+                            session.term.scroll_to_bottom();
+                        }
+                        imp.scroll.set(session.term.scroll_position());
+                    }
+                    drop(guard);
+                    self.reveal_scrollbar();
+                    self.queue_draw();
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
+            }
+        }
+
         // Application shortcuts live on Ctrl+Shift, because Ctrl+C and Ctrl+V
         // belong to the shell.
         if mods.contains(Mods::CTRL) && mods.contains(Mods::SHIFT) {
@@ -820,8 +1201,12 @@ impl TuniTerminal {
         match session.term.encode_key(&input) {
             Ok(bytes) if !bytes.is_empty() => {
                 let _ = session.pty.write(bytes);
+                // Typing pulls the viewport back down: the answer is about to
+                // arrive at the bottom.
                 session.term.scroll_to_bottom();
+                imp.scroll.set(session.term.scroll_position());
                 drop(guard);
+                self.note_input();
                 self.queue_draw();
                 glib::Propagation::Stop
             }
@@ -854,6 +1239,12 @@ impl TuniTerminal {
         let font = imp.font.borrow();
         let layout = pango::Layout::new(&context);
         layout.set_font_description(Some(&font));
+        let painter = Painter {
+            snapshot,
+            layout: &layout,
+            font: &font,
+            m,
+        };
 
         let mut text = String::with_capacity(256);
 
@@ -871,7 +1262,7 @@ impl TuniTerminal {
                         let _ = start;
                     }
                     (Some((start, current)), _) => {
-                        fill_run(snapshot, m, *start, col, y, *current);
+                        painter.fill_run(*start, col, y, *current);
                         run_start = bg.map(|bg| (col, bg));
                     }
                     (None, Some(bg)) => run_start = Some((col, bg)),
@@ -879,12 +1270,10 @@ impl TuniTerminal {
                 }
             }
             if let Some((start, color)) = run_start {
-                fill_run(snapshot, m, start, cells.len(), y, color);
+                painter.fill_run(start, cells.len(), y, color);
             }
 
-            // Then text, batched into runs sharing a style. Each run is placed
-            // at its own column origin, so per-run advance drift cannot
-            // accumulate across the line.
+            // Then text, batched into runs sharing a style.
             let mut col = 0usize;
             while col < cells.len() {
                 if cells[col].text.is_empty() {
@@ -908,22 +1297,53 @@ impl TuniTerminal {
                     col += UnicodeWidthStr::width(cell.text.as_str()).max(1);
                 }
 
-                draw_run(
-                    snapshot,
-                    &layout,
-                    &font,
-                    m,
-                    start,
-                    y,
-                    &text,
-                    &cells[start],
-                );
+                painter.draw_run(start, y, &text, &cells[start]);
             }
         }
 
-        if let Some(cursor) = grid.cursor {
-            draw_cursor(snapshot, &layout, m, &cursor, grid, self.has_focus());
+        let cursor = grid.cursor;
+        if let Some(cursor) = cursor {
+            // Hidden for this half of the blink cycle, but the cell still keeps
+            // its glyph, which the row loop above already drew.
+            if imp.blink_on.get() || !cursor.blinking {
+                painter.draw_cursor(&cursor, grid, self.has_focus());
+            }
         }
+        drop(font);
+        drop(guard);
+
+        // Recorded rather than acted on: the blink timer reads it, and touching
+        // the widget's state from inside a snapshot would be a redraw loop.
+        imp.blink_wanted
+            .set(cursor.is_some_and(|cursor| cursor.blinking));
+
+        self.draw_scrollbar(snapshot);
+    }
+
+    /// The overlay thumb, drawn last so it floats over the text.
+    fn draw_scrollbar(&self, snapshot: &gtk::Snapshot) {
+        let imp = self.imp();
+        let alpha = imp.bar_alpha.get();
+        if alpha <= 0.01 {
+            return;
+        }
+        let Some(thumb) = self.thumb() else {
+            return;
+        };
+
+        // The widget's own foreground color, so the thumb reads as part of the
+        // desktop rather than of the terminal's palette.
+        let held = imp.bar_hover.get() || imp.bar_drag.get().is_some();
+        let mut color = self.color();
+        color.set_alpha(alpha * if held { 0.5 } else { 0.35 });
+
+        let rect = graphene::Rect::new(thumb.x, thumb.y, thumb.width, thumb.height);
+        let radius = graphene::Size::new(thumb.width / 2.0, thumb.width / 2.0);
+        let rounded = gtk::gsk::RoundedRect::new(rect, radius, radius, radius, radius);
+
+        snapshot.push_rounded_clip(&rounded);
+        snapshot.append_color(&color, &rect);
+        snapshot.pop();
     }
 }
 
@@ -966,112 +1386,113 @@ fn rgba(color: Rgb) -> gdk::RGBA {
     )
 }
 
-fn fill_run(
-    snapshot: &gtk::Snapshot,
+/// Where a frame is painted and with what. Bundled so the row helpers take one
+/// target instead of the same four parameters each.
+struct Painter<'a> {
+    snapshot: &'a gtk::Snapshot,
+    layout: &'a pango::Layout,
+    font: &'a pango::FontDescription,
     m: Metrics,
-    start: usize,
-    end: usize,
-    y: f32,
-    color: Rgb,
-) {
-    let x = start as f32 * m.cell_width;
-    let w = (end - start) as f32 * m.cell_width;
-    snapshot.append_color(&rgba(color), &graphene::Rect::new(x, y, w, m.cell_height));
 }
 
-fn draw_run(
-    snapshot: &gtk::Snapshot,
-    layout: &pango::Layout,
-    font: &pango::FontDescription,
-    m: Metrics,
-    start: usize,
-    y: f32,
-    text: &str,
-    style: &tuni_vt::Cell,
-) {
-    let mut desc = font.clone();
-    if style.bold {
-        desc.set_weight(pango::Weight::Bold);
-    }
-    if style.italic {
-        desc.set_style(pango::Style::Italic);
-    }
-    layout.set_font_description(Some(&desc));
-    layout.set_text(text);
-
-    let attrs = pango::AttrList::new();
-    if style.underline {
-        attrs.insert(pango::AttrInt::new_underline(pango::Underline::Single));
-    }
-    if style.strikethrough {
-        attrs.insert(pango::AttrInt::new_strikethrough(true));
-    }
-    layout.set_attributes(Some(&attrs));
-
-    snapshot.save();
-    snapshot.translate(&graphene::Point::new(start as f32 * m.cell_width, y));
-    // `append_layout` places the layout's top-left at the origin, and Pango's
-    // own ascent already puts the baseline where we want it.
-    snapshot.append_layout(layout, &rgba(style.fg));
-    snapshot.restore();
-}
-
-fn draw_cursor(
-    snapshot: &gtk::Snapshot,
-    layout: &pango::Layout,
-    m: Metrics,
-    cursor: &tuni_vt::Cursor,
-    grid: &tuni_vt::Grid,
-    focused: bool,
-) {
-    let x = f32::from(cursor.col) * m.cell_width;
-    let y = f32::from(cursor.row) * m.cell_height;
-    let color = cursor.color.unwrap_or(grid.fg);
-
-    if !focused {
-        // An unfocused terminal shows a hollow cell, the convention every
-        // terminal on this desktop follows.
-        draw_hollow(snapshot, m, x, y, color);
-        return;
+impl Painter<'_> {
+    /// One background rectangle spanning the cells `start..end` of a row.
+    fn fill_run(&self, start: usize, end: usize, y: f32, color: Rgb) {
+        let x = start as f32 * self.m.cell_width;
+        let w = (end - start) as f32 * self.m.cell_width;
+        self.snapshot.append_color(
+            &rgba(color),
+            &graphene::Rect::new(x, y, w, self.m.cell_height),
+        );
     }
 
-    match cursor.shape {
-        CursorShape::Block => {
-            snapshot.append_color(
-                &rgba(color),
-                &graphene::Rect::new(x, y, m.cell_width, m.cell_height),
-            );
-            // Repaint the covered glyph in the background color so it stays
-            // readable under the block.
-            if let Some(cell) = grid.cell(cursor.col, cursor.row)
-                && !cell.text.is_empty()
-            {
-                layout.set_text(&cell.text);
-                layout.set_attributes(None);
-                snapshot.save();
-                snapshot.translate(&graphene::Point::new(x, y));
-                snapshot.append_layout(layout, &rgba(cell.bg.unwrap_or(grid.bg)));
-                snapshot.restore();
-            }
+    /// One run of text sharing a style, placed at its own column origin so
+    /// per-run advance drift cannot accumulate across the line.
+    fn draw_run(&self, start: usize, y: f32, text: &str, style: &tuni_vt::Cell) {
+        let mut desc = self.font.clone();
+        if style.bold {
+            desc.set_weight(pango::Weight::Bold);
         }
-        CursorShape::BlockHollow => draw_hollow(snapshot, m, x, y, color),
-        CursorShape::Bar => snapshot.append_color(
-            &rgba(color),
-            &graphene::Rect::new(x, y, 2.0, m.cell_height),
-        ),
-        CursorShape::Underline => snapshot.append_color(
-            &rgba(color),
-            &graphene::Rect::new(x, y + m.cell_height - 2.0, m.cell_width, 2.0),
-        ),
-    }
-}
+        if style.italic {
+            desc.set_style(pango::Style::Italic);
+        }
+        self.layout.set_font_description(Some(&desc));
+        self.layout.set_text(text);
 
-fn draw_hollow(snapshot: &gtk::Snapshot, m: Metrics, x: f32, y: f32, color: Rgb) {
-    let c = rgba(color);
-    let w = m.cell_width;
-    let h = m.cell_height;
-    snapshot.append_color(&c, &graphene::Rect::new(x, y, w, 1.0));
-    snapshot.append_color(&c, &graphene::Rect::new(x, y + h - 1.0, w, 1.0));
-    snapshot.append_color(&c, &graphene::Rect::new(x, y, 1.0, h));
-    snapshot.append_color(&c, &graphene::Rect::new(x + w - 1.0, y, 1.0, h));
+        let attrs = pango::AttrList::new();
+        if style.underline {
+            attrs.insert(pango::AttrInt::new_underline(pango::Underline::Single));
+        }
+        if style.strikethrough {
+            attrs.insert(pango::AttrInt::new_strikethrough(true));
+        }
+        self.layout.set_attributes(Some(&attrs));
+
+        self.snapshot.save();
+        self.snapshot
+            .translate(&graphene::Point::new(start as f32 * self.m.cell_width, y));
+        // `append_layout` places the layout's top-left at the origin, and
+        // Pango's own ascent already puts the baseline where we want it.
+        self.snapshot.append_layout(self.layout, &rgba(style.fg));
+        self.snapshot.restore();
+    }
+
+    fn draw_cursor(&self, cursor: &tuni_vt::Cursor, grid: &tuni_vt::Grid, focused: bool) {
+        let m = self.m;
+        let x = f32::from(cursor.col) * m.cell_width;
+        let y = f32::from(cursor.row) * m.cell_height;
+        let color = cursor.color.unwrap_or(grid.fg);
+
+        if !focused {
+            // An unfocused terminal shows a hollow cell, the convention every
+            // terminal on this desktop follows.
+            self.draw_hollow(x, y, color);
+            return;
+        }
+
+        match cursor.shape {
+            CursorShape::Block => {
+                self.snapshot.append_color(
+                    &rgba(color),
+                    &graphene::Rect::new(x, y, m.cell_width, m.cell_height),
+                );
+                // Repaint the covered glyph in the background color so it stays
+                // readable under the block.
+                if let Some(cell) = grid.cell(cursor.col, cursor.row)
+                    && !cell.text.is_empty()
+                {
+                    self.layout.set_text(&cell.text);
+                    self.layout.set_attributes(None);
+                    self.snapshot.save();
+                    self.snapshot.translate(&graphene::Point::new(x, y));
+                    self.snapshot
+                        .append_layout(self.layout, &rgba(cell.bg.unwrap_or(grid.bg)));
+                    self.snapshot.restore();
+                }
+            }
+            CursorShape::BlockHollow => self.draw_hollow(x, y, color),
+            CursorShape::Bar => self.snapshot.append_color(
+                &rgba(color),
+                &graphene::Rect::new(x, y, 2.0, m.cell_height),
+            ),
+            CursorShape::Underline => self.snapshot.append_color(
+                &rgba(color),
+                &graphene::Rect::new(x, y + m.cell_height - 2.0, m.cell_width, 2.0),
+            ),
+        }
+    }
+
+    fn draw_hollow(&self, x: f32, y: f32, color: Rgb) {
+        let c = rgba(color);
+        let w = self.m.cell_width;
+        let h = self.m.cell_height;
+        self.snapshot
+            .append_color(&c, &graphene::Rect::new(x, y, w, 1.0));
+        self.snapshot
+            .append_color(&c, &graphene::Rect::new(x, y + h - 1.0, w, 1.0));
+        self.snapshot
+            .append_color(&c, &graphene::Rect::new(x, y, 1.0, h));
+        self.snapshot
+            .append_color(&c, &graphene::Rect::new(x + w - 1.0, y, 1.0, h));
+    }
 }

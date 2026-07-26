@@ -13,6 +13,9 @@ pub struct TerminalConfig {
     pub scrollback_lines: usize,
     /// Extra space between rows, in pixels. Ghostty exposes the same knob.
     pub line_height_extra: f64,
+    /// Whether the cursor blinks when the application has not asked for a
+    /// particular style. The desktop's own blink preference still wins.
+    pub cursor_blink: bool,
 }
 
 impl Default for TerminalConfig {
@@ -22,6 +25,7 @@ impl Default for TerminalConfig {
             font_size: 11.0,
             scrollback_lines: 10_000,
             line_height_extra: 0.0,
+            cursor_blink: true,
         }
     }
 }

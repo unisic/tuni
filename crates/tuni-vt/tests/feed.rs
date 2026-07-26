@@ -132,6 +132,47 @@ fn scrolling_back_shows_lines_that_left_the_viewport() {
     assert_eq!(row_text(&mut terminal, 0), "two");
 }
 
+#[test]
+fn scroll_position_describes_the_scrollable_area() {
+    let mut terminal = Terminal::new(20, 3, 100).expect("terminal");
+    assert!(!terminal.scroll_position().is_scrollable());
+
+    terminal.feed(b"one\r\ntwo\r\nthree\r\nfour");
+    let bottom = terminal.scroll_position();
+    assert_eq!(bottom.len, 3);
+    assert_eq!(bottom.total, 4);
+    assert_eq!(bottom.offset, 1);
+    assert!(bottom.is_scrollable());
+    // Pinned to the bottom of a four-row area showing three of them.
+    assert_eq!(bottom.fraction(), 1.0);
+
+    terminal.scroll_lines(-1);
+    let top = terminal.scroll_position();
+    assert_eq!(top.offset, 0);
+    assert_eq!(top.fraction(), 0.0);
+    assert_eq!(top.proportion(), 0.75);
+}
+
+#[test]
+fn scroll_to_row_round_trips_through_a_fraction() {
+    let mut terminal = Terminal::new(20, 4, 100).expect("terminal");
+    for line in 0..24 {
+        terminal.feed(format!("line{line}\r\n").as_bytes());
+    }
+
+    // What a scrollbar thumb dragged to its middle asks for.
+    let row = terminal.scroll_position().row_at(0.5);
+    terminal.scroll_to_row(row);
+
+    let position = terminal.scroll_position();
+    assert_eq!(position.offset, row);
+    assert!((position.fraction() - 0.5).abs() < 0.05);
+
+    terminal.scroll_to_top();
+    assert_eq!(terminal.scroll_position().offset, 0);
+    assert_eq!(row_text(&mut terminal, 0), "line0");
+}
+
 // --- key encoding ---------------------------------------------------------
 
 fn press(terminal: &mut Terminal, key: Key, mods: Mods, text: Option<&str>) -> Vec<u8> {
@@ -355,4 +396,24 @@ fn osc_fifty_two_asks_for_a_clipboard_write() {
 fn bare_modifiers_produce_nothing() {
     let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
     assert!(press(&mut terminal, Key::ShiftLeft, Mods::SHIFT, None).is_empty());
+}
+
+// --- working directory ------------------------------------------------------
+
+#[test]
+fn osc_seven_reports_a_local_working_directory() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    assert_eq!(terminal.pwd(), None);
+
+    terminal.feed(b"\x1b]7;file://localhost/home/user/my%20code\x07");
+    assert!(terminal.take_effects().pwd_changed);
+    assert_eq!(terminal.pwd().as_deref(), Some("/home/user/my code"));
+}
+
+#[test]
+fn osc_seven_ignores_a_directory_on_another_machine() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    terminal.feed(b"\x1b]7;file://somewhere-else/home/user\x07");
+    // An SSH session's path is not one this machine can open.
+    assert_eq!(terminal.pwd(), None);
 }
