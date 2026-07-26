@@ -235,8 +235,12 @@ pub fn present(parent: &impl IsA<gtk::Widget>, entries: Vec<Entry>) {
     let run = {
         let entries = Rc::clone(&entries);
         let rows = Rc::clone(&rows);
-        let dialog = dialog.clone();
-        let parent = parent.as_ref().clone();
+        // Weak, because this closure is handed to widgets the dialog owns: a
+        // strong dialog here is a cycle the palette never escapes, and it holds
+        // the window with it — so every palette ever opened would keep a whole
+        // window, its terminals and their scrollback alive for the process.
+        let dialog = dialog.downgrade();
+        let parent = parent.as_ref().downgrade();
         move |row: &gtk::ListBoxRow| {
             let index = {
                 let rows = rows.borrow();
@@ -250,12 +254,14 @@ pub fn present(parent: &impl IsA<gtk::Widget>, entries: Vec<Entry>) {
             };
             let action = entry.action;
             let target = entry.target.clone();
-            dialog.close();
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
             // After the palette is gone, not before: several of these move the
             // keyboard, and a dialog still on screen would take it back.
-            glib::idle_add_local_once({
-                let parent = parent.clone();
-                move || {
+            let parent = parent.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(parent) = parent.upgrade() {
                     let _ = parent.activate_action(action, target.as_ref());
                 }
             });
