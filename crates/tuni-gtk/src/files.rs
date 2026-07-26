@@ -201,7 +201,7 @@ impl TuniFiles {
         up.add_css_class("flat");
 
         let jump = gtk::Button::builder()
-            .icon_name("go-jump-symbolic")
+            .icon_name("folder-open-symbolic")
             .tooltip_text("Go to Directory")
             .action_name("files.location")
             .valign(gtk::Align::Center)
