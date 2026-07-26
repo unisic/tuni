@@ -12,11 +12,14 @@
 //! `GtkListStore` splice that [`crate::files`] uses, and the row builder below
 //! is the part that would move.
 //!
-//! Nothing here connects to anything. Reading the configuration is files, so it
-//! happens off this thread; picking a host is a message to the window, which
-//! owns the panes a connection could go in.
+//! Nothing here opens a connection. Picking a host is a message to the window,
+//! which owns the panes a connection could go in. What the list does do itself
+//! is read the configuration and ask which connections are still answering,
+//! and both of those are files and subprocesses, so both happen off this
+//! thread.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -25,7 +28,38 @@ use gtk::gio;
 use gtk::glib;
 
 use tuni_core::fuzzy;
+use tuni_core::settings::Settings;
 use tuni_core::ssh::{self, Host, Hosts, Meta, Notes, Source};
+
+thread_local! {
+    // Every host this process has opened a shared connection to.
+    //
+    // Not per window and not per launcher, because a master is neither. It
+    // outlives the pane that opened it by `ControlPersist`, so the last window
+    // closing is the one that has to hang up what an earlier one left running,
+    // and every launcher on screen has the same connections to draw.
+    //
+    // It is also the only set tuni asks `ssh` about. Asking after every host in
+    // the list would run the user's `Match exec` blocks for machines nobody has
+    // touched, which is the one thing `tuni_core::ssh` says never to do.
+    static CONNECTED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+/// Remembers a host tuni has just run `ssh` for.
+pub(crate) fn opened(destination: String) {
+    CONNECTED.with_borrow_mut(|connected| {
+        connected.insert(destination);
+    });
+}
+
+/// The hosts tuni may claim a live connection to, or hang one up on.
+pub(crate) fn connected() -> Vec<String> {
+    CONNECTED.with_borrow(|connected| {
+        let mut all: Vec<String> = connected.iter().cloned().collect();
+        all.sort();
+        all
+    })
+}
 
 /// How many hosts the Recent section holds before the rest of them are just the
 /// list underneath it.
@@ -47,7 +81,7 @@ enum Choice {
 }
 
 mod imp {
-    use super::{Cell, Choice, Hosts, Notes, Rc, RefCell, glib};
+    use super::{Cell, Choice, HashSet, Hosts, Notes, Rc, RefCell, glib};
     use adw::prelude::*;
     use adw::subclass::prelude::*;
 
@@ -76,6 +110,10 @@ mod imp {
         /// Labels, tags and when each host was last connected to, which is what
         /// the Recent section is sorted on.
         pub notes: RefCell<Notes>,
+        /// The hosts a shared connection was answering on when the list was
+        /// last read. What the dot on a row is, and what decides whether there
+        /// is anything to disconnect from.
+        pub live: RefCell<HashSet<String>>,
         /// What each row on screen stands for, in the order they are in. The
         /// widgets are rebuilt on every keystroke and this with them.
         pub(super) rows: RefCell<Vec<(gtk::ListBoxRow, Choice)>>,
@@ -389,6 +427,7 @@ impl TuniHosts {
                 hosts.clipboard().set_text(&format!("ssh {alias}"));
             }),
             entry("local-shell", self, |hosts| hosts.send(Message::LocalShell)),
+            entry("disconnect", self, TuniHosts::disconnect),
             entry("refresh", self, TuniHosts::reload),
             entry("add", self, |hosts| hosts.edit_host(None, false)),
             entry("edit", self, |hosts| {
@@ -437,13 +476,14 @@ impl TuniHosts {
             .borrow()
             .get(&alias)
             .map(|host| (host.source, host.origin.is_some()));
+        let live = self.imp().live.borrow().contains(&alias);
         self.imp().target.replace(Some(alias));
 
         let Some(menu) = self.imp().menu.borrow().clone() else {
             return;
         };
         let (source, declared) = known.unwrap_or((Source::Adhoc, false));
-        menu.set_menu_model(Some(&row_menu(source, declared)));
+        menu.set_menu_model(Some(&row_menu(source, declared, live)));
         // The gesture measures from the list; the popover hangs off this
         // widget, and the two are a header and a search entry apart.
         let point = gtk::graphene::Point::new(x as f32, y as f32);
@@ -475,6 +515,28 @@ impl TuniHosts {
         glib::spawn_future_local(async move {
             let _ = gio::spawn_blocking(move || notes.save()).await;
         });
+    }
+
+    /// Hangs up the shared connection to the row the menu was opened on.
+    ///
+    /// Not a question first. The rows that offer it are the ones something is
+    /// answering on, the panes on that connection show what happened to them,
+    /// and a connection is not a file: hanging one up loses nothing that was
+    /// not going to be lost when `ControlPersist` ran out anyway.
+    fn disconnect(&self) {
+        let Some(destination) = self.imp().target.borrow().clone() else {
+            return;
+        };
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let ended = gio::spawn_blocking(move || control().stop(&destination)).await;
+                this.report(
+                    ended.unwrap_or_else(|_| Err("The connection would not end".to_owned())),
+                );
+            }
+        ));
     }
 
     // --- writing -----------------------------------------------------------
@@ -599,17 +661,22 @@ impl TuniHosts {
         imp.loading.set(true);
         let generation = imp.generation.get() + 1;
         imp.generation.set(generation);
+        // Read here rather than in there: the set lives on this thread.
+        let opened = connected();
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
             self,
             async move {
-                // Files and no subprocess, but files on a network share are
-                // files that block, and this pane is the whole window's
-                // keyboard while it is up.
-                let read = gio::spawn_blocking(|| (Hosts::load(), Notes::load())).await;
+                // Files on a network share are files that block, and this pane
+                // is the whole window's keyboard while it is up. The liveness
+                // check is a subprocess per host on top of that, which is the
+                // other half of why none of it happens here.
+                let read =
+                    gio::spawn_blocking(move || (Hosts::load(), Notes::load(), answering(opened)))
+                        .await;
                 let imp = this.imp();
                 imp.loading.set(false);
-                let Ok((hosts, notes)) = read else {
+                let Ok((hosts, notes, live)) = read else {
                     return;
                 };
                 if imp.generation.get() != generation {
@@ -617,6 +684,7 @@ impl TuniHosts {
                 }
                 imp.hosts.replace(hosts);
                 imp.notes.replace(notes);
+                imp.live.replace(live);
                 this.fill();
             }
         ));
@@ -644,6 +712,7 @@ impl TuniHosts {
 
         let hosts = imp.hosts.borrow();
         let notes = imp.notes.borrow();
+        let live = imp.live.borrow();
         if let Some(label) = imp.count.borrow().as_ref() {
             label.set_text(&count(hosts.all().len()));
         }
@@ -669,7 +738,7 @@ impl TuniHosts {
                 list.append(&header("Recent"));
             }
             for (host, _) in &recent {
-                let row = host_row(host, &notes.get(&host.alias));
+                let row = host_row(host, &notes.get(&host.alias), live.contains(&host.alias));
                 list.append(&row);
                 rows.push((row, Choice::Host(host.alias.clone())));
             }
@@ -684,7 +753,7 @@ impl TuniHosts {
                 list.append(&header("Hosts"));
             }
             for host in sorted {
-                let row = host_row(host, &notes.get(&host.alias));
+                let row = host_row(host, &notes.get(&host.alias), live.contains(&host.alias));
                 list.append(&row);
                 rows.push((row, Choice::Host(host.alias.clone())));
             }
@@ -711,7 +780,7 @@ impl TuniHosts {
                     .then_with(|| left.0.alias.cmp(&right.0.alias))
             });
             for (host, meta, _) in &ranked {
-                let row = host_row(host, meta);
+                let row = host_row(host, meta, live.contains(&host.alias));
                 list.append(&row);
                 rows.push((row, Choice::Host(host.alias.clone())));
             }
@@ -741,6 +810,7 @@ impl TuniHosts {
         if let Some((row, _)) = rows.first() {
             list.select_row(Some(row));
         }
+        drop(live);
         drop(notes);
         drop(hosts);
         imp.rows.replace(rows);
@@ -840,13 +910,16 @@ fn header_menu() -> gio::Menu {
 
 /// The menu for one row. What it offers depends on which file the host came
 /// out of: tuni rewrites its own, and points at the user's.
-fn row_menu(source: Source, declared: bool) -> gio::Menu {
+fn row_menu(source: Source, declared: bool, live: bool) -> gio::Menu {
     let menu = gio::Menu::new();
 
     let open = gio::Menu::new();
     open.append(Some("Connect"), Some("hosts.connect"));
     open.append(Some("Connect to the Side"), Some("hosts.connect-to-side"));
     open.append(Some("Connect in a New Tab"), Some("hosts.connect-in-tab"));
+    if live {
+        open.append(Some("Disconnect"), Some("hosts.disconnect"));
+    }
     menu.append_section(None, &open);
 
     if source != Source::Adhoc {
@@ -889,10 +962,10 @@ fn header(title: &str) -> gtk::ListBoxRow {
 }
 
 fn local_row() -> gtk::ListBoxRow {
-    row("utilities-terminal-symbolic", "Local shell", "", "")
+    row("utilities-terminal-symbolic", "Local shell", "", "", false)
 }
 
-fn host_row(host: &Host, meta: &Meta) -> gtk::ListBoxRow {
+fn host_row(host: &Host, meta: &Meta, live: bool) -> gtk::ListBoxRow {
     let name = if meta.label.is_empty() {
         &host.alias
     } else {
@@ -907,7 +980,13 @@ fn host_row(host: &Host, meta: &Meta) -> gtk::ListBoxRow {
     } else {
         meta.tags.join(", ")
     };
-    let row = row("network-server-symbolic", name, &host.address(), &note);
+    let row = row(
+        "network-server-symbolic",
+        name,
+        &host.address(),
+        &note,
+        live,
+    );
     if let Some(origin) = &host.origin {
         row.set_tooltip_text(Some(&format!(
             "{}:{}",
@@ -924,10 +1003,22 @@ fn adhoc_row(host: &Host) -> gtk::ListBoxRow {
         &format!("Connect to {}", host.target()),
         &host.address(),
         "not saved",
+        false,
     )
 }
 
-fn row(icon: &str, name: &str, address: &str, note: &str) -> gtk::ListBoxRow {
+fn row(icon: &str, name: &str, address: &str, note: &str, live: bool) -> gtk::ListBoxRow {
+    // Emptied rather than hidden, so the icons below it stay in one column
+    // whether or not anything is connected.
+    let dot = gtk::Image::from_icon_name("media-record-symbolic");
+    dot.set_pixel_size(8);
+    if live {
+        dot.add_css_class("success");
+        dot.set_tooltip_text(Some("Connected"));
+    } else {
+        dot.set_icon_name(None);
+    }
+
     let image = gtk::Image::from_icon_name(icon);
     image.add_css_class("dim-label");
 
@@ -942,6 +1033,7 @@ fn row(icon: &str, name: &str, address: &str, note: &str) -> gtk::ListBoxRow {
     line.set_margin_end(6);
     line.set_margin_top(4);
     line.set_margin_bottom(4);
+    line.append(&dot);
     line.append(&image);
     line.append(&title);
 
@@ -1006,6 +1098,28 @@ fn remove(alias: &str) -> Result<(), String> {
     let mut notes = Notes::load();
     notes.set(alias, Meta::default());
     notes.save().map_err(|error| error.to_string())
+}
+
+/// Which of `destinations` a shared connection is open and answering on.
+///
+/// Two subprocesses per host, so it belongs where the files are read and not
+/// on the main thread.
+fn answering(destinations: Vec<String>) -> HashSet<String> {
+    if destinations.is_empty() {
+        return HashSet::new();
+    }
+    let control = control();
+    destinations
+        .into_iter()
+        .filter(|destination| control.is_live(destination))
+        .collect()
+}
+
+/// The shared connections as this run is configured to keep them. Off the main
+/// thread, always: it reads the settings file.
+fn control() -> ssh::Control {
+    let settings = Settings::load();
+    ssh::Control::new(settings.ssh_control_persist, settings.ssh_share_connections)
 }
 
 /// A name like `alias` that nothing else answers to yet.

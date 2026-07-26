@@ -129,6 +129,18 @@ fn main() -> glib::ExitCode {
         for (action, accels) in ACCELS {
             app.set_accels_for_action(action, accels);
         }
+        // What a master killed rather than asked to leave left behind. Startup
+        // runs once however many windows open, which is how often this is
+        // worth doing, and on a thread of its own because the window is what
+        // the person is waiting for.
+        std::thread::spawn(|| {
+            let settings = tuni_core::settings::Settings::load();
+            tuni_core::ssh::Control::new(
+                settings.ssh_control_persist,
+                settings.ssh_share_connections,
+            )
+            .sweep();
+        });
         for number in 1..=9 {
             app.set_accels_for_action(
                 &format!("win.select-tab({number})"),

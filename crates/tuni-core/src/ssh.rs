@@ -121,6 +121,13 @@ impl Control {
             .filter(|path| path.is_absolute())
             .unwrap_or_else(|| crate::settings::home().join(".cache"))
             .join("tuni/ssh");
+        Self::at(directory, persist, enabled)
+    }
+
+    /// A socket directory of somebody else's choosing, which is what the tests
+    /// use: the real one is where a real master would be.
+    #[must_use]
+    pub fn at(directory: PathBuf, persist: u32, enabled: bool) -> Self {
         Self {
             directory,
             persist,
@@ -190,6 +197,31 @@ impl Control {
         options
     }
 
+    /// The socket a shared connection to `destination` lives on, and whether it
+    /// is tuni's own rather than one the user's configuration asked for.
+    ///
+    /// Asked of `ssh` rather than worked out here. The name is `%C`, ssh's own
+    /// hash of the login, host, port, user and jump host, and a second
+    /// implementation of it would disagree in exactly the cases that matter.
+    /// `ssh -G` reports it expanded, `~` and all.
+    ///
+    /// Nothing when sharing is off, which is what `ControlPath none` says and
+    /// what a configuration that never mentions it means.
+    ///
+    /// Two subprocesses, so the caller belongs off the main thread.
+    #[must_use]
+    pub fn socket(&self, destination: &str) -> Option<(PathBuf, bool)> {
+        let options = self.options(destination);
+        let ours = options
+            .iter()
+            .any(|option| option.starts_with("ControlPath="));
+        let path = described(&options, destination)
+            .into_iter()
+            .find(|(keyword, _)| keyword == "controlpath")
+            .map(|(_, value)| value)?;
+        (path != "none").then(|| (PathBuf::from(path), ours))
+    }
+
     /// Whether a shared connection to `destination` is already open and
     /// answering.
     ///
@@ -216,6 +248,86 @@ impl Control {
         args.push("--".to_owned());
         args.push(destination.to_owned());
         run(&args).code == 0
+    }
+
+    /// Hangs up the shared connection to `destination`, and with it every pane,
+    /// tunnel and listing on it.
+    ///
+    /// Refuses one the user's own configuration asked for. `-O exit` ends a
+    /// master and every session it is carrying, and a master tuni merely
+    /// attached to may be carrying a shell somebody started by typing `ssh` in
+    /// a terminal that has nothing to do with tuni.
+    ///
+    /// Ending something that is not running is not a failure: there is no
+    /// connection either way round.
+    ///
+    /// Three subprocesses, so the caller belongs off the main thread.
+    pub fn stop(&self, destination: &str) -> Result<(), String> {
+        let Some((path, ours)) = self.socket(destination) else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        if !ours {
+            return Err(format!(
+                "The connection to {destination} is shared by your own configuration, \
+                 so tuni leaves it running"
+            ));
+        }
+        let mut args = Vec::new();
+        for option in self.options(destination) {
+            args.push("-o".to_owned());
+            args.push(option);
+        }
+        args.push("-O".to_owned());
+        args.push("exit".to_owned());
+        args.push("--".to_owned());
+        args.push(destination.to_owned());
+        let output = run(&args);
+        if output.is_ok() {
+            return Ok(());
+        }
+        Err(output.message(&format!("{destination} would not hang up")))
+    }
+
+    /// Unlinks the sockets nothing answers on.
+    ///
+    /// A master killed rather than asked to leave, by an out-of-memory kill or
+    /// a power cut, leaves its socket behind. Every `ssh` after that prints
+    /// `ControlSocket ... already exists, disabling multiplexing` and then
+    /// carries on with a connection of its own, so it looks like it worked
+    /// while every tunnel and listing quietly attaches to nothing.
+    ///
+    /// This is the one place tuni deletes something, and it is written to be
+    /// the most conservative code in the file: its own directory only, names
+    /// only of the shape `%C` expands to, sockets only, and only where the
+    /// kernel refuses the connection, which is its answer for a socket with
+    /// nothing listening behind it. A master still starting up is bound to a
+    /// name of another shape, and a master that is alive answers.
+    ///
+    /// No subprocess: a connect and a close.
+    pub fn sweep(&self) {
+        use std::os::unix::fs::FileTypeExt;
+
+        let Ok(entries) = fs::read_dir(&self.directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !hashed(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
+            if !entry.file_type().is_ok_and(|kind| kind.is_socket()) {
+                continue;
+            }
+            let path = entry.path();
+            let refused = std::os::unix::net::UnixStream::connect(&path)
+                .err()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused);
+            if refused {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
 
     /// Whether the socket directory is there, making it if it is not. No
@@ -1012,8 +1124,22 @@ fn describe_io(path: &Path, error: &std::io::Error) -> String {
 /// nothing defines, because a name nothing defines is a hostname.
 #[must_use]
 pub fn describe(alias: &str) -> Vec<(String, String)> {
+    described(&[], alias)
+}
+
+/// The same report with settings of tuni's own applied first, which is the only
+/// way to learn where a connection tuni asked to share actually ends up: a
+/// command-line `-o` is obtained before the file, and `%C` is a hash this crate
+/// does not implement.
+fn described(options: &[String], destination: &str) -> Vec<(String, String)> {
+    let mut args: Vec<&str> = Vec::new();
+    for option in options {
+        args.push("-o");
+        args.push(option);
+    }
     // `--` because an alias may begin with a dash.
-    let output = run(&["-G", "--", alias]);
+    args.extend(["-G", "--", destination]);
+    let output = run(&args);
     if !output.is_ok() {
         return Vec::new();
     }
@@ -1023,6 +1149,14 @@ pub fn describe(alias: &str) -> Vec<(String, String)> {
         .filter_map(|line| line.split_once(' '))
         .map(|(keyword, value)| (keyword.to_owned(), value.to_owned()))
         .collect()
+}
+
+/// Whether a name is the forty hex characters `%C` expands to, which is what
+/// tells a socket tuni asked for from anything else in the directory. OpenSSH
+/// binds a master to a name with a suffix on it and moves it into place once it
+/// is listening, so the half-built ones are not this shape.
+fn hashed(name: &str) -> bool {
+    name.len() == 40 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// What an alias resolves to once `ssh` has applied everything it applies.
@@ -1834,5 +1968,50 @@ mod tests {
         // there and gives up at once, without touching the network.
         assert!(!Control::new(CONTROL_PERSIST, true).is_live("tuni-no-such-alias"));
         assert!(!Control::new(CONTROL_PERSIST, false).is_live("tuni-no-such-alias"));
+    }
+
+    #[test]
+    fn only_a_name_ssh_itself_would_have_chosen_is_a_socket_of_ours() {
+        assert!(hashed("7beec8e1563d1471b67ad65b8a4db8b98b9f780b"));
+        assert!(!hashed("7beec8e1563d1471b67ad65b8a4db8b98b9f780b.4ab1c9"));
+        assert!(!hashed("prod-db"));
+    }
+
+    #[test]
+    fn a_sweep_takes_the_dead_socket_and_nothing_else() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let directory = tempdir();
+        let name = |character: &str| directory.join(character.repeat(40));
+
+        let dead = name("a");
+        drop(UnixListener::bind(&dead).expect("bind"));
+        // Another test forking while that socket was open leaves a child
+        // holding a copy of it until it execs, and a socket somebody holds is
+        // one somebody answers on. Wait for the kernel to agree it is gone.
+        for _ in 0..1000 {
+            if UnixStream::connect(&dead).is_err() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let alive = name("b");
+        let listener = UnixListener::bind(&alive).expect("bind");
+        let regular = name("c");
+        fs::write(&regular, "not a socket").expect("write");
+        // What a master looks like in the moment between binding its socket and
+        // moving it to the name it will be found under.
+        let starting = directory.join(format!("{}.4ab1c9", "d".repeat(40)));
+        drop(UnixListener::bind(&starting).expect("bind"));
+
+        Control::at(directory.clone(), CONTROL_PERSIST, true).sweep();
+
+        assert!(!dead.exists(), "a socket with nothing behind it survived");
+        assert!(alive.exists(), "a live master lost its socket");
+        assert!(regular.exists(), "a file that is not a socket was unlinked");
+        assert!(starting.exists(), "a master starting up lost its socket");
+
+        drop(listener);
+        let _ = fs::remove_dir_all(&directory);
     }
 }

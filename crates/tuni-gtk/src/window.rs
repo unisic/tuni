@@ -362,6 +362,7 @@ mod imp {
             // of the live terminals, and a terminal that has been shut down has
             // nothing left to read.
             self.obj().save_session();
+            self.obj().hang_up();
             // Hang up every shell before the widgets go, so the closing window
             // does not race the reader threads.
             for terminal in self.terminals.borrow().values() {
@@ -1187,6 +1188,46 @@ impl TuniWindow {
             }
             crate::files::Message::Open(path) => self.open_file(path),
             crate::files::Message::OpenToSide(path) => self.open_file_to_side(path),
+        }
+    }
+
+    /// Ends the shared connections tuni opened, so a tunnel does not outlive
+    /// the window that asked for it. A user who quits a terminal and finds
+    /// `localhost:5432` still reaching production has been handed a security
+    /// problem by a terminal.
+    ///
+    /// On this thread and in the way of the close, because a thread detached
+    /// here would be killed the moment the process leaves. Each host is a local
+    /// socket and one message on it: no network, no authentication, and only
+    /// the hosts somebody actually connected to.
+    ///
+    /// A hard kill still leaves up to `ssh-control-persist` seconds of tunnel.
+    /// Nothing running inside this process can help with that, and the next
+    /// start sweeps what it left behind.
+    fn hang_up(&self) {
+        // Only the last window out. `-O exit` ends a master and every session
+        // on it, and another window may be sitting in one of them. This one
+        // still counts itself, which is what makes one of them the last.
+        if self
+            .application()
+            .is_some_and(|app| app.windows().len() > 1)
+        {
+            return;
+        }
+        let destinations = crate::hosts::connected();
+        if destinations.is_empty() {
+            return;
+        }
+        let settings = self.imp().settings.borrow().clone();
+        let control = tuni_core::ssh::Control::new(
+            settings.ssh_control_persist,
+            settings.ssh_share_connections,
+        );
+        for destination in destinations {
+            // A master the user's own configuration owns is refused by `stop`
+            // itself, and refusing it is the whole point rather than an error
+            // anybody can act on at this stage of a close.
+            let _ = control.stop(&destination);
         }
     }
 
@@ -2024,26 +2065,30 @@ impl TuniWindow {
             #[weak]
             terminal,
             async move {
-                let Ok(argv) = gio::spawn_blocking(move || {
+                let Ok(dialled) = gio::spawn_blocking(move || {
                     let control = tuni_core::ssh::Control::new(
                         settings.ssh_control_persist,
                         settings.ssh_share_connections,
                     );
                     let host = tuni_core::ssh::host(&alias);
-                    (dial || control.is_live(&host.target()))
-                        .then(|| tuni_core::ssh::command(&host, &control))
+                    let destination = host.target();
+                    (dial || control.is_live(&destination))
+                        .then(|| (tuni_core::ssh::command(&host, &control), destination))
                 })
                 .await
                 else {
                     return;
                 };
                 let remote = this.imp().remotes.borrow().get(&pane).cloned();
-                let Some(argv) = argv else {
+                let Some((argv, destination)) = dialled else {
                     if let Some(remote) = remote {
                         remote.set_idle(&format!("Not connected to {name}"), "Connect");
                     }
                     return;
                 };
+                // Written down before the pane starts, so a connection is on the
+                // list to be hung up from the moment there is one to hang up.
+                crate::hosts::opened(destination);
                 if let Some(remote) = remote {
                     remote.set_running();
                 }
