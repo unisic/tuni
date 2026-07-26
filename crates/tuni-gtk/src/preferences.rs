@@ -9,6 +9,9 @@
 //! copy with the other rows, so two rows changed in quick succession cannot
 //! overwrite each other with a stale snapshot.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use adw::prelude::*;
 use gtk::glib;
 use gtk::pango;
@@ -24,11 +27,22 @@ const APPEARANCES: [(Appearance, &str); 3] = [
     (Appearance::Dark, "Dark"),
 ];
 
+/// What repaints the preview when a setting is written.
+type Paint = Rc<dyn Fn(&Settings)>;
+
+thread_local! {
+    /// The preview in the dialog that is open, if one is. Every row's change
+    /// goes through [`edit`], so that is where the preview is told; one slot,
+    /// because the settings are one dialog.
+    static PREVIEW: RefCell<Option<Paint>> = const { RefCell::new(None) };
+}
+
 pub fn present(window: &crate::window::TuniWindow, settings: &Settings) {
     let dialog = adw::PreferencesDialog::new();
     dialog.set_title("Preferences");
     dialog.add(&appearance_page(window, settings));
     dialog.add(&terminal_page(window, settings));
+    dialog.connect_closed(|_| PREVIEW.with_borrow_mut(|slot| *slot = None));
     dialog.present(Some(window));
 }
 
@@ -162,9 +176,22 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
     ));
     let font = adw::ActionRow::builder()
         .title("Font")
-        .subtitle("Family and size")
+        .subtitle(font_subtitle(&chooser, &settings.terminal.font_family))
         .activatable_widget(&chooser)
         .build();
+    // The chooser shows "None" for a family fontconfig cannot find, which says
+    // nothing about which family that was or what is being drawn instead.
+    chooser.connect_font_desc_notify(glib::clone!(
+        #[weak]
+        font,
+        move |chooser| {
+            let family = chooser
+                .font_desc()
+                .and_then(|desc| desc.family())
+                .map_or_else(String::new, |family| family.to_string());
+            font.set_subtitle(&font_subtitle(chooser, &family));
+        }
+    ));
     font.add_suffix(&chooser);
     font_group.add(&font);
 
@@ -207,6 +234,7 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
     ));
     font_group.add(&line_height);
     page.add(&font_group);
+    page.add(&preview_group(settings));
 
     // --- behavior
 
@@ -296,7 +324,111 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
 fn edit(window: &crate::window::TuniWindow, change: impl FnOnce(&mut Settings)) {
     let mut settings = window.settings();
     change(&mut settings);
-    window.apply_settings(settings);
+    window.apply_settings(settings.clone());
+
+    // Taken out of the slot before it is called: the closure paints a widget
+    // inside this dialog, and nothing says a widget cannot reach back here.
+    let preview = PREVIEW.with_borrow(Clone::clone);
+    if let Some(preview) = preview {
+        preview(&settings);
+    }
+}
+
+/// What the font row says under its title: the family and size, or the truth
+/// when the family named is not on this machine. Tuni bundles no fonts, so the
+/// default is a family a fresh install may well not have, and the terminal
+/// falls back through the Nerd Font symbols to whatever fontconfig calls
+/// monospace rather than showing nothing.
+fn font_subtitle(widget: &impl IsA<gtk::Widget>, family: &str) -> String {
+    let family = family.trim();
+    if family.is_empty() || installed(widget, family) {
+        return "Family and size".to_owned();
+    }
+    format!("{family} is not installed — falling back to monospace")
+}
+
+fn installed(widget: &impl IsA<gtk::Widget>, family: &str) -> bool {
+    let Some(map) = widget.as_ref().pango_context().font_map() else {
+        return true;
+    };
+    map.list_families()
+        .iter()
+        .any(|known| known.name().eq_ignore_ascii_case(family))
+}
+
+/// A line of terminal, drawn in the font and the theme that are being chosen —
+/// kero shows the same thing, and for the same reason: neither setting is
+/// decided from a name in a list.
+fn preview_group(settings: &Settings) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Preview").build();
+
+    let label = gtk::Label::builder()
+        .use_markup(true)
+        .xalign(0.0)
+        .wrap(false)
+        .ellipsize(pango::EllipsizeMode::End)
+        .build();
+    label.add_css_class("tuni-preview");
+    group.add(&label);
+
+    let paint = move |settings: &Settings| {
+        let theme = settings
+            .terminal
+            .theme(adw::StyleManager::default().is_dark());
+        apply_preview_style(settings, &theme);
+        label.set_markup(&preview_markup(&theme));
+    };
+    paint(settings);
+    PREVIEW.with_borrow_mut(|slot| *slot = Some(Rc::new(paint)));
+
+    group
+}
+
+/// Three lines that between them show what the two settings do: the shapes a
+/// coding font is chosen for, the powerline glyphs a prompt needs a fallback
+/// for, and the colors an error arrives in.
+fn preview_markup(theme: &theme::Theme) -> String {
+    let color = |index: usize| theme.palette[index].to_hex();
+    format!(
+        "<span foreground=\"{green}\">tuni</span> \
+         <span foreground=\"{blue}\">\u{276f}</span> \
+         echo \"the quick brown fox\" 0O 1lI\n\
+         <span foreground=\"{cyan}\">\u{e0a0} main \u{e0b0} ~/dev/tuni</span>\n\
+         <b><span foreground=\"{red}\">error</span></b>: \
+         permission denied (os error 13)",
+        green = color(2),
+        blue = color(4),
+        cyan = color(6),
+        red = color(1),
+    )
+}
+
+/// The preview's own colors and font, on the display's provider like the
+/// chrome's and the editor's, since a label has no terminal to inherit from.
+fn apply_preview_style(settings: &Settings, theme: &theme::Theme) {
+    thread_local! {
+        static PROVIDER: gtk::CssProvider = gtk::CssProvider::new();
+    }
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let css = format!(
+        ".tuni-preview {{ font-family: {family}; font-size: {size}pt; \
+         background-color: {bg}; color: {fg}; padding: 12px; \
+         border-radius: 12px; }}\n",
+        family = settings.terminal.font_stack(),
+        size = settings.terminal.font_size,
+        bg = theme.background.to_hex(),
+        fg = theme.foreground.to_hex(),
+    );
+    PROVIDER.with(|provider| {
+        provider.load_from_string(&css);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
 }
 
 fn list<'a>(items: impl Iterator<Item = &'a str>) -> gtk::StringList {

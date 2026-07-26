@@ -94,7 +94,11 @@ room they had, the names that were typed, and a fresh shell in each pane's last
 working directory. What those shells had printed is not restored unless it is
 asked for. A settings window under `Ctrl+,` edits the font, the two themes, the
 scrollback, whether a file pane wraps its long lines, and that last decision,
-writing each change to `~/.config/tuni/config.toml` as it is made.
+writing each change to `~/.config/tuni/config.toml` as it is made. There is no
+OK button; a line of terminal beside the font rows is drawn in whatever has
+just been chosen, since that is the only way a font or a palette is actually
+picked. It also says so when the family named is not installed on the machine,
+rather than leaving the chooser reading "None".
 
 | Shortcut | Action |
 | --- | --- |
