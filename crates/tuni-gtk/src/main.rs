@@ -30,6 +30,7 @@ fn build_window(app: &adw::Application) {
     let terminal = TuniTerminal::new();
     terminal.set_hexpand(true);
     terminal.set_vexpand(true);
+    terminal.set_config(&config());
 
     let header = adw::HeaderBar::new();
     let title = adw::WindowTitle::new("tuni", "");
@@ -115,14 +116,21 @@ fn build_window(app: &adw::Application) {
 /// The configuration for this run.
 ///
 /// Etap 4 reads this from disk and a settings window edits it. Until then the
-/// defaults are the whole story, except for `TUNI_THEME`, which names one of
-/// the bundled themes for both appearances — enough to look at any of the 574
-/// without a settings UI.
+/// defaults are the whole story, except for the environment: `TUNI_THEME` names
+/// one of the bundled themes for both appearances, `TUNI_FONT` is a font the
+/// way Pango writes one, and `TUNI_LIGATURES` turns ligatures on. Enough to
+/// look at any of the 574 themes, and at any font, without a settings UI.
 fn config() -> tuni_core::TerminalConfig {
     let mut config = tuni_core::TerminalConfig::default();
     if let Ok(name) = std::env::var("TUNI_THEME") {
         config.theme_light = name.clone();
         config.theme_dark = name;
+    }
+    if let Ok(font) = std::env::var("TUNI_FONT") {
+        config.set_font(&font);
+    }
+    if let Ok(value) = std::env::var("TUNI_LIGATURES") {
+        config.font_ligatures = matches!(value.trim(), "1" | "true" | "yes" | "on");
     }
     config
 }
@@ -222,6 +230,25 @@ fn maybe_capture(window: &adw::ApplicationWindow, terminal: &TuniTerminal) {
                 #[weak]
                 terminal,
                 move || terminal.send_text(&input)
+            ),
+        );
+    }
+
+    // A scripted zoom, in whole steps, driving the same path Ctrl+plus does.
+    // The shell is told about the new cell size, so `stty size` in the captured
+    // output is the check that the resize actually landed.
+    if let Ok(steps) = std::env::var("TUNI_CAPTURE_ZOOM")
+        && let Ok(steps) = steps.trim().parse::<i32>()
+    {
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(300),
+            glib::clone!(
+                #[weak]
+                terminal,
+                move || {
+                    terminal.zoom(steps);
+                    println!("font size: {}", terminal.font_size());
+                }
             ),
         );
     }

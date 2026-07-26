@@ -63,13 +63,26 @@ impl Thumb {
     }
 }
 
+/// One step of the font-size shortcut, in points. Ghostty's step, and the one
+/// every terminal on this desktop uses.
+const FONT_STEP: f64 = 1.0;
+
+/// The sample the cell width is measured from: digits and letters of a width a
+/// monospace face is obliged to share. Long enough that rounding in a single
+/// advance cannot skew the average.
+const WIDTH_SAMPLE: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
+
 /// Cell geometry derived from the font. Everything on screen is placed off
-/// these two numbers, so a terminal stays a grid even when the font lies about
+/// these numbers, so a terminal stays a grid even when the font lies about
 /// being monospace.
 #[derive(Clone, Copy, Debug)]
 struct Metrics {
     cell_width: f32,
     cell_height: f32,
+    /// Distance from the top of a cell to the baseline. Runs that fall back to
+    /// another face are aligned on this rather than on their own box, so a
+    /// missing glyph does not lift or drop the line it lands in.
+    ascent: f32,
 }
 
 impl Default for Metrics {
@@ -77,6 +90,7 @@ impl Default for Metrics {
         Self {
             cell_width: 8.0,
             cell_height: 16.0,
+            ascent: 12.0,
         }
     }
 }
@@ -97,10 +111,15 @@ mod imp {
         /// a shell starts — is painted from the theme rather than from CSS.
         pub(super) theme: RefCell<Theme>,
         pub(super) font: RefCell<pango::FontDescription>,
+        /// Point size in effect, which the zoom shortcuts move away from the
+        /// configured one and put back.
+        pub(super) font_size: Cell<f64>,
         pub(super) metrics: Cell<Metrics>,
         /// Grid size last pushed to the VT and the PTY, so a resize that does
-        /// not cross a cell boundary costs nothing.
+        /// not cross a cell boundary costs nothing. The cell's pixel size goes
+        /// with it, because zooming changes that without changing the grid.
         pub(super) grid_size: Cell<(u16, u16)>,
+        pub(super) cell_size: Cell<(u16, u16)>,
         pub(super) im: RefCell<Option<gtk::IMMulticontext>>,
         /// Text the input method committed during the current key press.
         pub(super) pending_commit: RefCell<Option<String>>,
@@ -148,10 +167,12 @@ mod imp {
                 theme: RefCell::new(
                     TerminalConfig::default().theme(adw::StyleManager::default().is_dark()),
                 ),
+                font_size: Cell::new(TerminalConfig::default().font_size),
                 config: RefCell::new(TerminalConfig::default()),
                 font: RefCell::new(pango::FontDescription::new()),
                 metrics: Cell::new(Metrics::default()),
                 grid_size: Cell::new((0, 0)),
+                cell_size: Cell::new((0, 0)),
                 im: RefCell::new(None),
                 pending_commit: RefCell::new(None),
                 title: RefCell::new(None),
@@ -313,14 +334,11 @@ impl TuniTerminal {
 
     fn setup_font(&self) {
         let imp = self.imp();
-        let config = imp.config.borrow();
+        let stack = imp.config.borrow().font_stack();
 
         let mut font = pango::FontDescription::new();
-        // A family list, so a missing JetBrains Mono degrades to the system
-        // monospace instead of to a proportional default.
-        font.set_family(&format!("{}, monospace", config.font_family));
-        font.set_size((config.font_size * f64::from(pango::SCALE)).round() as i32);
-        drop(config);
+        font.set_family(&stack);
+        font.set_size((imp.font_size.get() * f64::from(pango::SCALE)).round() as i32);
 
         imp.font.replace(font);
         self.update_metrics();
@@ -332,18 +350,68 @@ impl TuniTerminal {
         let font = imp.font.borrow();
         let metrics = context.metrics(Some(&font), None);
 
-        let scale = f32::from(pango::SCALE as i16);
+        let scale = pango::SCALE as f32;
         let ascent = metrics.ascent() as f32 / scale;
         let descent = metrics.descent() as f32 / scale;
-        // `approximate_char_width` is the advance of a typical character, which
-        // for a monospace face is the cell width.
-        let cell_width = metrics.approximate_char_width() as f32 / scale;
-        let extra = imp.config.borrow().line_height_extra as f32;
 
+        // Measured rather than taken from `approximate_char_width`: that number
+        // is a hint the font supplies, and a face whose hint disagrees with its
+        // own advances would draw a grid that drifts a fraction of a pixel per
+        // column. Laying out a real run asks the question the renderer will.
+        let layout = pango::Layout::new(&context);
+        layout.set_font_description(Some(&font));
+        layout.set_text(WIDTH_SAMPLE);
+        let measured = layout.size().0 as f32 / scale / WIDTH_SAMPLE.chars().count() as f32;
+        let cell_width = if measured >= 1.0 {
+            measured
+        } else {
+            metrics.approximate_char_width() as f32 / scale
+        };
+        drop(font);
+
+        let extra = imp.config.borrow().line_height_extra as f32;
         imp.metrics.set(Metrics {
             cell_width: cell_width.max(1.0),
             cell_height: (ascent + descent + extra).max(1.0),
+            ascent: ascent + extra / 2.0,
         });
+    }
+
+    // --- font size -----------------------------------------------------------
+
+    /// The point size the terminal is drawn at.
+    #[must_use]
+    pub fn font_size(&self) -> f64 {
+        self.imp().font_size.get()
+    }
+
+    /// Draw at a different point size, re-deriving the grid from it.
+    ///
+    /// The window keeps its size and the grid changes shape, which is what a
+    /// tiling desktop leaves room for; growing the window instead would fight
+    /// the compositor.
+    pub fn set_font_size(&self, size: f64) {
+        let imp = self.imp();
+        let size = size.clamp(tuni_core::FONT_SIZE_MIN, tuni_core::FONT_SIZE_MAX);
+        if (size - imp.font_size.get()).abs() < 0.01 {
+            return;
+        }
+        imp.font_size.set(size);
+
+        self.setup_font();
+        self.apply_size(self.width(), self.height());
+        self.queue_resize();
+        self.queue_draw();
+    }
+
+    /// Move the size by whole points, as `Ctrl+plus` and `Ctrl+minus` do.
+    pub fn zoom(&self, steps: i32) {
+        self.set_font_size(self.font_size() + f64::from(steps) * FONT_STEP);
+    }
+
+    /// Back to the configured size.
+    pub fn reset_zoom(&self) {
+        self.set_font_size(self.imp().config.borrow().font_size);
     }
 
     fn setup_input(&self) {
@@ -476,6 +544,25 @@ impl TuniTerminal {
         self.imp().theme.borrow().clone()
     }
 
+    // --- configuration -------------------------------------------------------
+
+    /// Adopt a configuration: font, ligatures, row spacing, scrollback.
+    ///
+    /// The zoom goes back to the configured size, which is the only sensible
+    /// reading of being handed a new one. Scrollback depth is fixed when the
+    /// shell starts, so a change to it only reaches a session started after
+    /// this call.
+    pub fn set_config(&self, config: &TerminalConfig) {
+        let imp = self.imp();
+        imp.config.replace(config.clone());
+        imp.font_size.set(config.font_size);
+
+        self.setup_font();
+        self.apply_size(self.width(), self.height());
+        self.queue_resize();
+        self.queue_draw();
+    }
+
     // --- session lifecycle -------------------------------------------------
 
     /// Start the shell. Safe to call once the widget has a size; before that
@@ -506,6 +593,8 @@ impl TuniTerminal {
         let events = pty.events();
         imp.session.replace(Some(Session { term, pty }));
         imp.grid_size.set((cols, rows));
+        imp.cell_size
+            .set((m.cell_width.round() as u16, m.cell_height.round() as u16));
 
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
@@ -595,28 +684,28 @@ impl TuniTerminal {
         let m = imp.metrics.get();
         let cols = ((width as f32 / m.cell_width).floor() as i32).clamp(1, i32::from(u16::MAX)) as u16;
         let rows = ((height as f32 / m.cell_height).floor() as i32).clamp(1, i32::from(u16::MAX)) as u16;
+        let cell = (
+            (m.cell_width.round() as i32).clamp(1, i32::from(u16::MAX)) as u16,
+            (m.cell_height.round() as i32).clamp(1, i32::from(u16::MAX)) as u16,
+        );
 
-        if imp.grid_size.get() == (cols, rows) {
+        // Zooming can leave the grid the same shape while changing what a cell
+        // measures, and an application that draws with sixels or images needs
+        // the pixel size to be right either way.
+        if imp.grid_size.get() == (cols, rows) && imp.cell_size.get() == cell {
             return;
         }
         imp.grid_size.set((cols, rows));
+        imp.cell_size.set(cell);
 
         let mut guard = imp.session.borrow_mut();
         let Some(session) = guard.as_mut() else {
             return;
         };
-        let _ = session.term.resize(
-            cols,
-            rows,
-            m.cell_width.round() as u32,
-            m.cell_height.round() as u32,
-        );
-        let _ = session.pty.resize(
-            cols,
-            rows,
-            m.cell_width.round() as u16,
-            m.cell_height.round() as u16,
-        );
+        let _ = session
+            .term
+            .resize(cols, rows, u32::from(cell.0), u32::from(cell.1));
+        let _ = session.pty.resize(cols, rows, cell.0, cell.1);
     }
 
     // --- cursor blinking -----------------------------------------------------
@@ -1175,6 +1264,26 @@ impl TuniTerminal {
             }
         }
 
+        // Font size sits on plain Ctrl, where Ghostty and every browser put it.
+        // None of these three keys carries a control code a shell would miss.
+        if mods.contains(Mods::CTRL) && !mods.contains(Mods::ALT) {
+            match keyval {
+                gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => {
+                    self.zoom(1);
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::minus | gdk::Key::KP_Subtract => {
+                    self.zoom(-1);
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::_0 | gdk::Key::KP_0 => {
+                    self.reset_zoom();
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
+            }
+        }
+
         // Application shortcuts live on Ctrl+Shift, because Ctrl+C and Ctrl+V
         // belong to the shell.
         if mods.contains(Mods::CTRL) && mods.contains(Mods::SHIFT) {
@@ -1281,6 +1390,7 @@ impl TuniTerminal {
             snapshot,
             layout: &layout,
             font: &font,
+            ligatures: imp.config.borrow().font_ligatures,
             m,
         };
 
@@ -1328,11 +1438,21 @@ impl TuniTerminal {
                     if cell.text.is_empty() || style_key(cell) != style {
                         break;
                     }
+                    // Anything that is not one plain ASCII character is laid
+                    // out alone, so it lands on its own column rather than
+                    // wherever the run's accumulated advances put it.
+                    let simple = is_simple(&cell.text);
+                    if !simple && col != start {
+                        break;
+                    }
                     text.push_str(&cell.text);
                     // A double-width grapheme owns the following cell; the VT
                     // reports that cell as empty, and stepping over it keeps
                     // the run's column arithmetic honest.
                     col += UnicodeWidthStr::width(cell.text.as_str()).max(1);
+                    if !simple {
+                        break;
+                    }
                 }
 
                 painter.draw_run(start, y, &text, &cells[start]);
@@ -1405,6 +1525,17 @@ fn mouse_button(button: u32) -> Option<MouseButton> {
     }
 }
 
+/// Whether a cell may share a layout with its neighbours.
+///
+/// One printable ASCII character is a glyph the primary font is certain to
+/// have and to advance by exactly one cell. A wide character, a fallback to
+/// another face, or a combining sequence is none of those, so it gets a layout
+/// to itself and is placed on its column exactly.
+fn is_simple(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!(chars.next(), Some(c) if c == ' ' || c.is_ascii_graphic()) && chars.next().is_none()
+}
+
 fn style_key(cell: &tuni_vt::Cell) -> StyleKey {
     StyleKey {
         fg: cell.fg,
@@ -1453,6 +1584,7 @@ struct Painter<'a> {
     snapshot: &'a gtk::Snapshot,
     layout: &'a pango::Layout,
     font: &'a pango::FontDescription,
+    ligatures: bool,
     m: Metrics,
 }
 
@@ -1481,6 +1613,14 @@ impl Painter<'_> {
         self.layout.set_text(text);
 
         let attrs = pango::AttrList::new();
+        if !self.ligatures {
+            // A ligature is one glyph where the terminal still counts several
+            // cells, so it is off unless the configuration asks for it. These
+            // four features are what a coding font joins characters with.
+            attrs.insert(pango::AttrFontFeatures::new(
+                "liga 0, clig 0, dlig 0, calt 0",
+            ));
+        }
         if style.underline {
             attrs.insert(pango::AttrInt::new_underline(pango::Underline::Single));
         }
@@ -1490,12 +1630,21 @@ impl Painter<'_> {
         self.layout.set_attributes(Some(&attrs));
 
         self.snapshot.save();
-        self.snapshot
-            .translate(&graphene::Point::new(start as f32 * self.m.cell_width, y));
-        // `append_layout` places the layout's top-left at the origin, and
-        // Pango's own ascent already puts the baseline where we want it.
+        self.snapshot.translate(&graphene::Point::new(
+            start as f32 * self.m.cell_width,
+            y + self.baseline_offset(),
+        ));
         self.snapshot.append_layout(self.layout, &rgba(style.fg));
         self.snapshot.restore();
+    }
+
+    /// How far to lift or drop this layout so its baseline lands on the row's.
+    ///
+    /// `append_layout` places the layout's top-left at the origin, so a run
+    /// that fell back to a face with a taller ascent would otherwise sit lower
+    /// than the run beside it.
+    fn baseline_offset(&self) -> f32 {
+        self.m.ascent - self.layout.baseline() as f32 / pango::SCALE as f32
     }
 
     fn draw_cursor(&self, cursor: &tuni_vt::Cursor, grid: &tuni_vt::Grid, focused: bool) {
@@ -1525,10 +1674,14 @@ impl Painter<'_> {
                     && !cell.text.is_empty()
                 {
                     let text = cursor.text_color.unwrap_or(cell.bg.unwrap_or(grid.bg));
+                    // Back to the base description: the layout still carries
+                    // whatever weight the last run of the frame asked for.
+                    self.layout.set_font_description(Some(self.font));
                     self.layout.set_text(&cell.text);
                     self.layout.set_attributes(None);
                     self.snapshot.save();
-                    self.snapshot.translate(&graphene::Point::new(x, y));
+                    self.snapshot
+                        .translate(&graphene::Point::new(x, y + self.baseline_offset()));
                     self.snapshot.append_layout(self.layout, &rgba(text));
                     self.snapshot.restore();
                 }

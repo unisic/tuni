@@ -15,10 +15,10 @@ One window, one terminal: keyboard input, Pango rendering, mouse selection with
 word and line clicks, clipboard and bracketed paste, SGR mouse reporting for
 applications that ask for it, an overlay scrollbar that fades when idle, a
 cursor that blinks by the desktop's own preference, a window title and subtitle
-that follow OSC 0/2 and OSC 7, and Ghostty's 574 color themes, which paint the
-window chrome as well as the terminal. `ls`, `vi`, and `top` all
-render correctly. Still missing before it is a daily terminal: font
-configuration, hyperlinks, tabs.
+that follow OSC 0/2 and OSC 7, a configurable font with live zoom, and
+Ghostty's 574 color themes, which paint the window chrome as well as the
+terminal. `ls`, `vi`, and `top` all render correctly. Still missing before it
+is a daily terminal: hyperlinks, tabs.
 
 | Shortcut | Action |
 | --- | --- |
@@ -30,6 +30,7 @@ configuration, hyperlinks, tabs.
 | `Shift`+click | Select even while an application is tracking the mouse |
 | `Shift+Page Up` / `Shift+Page Down` | Scroll the viewport by a page |
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
+| `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
 
 From here the work runs to full parity: a complete standalone terminal, then
 projects and tabs, the niri-style pane layout, session persistence, the file
@@ -79,6 +80,14 @@ Text is drawn with Pango rather than a GPU glyph atlas. Pango brings fontconfig
 fallback, subpixel antialiasing, and input methods, and text quality is what a
 terminal is judged on.
 
+The cell width is measured from a real run of glyphs rather than read off the
+font's own `approximate_char_width` hint, and every run is placed on the row's
+baseline rather than in its own box, so a character that falls back to another
+face lands on its column and on the line instead of near them. Runs of plain
+ASCII share one layout; anything wide, combining, or borrowed from a fallback
+face gets a layout of its own. Ligatures are off by default for the same
+reason — a ligature is one glyph where the terminal still counts several cells.
+
 ## Building
 
 Requires a Rust toolchain, GTK4 and libadwaita development headers, and Zig —
@@ -95,8 +104,10 @@ cargo run --release
 ```
 
 Debugging aids, all off unless set: `TUNI_THEME` names one of the bundled
-themes for the run, which is how to look at them until there is a settings
-window; `TUNI_DEBUG_FRAME_TIME` prints draw-time percentiles;
+themes for the run and `TUNI_FONT` a font the way Pango writes one
+(`"JetBrains Mono 13"`), with `TUNI_LIGATURES=1` to let them fire — which is
+how to look at any of them until there is a settings window;
+`TUNI_DEBUG_FRAME_TIME` prints draw-time percentiles;
 `TUNI_DEBUG_PTY_WRITE` logs what the terminal answers back to the shell; and
 `TUNI_CAPTURE_PNG` renders the widget to a file and exits — useful on
 compositors with no screenshot protocol.
