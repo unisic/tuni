@@ -31,8 +31,11 @@ use tuni_core::workspace::{Id, Tab, Workspace};
 
 use crate::diff::TuniDiff;
 use crate::editor::TuniEditor;
+use crate::find::TuniFind;
 use crate::grid::{Message, TuniGrid};
+use crate::palette;
 use crate::panel::TuniPanel;
+use crate::switcher::{Card, TuniSwitcher};
 use crate::preferences;
 use crate::terminal::TuniTerminal;
 
@@ -52,10 +55,34 @@ const PANEL_MAX: i32 = 560;
 /// read of what is already in the page cache costs nothing anyone can measure.
 const PANEL_POLL_SECONDS: u32 = 2;
 
+/// What the palette lists before the projects and terminals: the window's own
+/// actions, by the name a person would search for, with the keys that do the
+/// same thing so the palette teaches them. The shortcuts repeat `ACCELS` in
+/// main.rs, spelled the way a keycap is rather than the way GTK parses one.
+const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
+    ("New Tab", "tab-new-symbolic", Some("Ctrl+Shift+T"), "win.new-tab"),
+    ("New Project", "folder-new-symbolic", Some("Ctrl+Shift+N"), "win.new-project"),
+    ("Split Right", "view-right-pane-symbolic", Some("Ctrl+Shift+D"), "win.split-right"),
+    ("Split Down", "view-bottom-pane-symbolic", Some("Ctrl+Shift+E"), "win.split-down"),
+    ("Close Pane", "window-close-symbolic", Some("Ctrl+Shift+W"), "win.close-pane"),
+    ("Zoom Pane", "view-fullscreen-symbolic", Some("Ctrl+Shift+Enter"), "win.zoom-pane"),
+    ("Equalize Panes", "view-grid-symbolic", Some("Ctrl+Alt+="), "win.equalize-panes"),
+    ("Next Tab", "go-next-symbolic", Some("Ctrl+Page Down"), "win.next-tab"),
+    ("Previous Tab", "go-previous-symbolic", Some("Ctrl+Page Up"), "win.previous-tab"),
+    ("Rename Tab", "document-edit-symbolic", None, "win.tab-rename"),
+    ("Close Tab", "window-close-symbolic", None, "win.tab-close"),
+    ("Find in Terminal", "edit-find-symbolic", Some("Ctrl+Shift+F"), "win.find"),
+    ("Save File", "document-save-symbolic", Some("Ctrl+S"), "win.save-file"),
+    ("Toggle Sidebar", "sidebar-show-symbolic", Some("F9"), "win.toggle-sidebar"),
+    ("Toggle Files Panel", "folder-symbolic", Some("Ctrl+Shift+B"), "win.toggle-panel"),
+    ("Show Git", "media-record-symbolic", Some("Ctrl+Shift+G"), "win.show-git"),
+    ("Preferences", "preferences-system-symbolic", Some("Ctrl+,"), "win.settings"),
+];
+
 mod imp {
     use super::{
-        Cell, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniGrid, TuniPanel,
-        TuniTerminal, Workspace, glib,
+        Cell, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniFind, TuniGrid, TuniPanel,
+        TuniSwitcher, TuniTerminal, Workspace, glib,
     };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
@@ -102,6 +129,14 @@ mod imp {
         pub stack: RefCell<Option<gtk::Stack>>,
         /// Tab strips, or the empty state when there is nothing to show.
         pub content: RefCell<Option<gtk::Stack>>,
+        /// The find bar floating over them.
+        pub find: RefCell<Option<TuniFind>>,
+        /// The tab switcher, floating over them too.
+        pub switcher: RefCell<Option<TuniSwitcher>>,
+        /// Tabs in the order they were last worked in, most recent first, which
+        /// is the order the switcher walks. Every project's tabs are in the one
+        /// list; the switcher takes the ones belonging to the project in front.
+        pub recent: RefCell<Vec<Id>>,
         pub status: RefCell<Option<adw::StatusPage>>,
         pub status_button: RefCell<Option<gtk::Button>>,
         pub tab_bar: RefCell<Option<adw::TabBar>>,
@@ -127,6 +162,7 @@ mod imp {
             let obj = self.obj();
             obj.build_ui();
             obj.install_actions();
+            obj.install_switcher();
             obj.watch_appearance();
         }
 
@@ -289,6 +325,16 @@ impl TuniWindow {
         content_stack.add_named(&stack, Some("tabs"));
         content_stack.add_named(&status, Some("empty"));
 
+        // The find bar floats over whichever pane is showing rather than living
+        // inside one: a pane's widgets are rebuilt whenever the layout changes
+        // shape, and a bar parented there would go with them.
+        let find = TuniFind::new();
+        let switcher = TuniSwitcher::new();
+        let content_overlay = gtk::Overlay::new();
+        content_overlay.set_child(Some(&content_stack));
+        content_overlay.add_overlay(&find);
+        content_overlay.add_overlay(&switcher);
+
         let new_tab = gtk::Button::builder()
             .icon_name("tab-new-symbolic")
             .tooltip_text("New Tab (Ctrl+Shift+T)")
@@ -321,7 +367,7 @@ impl TuniWindow {
         let panel = adw::OverlaySplitView::builder()
             .sidebar(&panel_view)
             .sidebar_position(gtk::PackType::End)
-            .content(&content_stack)
+            .content(&content_overlay)
             .show_sidebar(false)
             .sidebar_width_fraction(PANEL_FRACTION)
             .min_sidebar_width(f64::from(PANEL_MIN))
@@ -393,6 +439,8 @@ impl TuniWindow {
         imp.row_menu.replace(Some(row_menu));
         imp.stack.replace(Some(stack));
         imp.content.replace(Some(content_stack));
+        imp.find.replace(Some(find));
+        imp.switcher.replace(Some(switcher));
         imp.status.replace(Some(status));
         imp.status_button.replace(Some(status_button));
         imp.tab_bar.replace(Some(tab_bar));
@@ -536,6 +584,25 @@ impl TuniWindow {
             entry("save-file", None, |window, _| {
                 if let Some(editor) = window.active_editor() {
                     editor.save();
+                }
+            }),
+            // Only over a terminal: a file pane has GtkSourceView's own search,
+            // and a diff is a rendering of a command's output rather than
+            // something to search through.
+            entry("find", None, |window, _| {
+                if let (Some(find), Some(terminal)) = (
+                    window.imp().find.borrow().clone(),
+                    window.active_terminal(),
+                ) {
+                    find.open(&terminal);
+                }
+            }),
+            entry("palette", None, |window, _| window.show_palette()),
+            // Jumps to a pane wherever it is: its project, then its tab, then
+            // the pane itself. What the palette's second section runs.
+            entry("reveal-pane", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.reveal_pane(id);
                 }
             }),
             entry("settings", None, |window, _| window.show_preferences()),
@@ -1939,6 +2006,9 @@ impl TuniWindow {
         if let Some(entry) = imp.workspace.borrow_mut().project_mut(project) {
             entry.select(selected);
         }
+        if let Some(tab) = selected {
+            self.mark_recent(tab);
+        }
         self.refresh();
         self.sync_files();
         self.focus_pane();
@@ -2081,6 +2151,333 @@ impl TuniWindow {
         self.imp().diffs.borrow().get(&pane).cloned()
     }
 
+    // --- the tab switcher ----------------------------------------------------
+
+    /// The keys the switcher lives on, watched before anything else sees them.
+    ///
+    /// Not an accelerator, because an accelerator cannot see a modifier being
+    /// let go, and letting go of `Ctrl` is the whole gesture: the switcher stays
+    /// up across as many `Tab` presses as are held for, and commits on release.
+    fn install_switcher(&self) {
+        let keys = gtk::EventControllerKey::new();
+        // The capture phase, so the pane with the keyboard never sees a `Tab`
+        // meant for the switcher.
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, state| this.switcher_key(key, state)
+        ));
+        keys.connect_key_released(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_, key, _, _| {
+                if matches!(key, gdk::Key::Control_L | gdk::Key::Control_R) {
+                    this.switcher_commit();
+                }
+            }
+        ));
+        self.add_controller(keys);
+    }
+
+    fn switcher_key(&self, key: gdk::Key, state: gdk::ModifierType) -> glib::Propagation {
+        let Some(switcher) = self.imp().switcher.borrow().clone() else {
+            return glib::Propagation::Proceed;
+        };
+        // Escape is only the switcher's while it is up; the rest of the time it
+        // belongs to whatever is in the pane.
+        if switcher.is_open() && key == gdk::Key::Escape {
+            switcher.close();
+            return glib::Propagation::Stop;
+        }
+        if !matches!(key, gdk::Key::Tab | gdk::Key::ISO_Left_Tab | gdk::Key::KP_Tab) {
+            return glib::Propagation::Proceed;
+        }
+        // `Ctrl+Alt+Tab` is the desktop's own, and `Ctrl+Shift+Tab` steps back.
+        if !state.contains(gdk::ModifierType::CONTROL_MASK)
+            || state.contains(gdk::ModifierType::ALT_MASK)
+        {
+            return glib::Propagation::Proceed;
+        }
+        let forward = !state.contains(gdk::ModifierType::SHIFT_MASK);
+
+        if switcher.is_open() {
+            switcher.step(forward);
+            return glib::Propagation::Stop;
+        }
+        let cards = self.switcher_cards();
+        if cards.len() < 2 {
+            return glib::Propagation::Proceed;
+        }
+        // Opening lands on the tab before this one, which is what one press and
+        // release is for: the way back to where the work just was.
+        let start = if forward { 1 } else { cards.len() - 1 };
+        switcher.open(&cards, start);
+        glib::Propagation::Stop
+    }
+
+    /// Selects whatever the highlight is on and puts the switcher away.
+    fn switcher_commit(&self) {
+        let Some(switcher) = self.imp().switcher.borrow().clone() else {
+            return;
+        };
+        if !switcher.is_open() {
+            return;
+        }
+        let chosen = switcher.highlighted();
+        switcher.close();
+        if let Some(tab) = chosen
+            && let (Some(view), Some(page)) =
+                (self.selected_view(), self.imp().pages.borrow().get(&tab).cloned())
+        {
+            view.set_selected_page(&page);
+        }
+    }
+
+    /// The tabs of the project in front, most recently worked in first, with a
+    /// picture of what is in each.
+    fn switcher_cards(&self) -> Vec<Card> {
+        let imp = self.imp();
+        let ordered = {
+            let workspace = imp.workspace.borrow();
+            let Some(project) = workspace.selected_project() else {
+                return Vec::new();
+            };
+            let recent = imp.recent.borrow();
+            let mut ordered: Vec<Id> = recent
+                .iter()
+                .copied()
+                .filter(|id| project.tabs().iter().any(|tab| tab.id() == *id))
+                .collect();
+            // A tab nobody has been in yet is not in the recency list at all, so
+            // the strip order fills in behind it.
+            let rest: Vec<Id> = project
+                .tabs()
+                .iter()
+                .map(Tab::id)
+                .filter(|id| !ordered.contains(id))
+                .collect();
+            ordered.extend(rest);
+            ordered
+        };
+
+        ordered
+            .into_iter()
+            .filter_map(|id| self.switcher_card(id))
+            .collect()
+    }
+
+    fn switcher_card(&self, tab: Id) -> Option<Card> {
+        let imp = self.imp();
+        let (title, pane, content) = {
+            let workspace = imp.workspace.borrow();
+            let entry = workspace
+                .projects()
+                .iter()
+                .find_map(|project| project.tabs().iter().find(|entry| entry.id() == tab))?;
+            let pane = entry.layout().focused_pane()?;
+            (
+                entry.name().to_owned(),
+                pane.id(),
+                pane.content.clone(),
+            )
+        };
+
+        let (icon, preview) = match &content {
+            Content::Terminal => (
+                "utilities-terminal-symbolic",
+                imp.terminals
+                    .borrow()
+                    .get(&pane)
+                    // A card is a picture of a screen, so it holds a screen's
+                    // worth of lines and no more.
+                    .map(|terminal| terminal.preview(28))
+                    .unwrap_or_default(),
+            ),
+            Content::File(path) => (
+                "text-x-generic-symbolic",
+                shorten(&path.to_string_lossy()),
+            ),
+            Content::Diff { path, staged } => (
+                "media-record-symbolic",
+                format!(
+                    "{}{}",
+                    shorten(&path.to_string_lossy()),
+                    if *staged { " (staged)" } else { "" }
+                ),
+            ),
+        };
+
+        Some(Card {
+            tab,
+            title,
+            icon,
+            preview,
+        })
+    }
+
+    /// A `Ctrl+Tab` on the harness's behalf, down the same path a real one
+    /// takes: the gesture the switcher lives on is a held modifier, and nothing
+    /// scripted can hold a key.
+    pub(crate) fn switcher_press(&self, forward: bool) {
+        let mut state = gdk::ModifierType::CONTROL_MASK;
+        if !forward {
+            state |= gdk::ModifierType::SHIFT_MASK;
+        }
+        let _ = self.switcher_key(gdk::Key::Tab, state);
+    }
+
+    /// Releases the modifier on the harness's behalf.
+    pub(crate) fn switcher_finish(&self) {
+        self.switcher_commit();
+    }
+
+    /// The tab the highlight is on, by name, for the harness to check.
+    #[must_use]
+    pub(crate) fn switcher_highlight(&self) -> String {
+        let chosen = self
+            .imp()
+            .switcher
+            .borrow()
+            .as_ref()
+            .and_then(TuniSwitcher::highlighted);
+        let workspace = self.imp().workspace.borrow();
+        workspace
+            .projects()
+            .iter()
+            .flat_map(|project| project.tabs())
+            .find(|tab| Some(tab.id()) == chosen)
+            .map(|tab| tab.name().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// Remembers that a tab has just been worked in, which is the order the
+    /// switcher walks.
+    fn mark_recent(&self, tab: Id) {
+        let mut recent = self.imp().recent.borrow_mut();
+        recent.retain(|id| *id != tab);
+        recent.insert(0, tab);
+    }
+
+    // --- the command palette -----------------------------------------------
+
+    /// Brings a pane on screen wherever it is: its project, then its tab within
+    /// that project, then the pane within that tab.
+    fn reveal_pane(&self, pane: Id) {
+        let imp = self.imp();
+        let found = {
+            let workspace = imp.workspace.borrow();
+            workspace.projects().iter().find_map(|project| {
+                project.tabs().iter().find_map(|tab| {
+                    tab.layout()
+                        .panes()
+                        .any(|candidate| candidate.id() == pane)
+                        .then_some((project.id(), tab.id()))
+                })
+            })
+        };
+        let Some((project, tab)) = found else {
+            return;
+        };
+
+        if imp.workspace.borrow().selected_id() != Some(project) {
+            if let Some(index) = imp.workspace.borrow().index_of(project) {
+                imp.workspace.borrow_mut().select_index(index);
+            }
+            self.show_selected_project();
+        }
+        let page = imp.pages.borrow().get(&tab).cloned();
+        if let (Some(view), Some(page)) = (self.selected_view(), page) {
+            view.set_selected_page(&page);
+        }
+        self.focus_pane_at(tab, pane);
+    }
+
+    fn show_palette(&self) {
+        crate::palette::present(self, self.palette_entries());
+    }
+
+    /// What the palette lists: the window's own actions, the projects around
+    /// this one, and every terminal in the workspace.
+    fn palette_entries(&self) -> Vec<palette::Entry> {
+        use palette::Entry;
+
+        let mut entries: Vec<Entry> = COMMANDS
+            .iter()
+            .map(|(title, icon, shortcut, action)| Entry::command(title, icon, *shortcut, action))
+            .collect();
+
+        let workspace = self.imp().workspace.borrow();
+        let selected = workspace.selected_id();
+        for (index, project) in workspace.projects().iter().enumerate() {
+            if Some(project.id()) == selected {
+                entries.push(
+                    Entry::command(
+                        &format!("Close Project: {}", project.name()),
+                        "window-close-symbolic",
+                        None,
+                        "win.close-project",
+                    )
+                    .with_target(project.id().raw().to_variant()),
+                );
+                continue;
+            }
+            entries.push(
+                Entry::command(
+                    &format!("Switch to Project: {}", project.name()),
+                    "folder-symbolic",
+                    None,
+                    "win.select-project",
+                )
+                // The action counts projects from one, the way the keys that
+                // select them do.
+                .with_target((index as i32 + 1).to_variant()),
+            );
+        }
+
+        for project in workspace.projects() {
+            for tab in project.tabs() {
+                for pane in tab.layout().panes() {
+                    // Only shells: a file pane is reached through the tree
+                    // beside it, and it is the terminals that scatter across
+                    // projects until nobody can find them.
+                    if pane.content != Content::Terminal {
+                        continue;
+                    }
+                    let title = pane
+                        .title
+                        .clone()
+                        .filter(|title| !title.is_empty())
+                        .unwrap_or_else(|| tab.name().to_owned());
+                    let directory = pane.directory.as_deref().map(shorten);
+                    entries.push(palette::Entry {
+                        search: format!(
+                            "{title} {} {}",
+                            project.name(),
+                            directory.as_deref().unwrap_or_default()
+                        ),
+                        title,
+                        subtitle: directory,
+                        icon: "utilities-terminal-symbolic",
+                        shortcut: None,
+                        action: "win.reveal-pane",
+                        target: Some(pane.id().raw().to_variant()),
+                        terminal: true,
+                    });
+                }
+            }
+        }
+        entries
+    }
+
+    /// The find bar, for the smoke captures.
+    #[must_use]
+    pub(crate) fn find_bar(&self) -> Option<TuniFind> {
+        self.imp().find.borrow().clone()
+    }
+
     pub(crate) fn active_editor(&self) -> Option<TuniEditor> {
         let pane = self.focused_pane()?;
         self.imp().editors.borrow().get(&pane).cloned()
@@ -2127,6 +2524,15 @@ impl TuniWindow {
                 button.set_label("New Project");
                 button.set_action_name(Some("win.new-project"));
             }
+        }
+
+        // A find bar pointing at a terminal that is no longer the one being
+        // worked in is searching something nobody is looking at. Everything that
+        // moves the focus — another pane, another tab, another project — comes
+        // through here.
+        let find = imp.find.borrow().clone();
+        if let Some(find) = find {
+            find.close_unless(self.active_terminal().as_ref());
         }
 
         self.refresh_names();
@@ -2556,7 +2962,16 @@ fn load_css() {
              .tuni-pane.ringed:hover > .tuni-grip { opacity: 0.35; \
               background-image: radial-gradient(circle, currentColor 1px, transparent 1px); \
               background-size: 4px 4px; }\n\
-             .tuni-drop { background-color: alpha(@accent_color, 0.28); border-radius: 6px; }\n",
+             .tuni-drop { background-color: alpha(@accent_color, 0.28); border-radius: 6px; }\n\
+             .tuni-switcher { border-radius: 26px; padding: 8px; }\n\
+             .tuni-switch-card { padding: 9px 9px 14px 9px; border-radius: 16px; }\n\
+             .tuni-switch-card.selected { background-color: alpha(currentColor, 0.20); }\n\
+             .tuni-switch-preview { border-radius: 12px; padding: 4px; \
+              border: 1px solid alpha(currentColor, 0.16); \
+              background-color: alpha(@window_bg_color, 0.7); }\n\
+             /* Small enough that a screen's worth of terminal fits the card,\n\
+                which is what makes a thumbnail readable as itself. */\n\
+             .tuni-switch-preview label { font-size: 5pt; }\n",
         );
         gtk::style_context_add_provider_for_display(
             &display,

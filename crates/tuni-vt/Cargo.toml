@@ -9,3 +9,5 @@ version.workspace = true
 
 [dependencies]
 libghostty-vt.workspace = true
+# A match is reported in cells, and one character is not always one cell.
+unicode-width = "0.2"

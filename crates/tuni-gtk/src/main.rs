@@ -5,11 +5,14 @@
 mod diff;
 mod editor;
 mod files;
+mod find;
 mod git;
 mod grid;
 mod keymap;
+mod palette;
 mod panel;
 mod preferences;
+mod switcher;
 mod terminal;
 mod tiles;
 mod window;
@@ -29,7 +32,9 @@ const APP_ID: &str = "dev.unisic.Tuni";
 /// `Ctrl+D` belong to the shell. So the application's own actions sit on
 /// `Ctrl+Shift`, which is the convention every Linux terminal follows, and tab
 /// selection on `Alt`+digit, which is what a tabbed terminal does. `Ctrl+Tab`
-/// is the exception, because nothing in a shell wants it.
+/// is the exception, because nothing in a shell wants it — and it is not in
+/// this table at all: it belongs to the tab switcher, which watches the keys
+/// itself so that it can see `Ctrl` being let go.
 ///
 /// Panes take the arrow keys under `Ctrl+Alt`, which is where a tiling window
 /// manager puts them and what kero spends ⌘⌥ on. That pushes project switching
@@ -42,8 +47,10 @@ const ACCELS: &[(&str, &[&str])] = &[
     // both means in practice. Closing a *split* tab whole stays on the tab menu
     // rather than taking `Ctrl+Shift+Q`, which every desktop reads as quit.
     ("win.close-pane", &["<Ctrl><Shift>w"]),
-    ("win.next-tab", &["<Ctrl>Tab", "<Ctrl>Page_Down"]),
-    ("win.previous-tab", &["<Ctrl><Shift>Tab", "<Ctrl>Page_Up"]),
+    // `Ctrl+Tab` is not here: it belongs to the tab switcher, which has to see
+    // the modifier being let go and so cannot be an accelerator at all.
+    ("win.next-tab", &["<Ctrl>Page_Down"]),
+    ("win.previous-tab", &["<Ctrl>Page_Up"]),
     ("win.new-project", &["<Ctrl><Shift>n"]),
     ("win.next-project", &["<Ctrl><Alt>Page_Down"]),
     ("win.previous-project", &["<Ctrl><Alt>Page_Up"]),
@@ -53,6 +60,12 @@ const ACCELS: &[(&str, &[&str])] = &[
     // And its key for the repository, which opens the panel on that page.
     ("win.show-git", &["<Ctrl><Shift>g"]),
     ("win.settings", &["<Ctrl>comma"]),
+    // Find in the terminal. `Ctrl+F` belongs to the shell — it is emacs-mode
+    // forward-char, and readline would never see it again.
+    ("win.find", &["<Ctrl><Shift>f"]),
+    // kero's palette is ⌘K; `Ctrl+K` is kill-line in a shell, so the palette
+    // takes the key every editor on this desktop puts it on.
+    ("win.palette", &["<Ctrl><Shift>p"]),
     ("win.split-right", &["<Ctrl><Shift>d"]),
     ("win.split-down", &["<Ctrl><Shift>e"]),
     ("win.focus-pane-left", &["<Ctrl><Alt>Left"]),
@@ -154,9 +167,10 @@ fn settings() -> tuni_core::settings::Settings {
 ///
 /// The rest of the family below drives one part of the window each:
 /// `TUNI_CAPTURE_ACTIONS`, `TUNI_CAPTURE_OPEN`, `TUNI_CAPTURE_DIFF`,
-/// `TUNI_CAPTURE_STAGE`, `TUNI_CAPTURE_FIND`, `TUNI_CAPTURE_EDIT`,
-/// `TUNI_CAPTURE_ZOOM`, `TUNI_CAPTURE_SCROLL`, `TUNI_CAPTURE_HOVER`, and
-/// `TUNI_CAPTURE_SELECT`.
+/// `TUNI_CAPTURE_STAGE`, `TUNI_CAPTURE_FIND`, `TUNI_CAPTURE_SEARCH`,
+/// `TUNI_CAPTURE_PALETTE`, `TUNI_CAPTURE_SWITCHER`,
+/// `TUNI_CAPTURE_EDIT`, `TUNI_CAPTURE_ZOOM`, `TUNI_CAPTURE_SCROLL`,
+/// `TUNI_CAPTURE_HOVER`, and `TUNI_CAPTURE_SELECT`.
 fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
     let Ok(path) = std::env::var("TUNI_CAPTURE_PNG") else {
         return;
@@ -339,6 +353,110 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
         );
     }
 
+    // A scripted find in the terminal: "needle" or "needle|3" to step forward
+    // three times after it. Prints the tally the bar shows, which is the check
+    // that the search reached the grid and that stepping moved through it.
+    if let Ok(spec) = std::env::var("TUNI_CAPTURE_SEARCH") {
+        let (needle, steps) = match spec.split_once('|') {
+            Some((needle, tail)) => (needle.to_owned(), tail.trim().parse::<u32>().unwrap_or(0)),
+            None => (spec, 0),
+        };
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(delay.saturating_sub(600)),
+            glib::clone!(
+                #[weak]
+                window,
+                move || {
+                    let (Some(find), Some(terminal)) = (window.find_bar(), window.active_terminal())
+                    else {
+                        eprintln!("TUNI_CAPTURE_SEARCH: no terminal is open");
+                        return;
+                    };
+                    find.open(&terminal);
+                    find.search_text(&needle);
+                    // The entry waits a moment before it searches, the way it
+                    // does for someone still typing.
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(400),
+                        move || {
+                            for _ in 0..steps {
+                                find.step_match(true);
+                            }
+                            println!("find: {}", find.tally());
+                        },
+                    );
+                }
+            ),
+        );
+    }
+
+    // The tab switcher, which no scripted key press can reach: it lives on a
+    // held modifier, and holding a key is the one thing a script cannot do.
+    // "1" is a single `Ctrl+Tab`, "3" is three of them with the modifier still
+    // down, "back" walks the other way, and "commit" lets the modifier go.
+    // Prints the tab the highlight is on.
+    if let Ok(spec) = std::env::var("TUNI_CAPTURE_SWITCHER") {
+        let mut fields = spec.split('|').map(str::trim);
+        let presses: u32 = fields.next().unwrap_or_default().parse().unwrap_or(1);
+        let flags: Vec<&str> = fields.collect();
+        let forward = !flags.contains(&"back");
+        let commit = flags.contains(&"commit");
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(delay.saturating_sub(300)),
+            glib::clone!(
+                #[weak]
+                window,
+                move || {
+                    for _ in 0..presses.max(1) {
+                        window.switcher_press(forward);
+                    }
+                    println!("switcher: {}", window.switcher_highlight());
+                    if commit {
+                        window.switcher_finish();
+                    }
+                }
+            ),
+        );
+    }
+
+    // A scripted palette: "query" opens it and types, "query|2" walks two rows
+    // down, "query|2|run" runs what that lands on. Prints the row that is
+    // selected, which is the check that the ranking put the right thing under
+    // Return.
+    if let Ok(spec) = std::env::var("TUNI_CAPTURE_PALETTE") {
+        let mut fields = spec.split('|');
+        let query = fields.next().unwrap_or_default().to_owned();
+        let rest: Vec<&str> = fields.map(str::trim).collect();
+        let steps: u32 = rest
+            .iter()
+            .find_map(|field| field.parse().ok())
+            .unwrap_or(0);
+        let run = rest.contains(&"run");
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(delay.saturating_sub(600)),
+            glib::clone!(
+                #[weak]
+                window,
+                move || {
+                    gtk::prelude::WidgetExt::activate_action(&window, "win.palette", None).ok();
+                    palette::type_query(&query);
+                    // Same wait the find bar needs: the entry searches once the
+                    // typing stops.
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(400),
+                        move || {
+                            palette::move_selection(steps);
+                            println!("palette: {}", palette::selection().unwrap_or_default());
+                            if run {
+                                palette::run_selection();
+                            }
+                        },
+                    );
+                }
+            ),
+        );
+    }
+
     // Text typed into the file that is open, and optionally the save after it:
     // "text" or "text|save". Runs the same buffer the keyboard writes into, so
     // the shot shows the unsaved mark and the disk shows what the save wrote.
@@ -468,6 +586,11 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                     eprintln!("capture failed: {error}");
                 }
                 window.force_close();
+                // A dialog on top of the window keeps it alive, and the
+                // capture is over either way.
+                if let Some(app) = window.application() {
+                    app.quit();
+                }
             }
         ),
     );

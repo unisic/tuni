@@ -104,6 +104,43 @@ struct Session {
     pty: Pty,
 }
 
+/// What the find bar asked for and what the terminal answered.
+///
+/// Empty needle means the bar is closed or has nothing typed in it, which is
+/// the same thing as far as the drawing is concerned: nothing is highlighted.
+#[derive(Default)]
+struct Find {
+    needle: String,
+    hits: Vec<tuni_vt::Hit>,
+    /// Which hit the viewport was moved to, as an index into `hits`. `None`
+    /// until the first step, so opening the bar counts matches without
+    /// dragging the viewport away from what the user was looking at.
+    current: Option<usize>,
+}
+
+impl Find {
+    fn status(&self) -> FindStatus {
+        FindStatus {
+            total: self.hits.len(),
+            // Shown to a person, so counted from one.
+            current: self.current.map(|index| index + 1),
+        }
+    }
+}
+
+/// What the find bar puts beside its entry: how many matches there are, and
+/// which of them the viewport was stepped to, if any.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FindStatus {
+    pub total: usize,
+    pub current: Option<usize>,
+}
+
+/// How far a match's background is tinted toward the theme's yellow, and how
+/// far the one the viewport is on goes past it.
+const MATCH_TINT: f64 = 0.55;
+const CURRENT_TINT: f64 = 1.0;
+
 mod imp {
     use super::*;
 
@@ -172,6 +209,11 @@ mod imp {
         /// When the user last typed. GTK stops blinking a while after input,
         /// so an idle terminal does not animate forever.
         pub(super) last_input: Cell<Option<Instant>>,
+        /// What the find bar is looking for, where it is, and which of those is
+        /// the one the viewport was moved to, plus whether a re-search over new
+        /// output is already queued.
+        pub(super) find: RefCell<Find>,
+        pub(super) find_pending: Cell<bool>,
         /// Draw timings, collected only when TUNI_DEBUG_FRAME_TIME is set.
         /// This is the measurement that decides whether Pango can keep up.
         pub(super) frame_timing: bool,
@@ -215,6 +257,8 @@ mod imp {
                 blink_source: RefCell::new(None),
                 blink_wanted: Cell::new(false),
                 last_input: Cell::new(None),
+                find: RefCell::new(Find::default()),
+                find_pending: Cell::new(false),
                 frame_timing: std::env::var_os("TUNI_DEBUG_FRAME_TIME").is_some(),
                 frame_times: RefCell::new(Vec::with_capacity(120)),
             }
@@ -259,6 +303,10 @@ mod imp {
                     // The application rang. A tab that is not on screen shows it
                     // as an attention mark rather than as a sound.
                     glib::subclass::Signal::builder("bell").build(),
+                    // Output changed what the live search finds. The find bar
+                    // reads the tally back rather than being handed it, because
+                    // by the time it runs the terminal may have moved on again.
+                    glib::subclass::Signal::builder("find-changed").build(),
                 ]
             })
         }
@@ -867,6 +915,7 @@ impl TuniTerminal {
             }
         }
         self.invalidate_links();
+        self.schedule_refind();
         self.queue_draw();
     }
 
@@ -900,8 +949,10 @@ impl TuniTerminal {
                 let _ = session.pty.resize(cols, rows, cell.0, cell.1);
             }
         }
-        // Reflow moves every viewport coordinate, the hover's cells among them.
+        // Reflow moves every viewport coordinate, the hover's cells among them,
+        // and every row a match was found on.
         self.invalidate_links();
+        self.schedule_refind();
     }
 
     // --- cursor blinking -----------------------------------------------------
@@ -1133,6 +1184,203 @@ impl TuniTerminal {
         self.invalidate_links();
         self.reveal_scrollbar();
         self.queue_draw();
+    }
+
+    /// What is on screen as plain text, the last `lines` of it, for the card
+    /// the tab switcher draws.
+    ///
+    /// The tail rather than the head: the bottom of a terminal is where the
+    /// work is, and a card showing the top of a full screen would be a picture
+    /// of whatever scrolled past minutes ago.
+    #[must_use]
+    pub fn preview(&self, lines: usize) -> String {
+        let mut guard = self.imp().session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return String::new();
+        };
+        let Ok(grid) = session.term.snapshot() else {
+            return String::new();
+        };
+        let mut rows: Vec<String> = (0..grid.rows)
+            .map(|row| {
+                let text: String = grid.row(row).iter().map(|cell| cell.text.as_str()).collect();
+                text.trim_end().to_owned()
+            })
+            .collect();
+        while rows.last().is_some_and(String::is_empty) {
+            rows.pop();
+        }
+        if rows.len() > lines {
+            rows.drain(..rows.len() - lines);
+        }
+        rows.join("\n")
+    }
+
+    // --- find ----------------------------------------------------------------
+
+    /// Look for `needle`, forget where the last search was, and report the tally
+    /// the find bar shows. An empty needle is how the bar says it has nothing to
+    /// look for, and clears the highlight.
+    pub fn find(&self, needle: &str) -> FindStatus {
+        let hits = self.search(needle);
+        let imp = self.imp();
+        let mut find = imp.find.borrow_mut();
+        needle.clone_into(&mut find.needle);
+        find.hits = hits;
+        find.current = None;
+        let status = find.status();
+        drop(find);
+        self.queue_draw();
+        status
+    }
+
+    /// Move to the next match, or the previous one, scrolling it into view.
+    ///
+    /// The first step from a fresh search starts at the viewport rather than at
+    /// the top of the scrollback, so a user who typed something visible steps to
+    /// what they can already see instead of to the oldest match in the history.
+    pub fn find_step(&self, forward: bool) -> FindStatus {
+        let imp = self.imp();
+        let mut find = imp.find.borrow_mut();
+        if find.hits.is_empty() {
+            return find.status();
+        }
+
+        let last = find.hits.len() - 1;
+        let next = match find.current {
+            Some(current) if forward => {
+                if current == last {
+                    0
+                } else {
+                    current + 1
+                }
+            }
+            Some(current) => {
+                if current == 0 {
+                    last
+                } else {
+                    current - 1
+                }
+            }
+            None => {
+                let view = imp.scroll.get();
+                let bottom = view.offset + view.len;
+                if forward {
+                    find.hits
+                        .iter()
+                        .position(|hit| hit.row >= view.offset)
+                        .unwrap_or(0)
+                } else {
+                    find.hits
+                        .iter()
+                        .rposition(|hit| hit.row < bottom)
+                        .unwrap_or(last)
+                }
+            }
+        };
+        find.current = Some(next);
+        let row = find.hits[next].row;
+        let status = find.status();
+        drop(find);
+
+        self.scroll_into_view(row);
+        self.queue_draw();
+        status
+    }
+
+    /// Put the find state back to nothing, which also takes the highlight off.
+    pub fn find_clear(&self) {
+        let imp = self.imp();
+        let mut find = imp.find.borrow_mut();
+        if find.needle.is_empty() && find.hits.is_empty() {
+            return;
+        }
+        *find = Find::default();
+        drop(find);
+        self.queue_draw();
+    }
+
+    fn search(&self, needle: &str) -> Vec<tuni_vt::Hit> {
+        let mut guard = self.imp().session.borrow_mut();
+        guard
+            .as_mut()
+            .and_then(|session| session.term.search(needle).ok())
+            .unwrap_or_default()
+    }
+
+    /// Scroll only when `row` is off screen, and then put it a third of the way
+    /// down, where the line around a match is readable.
+    fn scroll_into_view(&self, row: usize) {
+        let imp = self.imp();
+        let view = imp.scroll.get();
+        if row >= view.offset && row < view.offset + view.len {
+            return;
+        }
+
+        let mut guard = imp.session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        session.term.scroll_to_row(row.saturating_sub(view.len / 3));
+        imp.scroll.set(session.term.scroll_position());
+        drop(guard);
+
+        self.invalidate_links();
+        self.reveal_scrollbar();
+    }
+
+    /// The tally as it stands, for a find bar that has just been told the
+    /// terminal's matches moved.
+    pub fn find_status(&self) -> FindStatus {
+        self.imp().find.borrow().status()
+    }
+
+    /// Ask for the live search to be run again once the current burst of output
+    /// is over.
+    ///
+    /// A search reads the whole screen, and output arrives in chunks, so running
+    /// it per chunk would search the same screen several times for one frame.
+    /// The idle handler runs once per main-loop turn instead, which is the same
+    /// rate the widget redraws at.
+    fn schedule_refind(&self) {
+        let imp = self.imp();
+        if imp.find.borrow().needle.is_empty() || imp.find_pending.replace(true) {
+            return;
+        }
+        glib::idle_add_local_once(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move || {
+                this.imp().find_pending.set(false);
+                let before = this.find_status();
+                this.refind();
+                if this.find_status() != before {
+                    this.emit_by_name::<()>("find-changed", &[]);
+                }
+                this.queue_draw();
+            }
+        ));
+    }
+
+    /// Run the live search again over what the terminal now holds.
+    ///
+    /// Output moves every row a match sits on, so the hits are re-taken rather
+    /// than adjusted. The step index is kept where it was if there is still a
+    /// match there, which holds Enter-Enter-Enter stepping steady under a shell
+    /// that keeps printing, and the viewport is left alone either way.
+    fn refind(&self) {
+        let imp = self.imp();
+        let needle = imp.find.borrow().needle.clone();
+        if needle.is_empty() {
+            return;
+        }
+        let hits = self.search(&needle);
+        let mut find = imp.find.borrow_mut();
+        find.current = find
+            .current
+            .filter(|_| !hits.is_empty())
+            .map(|current| current.min(hits.len() - 1));
+        find.hits = hits;
     }
 
     // --- mouse ---------------------------------------------------------------
@@ -1780,6 +2028,14 @@ impl TuniTerminal {
         let height = self.height() as f32;
 
         let mut guard = imp.session.borrow_mut();
+        // Taken before the grid, which borrows the terminal for the rest of the
+        // frame. Search hits are in scrollback rows and this is what turns them
+        // into viewport rows.
+        let view = guard
+            .as_ref()
+            .map_or_else(ScrollPosition::default, |session| {
+                session.term.scroll_position()
+            });
         let grid = guard
             .as_mut()
             .and_then(|session| session.term.snapshot().ok());
@@ -1841,6 +2097,42 @@ impl TuniTerminal {
             None => Vec::new(),
         };
 
+        // Search hits as a second bitmap: 0 no match, 1 a match, 2 the one the
+        // viewport was stepped to. A common needle can match thousands of times,
+        // so the list is walked once here rather than once per row.
+        let find = imp.find.borrow();
+        let mut marks = Vec::new();
+        if !find.hits.is_empty() {
+            marks = vec![0u8; usize::from(grid.cols) * usize::from(grid.rows)];
+            for (index, hit) in find.hits.iter().enumerate() {
+                let Some(row) = hit.row.checked_sub(view.offset) else {
+                    continue;
+                };
+                if row >= usize::from(grid.rows) {
+                    continue;
+                }
+                let base = row * usize::from(grid.cols);
+                let mark = if find.current == Some(index) { 2 } else { 1 };
+                let end = usize::from(hit.col) + usize::from(hit.len);
+                for col in usize::from(hit.col)..end.min(usize::from(grid.cols)) {
+                    marks[base + col] = mark;
+                }
+            }
+        }
+        drop(find);
+
+        // A match is drawn as a solid block the way a selection is, because a
+        // tint under whatever colors the shell chose is not reliably legible.
+        // The text on top is repainted in whichever of black or white survives.
+        let page = tuni_core::theme::Rgb::new(background.r, background.g, background.b);
+        let hit_bg = [
+            page,
+            page.blend(imp.theme.borrow().palette[3], MATCH_TINT),
+            page.blend(imp.theme.borrow().palette[3], CURRENT_TINT),
+        ];
+        let hit_fg = hit_bg.map(|color| theme_rgb(color.contrasting()));
+        let hit_bg = hit_bg.map(theme_rgb);
+
         let mut text = String::with_capacity(256);
 
         for row in 0..grid.rows {
@@ -1848,12 +2140,16 @@ impl TuniTerminal {
             let y = row as f32 * m.cell_height;
             let base = usize::from(row) * usize::from(grid.cols);
             let hot = |col: usize| hot.get(base + col).copied().unwrap_or(false);
+            let mark = |col: usize| marks.get(base + col).copied().unwrap_or(0);
 
             // Backgrounds first, batched into runs of equal color, so a full
             // reverse-video line is one rectangle rather than eighty.
             let mut run_start: Option<(usize, Rgb)> = None;
             for (col, cell) in cells.iter().enumerate() {
-                let bg = cell.bg;
+                let bg = match mark(col) {
+                    0 => cell.bg,
+                    other => Some(hit_bg[usize::from(other)]),
+                };
                 match (&run_start, bg) {
                     (Some((start, current)), Some(bg)) if *current == bg => {
                         let _ = start;
@@ -1879,12 +2175,12 @@ impl TuniTerminal {
                 }
 
                 let start = col;
-                let style = style_key(&cells[col], hot(col));
+                let style = style_key(&cells[col], hot(col), mark(col));
                 text.clear();
 
                 while col < cells.len() {
                     let cell = &cells[col];
-                    if cell.text.is_empty() || style_key(cell, hot(col)) != style {
+                    if cell.text.is_empty() || style_key(cell, hot(col), mark(col)) != style {
                         break;
                     }
                     // Anything that is not one plain ASCII character is laid
@@ -1904,7 +2200,11 @@ impl TuniTerminal {
                     }
                 }
 
-                painter.draw_run(start, y, &text, &cells[start], hot(start));
+                let fg = match mark(start) {
+                    0 => cells[start].fg,
+                    other => hit_fg[usize::from(other)],
+                };
+                painter.draw_run(start, y, &text, &cells[start], hot(start), fg);
             }
         }
         drop(hovered);
@@ -1965,6 +2265,9 @@ struct StyleKey {
     /// Whether the hovered hyperlink covers this cell. Part of the key so a run
     /// breaks where the highlight does.
     link: bool,
+    /// Which search highlight this cell carries, for the same reason: a run has
+    /// to break where the match does, because the text color changes there.
+    mark: u8,
 }
 
 fn mouse_button(button: u32) -> Option<MouseButton> {
@@ -1997,7 +2300,7 @@ fn is_simple(text: &str) -> bool {
     matches!(chars.next(), Some(c) if c == ' ' || c.is_ascii_graphic()) && chars.next().is_none()
 }
 
-fn style_key(cell: &tuni_vt::Cell, link: bool) -> StyleKey {
+fn style_key(cell: &tuni_vt::Cell, link: bool, mark: u8) -> StyleKey {
     StyleKey {
         fg: cell.fg,
         bold: cell.bold,
@@ -2005,6 +2308,7 @@ fn style_key(cell: &tuni_vt::Cell, link: bool) -> StyleKey {
         underline: cell.underline,
         strikethrough: cell.strikethrough,
         link,
+        mark,
     }
 }
 
@@ -2072,7 +2376,15 @@ impl Painter<'_> {
 
     /// One run of text sharing a style, placed at its own column origin so
     /// per-run advance drift cannot accumulate across the line.
-    fn draw_run(&self, start: usize, y: f32, text: &str, style: &tuni_vt::Cell, link: bool) {
+    fn draw_run(
+        &self,
+        start: usize,
+        y: f32,
+        text: &str,
+        style: &tuni_vt::Cell,
+        link: bool,
+        fg: Rgb,
+    ) {
         let mut desc = self.font.clone();
         if style.bold {
             desc.set_weight(pango::Weight::Bold);
@@ -2113,7 +2425,7 @@ impl Painter<'_> {
             start as f32 * self.m.cell_width,
             y + self.baseline_offset(),
         ));
-        self.snapshot.append_layout(self.layout, &rgba(style.fg));
+        self.snapshot.append_layout(self.layout, &rgba(fg));
         self.snapshot.restore();
     }
 

@@ -668,3 +668,58 @@ fn two_hyperlinks_are_told_apart_by_their_uris() {
     assert_eq!(second.uri, "https://two.example");
     assert_eq!(second.cells, vec![(3, 0), (4, 0)]);
 }
+
+// --- search -------------------------------------------------------------------
+
+#[test]
+fn a_match_is_reported_on_the_row_the_viewport_can_scroll_to() {
+    let mut terminal = Terminal::new(20, 3, 100).expect("terminal");
+    terminal.feed(b"alpha\r\nbeta\r\ngamma\r\ndelta\r\nepsilon");
+
+    let hits = terminal.search("beta").expect("search");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].col, 0);
+    assert_eq!(hits[0].len, 4);
+
+    // The row a hit names is the row that puts it at the top of the viewport.
+    terminal.scroll_to_row(hits[0].row);
+    assert_eq!(row_text(&mut terminal, 0), "beta");
+}
+
+#[test]
+fn a_search_ignores_case_and_finds_every_occurrence_on_a_row() {
+    let mut terminal = Terminal::new(40, 4, 100).expect("terminal");
+    terminal.feed(b"Error: error while erroring");
+
+    let hits = terminal.search("ERROR").expect("search");
+    assert_eq!(hits.len(), 3);
+    assert!(hits.iter().all(|hit| hit.row == hits[0].row));
+    assert_eq!(hits[0].col, 0);
+    assert_eq!(hits[1].col, 7);
+    assert_eq!(hits[2].col, 19);
+}
+
+#[test]
+fn a_match_after_a_double_width_character_is_reported_in_cells() {
+    let mut terminal = Terminal::new(20, 3, 100).expect("terminal");
+    // Two cells for the ideograph, then the needle.
+    terminal.feed("漢x".as_bytes());
+
+    let hits = terminal.search("x").expect("search");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].col, 2);
+}
+
+#[test]
+fn an_empty_needle_matches_nothing() {
+    let mut terminal = Terminal::new(20, 3, 100).expect("terminal");
+    terminal.feed(b"anything at all");
+    assert!(terminal.search("").expect("search").is_empty());
+}
+
+#[test]
+fn a_needle_that_is_not_there_is_not_found() {
+    let mut terminal = Terminal::new(20, 3, 100).expect("terminal");
+    terminal.feed(b"one\r\ntwo");
+    assert!(terminal.search("three").expect("search").is_empty());
+}

@@ -32,6 +32,7 @@ use libghostty_vt::terminal::{
     Terminal as VtTerminal,
 };
 use libghostty_vt::{key, mouse, paste};
+use unicode_width::UnicodeWidthChar;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -108,6 +109,66 @@ impl ScrollPosition {
         let travel = self.total.saturating_sub(self.len);
         (fraction.clamp(0.0, 1.0) * travel as f64).round() as usize
     }
+}
+
+/// Where one search match sits: the row it is on, counted from the top of the
+/// scrollback the way [`ScrollPosition::offset`] counts, and the cells it
+/// covers on that row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Hit {
+    pub row: usize,
+    pub col: u16,
+    pub len: u16,
+}
+
+/// Records every non-overlapping, case-insensitive occurrence of `needle` in
+/// one row of text, in cells rather than in characters.
+fn find_in_line(line: &str, needle: &str, row: usize, hits: &mut Vec<Hit>) {
+    let mut byte = 0;
+    let mut col = 0usize;
+    while byte < line.len() {
+        let rest = &line[byte..];
+        if let Some(len) = match_at(rest, needle) {
+            let width = cells(&rest[..len]);
+            hits.push(Hit {
+                row,
+                col: u16::try_from(col).unwrap_or(u16::MAX),
+                len: u16::try_from(width).unwrap_or(u16::MAX),
+            });
+            byte += len;
+            col += width;
+            continue;
+        }
+        let Some(next) = rest.chars().next() else {
+            break;
+        };
+        byte += next.len_utf8();
+        col += cells(next.encode_utf8(&mut [0u8; 4]));
+    }
+}
+
+/// The length in bytes of `needle` matching at the front of `haystack`,
+/// ignoring case. The two can differ in length — a character whose lowercase
+/// form is a different width still matches.
+fn match_at(haystack: &str, needle: &str) -> Option<usize> {
+    let mut chars = haystack.char_indices();
+    let mut end = 0;
+    for wanted in needle.chars() {
+        let (index, found) = chars.next()?;
+        if found != wanted && !found.to_lowercase().eq(wanted.to_lowercase()) {
+            return None;
+        }
+        end = index + found.len_utf8();
+    }
+    Some(end)
+}
+
+/// How many cells a piece of text occupies. A combining mark is part of the
+/// cell before it and adds nothing.
+fn cells(text: &str) -> usize {
+    text.chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
 }
 
 /// Pixel geometry of the rendered grid.
@@ -258,6 +319,9 @@ pub struct Terminal {
     /// Scratch buffer for a hyperlink URI, reused so hovering a link does not
     /// allocate once per cell of the viewport.
     link_buf: Vec<u8>,
+    /// Scratch buffer for the whole screen as text, reused because a find bar
+    /// searches it again on every keystroke.
+    search_buf: Vec<u8>,
     /// Selection colors, which the library does not own: selection is drawn by
     /// us, over cells the library only marks.
     selection_colors: Option<(Option<Rgb>, Option<Rgb>)>,
@@ -345,6 +409,7 @@ impl Terminal {
             encoded: Vec::with_capacity(64),
             selection_buf: Vec::new(),
             link_buf: Vec::new(),
+            search_buf: Vec::new(),
             selection_colors: None,
             cursor_text: None,
         })
@@ -705,6 +770,69 @@ impl Terminal {
                 Err(Error::OutOfSpace { required }) if required > self.encoded.len() => {
                     self.encoded.resize(required, 0);
                     data.copy_from_slice(text.as_bytes());
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    // --- search --------------------------------------------------------------
+
+    /// Every place `needle` occurs in what the terminal is holding, screen and
+    /// scrollback alike, in reading order.
+    ///
+    /// Upstream has no search of its own, so this is the whole screen formatted
+    /// as text — one line per row, so the line a match lands on *is* its row —
+    /// scanned case-insensitively. Soft-wrapped lines are left wrapped for that
+    /// reason: a row has to keep its number for the viewport to be able to
+    /// scroll to it, which also means a match split across a wrap is two rows
+    /// and is not found. Ghostty's own search has the same limit.
+    ///
+    /// Matches do not overlap, and an empty needle matches nothing rather than
+    /// everything.
+    pub fn search(&mut self, needle: &str) -> Result<Vec<Hit>> {
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(text) = self.screen_text()? else {
+            return Ok(Vec::new());
+        };
+
+        let mut hits = Vec::new();
+        for (row, line) in text.split('\n').enumerate() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            find_in_line(line, needle, row, &mut hits);
+        }
+        Ok(hits)
+    }
+
+    /// The whole screen as plain text, one line per row.
+    fn screen_text(&mut self) -> Result<Option<String>> {
+        let Some(selection) = self.inner.select_all()? else {
+            return Ok(None);
+        };
+        if self.search_buf.is_empty() {
+            self.search_buf.resize(64 * 1024, 0);
+        }
+        loop {
+            // Neither unwrapped nor trimmed: both would move text off the row
+            // it is actually on, and a row number is what a hit is for.
+            let options = FormatOptions::new()
+                .with_emit_format(Format::Plain)
+                .with_selection(&selection)
+                .with_unwrap(false)
+                .with_trim(false);
+            match self.inner.format_selection_buf(options, &mut self.search_buf) {
+                Ok(None) => return Ok(None),
+                Ok(Some(len)) => {
+                    return Ok(Some(
+                        String::from_utf8_lossy(&self.search_buf[..len]).into_owned(),
+                    ));
+                }
+                // Grow and retry. A required size that would not actually grow
+                // the buffer would loop forever, so treat it as a failure.
+                Err(Error::OutOfSpace { required }) if required > self.search_buf.len() => {
+                    self.search_buf.resize(required, 0);
                 }
                 Err(err) => return Err(err),
             }

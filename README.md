@@ -66,6 +66,17 @@ either way it is a patch handed to `git apply`, so the index ends up where the
 command line would have left it. What the shell beside the pane does to the file
 lands in the diff on its own.
 
+Three ways to get somewhere. `Ctrl+Shift+F` opens a find bar over the terminal:
+every match on screen and in the scrollback is highlighted as you type, the
+tally counts them, and Enter walks forward while Shift+Enter walks back,
+scrolling each match into view. `Ctrl+Shift+P` opens the command palette —
+everything the window can do, by name, with the keys that do the same thing
+beside it, and under that every terminal in the workspace, so a shell in another
+project is one query away rather than a hunt through tabs. Holding `Ctrl` and
+pressing `Tab` brings up the tab switcher: a card per tab with a picture of what
+is in it, in the order they were last worked in, so one press and release goes
+back to where you just were.
+
 Closing the window writes that arrangement down, and opening it again puts it
 back: the projects, their tabs, the columns and panes inside each one with the
 room they had, the names that were typed, and a fresh shell in each pane's last
@@ -86,7 +97,8 @@ scrollback, and that last decision, writing each change to
 | Drag a pane's grip onto another | Move it to that pane's left, right, top, or bottom |
 | Drag the gap between panes | Move the divider |
 | `Ctrl+Shift+T` | New tab |
-| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next tab, previous tab — also `Ctrl+Page Down` / `Ctrl+Page Up` |
+| `Ctrl+Page Down` / `Ctrl+Page Up` | Next tab, previous tab |
+| Hold `Ctrl`, press `Tab` | The tab switcher: cards for every tab, most recently used first. `Shift+Tab` walks back, `Escape` cancels, letting `Ctrl` go switches |
 | `Alt+1` … `Alt+9` | Jump to a tab; `Alt+9` is the last one |
 | `Ctrl+Shift+N` | New project |
 | `Ctrl+Alt+Page Down` / `Ctrl+Alt+Page Up` | Next project, previous project |
@@ -96,6 +108,8 @@ scrollback, and that last decision, writing each change to
 | `Ctrl+Shift+G` | Open the panel on the repository |
 | `Ctrl+,` | Preferences |
 | `Ctrl+S` | Save the file in the focused pane |
+| `Ctrl+Shift+P` | The command palette |
+| `Ctrl+Shift+F` | Find in the terminal; Enter and `Shift+Enter` walk the matches, `Escape` closes |
 | `Ctrl+F` / `Ctrl+H` | Find, find and replace — in a file pane only |
 | `Ctrl+G` / `Ctrl+Shift+G` | Next match, previous match — in a file pane only |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection, paste |
@@ -109,8 +123,7 @@ scrollback, and that last decision, writing each change to
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
 
-From here the work runs to full parity: the command palette, the tab switcher,
-find in the terminal, and packaging.
+From here the work runs to full parity: desktop notifications and packaging.
 
 Consuming a 200 MiB stream, measured with `scripts/throughput.sh` on this
 machine:

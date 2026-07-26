@@ -989,6 +989,7 @@ name = "tuni-vt"
 version = "0.0.0"
 dependencies = [
  "libghostty-vt",
+ "unicode-width",
 ]
 
 [[package]]

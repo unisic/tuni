@@ -7,6 +7,7 @@
 pub mod diff;
 pub mod editor;
 pub mod files;
+pub mod fuzzy;
 pub mod git;
 pub mod panes;
 pub mod session;
