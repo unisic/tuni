@@ -21,8 +21,8 @@ use tuni_core::TerminalConfig;
 use tuni_core::theme::Theme;
 use tuni_pty::{Pty, PtyConfig, PtyEvent};
 use tuni_vt::{
-    ClipboardTarget, Colors, CursorShape, Geometry, Key, KeyAction, KeyInput, Mods, MouseAction,
-    MouseButton, MouseInput, Progress, Rgb, ScrollPosition,
+    ClipboardTarget, Colors, CursorShape, Geometry, Key, KeyAction, KeyInput, Layer, Mods,
+    MouseAction, MouseButton, MouseInput, Progress, Rgb, ScrollPosition,
 };
 
 use crate::keymap;
@@ -108,6 +108,48 @@ impl Default for Metrics {
 struct Session {
     term: tuni_vt::Terminal,
     pty: Pty,
+}
+
+/// How many inline images are kept as textures at once. An image is uploaded
+/// again the moment it is drawn again, so this only decides how much scrolling
+/// past a picture costs; it is not a limit on how many a terminal may hold.
+const TEXTURE_CACHE: usize = 16;
+
+/// Uploaded inline images, keyed by which image and which version of it.
+///
+/// The key carries the storage's generation, so a plot redrawn under the same
+/// image id lands as a new texture rather than as the previous frame.
+#[derive(Default)]
+struct Textures {
+    map: std::collections::HashMap<tuni_vt::ImageKey, gdk::MemoryTexture>,
+    /// Insertion order, for evicting the oldest when the map is full.
+    order: std::collections::VecDeque<tuni_vt::ImageKey>,
+}
+
+impl Textures {
+    fn get(&self, key: &tuni_vt::ImageKey) -> Option<&gdk::MemoryTexture> {
+        self.map.get(key)
+    }
+
+    fn insert(&mut self, key: tuni_vt::ImageKey, pixels: &tuni_vt::Pixels) {
+        let stride = pixels.width as usize * 4;
+        let bytes = glib::Bytes::from(&pixels.rgba[..]);
+        let texture = gdk::MemoryTexture::new(
+            pixels.width as i32,
+            pixels.height as i32,
+            // Straight alpha, which is what the protocol transmits.
+            gdk::MemoryFormat::R8g8b8a8,
+            &bytes,
+            stride,
+        );
+        while self.order.len() >= TEXTURE_CACHE {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.order.push_back(key);
+        self.map.insert(key, texture);
+    }
 }
 
 /// What the find bar asked for and what the terminal answered.
@@ -226,6 +268,12 @@ mod imp {
         pub(super) progress: Cell<Option<Progress>>,
         pub(super) progress_value: Cell<u8>,
         pub(super) progress_stale: RefCell<Option<glib::SourceId>>,
+        /// Inline images: where this frame's are, and the textures they were
+        /// last uploaded as. The geometry is rebuilt every frame because
+        /// scrolling moves it; the pixels are not, because they are the
+        /// expensive half.
+        pub(super) images: RefCell<Vec<tuni_vt::Placement>>,
+        pub(super) textures: RefCell<Textures>,
         /// Draw timings, collected only when TUNI_DEBUG_FRAME_TIME is set.
         /// This is the measurement that decides whether Pango can keep up.
         pub(super) frame_timing: bool,
@@ -274,6 +322,8 @@ mod imp {
                 progress: Cell::new(None),
                 progress_value: Cell::new(0),
                 progress_stale: RefCell::new(None),
+                images: RefCell::new(Vec::new()),
+                textures: RefCell::new(Textures::default()),
                 frame_timing: std::env::var_os("TUNI_DEBUG_FRAME_TIME").is_some(),
                 frame_times: RefCell::new(Vec::with_capacity(120)),
             }
@@ -2071,6 +2121,27 @@ impl TuniTerminal {
             .map_or_else(ScrollPosition::default, |session| {
                 session.term.scroll_position()
             });
+        // Inline images, before the grid for the same reason as the scroll
+        // position: the snapshot borrows the terminal for the rest of the frame.
+        // Only a cache miss reads pixels, so a program redrawing a plot every
+        // frame uploads once per version of it rather than once per frame.
+        {
+            let mut placements = imp.images.borrow_mut();
+            placements.clear();
+            if let Some(session) = guard.as_ref() {
+                let _ = session.term.images(&mut placements);
+                let mut textures = imp.textures.borrow_mut();
+                for placement in placements.iter() {
+                    if textures.get(&placement.image).is_some() {
+                        continue;
+                    }
+                    if let Ok(Some(pixels)) = session.term.image_pixels(placement.image.id) {
+                        textures.insert(placement.image, &pixels);
+                    }
+                }
+            }
+        }
+
         let grid = guard
             .as_mut()
             .and_then(|session| session.term.snapshot().ok());
@@ -2170,14 +2241,21 @@ impl TuniTerminal {
 
         let mut text = String::with_capacity(256);
 
+        // Images stack in three layers of their own, and the cells they cover
+        // are drawn around them: under the backgrounds, between the backgrounds
+        // and the text, or over everything. So backgrounds and text are two
+        // passes over the rows rather than one, with the images in between.
+        let images = imp.images.borrow();
+        let textures = imp.textures.borrow();
+        self.draw_images(snapshot, &images, &textures, Layer::BelowBackground, m);
+
         for row in 0..grid.rows {
             let cells = grid.row(row);
             let y = row as f32 * m.cell_height;
             let base = usize::from(row) * usize::from(grid.cols);
-            let hot = |col: usize| hot.get(base + col).copied().unwrap_or(false);
             let mark = |col: usize| marks.get(base + col).copied().unwrap_or(0);
 
-            // Backgrounds first, batched into runs of equal color, so a full
+            // Backgrounds, batched into runs of equal color, so a full
             // reverse-video line is one rectangle rather than eighty.
             let mut run_start: Option<(usize, Rgb)> = None;
             for (col, cell) in cells.iter().enumerate() {
@@ -2200,8 +2278,18 @@ impl TuniTerminal {
             if let Some((start, color)) = run_start {
                 painter.fill_run(start, cells.len(), y, color);
             }
+        }
 
-            // Then text, batched into runs sharing a style.
+        self.draw_images(snapshot, &images, &textures, Layer::BelowText, m);
+
+        for row in 0..grid.rows {
+            let cells = grid.row(row);
+            let y = row as f32 * m.cell_height;
+            let base = usize::from(row) * usize::from(grid.cols);
+            let hot = |col: usize| hot.get(base + col).copied().unwrap_or(false);
+            let mark = |col: usize| marks.get(base + col).copied().unwrap_or(0);
+
+            // Text, batched into runs sharing a style.
             let mut col = 0usize;
             while col < cells.len() {
                 if cells[col].text.is_empty() {
@@ -2252,6 +2340,10 @@ impl TuniTerminal {
                 painter.draw_cursor(&cursor, grid, self.has_focus());
             }
         }
+
+        self.draw_images(snapshot, &images, &textures, Layer::AboveText, m);
+        drop(images);
+        drop(textures);
         drop(font);
         drop(guard);
 
@@ -2262,6 +2354,60 @@ impl TuniTerminal {
 
         self.draw_scrollbar(snapshot);
         self.draw_progress(snapshot);
+    }
+
+    /// The inline images of one layer.
+    ///
+    /// A placement names a rectangle of the image and a rectangle of the
+    /// terminal to put it in; a texture node takes neither, only a rectangle to
+    /// draw the whole texture into. So the whole image is placed at whatever
+    /// size and offset makes the wanted part land where it belongs, and the
+    /// clip cuts away the rest. That is also what handles a picture that has
+    /// scrolled halfway off the top, which arrives as a negative row.
+    fn draw_images(
+        &self,
+        snapshot: &gtk::Snapshot,
+        images: &[tuni_vt::Placement],
+        textures: &Textures,
+        layer: Layer,
+        m: Metrics,
+    ) {
+        let bounds = graphene::Rect::new(0.0, 0.0, self.width() as f32, self.height() as f32);
+        for placement in images.iter().filter(|image| image.layer() == layer) {
+            if placement.width == 0
+                || placement.height == 0
+                || placement.source_width == 0
+                || placement.source_height == 0
+            {
+                continue;
+            }
+            let Some(texture) = textures.get(&placement.image) else {
+                continue;
+            };
+
+            let x = placement.col as f32 * m.cell_width + placement.x_offset as f32;
+            let y = placement.row as f32 * m.cell_height + placement.y_offset as f32;
+            let clip = graphene::Rect::new(x, y, placement.width as f32, placement.height as f32);
+            let Some(clip) = clip.intersection(&bounds) else {
+                continue;
+            };
+
+            let scale_x = placement.width as f32 / placement.source_width as f32;
+            let scale_y = placement.height as f32 / placement.source_height as f32;
+            let whole = graphene::Rect::new(
+                x - placement.source_x as f32 * scale_x,
+                y - placement.source_y as f32 * scale_y,
+                texture.width() as f32 * scale_x,
+                texture.height() as f32 * scale_y,
+            );
+
+            snapshot.push_clip(&clip);
+            // Trilinear rather than the default: an image is nearly always
+            // asked for at a size that is not its own, and a terminal scales
+            // down more often than up.
+            snapshot.append_scaled_texture(texture, gtk::gsk::ScalingFilter::Trilinear, &whole);
+            snapshot.pop();
+        }
     }
 
     /// Takes a progress report (OSC 9;4) and puts the bar where it says.

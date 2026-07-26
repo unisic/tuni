@@ -9,9 +9,11 @@
 //! byte buffers over a channel.
 
 mod grid;
+mod image;
 mod osc;
 
 pub use grid::{Cell, Cursor, CursorShape, Grid, LinkHover, Rgb};
+pub use image::{ImageKey, Layer, Pixels, Placement};
 pub use libghostty_vt::Error;
 pub use libghostty_vt::key::{Action as KeyAction, Key, Mods};
 pub use libghostty_vt::mouse::{Action as MouseAction, Button as MouseButton};
@@ -349,6 +351,13 @@ impl Terminal {
             max_scrollback,
         })?;
 
+        // The Kitty graphics protocol is off until a storage limit says
+        // otherwise, and a PNG transmission is refused until a decoder is
+        // installed. Both are the embedder's to decide, so both are decided
+        // here rather than left at a default that draws nothing.
+        image::install_png_decoder();
+        inner.set_kitty_image_storage_limit(image::STORAGE_LIMIT)?;
+
         let effects = Rc::new(RefCell::new(Effects::default()));
 
         let sink = Rc::clone(&effects);
@@ -488,6 +497,27 @@ impl Terminal {
     ) -> Result<()> {
         self.inner
             .resize(cols.max(1), rows.max(1), cell_width_px, cell_height_px)
+    }
+
+    /// Fill `out` with every inline image the viewport shows, bottom of the
+    /// stack first.
+    ///
+    /// Geometry alone: scrolling and resizing move a placement without touching
+    /// the image storage, so this is recomputed per frame while the pixels
+    /// behind it are fetched only when [`Terminal::image_pixels`] is asked for
+    /// them. The buffer belongs to the caller so that a frame with no images
+    /// allocates nothing.
+    pub fn images(&self, out: &mut Vec<Placement>) -> Result<()> {
+        image::placements(&self.inner, out)
+    }
+
+    /// One stored image as RGBA pixels, or `None` if it is gone.
+    ///
+    /// This copies the whole bitmap, so it is meant for a texture cache miss
+    /// rather than for a frame. [`Placement::image`] carries the key to cache
+    /// it under.
+    pub fn image_pixels(&self, id: u32) -> Result<Option<Pixels>> {
+        image::pixels(&self.inner, id)
     }
 
     pub fn scroll_lines(&mut self, delta: isize) {

@@ -15,9 +15,10 @@ A window of projects and tabs. The terminal itself: keyboard input, Pango
 rendering, mouse selection with word and line clicks, clipboard and bracketed
 paste, SGR mouse reporting for applications that ask for it, an overlay
 scrollbar that fades when idle, a cursor that blinks by the desktop's own
-preference, OSC 8 hyperlinks opened with `Ctrl`+click, a configurable font with
-live zoom, and Ghostty's 574 color themes, which paint the window chrome as
-well as the terminal. `ls`, `vi`, and `top` all render correctly.
+preference, OSC 8 hyperlinks opened with `Ctrl`+click, inline images over the
+kitty graphics protocol, a configurable font with live zoom, and Ghostty's 574
+color themes, which paint the window chrome as well as the terminal. `ls`,
+`vi`, and `top` all render correctly.
 
 Around it: a sidebar of projects, each with its own strip of tabs, and inside a
 tab a niri-style layout of panes. A project is named by whatever its visible
@@ -135,11 +136,15 @@ after fifteen seconds of nothing further. Each pane's notification replaces its
 own rather than stacking one banner per line of output, and focusing the pane
 withdraws it.
 
+An image printed to a pane is drawn as an image. Tuni speaks the kitty graphics
+protocol, so `timg`, `chafa -f kitty`, matplotlib's kitty backend and anything
+else that transmits one lands in the pane at the size, position and stacking
+order it asked for — under the text, over it, or under the cell backgrounds —
+and scrolls with the text it was printed beside.
+
 That is kero's behavior, less the two pieces of it that are macOS by nature:
 the Sparkle auto-updater, which a package manager stands in for, and the window
-blur, which Wayland has no protocol for. Inline images are the one thing still
-outstanding — `libghostty-vt` parses the kitty graphics protocol, and nothing
-above it draws the result yet.
+blur, which Wayland has no protocol for.
 
 Consuming a 200 MiB stream, measured with `scripts/throughput.sh` on this
 machine:
@@ -328,6 +333,24 @@ is skipped whole, so a tmux passing an inner program's OSC 9 through to the
 outer terminal cannot ring the window it is running in, and a payload is
 abandoned past 8 KiB so a program printing an escape it never terminates costs
 nothing to ignore.
+
+Images are the half of the kitty graphics protocol the library leaves to the
+embedder: it parses the transmissions, stores the images and works out where
+each placement belongs, and putting pixels on a surface is ours. So every frame
+asks it for the placements — geometry alone, recomputed each time because
+scrolling moves an image without touching the storage — and uploads a
+`GdkTexture` only when the sixteen most recent miss. The cache key is the image
+id together with the storage's generation stamp, so a plot retransmitted under
+the same id is a new texture rather than the previous frame's. Drawing happens
+in three passes because the protocol defines three layers, and a placement's
+`z` says which: under the cell backgrounds, under the text, or over everything.
+Two decisions are ours rather than the library's, since it makes neither by
+default: images are capped at 64 MiB a terminal, oldest evicted first, and PNG —
+which is what nearly every program transmits — is decoded by a callback that
+this crate installs, with a ceiling on the decoded size, because the bytes come
+from whatever is on the other end of the PTY. Virtual placements, kitty's
+unicode-placeholder form, are stored and skipped: the C API reports no position
+for one, and guessing is worse than not drawing.
 
 ## Installing
 

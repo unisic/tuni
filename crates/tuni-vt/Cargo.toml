@@ -9,5 +9,8 @@ version.workspace = true
 
 [dependencies]
 libghostty-vt.workspace = true
+# The Kitty graphics protocol transmits most images as PNG, and the library
+# decodes one only through a callback the embedder installs.
+png = "0.18"
 # A match is reported in cells, and one character is not always one cell.
 unicode-width = "0.2"

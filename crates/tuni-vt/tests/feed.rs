@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use tuni_vt::{
-    Colors, CursorShape, Geometry, Key, KeyAction, KeyInput, Mods, MouseAction, MouseButton,
+    Colors, CursorShape, Geometry, Key, KeyAction, KeyInput, Layer, Mods, MouseAction, MouseButton,
     MouseInput, Rgb, Terminal,
 };
 
@@ -722,4 +722,153 @@ fn a_needle_that_is_not_there_is_not_found() {
     let mut terminal = Terminal::new(20, 3, 100).expect("terminal");
     terminal.feed(b"one\r\ntwo");
     assert!(terminal.search("three").expect("search").is_empty());
+}
+
+/// A 2x2 image: red, green on the first row, blue, white on the second.
+const RGB_2X2: &str = "/wAAAP8AAAD/////";
+
+/// The same image as a PNG, which is how nearly every program transmits one.
+const PNG_2X2: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFElEQVR4nGP4z8DAAMIM/////w8AH+4F+7C4l8kAAAAASUVORK5CYII=";
+
+/// A terminal with a cell size, which a placement's geometry is measured in.
+fn imaging_terminal() -> Terminal {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    terminal.resize(20, 5, 8, 16).expect("resize");
+    terminal
+}
+
+#[test]
+fn a_terminal_that_has_seen_no_image_reports_no_placements() {
+    let mut terminal = imaging_terminal();
+    terminal.feed(b"plain text");
+
+    let mut placements = Vec::new();
+    terminal.images(&mut placements).expect("images");
+    assert!(placements.is_empty());
+}
+
+#[test]
+fn a_transmitted_image_is_placed_where_the_cursor_was() {
+    let mut terminal = imaging_terminal();
+    // Row 2, column 3 (CUP is 1-based), then transmit-and-display 2x2 raw RGB.
+    terminal.feed(b"\x1b[2;3H");
+    terminal.feed(format!("\x1b_Ga=T,f=24,s=2,v=2,i=1,q=2;{RGB_2X2}\x1b\\").as_bytes());
+
+    let mut placements = Vec::new();
+    terminal.images(&mut placements).expect("images");
+    assert_eq!(placements.len(), 1);
+
+    let placement = placements[0];
+    assert_eq!(placement.image.id, 1);
+    assert_eq!((placement.col, placement.row), (2, 1));
+    assert_eq!((placement.width, placement.height), (2, 2));
+    assert_eq!(
+        (placement.source_width, placement.source_height),
+        (2, 2),
+        "the whole image is drawn when no source rectangle was asked for"
+    );
+    assert_eq!(placement.layer(), Layer::AboveText);
+}
+
+#[test]
+fn image_pixels_come_back_as_rgba() {
+    let mut terminal = imaging_terminal();
+    terminal.feed(format!("\x1b_Ga=T,f=24,s=2,v=2,i=1,q=2;{RGB_2X2}\x1b\\").as_bytes());
+
+    let pixels = terminal
+        .image_pixels(1)
+        .expect("pixels")
+        .expect("image should be stored");
+    assert_eq!((pixels.width, pixels.height), (2, 2));
+    assert_eq!(
+        pixels.rgba,
+        vec![
+            255, 0, 0, 255, // red
+            0, 255, 0, 255, // green
+            0, 0, 255, 255, // blue
+            255, 255, 255, 255, // white
+        ],
+        "RGB gains an opaque alpha channel"
+    );
+}
+
+#[test]
+fn a_png_transmission_is_decoded() {
+    let mut terminal = imaging_terminal();
+    terminal.feed(format!("\x1b_Ga=T,f=100,i=7,q=2;{PNG_2X2}\x1b\\").as_bytes());
+
+    let pixels = terminal
+        .image_pixels(7)
+        .expect("pixels")
+        .expect("a PNG should decode through the installed decoder");
+    assert_eq!((pixels.width, pixels.height), (2, 2));
+    assert_eq!(&pixels.rgba[..4], &[255, 0, 0, 255]);
+    assert_eq!(&pixels.rgba[12..], &[255, 255, 255, 255]);
+}
+
+#[test]
+fn a_placement_is_sized_by_the_columns_and_rows_it_asks_for() {
+    let mut terminal = imaging_terminal();
+    terminal.feed(format!("\x1b_Ga=T,f=24,s=2,v=2,i=1,c=4,r=3,q=2;{RGB_2X2}\x1b\\").as_bytes());
+
+    let mut placements = Vec::new();
+    terminal.images(&mut placements).expect("images");
+    assert_eq!(placements.len(), 1);
+    // Four 8px columns by three 16px rows, whatever the image's own size is.
+    assert_eq!((placements[0].width, placements[0].height), (32, 48));
+}
+
+#[test]
+fn placements_are_ordered_by_the_layer_they_draw_in() {
+    let mut terminal = imaging_terminal();
+    let image = format!("\x1b_Ga=t,f=24,s=2,v=2,i=1,q=2;{RGB_2X2}\x1b\\");
+    terminal.feed(image.as_bytes());
+    // Three placements of the one image, each in a different layer.
+    terminal.feed(b"\x1b[1;1H\x1b_Ga=p,i=1,p=1,z=5,q=2;\x1b\\");
+    terminal.feed(b"\x1b[2;1H\x1b_Ga=p,i=1,p=2,z=-1,q=2;\x1b\\");
+    terminal.feed(format!("\x1b[3;1H\x1b_Ga=p,i=1,p=3,z={},q=2;\x1b\\", i32::MIN).as_bytes());
+
+    let mut placements = Vec::new();
+    terminal.images(&mut placements).expect("images");
+    assert_eq!(placements.len(), 3);
+    let layers: Vec<_> = placements.iter().map(tuni_vt::Placement::layer).collect();
+    assert_eq!(
+        layers,
+        vec![Layer::BelowBackground, Layer::BelowText, Layer::AboveText],
+        "sorted by z, which is the order the three layers stack in"
+    );
+}
+
+#[test]
+fn deleting_an_image_takes_its_placements_with_it() {
+    let mut terminal = imaging_terminal();
+    terminal.feed(format!("\x1b_Ga=T,f=24,s=2,v=2,i=1,q=2;{RGB_2X2}\x1b\\").as_bytes());
+    terminal.feed(b"\x1b_Ga=d,d=I,i=1,q=2;\x1b\\");
+
+    let mut placements = Vec::new();
+    terminal.images(&mut placements).expect("images");
+    assert!(placements.is_empty());
+    assert!(terminal.image_pixels(1).expect("pixels").is_none());
+}
+
+#[test]
+fn retransmitting_an_image_changes_its_cache_key() {
+    let mut terminal = imaging_terminal();
+    terminal.feed(format!("\x1b_Ga=T,f=24,s=2,v=2,i=1,q=2;{RGB_2X2}\x1b\\").as_bytes());
+    let mut placements = Vec::new();
+    terminal.images(&mut placements).expect("images");
+    let first = placements[0].image;
+
+    terminal.feed(b"\x1b[3;1H");
+    terminal.feed(format!("\x1b_Ga=T,f=24,s=2,v=2,i=1,q=2;{RGB_2X2}\x1b\\").as_bytes());
+    terminal.images(&mut placements).expect("images");
+    let second = placements
+        .iter()
+        .map(|placement| placement.image)
+        .find(|key| key.generation != first.generation);
+
+    assert!(
+        second.is_some(),
+        "same id, same pixels, different picture — only the generation says so"
+    );
 }
