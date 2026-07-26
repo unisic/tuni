@@ -1196,6 +1196,7 @@ name = "tuni-pty"
 version = "1.0.0"
 dependencies = [
  "async-channel",
+ "libc",
  "portable-pty",
 ]
 

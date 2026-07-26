@@ -120,9 +120,56 @@ impl Default for PtyConfig {
 
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    /// Bytes on their way to the shell. A queue rather than the writer itself
+    /// because writing is what blocks — see the thread in `spawn`.
+    writes: async_channel::Sender<Vec<u8>>,
+    /// The shell. Held in an `Option` so the hangup can hand it to whoever
+    /// reaps it, and held on this side until then so its pid cannot be recycled
+    /// under the signal the hangup sends.
+    child: Option<Box<dyn Child + Send + Sync>>,
     events: async_channel::Receiver<PtyEvent>,
+}
+
+impl Drop for Pty {
+    /// Hangs up the way closing a terminal window does.
+    ///
+    /// Dropping the master alone does not: the reader thread holds a duplicate
+    /// of it and is parked in `read()`, so the kernel still sees an open master
+    /// and sends nobody a hangup. A shell sitting at a prompt does leave —
+    /// `portable-pty`'s writer sends it an EOF as it goes — but a shell with a
+    /// foreground job never reads that EOF, so the shell, the job, the reader
+    /// thread and its fd all outlive the pane. SIGHUP to the shell's process
+    /// group is what actually ends it; the kernel then hangs up the foreground
+    /// job as well, because the shell it kills is the session leader holding
+    /// the controlling terminal.
+    ///
+    /// Reaping happens on a thread of its own, because waiting here would block
+    /// the frame that is closing the pane for as long as the shell takes to
+    /// die.
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if let Some(pid) = child.process_id() {
+            // Safe: `pid` names a process that has not been waited for — this
+            // is the only place the child is handed away — so the kernel still
+            // holds its slot and the number cannot mean a different process.
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGHUP);
+            }
+        }
+        let reaper = std::thread::Builder::new()
+            .name("tuni-pty-reaper".to_owned())
+            .spawn(move || {
+                let _ = child.wait();
+                if std::env::var_os("TUNI_DEBUG_LIFETIME").is_some() {
+                    eprintln!("tuni lifetime -pty-child");
+                }
+            });
+        // A machine that cannot start the thread would leak a zombie rather
+        // than a shell; nothing here can do better than let it.
+        drop(reaper);
+    }
 }
 
 impl Pty {
@@ -160,7 +207,7 @@ impl Pty {
         // EOF after the child exits.
         drop(pair.slave);
 
-        let writer = pair
+        let mut writer = pair
             .master
             .take_writer()
             .map_err(|e| Error::Spawn(e.to_string()))?;
@@ -190,13 +237,47 @@ impl Pty {
                     }
                 }
                 let _ = tx.send_blocking(PtyEvent::Exited);
+                // A reader that never reaches this line is a thread, a master
+                // fd and a shell that outlived their pane. `TUNI_DEBUG_LIFETIME`
+                // is read here rather than at spawn because it runs once per
+                // thread, at its end.
+                if std::env::var_os("TUNI_DEBUG_LIFETIME").is_some() {
+                    eprintln!("tuni lifetime -pty-reader");
+                }
+            })
+            .map_err(Error::Io)?;
+
+        // Writing to the master blocks whenever the shell is not reading, and
+        // the caller is always the GTK main loop. That is not merely a stall:
+        // a shell that has stopped reading is usually a shell that is waiting
+        // to write, and its output has nowhere to go while the main thread is
+        // parked in `write` instead of draining `rx` — so the reader thread
+        // fills the bounded channel, blocks, the shell blocks, and nobody
+        // moves again. Doing the write here, on a thread whose only job is to
+        // wait, leaves the main loop free to drain the reader and breaks the
+        // cycle at the only point where waiting is harmless.
+        //
+        // Unbounded because what queues here is what somebody typed, pasted or
+        // asked for, and it is bounded in practice by the shell reading it.
+        let (writes, pending) = async_channel::unbounded::<Vec<u8>>();
+        std::thread::Builder::new()
+            .name("tuni-pty-writer".to_owned())
+            .spawn(move || {
+                while let Ok(chunk) = pending.recv_blocking() {
+                    if writer.write_all(&chunk).and_then(|()| writer.flush()).is_err() {
+                        break;
+                    }
+                }
+                // Dropping the writer here is what sends the shell its EOF, and
+                // it happens either when the pane closes and the sender goes,
+                // or when the write above fails because the shell is gone.
             })
             .map_err(Error::Io)?;
 
         Ok(Self {
             master: pair.master,
-            writer,
-            child,
+            writes,
+            child: Some(child),
             events: rx,
         })
     }
@@ -207,13 +288,15 @@ impl Pty {
         self.events.clone()
     }
 
+    /// Hands `data` to the writer thread. Never blocks, so it is safe to call
+    /// from the main loop; the error case is a shell that is already gone.
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
-        self.writer.write_all(data)?;
-        self.writer.flush()?;
-        Ok(())
+        self.writes
+            .try_send(data.to_vec())
+            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))
     }
 
     pub fn resize(
@@ -237,7 +320,7 @@ impl Pty {
     /// running" and for confirming a close.
     #[must_use]
     pub fn shell_pid(&self) -> Option<u32> {
-        self.child.process_id()
+        self.child.as_ref().and_then(|child| child.process_id())
     }
 }
 

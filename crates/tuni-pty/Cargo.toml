@@ -9,4 +9,7 @@ version.workspace = true
 
 [dependencies]
 async-channel = "2"
+# For the one thing a hangup needs and `portable-pty` does not expose: SIGHUP to
+# the shell's process group. Already in the tree as its own dependency.
+libc = "0.2"
 portable-pty = "0.9"
