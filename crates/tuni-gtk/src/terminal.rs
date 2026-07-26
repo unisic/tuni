@@ -115,6 +115,13 @@ struct Session {
 /// past a picture costs; it is not a limit on how many a terminal may hold.
 const TEXTURE_CACHE: usize = 16;
 
+/// How often to look at whether the widget has stopped resizing. Two quiet
+/// ticks end the wait, so the shell hears about a new size between one and two
+/// of these after the last frame — near enough to instant for a person, and
+/// long enough to swallow a whole slide-in animation. Kitty debounces the same
+/// way and for the same reason.
+const RESIZE_SETTLE: Duration = Duration::from_millis(50);
+
 /// Uploaded inline images, keyed by which image and which version of it.
 ///
 /// The key carries the storage's generation, so a plot redrawn under the same
@@ -213,6 +220,11 @@ mod imp {
         /// with it, because zooming changes that without changing the grid.
         pub(super) grid_size: Cell<(u16, u16)>,
         pub(super) cell_size: Cell<(u16, u16)>,
+        /// A size the widget has been given but the shell has not been told
+        /// about yet, and the timer that will tell it once the widget stops
+        /// moving. See `apply_size`.
+        pub(super) pending_size: Cell<Option<(i32, i32)>>,
+        pub(super) resize_timer: RefCell<Option<glib::SourceId>>,
         pub(super) im: RefCell<Option<gtk::IMMulticontext>>,
         /// Text the input method committed during the current key press.
         pub(super) pending_commit: RefCell<Option<String>>,
@@ -295,6 +307,8 @@ mod imp {
                 pango_serial: Cell::new(0),
                 grid_size: Cell::new((0, 0)),
                 cell_size: Cell::new((0, 0)),
+                pending_size: Cell::new(None),
+                resize_timer: RefCell::new(None),
                 im: RefCell::new(None),
                 pending_commit: RefCell::new(None),
                 title: RefCell::new(None),
@@ -402,6 +416,9 @@ mod imp {
                 tick.remove();
             }
             if let Some(source) = self.progress_stale.take() {
+                source.remove();
+            }
+            if let Some(source) = self.resize_timer.take() {
                 source.remove();
             }
             // Drop the session before the widget so the reader thread's channel
@@ -1040,7 +1057,61 @@ impl TuniTerminal {
         self.queue_draw();
     }
 
+    /// Takes note of the widget's new size and tells the shell about it once
+    /// the widget stops moving.
+    ///
+    /// A sidebar or a panel slides open over a quarter of a second, and every
+    /// frame of that animation is a different width. Telling the shell each
+    /// time is not just wasted work: a shell redraws its prompt for every
+    /// SIGWINCH, and a prompt written to fill the old width no longer fits the
+    /// new one, so the terminal wraps it onto a second row while the shell —
+    /// which believes it wrote one row — erases from one row up. The head of
+    /// the old prompt survives, once per frame, and a single animation leaves a
+    /// screenful of them. Waiting for the size to settle turns that into one
+    /// resize, which is what dragging a window edge in any terminal does.
     fn apply_size(&self, width: i32, height: i32) {
+        let imp = self.imp();
+        // Nothing is running yet: the first allocation decides what size the
+        // shell is started at, and there is no output to disturb.
+        if imp.session.borrow().is_none() {
+            self.commit_size(width, height);
+            return;
+        }
+
+        imp.pending_size.set(Some((width, height)));
+        if imp.resize_timer.borrow().is_some() {
+            return;
+        }
+        // What the previous tick saw. Two ticks that read the same size mean
+        // nothing moved in between, which is the end of the animation.
+        let seen: Cell<Option<(i32, i32)>> = Cell::new(None);
+        let id = glib::timeout_add_local(
+            RESIZE_SETTLE,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    let imp = this.imp();
+                    let now = imp.pending_size.get();
+                    if now != seen.get() {
+                        seen.set(now);
+                        return glib::ControlFlow::Continue;
+                    }
+                    imp.resize_timer.replace(None);
+                    imp.pending_size.set(None);
+                    if let Some((width, height)) = now {
+                        this.commit_size(width, height);
+                    }
+                    glib::ControlFlow::Break
+                }
+            ),
+        );
+        imp.resize_timer.replace(Some(id));
+    }
+
+    fn commit_size(&self, width: i32, height: i32) {
         let imp = self.imp();
         let m = imp.metrics.get();
         let cols =
