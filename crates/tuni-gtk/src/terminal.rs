@@ -765,6 +765,7 @@ impl TuniTerminal {
                 if let Some(im) = this.imp().im.borrow().as_ref() {
                     im.focus_in();
                 }
+                this.report_focus(true);
                 this.start_blink();
                 this.queue_draw();
             }
@@ -776,6 +777,7 @@ impl TuniTerminal {
                 if let Some(im) = this.imp().im.borrow().as_ref() {
                     im.focus_out();
                 }
+                this.report_focus(false);
                 // An unfocused terminal draws a hollow cursor, which must not
                 // also blink.
                 this.stop_blink();
@@ -1734,6 +1736,21 @@ impl TuniTerminal {
             any_button_pressed,
         };
         if let Ok(bytes) = session.term.encode_mouse(&input, geometry)
+            && !bytes.is_empty()
+        {
+            let _ = session.pty.write(bytes);
+        }
+    }
+
+    /// Tell an application that the keyboard arrived or left. A pane counts as
+    /// its own window here, the way Ghostty reports per surface, so handing the
+    /// keyboard to the split next door is a departure for the one it left.
+    fn report_focus(&self, gained: bool) {
+        let mut guard = self.imp().session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        if let Ok(bytes) = session.term.encode_focus(gained)
             && !bytes.is_empty()
         {
             let _ = session.pty.write(bytes);

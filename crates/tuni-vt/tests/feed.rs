@@ -411,6 +411,19 @@ fn mouse_is_reported_only_when_the_application_asks() {
 }
 
 #[test]
+fn focus_is_reported_only_when_the_application_asks() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    assert!(terminal.encode_focus(true).expect("encode").is_empty());
+
+    terminal.feed(b"\x1b[?1004h");
+    assert_eq!(terminal.encode_focus(true).expect("encode"), b"\x1b[I");
+    assert_eq!(terminal.encode_focus(false).expect("encode"), b"\x1b[O");
+
+    terminal.feed(b"\x1b[?1004l");
+    assert!(terminal.encode_focus(false).expect("encode").is_empty());
+}
+
+#[test]
 fn paste_follows_bracketed_paste_mode() {
     let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
     assert_eq!(terminal.encode_paste("ls").expect("encode"), b"ls");

@@ -36,7 +36,7 @@ use libghostty_vt::terminal::{
     ClipboardLocation, Mode, Options as TerminalOptions, Point, PointCoordinate, ScrollViewport,
     Terminal as VtTerminal,
 };
-use libghostty_vt::{key, mouse, paste};
+use libghostty_vt::{focus, key, mouse, paste};
 use unicode_width::UnicodeWidthChar;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -673,6 +673,25 @@ impl Terminal {
         self.encoded.clear();
         self.mouse_encoder
             .encode_to_vec(&self.mouse_event, &mut self.encoded)?;
+        Ok(&self.encoded)
+    }
+
+    /// Encode the window gaining or losing the keyboard. Returns an empty slice
+    /// unless the application asked to hear about it with mode 1004; editors and
+    /// multiplexers use it to reload changed files or dim an idle pane.
+    pub fn encode_focus(&mut self, gained: bool) -> Result<&[u8]> {
+        self.encoded.clear();
+        if !self.inner.mode(Mode::FOCUS_EVENT).unwrap_or(false) {
+            return Ok(&self.encoded);
+        }
+        let event = if gained {
+            focus::Event::Gained
+        } else {
+            focus::Event::Lost
+        };
+        let mut buf = [0u8; 8];
+        let written = event.encode(&mut buf)?;
+        self.encoded.extend_from_slice(&buf[..written]);
         Ok(&self.encoded)
     }
 

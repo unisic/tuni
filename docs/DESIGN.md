@@ -16,7 +16,8 @@ iOS. Kero is GPLv3 and so is Tuni.
 
 A window of projects and tabs. The terminal itself: keyboard input, Pango
 rendering, mouse selection with word and line clicks, clipboard and bracketed
-paste, SGR mouse reporting for applications that ask for it, an overlay
+paste, SGR mouse reporting and focus reporting for applications that ask for
+them, an overlay
 scrollbar that fades when idle, a cursor that blinks by the desktop's own
 preference, OSC 8 hyperlinks opened with `Ctrl`+click, inline images over the
 kitty graphics protocol, a configurable font with live zoom, and Ghostty's 574
@@ -408,6 +409,12 @@ uses for the same setting. Turned off, no application is given the mouse
 however loudly it asks, and every drag selects. `Ctrl+Shift+M` turns it off
 and on again, because whether a program should have the mouse is a thing that
 changes several times an hour.
+
+The keyboard arriving and leaving is news as well, to the programs that asked
+for it with mode 1004: an editor rereads a file that changed while it was away,
+a multiplexer stops drawing a cursor nobody is typing at. A pane is a window of
+its own here, the way Ghostty reports per surface, so handing the keyboard to
+the split beside it is a departure for the pane that had it.
 
 A hyperlink is whatever the program holding the PTY says it is, which over ssh
 is not the person at the keyboard. So `Ctrl` has to be held before one lights up
