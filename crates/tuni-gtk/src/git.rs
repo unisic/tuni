@@ -35,7 +35,7 @@ mod imp {
     /// the number where it is visible without the panel showing.
     pub type Handler = Rc<dyn Fn(usize)>;
     /// The window's, called with the file a row names.
-    pub type Opener = Rc<dyn Fn(std::path::PathBuf)>;
+    pub type Opener = Rc<dyn Fn(std::path::PathBuf, bool)>;
 
     #[derive(Default)]
     pub struct TuniGit {
@@ -438,9 +438,10 @@ impl TuniGit {
         self.imp().changed.replace(Some(Rc::new(callback)));
     }
 
-    /// Called with the file a row names when the row is opened. Where it is
-    /// shown is the window's decision, not the panel's.
-    pub fn connect_open<F: Fn(std::path::PathBuf) + 'static>(&self, callback: F) {
+    /// Called with the file a row names and the side of the index it was
+    /// listed under, when the row is opened. Where it is shown is the window's
+    /// decision, not the panel's.
+    pub fn connect_open<F: Fn(std::path::PathBuf, bool) + 'static>(&self, callback: F) {
         self.imp().open.replace(Some(Rc::new(callback)));
     }
 
@@ -686,10 +687,11 @@ impl TuniGit {
             .tooltip_text(&entry.path)
             .build();
         let entry = entry.clone();
+        let staged = kind == Kind::Staged;
         row.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |_| this.open(&entry)
+            move |_| this.open(&entry, staged)
         ));
         row
     }
@@ -713,21 +715,20 @@ impl TuniGit {
         button
     }
 
-    /// Opens the file the row names, in a pane. The diff viewer takes this
-    /// over when there is one.
-    fn open(&self, entry: &Entry) {
+    /// Opens what changed in the file the row names, in a pane. Which side is
+    /// compared follows the section the row is in: a staged row is asking about
+    /// the index, an unstaged one about the working tree.
+    ///
+    /// A deleted file still has changes to show — the lines that were in it —
+    /// so nothing here checks that the bytes are still there.
+    fn open(&self, entry: &Entry, staged: bool) {
         let Some(status) = self.status() else {
             return;
         };
         let path = status.root.join(&entry.path);
-        // A deleted file has a row and no bytes behind it; there is nothing to
-        // open until the diff viewer can show what was in it.
-        if !path.exists() {
-            return;
-        }
         let handler = self.imp().open.borrow().clone();
         if let Some(handler) = handler {
-            handler(path);
+            handler(path, staged);
         }
     }
 

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::panes::{Column, Layout, Pane};
+use crate::panes::{Column, Content, Layout, Pane};
 use crate::settings::data_dir;
 use crate::workspace::{Id, Project, Tab, Workspace};
 
@@ -44,6 +44,13 @@ pub struct PaneSnapshot {
     /// not a place to hide a copy of one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<usize>,
+    /// Set when the pane was showing what changed in that file rather than the
+    /// file itself, and then to which side of the comparison: `true` for the
+    /// index against HEAD, `false` for the working tree against the index.
+    /// Absent means a plain file pane, which is what keeps older sessions
+    /// readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<bool>,
 }
 
 /// What the window knows about a pane that the model does not: the scrollback
@@ -268,6 +275,10 @@ fn snap_tab(tab: &Tab, state: &impl Fn(Id) -> PaneState) -> TabSnapshot {
                             history: state.history,
                             file: pane.path().map(|path| path.to_string_lossy().into_owned()),
                             cursor: state.cursor,
+                            diff: match pane.content {
+                                Content::Diff { staged, .. } => Some(staged),
+                                _ => None,
+                            },
                         }
                     })
                     .collect(),
@@ -292,9 +303,10 @@ fn restore_tab(
                 .panes
                 .iter()
                 .map(|saved| {
-                    let mut pane = match &saved.file {
-                        Some(path) => Pane::file(PathBuf::from(path)),
-                        None => Pane::new(),
+                    let mut pane = match (&saved.file, saved.diff) {
+                        (Some(path), Some(staged)) => Pane::diff(PathBuf::from(path), staged),
+                        (Some(path), None) => Pane::file(PathBuf::from(path)),
+                        (None, _) => Pane::new(),
                     };
                     if saved.directory.is_some() {
                         pane.directory.clone_from(&saved.directory);

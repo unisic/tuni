@@ -14,6 +14,7 @@
 //! and handed back as a [`Task`] for the caller to run.
 
 use std::ffi::OsStr;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -55,26 +56,63 @@ impl Output {
 /// prompt into a failure rather than a process waiting forever on a terminal
 /// nobody can see, and `LC_ALL=C` is what makes reading the error text safe.
 pub fn run<S: AsRef<OsStr>>(args: &[S], directory: &Path) -> Output {
-    let output = Command::new("git")
+    run_with_input(args, directory, None)
+}
+
+/// The same, with something on standard input — a patch, for the one command
+/// that takes one.
+pub fn run_with_input<S: AsRef<OsStr>>(
+    args: &[S],
+    directory: &Path,
+    input: Option<&str>,
+) -> Output {
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(directory)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .output();
+        .env("LC_ALL", "C");
 
+    let Some(input) = input else {
+        return finish(command.stdin(Stdio::null()).output());
+    };
+
+    // Written from this thread while the child runs: a patch is far smaller
+    // than a pipe buffer, so nothing can deadlock waiting for the other end.
+    let child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => return failure(&error.to_string()),
+    };
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(error) = stdin.write_all(input.as_bytes())
+    {
+        return failure(&error.to_string());
+    }
+    finish(child.wait_with_output())
+}
+
+fn finish(output: std::io::Result<std::process::Output>) -> Output {
     match output {
         Ok(output) => Output {
             code: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         },
-        Err(error) => Output {
-            code: -1,
-            stdout: String::new(),
-            stderr: error.to_string(),
-        },
+        Err(error) => failure(&error.to_string()),
+    }
+}
+
+fn failure(message: &str) -> Output {
+    Output {
+        code: -1,
+        stdout: String::new(),
+        stderr: message.to_owned(),
     }
 }
 
@@ -589,6 +627,9 @@ pub fn parse_commits(output: &str) -> Vec<Commit> {
 pub struct Task {
     pub label: String,
     pub commands: Vec<Vec<String>>,
+    /// Standard input for every command in the task. Only a patch uses it, and
+    /// a patch is one command.
+    pub input: Option<String>,
     /// Paths, relative to the root, for the caller to move to the desktop's
     /// trash once every command has succeeded. Git has no such thing as a
     /// recoverable delete, so discarding a file it does not track is the one
@@ -604,6 +645,7 @@ impl Task {
                 .into_iter()
                 .map(|command| command.into_iter().map(str::to_owned).collect())
                 .collect(),
+            input: None,
             trash: Vec::new(),
         }
     }
@@ -613,7 +655,7 @@ impl Task {
 pub fn run_task(task: &Task, root: &Path) -> Result<String, String> {
     let mut transcript = String::new();
     for command in &task.commands {
-        let output = run(command, root);
+        let output = run_with_input(command, root, task.input.as_deref());
         transcript.push_str(&output.stdout);
         transcript.push_str(&output.stderr);
         if !output.is_ok() {
@@ -652,6 +694,7 @@ pub fn stage(entry: &Entry) -> Task {
     Task {
         label: format!("Stage {}", entry.file_name()),
         commands: vec![literal(&["add"], &paths_of(entry, entry.unstaged))],
+        input: None,
         trash: Vec::new(),
     }
 }
@@ -669,6 +712,7 @@ pub fn unstage(entry: &Entry, has_head: bool) -> Task {
     Task {
         label: format!("Unstage {}", entry.file_name()),
         commands: vec![command],
+        input: None,
         trash: Vec::new(),
     }
 }
@@ -701,12 +745,14 @@ pub fn discard(entry: &Entry) -> Task {
         Task {
             label: format!("Discard {name}"),
             commands: vec![literal(&["rm", "--cached", "-f"], &[&entry.path])],
+            input: None,
             trash: vec![entry.path.clone()],
         }
     } else if entry.is_untracked() || entry.is_worktree_copy() {
         Task {
             label: format!("Move {name} to the trash"),
             commands: Vec::new(),
+            input: None,
             trash: vec![entry.path.clone()],
         }
     } else if entry.is_worktree_rename() {
@@ -714,12 +760,14 @@ pub fn discard(entry: &Entry) -> Task {
         Task {
             label: format!("Discard the rename of {name}"),
             commands: vec![literal(&["restore", "--worktree"], &[&original])],
+            input: None,
             trash: vec![entry.path.clone()],
         }
     } else {
         Task {
             label: format!("Discard changes in {name}"),
             commands: vec![literal(&["restore", "--worktree"], &[&entry.path])],
+            input: None,
             trash: Vec::new(),
         }
     }
@@ -762,6 +810,7 @@ pub fn discard_all(entries: &[Entry]) -> Task {
     Task {
         label: "Discard all changes".to_owned(),
         commands,
+        input: None,
         trash,
     }
 }
@@ -803,6 +852,7 @@ pub fn commit(
     Ok(Task {
         label: label.to_owned(),
         commands,
+        input: None,
         trash: Vec::new(),
     })
 }
@@ -864,6 +914,7 @@ pub fn switch_branch(name: &str) -> Task {
     Task {
         label: format!("Switch to {name}"),
         commands: vec![vec!["switch".to_owned(), name.to_owned()]],
+        input: None,
         trash: Vec::new(),
     }
 }
@@ -876,6 +927,7 @@ pub fn create_branch(name: &str) -> Result<Task, String> {
     Ok(Task {
         label: format!("Create {name}"),
         commands: vec![vec!["switch".to_owned(), "-c".to_owned(), name.to_owned()]],
+        input: None,
         trash: Vec::new(),
     })
 }
@@ -883,6 +935,107 @@ pub fn create_branch(name: &str) -> Result<Task, String> {
 #[must_use]
 pub fn init() -> Task {
     Task::new("Start a repository here", vec![vec!["init"]])
+}
+
+/// One file's diff, and the repository it came from.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FileDiff {
+    /// Where a patch made from this has to be applied.
+    pub root: PathBuf,
+    /// The path as git names it, relative to the root.
+    pub path: String,
+    /// What `git diff` printed, unparsed.
+    pub text: String,
+}
+
+/// Reads what changed in one file, as a unified diff.
+///
+/// `staged` asks the index against HEAD instead of the working tree against
+/// the index — the two halves the panel shows separately. A file git is not
+/// tracking has no diff at all, so it is compared against nothing, which
+/// produces the same patch a new file would.
+pub fn diff(path: &Path, staged: bool) -> Result<FileDiff, String> {
+    let directory = path.parent().unwrap_or(Path::new("/"));
+    let top = run(&["rev-parse", "--show-toplevel"], directory);
+    if !top.is_ok() {
+        return Err(top.message("This file is not in a git repository."));
+    }
+    let root = PathBuf::from(top.stdout.trim());
+    let relative = path
+        .strip_prefix(&root)
+        .map_err(|_| "This file is not in that repository.".to_owned())?
+        .to_string_lossy()
+        .into_owned();
+
+    // Untracked, and so nothing for git to compare against. `--no-index` is
+    // the one form of diff that reads two paths rather than the index, and
+    // `/dev/null` is the empty side.
+    let untracked = !staged
+        && run(
+            &["--literal-pathspecs", "ls-files", "--", &relative],
+            &root,
+        )
+        .stdout
+        .trim()
+        .is_empty();
+
+    let output = if untracked {
+        run(
+            &[
+                "diff",
+                "--no-index",
+                "--no-color",
+                "--no-ext-diff",
+                "--",
+                "/dev/null",
+                &relative,
+            ],
+            &root,
+        )
+    } else {
+        let mut args = vec!["--literal-pathspecs", "diff", "--no-color", "--no-ext-diff"];
+        if staged {
+            args.push("--cached");
+        }
+        args.push("--");
+        args.push(&relative);
+        run(&args, &root)
+    };
+
+    // `--no-index` reports a difference the way `diff(1)` does, with an exit
+    // status of one. Everywhere else that would be a failure.
+    if !output.is_ok() && !(untracked && output.code == 1) {
+        return Err(output.message("Couldn't read the diff."));
+    }
+    Ok(FileDiff {
+        root,
+        path: relative,
+        text: output.stdout,
+    })
+}
+
+/// Puts one hunk into the index, or takes one back out of it.
+///
+/// The patch is what the viewer was already showing, handed back to `git
+/// apply` unchanged, so what is staged is what was on screen. Reversing it is
+/// git's own `-R` rather than a patch written backwards.
+#[must_use]
+pub fn apply_hunk(patch: String, name: &str, stage: bool) -> Task {
+    let mut command = vec!["apply".to_owned(), "--cached".to_owned()];
+    if !stage {
+        command.push("--reverse".to_owned());
+    }
+    command.push("-".to_owned());
+    Task {
+        label: if stage {
+            format!("Stage a hunk of {name}")
+        } else {
+            format!("Unstage a hunk of {name}")
+        },
+        commands: vec![command],
+        input: Some(patch),
+        trash: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1256,5 +1409,94 @@ mod tests {
         let task = stash_pop(&status).expect("task");
         run_task(&task, &status.root).expect("pop");
         assert_eq!(sandbox.status().changed.len(), 1);
+    }
+
+    #[test]
+    fn a_diff_names_the_file_relative_to_the_repository() {
+        let sandbox = Sandbox::new("diff-path");
+        fs::create_dir_all(sandbox.path.join("src")).expect("directory");
+        sandbox.write("src/main.rs", "one\ntwo\n");
+        sandbox.git(&["add", "."]);
+        sandbox.git(&["commit", "-m", "first"]);
+        sandbox.write("src/main.rs", "one\nthree\n");
+
+        let file = diff(&sandbox.path.join("src/main.rs"), false).expect("diff");
+        assert_eq!(file.path, "src/main.rs");
+        assert!(file.text.contains("-two"), "{}", file.text);
+        assert!(file.text.contains("+three"), "{}", file.text);
+
+        // Nothing is staged yet, so the other side has nothing to say.
+        let staged = diff(&sandbox.path.join("src/main.rs"), true).expect("diff");
+        assert!(staged.text.trim().is_empty(), "{}", staged.text);
+    }
+
+    #[test]
+    fn an_untracked_file_diffs_against_nothing() {
+        let sandbox = Sandbox::new("diff-untracked");
+        sandbox.write("first.txt", "one\n");
+        sandbox.git(&["add", "."]);
+        sandbox.git(&["commit", "-m", "first"]);
+        sandbox.write("new.txt", "fresh\n");
+
+        let file = diff(&sandbox.path.join("new.txt"), false).expect("diff");
+        assert!(file.text.contains("+fresh"), "{}", file.text);
+    }
+
+    #[test]
+    fn one_hunk_goes_into_the_index_and_comes_back_out() {
+        let sandbox = Sandbox::new("hunk");
+        let before: String = (1..=20).map(|line| format!("line {line}\n")).collect();
+        sandbox.write("file.txt", &before);
+        sandbox.git(&["add", "file.txt"]);
+        sandbox.git(&["commit", "-m", "first"]);
+
+        // Two changes, far enough apart that git writes them as two hunks.
+        let after = before
+            .replace("line 2\n", "line two\n")
+            .replace("line 18\n", "line eighteen\n");
+        sandbox.write("file.txt", &after);
+
+        let file = diff(&sandbox.path.join("file.txt"), false).expect("diff");
+        let parsed = crate::diff::Diff::parse(&file.text);
+        assert_eq!(parsed.hunks.len(), 2, "{}", file.text);
+
+        let patch = parsed.patch(0).expect("patch");
+        let task = apply_hunk(patch, "file.txt", true);
+        run_task(&task, &sandbox.path).expect("stage");
+
+        // The first change is in the index, the second is still only in the
+        // working tree.
+        let staged = diff(&sandbox.path.join("file.txt"), true).expect("diff");
+        assert!(staged.text.contains("+line two"), "{}", staged.text);
+        assert!(!staged.text.contains("eighteen"), "{}", staged.text);
+        let unstaged = diff(&sandbox.path.join("file.txt"), false).expect("diff");
+        assert!(unstaged.text.contains("+line eighteen"), "{}", unstaged.text);
+        assert!(!unstaged.text.contains("+line two"), "{}", unstaged.text);
+
+        // And back out again, from the staged side.
+        let staged = crate::diff::Diff::parse(&staged.text);
+        let patch = staged.patch(0).expect("patch");
+        let task = apply_hunk(patch, "file.txt", false);
+        run_task(&task, &sandbox.path).expect("unstage");
+        assert!(
+            diff(&sandbox.path.join("file.txt"), true)
+                .expect("diff")
+                .text
+                .trim()
+                .is_empty()
+        );
+        assert!(sandbox.status().changed.len() == 1);
+    }
+
+    #[test]
+    fn a_file_outside_a_repository_says_so() {
+        let outside = std::env::temp_dir().join(format!("tuni-loose-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&outside).expect("directory");
+        fs::write(outside.join("file.txt"), "one\n").expect("write");
+
+        let read = diff(&outside.join("file.txt"), false);
+        assert!(read.is_err(), "{read:?}");
+        let _ = fs::remove_dir_all(&outside);
     }
 }

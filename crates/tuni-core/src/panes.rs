@@ -58,6 +58,9 @@ pub enum Content {
     Terminal,
     /// A file, open for editing.
     File(PathBuf),
+    /// What changed in a file: the worktree against the index, or the index
+    /// against HEAD when `staged`.
+    Diff { path: PathBuf, staged: bool },
 }
 
 /// One tile: what it holds, and what that last said about itself.
@@ -106,18 +109,54 @@ impl Pane {
         }
     }
 
+    /// A pane holding what changed in a file, named for the file with the side
+    /// of the comparison after it, since both sides can be open at once.
+    #[must_use]
+    pub fn diff(path: PathBuf, staged: bool) -> Self {
+        let side = if staged { "staged" } else { "changes" };
+        let title = path
+            .file_name()
+            .map(|name| format!("{} ({side})", name.to_string_lossy()));
+        let directory = path
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned());
+        Self {
+            content: Content::Diff { path, staged },
+            title,
+            directory,
+            ..Self::new()
+        }
+    }
+
     #[must_use]
     pub fn id(&self) -> Id {
         self.id
     }
 
-    /// The file this pane is showing, if it is showing one.
+    /// The file this pane is showing, whether for editing or as a diff.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         match &self.content {
             Content::Terminal => None,
-            Content::File(path) => Some(path),
+            Content::File(path) | Content::Diff { path, .. } => Some(path),
         }
+    }
+
+    /// Whether this pane is that file, open for editing. A pane showing what
+    /// changed in the file is not it: opening the file is not the same request
+    /// as opening its diff, and the two are meant to sit beside each other.
+    #[must_use]
+    pub fn shows_file(&self, path: &Path) -> bool {
+        matches!(&self.content, Content::File(open) if open == path)
+    }
+
+    /// Whether this pane is that file's changes, on that side of the index.
+    #[must_use]
+    pub fn shows_diff(&self, path: &Path, staged: bool) -> bool {
+        matches!(
+            &self.content,
+            Content::Diff { path: open, staged: side } if open == path && *side == staged
+        )
     }
 
     /// Points a file pane at another path, after the file was renamed under it.

@@ -2,6 +2,7 @@
 //!
 //! Everything the window does lives in `window.rs`; this file is the process.
 
+mod diff;
 mod editor;
 mod files;
 mod git;
@@ -112,9 +113,9 @@ fn build_window(app: &adw::Application) {
             if !window::session_enabled() || !window.restore_session() {
                 window.open_project();
             }
-            if let Some(terminal) = window.active_terminal() {
-                maybe_capture(&window, &terminal);
-            }
+            // A window restored onto a file or a diff has no terminal in the
+            // pane that is focused, and a capture of it is still a capture.
+            maybe_capture(&window, window.active_terminal().as_ref());
         }
     ));
 }
@@ -152,10 +153,11 @@ fn settings() -> tuni_core::settings::Settings {
 /// captures want.
 ///
 /// The rest of the family below drives one part of the window each:
-/// `TUNI_CAPTURE_ACTIONS`, `TUNI_CAPTURE_OPEN`, `TUNI_CAPTURE_FIND`,
-/// `TUNI_CAPTURE_EDIT`, `TUNI_CAPTURE_ZOOM`, `TUNI_CAPTURE_SCROLL`,
-/// `TUNI_CAPTURE_HOVER`, and `TUNI_CAPTURE_SELECT`.
-fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
+/// `TUNI_CAPTURE_ACTIONS`, `TUNI_CAPTURE_OPEN`, `TUNI_CAPTURE_DIFF`,
+/// `TUNI_CAPTURE_STAGE`, `TUNI_CAPTURE_FIND`, `TUNI_CAPTURE_EDIT`,
+/// `TUNI_CAPTURE_ZOOM`, `TUNI_CAPTURE_SCROLL`, `TUNI_CAPTURE_HOVER`, and
+/// `TUNI_CAPTURE_SELECT`.
+fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
     let Ok(path) = std::env::var("TUNI_CAPTURE_PNG") else {
         return;
     };
@@ -164,7 +166,9 @@ fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
         .and_then(|value| value.parse().ok())
         .unwrap_or(1500);
 
-    if let Ok(input) = std::env::var("TUNI_CAPTURE_INPUT") {
+    if let Ok(input) = std::env::var("TUNI_CAPTURE_INPUT")
+        && let Some(terminal) = terminal
+    {
         glib::timeout_add_local_once(
             std::time::Duration::from_millis(400),
             glib::clone!(
@@ -177,9 +181,9 @@ fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
 
     // Actions typed the way the keyboard would reach them: "win.new-tab" or
     // "win.new-project", one per comma, each a step later, so a capture can
-    // show a window that has more than one of anything. An "editor." action
-    // goes to the file that is open, since that group lives on the pane rather
-    // than on the window.
+    // show a window that has more than one of anything. An "editor." or a
+    // "diff." action goes to the pane showing one, since those groups live on
+    // the pane rather than on the window.
     if let Ok(actions) = std::env::var("TUNI_CAPTURE_ACTIONS") {
         for (step, action) in actions.split(',').map(str::trim).enumerate() {
             let action = action.to_owned();
@@ -197,14 +201,23 @@ fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
                             None => (action.clone(), None),
                         };
                         let target = target.map(|value| value.to_variant());
-                        let (widget, name) = match name.strip_prefix("editor.") {
-                            Some(rest) => match window.active_editor() {
+                        let (widget, name) = match (
+                            name.strip_prefix("editor."),
+                            name.strip_prefix("diff."),
+                        ) {
+                            (Some(rest), _) => match window.active_editor() {
                                 Some(editor) => {
                                     (editor.upcast::<gtk::Widget>(), format!("editor.{rest}"))
                                 }
                                 None => return eprintln!("no file is open: {name}"),
                             },
-                            None => {
+                            (_, Some(rest)) => match window.active_diff() {
+                                Some(diff) => {
+                                    (diff.upcast::<gtk::Widget>(), format!("diff.{rest}"))
+                                }
+                                None => return eprintln!("no diff is open: {name}"),
+                            },
+                            _ => {
                                 let name = name.strip_prefix("win.").unwrap_or(&name);
                                 (window.clone().upcast(), format!("win.{name}"))
                             }
@@ -244,6 +257,61 @@ fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
                 ),
             );
         }
+    }
+
+    // What changed in a file, put in a pane the way activating a row in the
+    // Git panel does. `path` shows the working tree, `path|staged` the index,
+    // and `|side` on the end splits the tab it is asked from instead of
+    // opening a tab of its own.
+    if let Ok(spec) = std::env::var("TUNI_CAPTURE_DIFF") {
+        for (step, spec) in spec.split(',').map(str::trim).enumerate() {
+            let mut parts = spec.split('|').map(str::trim);
+            let path = parts.next().unwrap_or_default().to_owned();
+            let flags: Vec<&str> = parts.collect();
+            let staged = flags.contains(&"staged");
+            let side = flags.contains(&"side");
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(350 + 100 * step as u64),
+                glib::clone!(
+                    #[weak]
+                    window,
+                    move || {
+                        let path = std::path::Path::new(&path);
+                        if side {
+                            window.open_diff_to_side(path, staged);
+                        } else {
+                            window.open_diff(path, staged);
+                        }
+                    }
+                ),
+            );
+        }
+    }
+
+    // A scripted hunk, staged or unstaged from the diff on screen: the index
+    // it names, counting from zero. Prints what the diff says afterwards, which
+    // is the check that git took the patch.
+    if let Ok(spec) = std::env::var("TUNI_CAPTURE_STAGE")
+        && let Ok(index) = spec.trim().parse::<usize>()
+    {
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(900),
+            glib::clone!(
+                #[weak]
+                window,
+                move || {
+                    let Some(diff) = window.active_diff() else {
+                        eprintln!("TUNI_CAPTURE_STAGE: no diff is open");
+                        return;
+                    };
+                    diff.stage_hunk(index);
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(700),
+                        move || println!("hunks after staging: {}", diff.hunk_count()),
+                    );
+                }
+            ),
+        );
     }
 
     // A scripted find: the bar opens with the text in it and the count is
@@ -309,6 +377,7 @@ fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
     // output is the check that the resize actually landed.
     if let Ok(steps) = std::env::var("TUNI_CAPTURE_ZOOM")
         && let Ok(steps) = steps.trim().parse::<i32>()
+        && let Some(terminal) = terminal
     {
         glib::timeout_add_local_once(
             std::time::Duration::from_millis(300),
@@ -327,6 +396,7 @@ fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
     // Exercises the same path the wheel takes, overlay scrollbar included.
     if let Ok(lines) = std::env::var("TUNI_CAPTURE_SCROLL")
         && let Ok(lines) = lines.trim().parse::<isize>()
+        && let Some(terminal) = terminal
     {
         glib::timeout_add_local_once(
             std::time::Duration::from_millis(delay.saturating_sub(200)),
@@ -340,7 +410,9 @@ fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
 
     // A scripted Ctrl-hover, in surface pixels: "x,y". Prints the hyperlink
     // found there, and leaves it highlighted for the capture.
-    if let Ok(spec) = std::env::var("TUNI_CAPTURE_HOVER") {
+    if let Ok(spec) = std::env::var("TUNI_CAPTURE_HOVER")
+        && let Some(terminal) = terminal
+    {
         glib::timeout_add_local_once(
             std::time::Duration::from_millis(delay.saturating_sub(200)),
             glib::clone!(
@@ -357,7 +429,9 @@ fn maybe_capture(window: &TuniWindow, terminal: &TuniTerminal) {
     // A scripted selection, in surface pixels: "x1,y1,x2,y2". Runs the same
     // widget path a real drag takes and prints what came out, because no
     // pointer injection tool exists on a locked-down Wayland session.
-    if let Ok(spec) = std::env::var("TUNI_CAPTURE_SELECT") {
+    if let Ok(spec) = std::env::var("TUNI_CAPTURE_SELECT")
+        && let Some(terminal) = terminal
+    {
         glib::timeout_add_local_once(
             std::time::Duration::from_millis(delay.saturating_sub(200)),
             glib::clone!(

@@ -23,12 +23,13 @@ use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
 
-use tuni_core::panes::{Edge, Layout, Pane};
+use tuni_core::panes::{Content, Edge, Layout, Pane};
 use tuni_core::session::{History, PaneState, Snapshot};
 use tuni_core::settings::{Appearance, HISTORY_LINE_LIMIT, Settings};
 use tuni_core::theme::Theme;
 use tuni_core::workspace::{Id, Tab, Workspace};
 
+use crate::diff::TuniDiff;
 use crate::editor::TuniEditor;
 use crate::grid::{Message, TuniGrid};
 use crate::panel::TuniPanel;
@@ -53,8 +54,8 @@ const PANEL_POLL_SECONDS: u32 = 2;
 
 mod imp {
     use super::{
-        Cell, HashMap, Id, RefCell, Settings, TuniEditor, TuniGrid, TuniPanel, TuniTerminal,
-        Workspace, glib,
+        Cell, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniGrid, TuniPanel,
+        TuniTerminal, Workspace, glib,
     };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
@@ -67,6 +68,8 @@ mod imp {
         /// One editor per pane holding a file, by pane id. A pane is in one map
         /// or the other, never in both.
         pub editors: RefCell<HashMap<Id, TuniEditor>>,
+        /// One diff per pane showing what changed in a file, by pane id.
+        pub diffs: RefCell<HashMap<Id, TuniDiff>>,
         /// One layout of panes per tab, by tab id.
         pub grids: RefCell<HashMap<Id, TuniGrid>>,
         /// The strip entry each tab was given, by tab id.
@@ -187,6 +190,7 @@ impl TuniWindow {
         let imp = self.imp();
         load_css();
         crate::editor::apply_font(&imp.settings.borrow().terminal);
+        crate::diff::apply_colors(&self.theme());
 
         let sidebar = gtk::ListBox::new();
         sidebar.set_selection_mode(gtk::SelectionMode::Single);
@@ -311,7 +315,7 @@ impl TuniWindow {
             git.connect_open(glib::clone!(
                 #[weak(rename_to = this)]
                 self,
-                move |path| this.open_file(&path)
+                move |path, staged| this.open_diff(&path, staged)
             ));
         }
         let panel = adw::OverlaySplitView::builder()
@@ -376,6 +380,7 @@ impl TuniWindow {
                 glib::ControlFlow::Break,
                 move || {
                     this.poll_files();
+                    this.poll_diffs();
                     glib::ControlFlow::Continue
                 }
             ),
@@ -616,6 +621,9 @@ impl TuniWindow {
                 for editor in this.imp().editors.borrow().values() {
                     editor.set_dark(style.is_dark());
                 }
+                for diff in this.imp().diffs.borrow().values() {
+                    diff.set_theme(&theme);
+                }
                 apply_chrome(&theme);
             }
         );
@@ -654,7 +662,11 @@ impl TuniWindow {
             terminal.set_config(&settings.terminal);
             terminal.set_theme(&theme);
         }
+        for diff in imp.diffs.borrow().values() {
+            diff.set_theme(&theme);
+        }
         crate::editor::apply_font(&settings.terminal);
+        crate::diff::apply_colors(&theme);
         apply_chrome(&theme);
 
         // Turning history off should not leave the last session's output on
@@ -725,6 +737,15 @@ impl TuniWindow {
         self.sync_files();
         if let Some(panel) = imp.panel_view.borrow().as_ref() {
             panel.poll();
+        }
+    }
+
+    /// A diff is over a file the shell beside it can edit, and nothing else
+    /// says when that happened, so the same timer re-reads it. A read that
+    /// comes back unchanged leaves the pane alone.
+    fn poll_diffs(&self) {
+        for diff in self.imp().diffs.borrow().values() {
+            diff.reload();
         }
     }
 
@@ -952,7 +973,9 @@ impl TuniWindow {
         };
         for tab in project.tabs() {
             for pane in tab.layout().panes() {
-                if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane.id()) {
+                imp.diffs.borrow_mut().remove(&pane.id());
+                imp.diffs.borrow_mut().remove(&pane.id());
+            if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane.id()) {
                     terminal.shutdown();
                 }
                 imp.editors.borrow_mut().remove(&pane.id());
@@ -1049,16 +1072,10 @@ impl TuniWindow {
         let (name, panes) = {
             let workspace = imp.workspace.borrow();
             let entry = workspace.project(project)?.tab(tab)?;
-            let panes: Vec<(Id, Option<String>, Option<PathBuf>)> = entry
+            let panes: Vec<(Id, Option<String>, Content)> = entry
                 .layout()
                 .panes()
-                .map(|pane| {
-                    (
-                        pane.id(),
-                        pane.directory.clone(),
-                        pane.path().map(Path::to_path_buf),
-                    )
-                })
+                .map(|pane| (pane.id(), pane.directory.clone(), pane.content.clone()))
                 .collect();
             (entry.name().to_owned(), panes)
         };
@@ -1073,9 +1090,9 @@ impl TuniWindow {
         // is laid out once rather than once per pane.
         let started: Vec<(TuniTerminal, Id, Option<PathBuf>)> = panes
             .into_iter()
-            .filter_map(|(pane, directory, file)| {
-                if let Some(file) = file {
-                    self.new_editor(project, tab, pane, &file);
+            .filter_map(|(pane, directory, content)| {
+                if content != Content::Terminal {
+                    self.new_content(project, tab, pane, &content);
                     return None;
                 }
                 let cwd = directory
@@ -1165,16 +1182,62 @@ impl TuniWindow {
         editor
     }
 
+    /// A diff for one pane, opened on a file and remembered.
+    fn new_diff(&self, project: Id, tab: Id, pane: Id, path: &Path, staged: bool) -> TuniDiff {
+        let imp = self.imp();
+        let diff = TuniDiff::new();
+        diff.set_hexpand(true);
+        diff.set_vexpand(true);
+        diff.set_theme(&self.theme());
+        diff.open(path, staged);
+        diff.connect_focused(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move || this.pane_focused(project, tab, pane)
+        ));
+        // Staging from the diff changes what the panel is showing, and the
+        // panel would otherwise not know until its next poll.
+        diff.connect_applied(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move || this.refresh_git()
+        ));
+        imp.diffs.borrow_mut().insert(pane, diff.clone());
+        diff
+    }
+
+    /// Reads the repository again, and every diff on screen with it.
+    fn refresh_git(&self) {
+        let imp = self.imp();
+        if let Some(git) = imp.panel_view.borrow().as_ref().and_then(TuniPanel::git) {
+            git.poll();
+        }
+        for diff in imp.diffs.borrow().values() {
+            diff.reload();
+        }
+    }
+
     // --- files in panes ----------------------------------------------------
 
     /// Opens a file in a tab of its own, next to the selected one.
-    ///
-    /// A file already open somewhere in this project is shown where it is
-    /// rather than opened twice — the same rule kero has, and the reason a
-    /// second click on a file in the panel goes back to the work in progress
-    /// instead of throwing it away.
     pub fn open_file(&self, path: &Path) {
-        if self.show_open_file(path) {
+        self.open_pane(Pane::file(path.to_path_buf()));
+    }
+
+    /// Opens what changed in a file the same way: the working tree against the
+    /// index, or the index against HEAD.
+    pub fn open_diff(&self, path: &Path, staged: bool) {
+        self.open_pane(Pane::diff(path.to_path_buf(), staged));
+    }
+
+    /// Puts a pane in a tab of its own, next to the selected one.
+    ///
+    /// What the pane holds, already open somewhere in this project, is shown
+    /// where it is rather than opened twice — the same rule kero has, and the
+    /// reason a second click on a file in the panel goes back to the work in
+    /// progress instead of throwing it away.
+    fn open_pane(&self, pane: Pane) {
+        if self.show_pane(&pane.content) {
             return;
         }
         let Some(project) = self.imp().workspace.borrow().selected_id() else {
@@ -1185,7 +1248,7 @@ impl TuniWindow {
             return;
         };
 
-        let tab = Tab::with_pane(Pane::file(path.to_path_buf()));
+        let tab = Tab::with_pane(pane);
         let tab_id = tab.id();
         let position = view
             .selected_page()
@@ -1204,27 +1267,52 @@ impl TuniWindow {
 
     /// Opens a file beside the focused pane, in the tab already on screen.
     pub fn open_file_to_side(&self, path: &Path) {
+        self.open_pane_to_side(Pane::file(path.to_path_buf()));
+    }
+
+    /// The same for a diff, which is how a file and its changes end up side by
+    /// side.
+    pub fn open_diff_to_side(&self, path: &Path, staged: bool) {
+        self.open_pane_to_side(Pane::diff(path.to_path_buf(), staged));
+    }
+
+    fn open_pane_to_side(&self, pane: Pane) {
         let Some((project, tab)) = self.selected_tab() else {
-            self.open_file(path);
+            self.open_pane(pane);
             return;
         };
-        if self.show_open_file_in(tab, path) {
+        if self.show_pane_in(tab, &pane.content) {
             return;
         }
-        let pane = Pane::file(path.to_path_buf());
         let pane_id = pane.id();
+        let content = pane.content.clone();
         if !self.insert_pane(project, tab, pane, Edge::Right) {
             return;
         }
-        self.new_editor(project, tab, pane_id, path);
+        self.new_content(project, tab, pane_id, &content);
         self.rebuild_grid(project, tab);
         self.refresh();
         self.focus_pane();
     }
 
-    /// Brings a file already open in this project back on screen. `false` when
-    /// it is not open anywhere.
-    fn show_open_file(&self, path: &Path) -> bool {
+    /// Builds whatever a pane holds, for a pane already in the layout. Not a
+    /// terminal: that needs a directory to start in and a shell to start,
+    /// which only the caller knows.
+    fn new_content(&self, project: Id, tab: Id, pane: Id, content: &Content) {
+        match content {
+            Content::Terminal => (),
+            Content::File(path) => {
+                self.new_editor(project, tab, pane, path);
+            }
+            Content::Diff { path, staged } => {
+                self.new_diff(project, tab, pane, path, *staged);
+            }
+        }
+    }
+
+    /// Brings a pane already open in this project back on screen. `false` when
+    /// nothing in it is showing that.
+    fn show_pane(&self, content: &Content) -> bool {
         let imp = self.imp();
         let found = {
             let workspace = imp.workspace.borrow();
@@ -1234,7 +1322,7 @@ impl TuniWindow {
             project.tabs().iter().find_map(|tab| {
                 tab.layout()
                     .panes()
-                    .find(|pane| pane.path() == Some(path))
+                    .find(|pane| &pane.content == content)
                     .map(|pane| (tab.id(), pane.id()))
             })
         };
@@ -1252,7 +1340,7 @@ impl TuniWindow {
 
     /// The same, for one tab: what splitting to the side checks before it
     /// splits.
-    fn show_open_file_in(&self, tab: Id, path: &Path) -> bool {
+    fn show_pane_in(&self, tab: Id, content: &Content) -> bool {
         let found = {
             let workspace = self.imp().workspace.borrow();
             workspace
@@ -1261,7 +1349,7 @@ impl TuniWindow {
                 .and_then(|tab| {
                     tab.layout()
                         .panes()
-                        .find(|pane| pane.path() == Some(path))
+                        .find(|pane| &pane.content == content)
                         .map(tuni_core::panes::Pane::id)
                 })
         };
@@ -1418,6 +1506,12 @@ impl TuniWindow {
                 .iter()
                 .map(|(id, editor)| (*id, editor.clone().upcast())),
         );
+        widgets.extend(
+            imp.diffs
+                .borrow()
+                .iter()
+                .map(|(id, diff)| (*id, diff.clone().upcast())),
+        );
         widgets
     }
 
@@ -1545,6 +1639,7 @@ impl TuniWindow {
     /// Closes one pane, and the tab with it when it was the last one.
     fn close_pane(&self, project: Id, tab: Id, pane: Id) {
         let imp = self.imp();
+        imp.diffs.borrow_mut().remove(&pane);
         if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane) {
             terminal.shutdown();
         }
@@ -1978,6 +2073,12 @@ impl TuniWindow {
     pub(crate) fn force_close(&self) {
         self.imp().closing.set(true);
         self.close();
+    }
+
+    /// The diff in the focused pane, when the focused pane is one.
+    pub(crate) fn active_diff(&self) -> Option<TuniDiff> {
+        let pane = self.focused_pane()?;
+        self.imp().diffs.borrow().get(&pane).cloned()
     }
 
     pub(crate) fn active_editor(&self) -> Option<TuniEditor> {

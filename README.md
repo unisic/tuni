@@ -55,6 +55,17 @@ window — happens without asking first. A picture opens in the pane too, and
 anything that is neither, or is past the 5 MiB the editor will read, says so and
 offers to hand the file to the desktop.
 
+A row on the Git page opens what changed in that file rather than the file, in a
+pane of the same kind: the working tree against the index, or — for a row that is
+already staged — the index against HEAD. Each hunk is headed by its `@@` line and
+how much it adds and removes, both sides' line numbers run down the margin, and
+the words that actually differ within a changed line are picked out of it. One
+button swaps the inline reading for the two sides beside each other. The plus on
+a hunk stages that hunk alone, and on the staged side takes it back out again;
+either way it is a patch handed to `git apply`, so the index ends up where the
+command line would have left it. What the shell beside the pane does to the file
+lands in the diff on its own.
+
 Closing the window writes that arrangement down, and opening it again puts it
 back: the projects, their tabs, the columns and panes inside each one with the
 room they had, the names that were typed, and a fresh shell in each pane's last
@@ -98,8 +109,8 @@ scrollback, and that last decision, writing each change to
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
 
-From here the work runs to full parity: the diff viewer — which is where staging
-a single hunk belongs — the command palette, and packaging.
+From here the work runs to full parity: the command palette, the tab switcher,
+find in the terminal, and packaging.
 
 Consuming a 200 MiB stream, measured with `scripts/throughput.sh` on this
 machine:
@@ -217,6 +228,21 @@ is on disk is the file, and the question before closing is asked while there is
 still someone there to answer it. A file is text if it decodes as UTF-8 and
 binary if it does not, which is a decision the bytes make rather than the
 extension.
+
+A diff is `git diff` and its output parsed, for the same reason the panel is:
+what the pane shows has to be what the command line would print, renames and
+`diff.algorithm` and all. An untracked file has nothing in the index to compare
+against, so it is `--no-index` against `/dev/null`, which is also the one form
+of diff that answers with an exit status of one when it worked. Staging is the
+hunk as it was parsed, handed back to `git apply --cached` on standard input,
+and unstaging is that same patch with git's own `--reverse` — a patch written
+backwards by hand is how a staging tool loses a line. Within a changed line the
+words that moved come from `similar`, run only on pairs of lines that a hunk
+already puts opposite each other; a diff of a generated file draws 4000 lines
+and then says how much it left. The pane re-reads on the same two-second timer
+as the panel, so a change made by the shell beside it appears without asking,
+and a read that comes back byte-for-byte identical is dropped rather than
+redrawn, which is what keeps the scroll position under someone reading.
 
 Ghostty's theme catalog is vendored under `data/themes` and baked into the
 binary at build time, so a fresh checkout runs with all 574 and a packaged
