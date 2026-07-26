@@ -89,6 +89,13 @@ ASCII share one layout; anything wide, combining, or borrowed from a fallback
 face gets a layout of its own. Ligatures are off by default for the same
 reason — a ligature is one glyph where the terminal still counts several cells.
 
+A key is named by where it is rather than by what it types: the hardware
+keycode a GDK event carries is the XKB one, which is the evdev scancode plus
+eight on Wayland and X11 alike, and that is what the Kitty keyboard protocol
+reports. The table is Ghostty's own, so the key where a US keyboard has Q is
+`KeyQ` on an AZERTY layout too. The keyval only settles what the scancode
+cannot: which key a keypad scancode is while Num Lock is off.
+
 A hyperlink is whatever the program holding the PTY says it is, which over ssh
 is not the person at the keyboard. So `Ctrl` has to be held before one lights up
 at all, the press only opens on release and only if the same link is still

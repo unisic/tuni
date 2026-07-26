@@ -457,7 +457,7 @@ impl TuniTerminal {
             self,
             #[upgrade_or]
             glib::Propagation::Proceed,
-            move |controller, keyval, _keycode, state| this.on_key(controller, keyval, state)
+            move |controller, keyval, keycode, state| this.on_key(controller, keyval, keycode, state)
         ));
         keys.connect_modifiers(glib::clone!(
             #[weak(rename_to = this)]
@@ -1396,6 +1396,7 @@ impl TuniTerminal {
         &self,
         controller: &gtk::EventControllerKey,
         keyval: gdk::Key,
+        keycode: u32,
         state: gdk::ModifierType,
     ) -> glib::Propagation {
         let imp = self.imp();
@@ -1495,7 +1496,7 @@ impl TuniTerminal {
             }
         }
 
-        let key = keymap::key_from_keyval(keyval);
+        let key = keymap::key_from_event(keyval, keycode);
         let text = committed.or_else(|| {
             keyval
                 .to_unicode()
