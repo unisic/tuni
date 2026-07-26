@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.unisic.Tuni</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Tuni</name>
+  <summary>Terminals, projects, files, and Git in one window</summary>
+
+  <description>
+    <p>
+      Tuni is a terminal workspace. A window holds projects, a project holds
+      tabs, and a tab holds a niri-style layout of panes — each one a terminal,
+      a file, or a diff.
+    </p>
+    <p>
+      The terminal is Ghostty's own emulation, through libghostty-vt: the VT
+      parser, the grid, reflow, scrollback, Kitty keyboard encoding, SGR mouse
+      reporting, and 574 color themes that paint the window as well as the
+      terminal.
+    </p>
+    <p>Around it:</p>
+    <ul>
+      <li>A file tree of the directory the focused shell is working in</li>
+      <li>A Git panel that stages, commits, and pushes by running git itself</li>
+      <li>An editor with syntax highlighting, and a diff viewer that stages a hunk at a time</li>
+      <li>A command palette, a find bar over the terminal, and a most-recently-used tab switcher</li>
+      <li>A session that comes back the way it was left</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">dev.unisic.Tuni.desktop</launchable>
+
+  <developer id="dev.unisic">
+    <name>Unisic</name>
+  </developer>
+
+  <url type="homepage">https://github.com/unisic/tuni</url>
+  <url type="bugtracker">https://github.com/unisic/tuni/issues</url>
+  <url type="vcs-browser">https://github.com/unisic/tuni</url>
+
+  <content_rating type="oars-1.1"/>
+
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+
+  <categories>
+    <category>System</category>
+    <category>TerminalEmulator</category>
+  </categories>
+
+  <keywords>
+    <keyword>terminal</keyword>
+    <keyword>shell</keyword>
+    <keyword>console</keyword>
+    <keyword>git</keyword>
+  </keywords>
+
+  <provides>
+    <binary>tuni</binary>
+  </provides>
+
+  <releases>
+    <release version="0.1.0" date="2026-07-26">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

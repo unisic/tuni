@@ -956,7 +956,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tuni-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "tuni-gtk"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "gtk4",
  "libadwaita",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "tuni-pty"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-channel",
  "portable-pty",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "tuni-vt"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "libghostty-vt",
  "unicode-width",

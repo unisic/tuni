@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Tuni. A window with a prompt in it: the two things the application is. -->
+  <defs>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3d3846"/>
+      <stop offset="1" stop-color="#241f31"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.04"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="14" width="112" height="100" rx="22" fill="url(#screen)"/>
+  <rect x="8.5" y="14.5" width="111" height="99" rx="21.5" fill="none" stroke="url(#edge)" stroke-width="1"/>
+
+  <!-- The strip along the top is the tab bar, which is what makes this a
+       workspace rather than a single terminal. -->
+  <path d="M8 36 h112 v56 a22 22 0 0 1 -22 22 h-68 a22 22 0 0 1 -22 -22 z" fill="#1c1a26" opacity="0.55"/>
+  <rect x="20" y="22" width="34" height="8" rx="4" fill="#99c1f1" opacity="0.9"/>
+  <rect x="60" y="22" width="24" height="8" rx="4" fill="#ffffff" opacity="0.25"/>
+
+  <!-- The prompt. -->
+  <path d="M30 56 L48 68 L30 80" fill="none" stroke="#8ff0a4" stroke-width="8"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="60" y="62" width="38" height="10" rx="5" fill="#f6f5f4" opacity="0.92"/>
+</svg>

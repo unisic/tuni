@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Tuni
+GenericName=Terminal Workspace
+Comment=Terminals, projects, files, and Git in one window
+Exec=tuni
+Icon=dev.unisic.Tuni
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;prompt;command;console;git;
+StartupNotify=true
+StartupWMClass=dev.unisic.Tuni
+X-GNOME-UsesNotifications=true

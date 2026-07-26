@@ -9,11 +9,13 @@
 //! byte buffers over a channel.
 
 mod grid;
+mod osc;
 
 pub use grid::{Cell, Cursor, CursorShape, Grid, LinkHover, Rgb};
 pub use libghostty_vt::Error;
 pub use libghostty_vt::key::{Action as KeyAction, Key, Mods};
 pub use libghostty_vt::mouse::{Action as MouseAction, Button as MouseButton};
+pub use osc::{Notification, Progress};
 
 use libghostty_vt::mouse::EncoderSize;
 
@@ -49,6 +51,12 @@ pub struct Effects {
     /// Clipboard writes requested by the application (OSC 52, OSC 1337 Copy).
     /// Reads are refused upstream and never reach us.
     pub clipboard_writes: Vec<ClipboardRequest>,
+    /// Desktop notifications the application asked for (OSC 9, OSC 99,
+    /// OSC 777), in the order they were asked for.
+    pub notifications: Vec<Notification>,
+    /// The last progress report (OSC 9;4). Only the last matters: a build that
+    /// counted from 1 to 40 while the widget was busy shows 40.
+    pub progress: Option<Progress>,
 }
 
 /// Which clipboard an application asked to write.
@@ -327,6 +335,10 @@ pub struct Terminal {
     selection_colors: Option<(Option<Rgb>, Option<Rgb>)>,
     /// The theme's cursor text color, applied to the cell under a block cursor.
     cursor_text: Option<Rgb>,
+    /// Reads the stream for the OSCs upstream parses but never reports.
+    sniffer: osc::Sniffer,
+    /// Scratch buffer for what the sniffer found, reused across feeds.
+    sniffed: Vec<osc::Event>,
 }
 
 impl Terminal {
@@ -412,6 +424,8 @@ impl Terminal {
             search_buf: Vec::new(),
             selection_colors: None,
             cursor_text: None,
+            sniffer: osc::Sniffer::default(),
+            sniffed: Vec::new(),
         })
     }
 
@@ -448,6 +462,21 @@ impl Terminal {
     /// logged upstream rather than propagated, by design.
     pub fn feed(&mut self, data: &[u8]) {
         self.inner.vt_write(data);
+
+        // Read the same bytes for what the parser above swallows: notifications
+        // and progress reports, which it recognises and then keeps.
+        self.sniffed.clear();
+        self.sniffer.feed(data, &mut self.sniffed);
+        if self.sniffed.is_empty() {
+            return;
+        }
+        let mut effects = self.effects.borrow_mut();
+        for event in self.sniffed.drain(..) {
+            match event {
+                osc::Event::Notify(notification) => effects.notifications.push(notification),
+                osc::Event::Progress(progress) => effects.progress = Some(progress),
+            }
+        }
     }
 
     pub fn resize(
@@ -822,7 +851,10 @@ impl Terminal {
                 .with_selection(&selection)
                 .with_unwrap(false)
                 .with_trim(false);
-            match self.inner.format_selection_buf(options, &mut self.search_buf) {
+            match self
+                .inner
+                .format_selection_buf(options, &mut self.search_buf)
+            {
                 Ok(None) => return Ok(None),
                 Ok(Some(len)) => {
                     return Ok(Some(

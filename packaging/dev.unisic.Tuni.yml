@@ -1,0 +1,62 @@
+# Flatpak manifest.
+#
+# Two toolchains have to be in the build sandbox: Rust, from the SDK extension,
+# and Zig, because libghostty-vt is Zig source compiled during the build.
+#
+# The build needs the network, for the same reason: the pinned Ghostty source
+# and the cargo registry are both fetched by the build. Build it with
+#
+#   flatpak-builder --user --install --force-clean \
+#       --install-deps-from=flathub build packaging/dev.unisic.Tuni.yml
+#
+# See packaging/README.md for what a Flathub submission would need on top of
+# this, which is offline sources for both.
+id: dev.unisic.Tuni
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: tuni
+
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # A terminal workspace whose file tree and Git panel only reached its own
+  # sandbox would be a terminal that cannot see the code in it.
+  - --filesystem=host
+  # git, and whatever the shell in a pane runs, are the point of the program.
+  - --talk-name=org.freedesktop.Flatpak
+  - --talk-name=org.freedesktop.Notifications
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/run/build/tuni/zig
+  build-args:
+    - --share=network
+  env:
+    CARGO_HOME: /run/build/tuni/cargo
+
+modules:
+  - name: tuni
+    buildsystem: simple
+    sources:
+      - type: dir
+        path: ..
+      # Fedora and the GNOME SDK both ship a Zig too new for the pinned
+      # Ghostty source, so the version that builds it comes down with the rest.
+      - type: archive
+        url: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+        sha256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+        dest: zig
+        strip-components: 1
+        only-arches: [x86_64]
+      - type: archive
+        url: https://ziglang.org/download/0.15.2/zig-aarch64-linux-0.15.2.tar.xz
+        sha256: 958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f
+        dest: zig
+        strip-components: 1
+        only-arches: [aarch64]
+    build-commands:
+      - make install PREFIX=/app

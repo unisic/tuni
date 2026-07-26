@@ -9,6 +9,7 @@ mod find;
 mod git;
 mod grid;
 mod keymap;
+mod notify;
 mod palette;
 mod panel;
 mod preferences;
@@ -91,6 +92,10 @@ fn main() -> glib::ExitCode {
         .build();
 
     app.connect_startup(|app| {
+        // Names the installed icon rather than carrying one: the desktop looks
+        // it up in the icon theme, which is also where the notification daemon
+        // and the window switcher look for it.
+        gtk::Window::set_default_icon_name(APP_ID);
         for (action, accels) in ACCELS {
             app.set_accels_for_action(action, accels);
         }
@@ -215,27 +220,25 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                             None => (action.clone(), None),
                         };
                         let target = target.map(|value| value.to_variant());
-                        let (widget, name) = match (
-                            name.strip_prefix("editor."),
-                            name.strip_prefix("diff."),
-                        ) {
-                            (Some(rest), _) => match window.active_editor() {
-                                Some(editor) => {
-                                    (editor.upcast::<gtk::Widget>(), format!("editor.{rest}"))
+                        let (widget, name) =
+                            match (name.strip_prefix("editor."), name.strip_prefix("diff.")) {
+                                (Some(rest), _) => match window.active_editor() {
+                                    Some(editor) => {
+                                        (editor.upcast::<gtk::Widget>(), format!("editor.{rest}"))
+                                    }
+                                    None => return eprintln!("no file is open: {name}"),
+                                },
+                                (_, Some(rest)) => match window.active_diff() {
+                                    Some(diff) => {
+                                        (diff.upcast::<gtk::Widget>(), format!("diff.{rest}"))
+                                    }
+                                    None => return eprintln!("no diff is open: {name}"),
+                                },
+                                _ => {
+                                    let name = name.strip_prefix("win.").unwrap_or(&name);
+                                    (window.clone().upcast(), format!("win.{name}"))
                                 }
-                                None => return eprintln!("no file is open: {name}"),
-                            },
-                            (_, Some(rest)) => match window.active_diff() {
-                                Some(diff) => {
-                                    (diff.upcast::<gtk::Widget>(), format!("diff.{rest}"))
-                                }
-                                None => return eprintln!("no diff is open: {name}"),
-                            },
-                            _ => {
-                                let name = name.strip_prefix("win.").unwrap_or(&name);
-                                (window.clone().upcast(), format!("win.{name}"))
-                            }
-                        };
+                            };
                         gtk::prelude::WidgetExt::activate_action(&widget, &name, target.as_ref())
                             .unwrap_or_else(|_| eprintln!("no such action: {name}"));
                     }
@@ -367,7 +370,8 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                 #[weak]
                 window,
                 move || {
-                    let (Some(find), Some(terminal)) = (window.find_bar(), window.active_terminal())
+                    let (Some(find), Some(terminal)) =
+                        (window.find_bar(), window.active_terminal())
                     else {
                         eprintln!("TUNI_CAPTURE_SEARCH: no terminal is open");
                         return;

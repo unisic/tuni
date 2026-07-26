@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The pinned Ghostty source builds with this and not with a newer one.
+  ZIG_VERSION: 0.15.2
+  ZIG_SHA256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Fedora, because that is the desktop this is developed against and it
+    # carries GTK 4 and libadwaita new enough without a PPA.
+    container: fedora:43
+
+    steps:
+      - name: Install dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            cargo rust rustfmt clippy gcc make git-core curl tar xz \
+            gtk4-devel libadwaita-devel gtksourceview5-devel \
+            desktop-file-utils libappstream-glib
+
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "${ZIG_SHA256}  zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | sha256sum -c -
+          tar xf "zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "${GITHUB_WORKSPACE}/zig-x86_64-linux-${ZIG_VERSION}" >> "${GITHUB_PATH}"
+
+      - name: Cache cargo and the Ghostty source
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      # The parts of the install that a compiler cannot check.
+      - name: Validate desktop integration
+        run: |
+          desktop-file-validate data/dev.unisic.Tuni.desktop
+          appstream-util validate-relax --nonet data/dev.unisic.Tuni.metainfo.xml
+
+      - name: Install into a staging root
+        run: make install PREFIX=/usr DESTDIR="${GITHUB_WORKSPACE}/staging"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tuni-x86_64
+          path: staging

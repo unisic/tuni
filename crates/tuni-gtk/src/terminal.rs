@@ -22,7 +22,7 @@ use tuni_core::theme::Theme;
 use tuni_pty::{Pty, PtyConfig, PtyEvent};
 use tuni_vt::{
     ClipboardTarget, Colors, CursorShape, Geometry, Key, KeyAction, KeyInput, Mods, MouseAction,
-    MouseButton, MouseInput, Rgb, ScrollPosition,
+    MouseButton, MouseInput, Progress, Rgb, ScrollPosition,
 };
 
 use crate::keymap;
@@ -37,6 +37,12 @@ const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 const SCROLLBAR_LINGER: Duration = Duration::from_millis(1100);
 const SCROLLBAR_FADE: Duration = Duration::from_millis(400);
 const SCROLLBAR_REVEAL: Duration = Duration::from_millis(100);
+
+/// The progress bar an application draws by reporting OSC 9;4, and how long a
+/// report stands before it is treated as abandoned. A shell killed mid-build
+/// never sends the report that clears the bar, so the bar clears itself.
+const PROGRESS_HEIGHT: f32 = 2.0;
+const PROGRESS_STALE: Duration = Duration::from_secs(15);
 
 /// What the pointer is doing between press and release. A drag either paints a
 /// selection or is reported to the application; never both.
@@ -214,6 +220,12 @@ mod imp {
         /// output is already queued.
         pub(super) find: RefCell<Find>,
         pub(super) find_pending: Cell<bool>,
+        /// The progress report in effect (OSC 9;4), the percentage last given
+        /// — states that report none carry the one before — and the timer that
+        /// retires a report nothing has refreshed.
+        pub(super) progress: Cell<Option<Progress>>,
+        pub(super) progress_value: Cell<u8>,
+        pub(super) progress_stale: RefCell<Option<glib::SourceId>>,
         /// Draw timings, collected only when TUNI_DEBUG_FRAME_TIME is set.
         /// This is the measurement that decides whether Pango can keep up.
         pub(super) frame_timing: bool,
@@ -259,6 +271,9 @@ mod imp {
                 last_input: Cell::new(None),
                 find: RefCell::new(Find::default()),
                 find_pending: Cell::new(false),
+                progress: Cell::new(None),
+                progress_value: Cell::new(0),
+                progress_stale: RefCell::new(None),
                 frame_timing: std::env::var_os("TUNI_DEBUG_FRAME_TIME").is_some(),
                 frame_times: RefCell::new(Vec::with_capacity(120)),
             }
@@ -303,6 +318,13 @@ mod imp {
                     // The application rang. A tab that is not on screen shows it
                     // as an attention mark rather than as a sound.
                     glib::subclass::Signal::builder("bell").build(),
+                    // The application asked the desktop to show something
+                    // (OSC 9, OSC 99, OSC 777): a title and a body, either of
+                    // which may be empty. Not called "notify", which is
+                    // GObject's own.
+                    glib::subclass::Signal::builder("desktop-notify")
+                        .param_types([String::static_type(), String::static_type()])
+                        .build(),
                     // Output changed what the live search finds. The find bar
                     // reads the tally back rather than being handed it, because
                     // by the time it runs the terminal may have moved on again.
@@ -328,6 +350,9 @@ mod imp {
             }
             if let Some(tick) = self.bar_tick.take() {
                 tick.remove();
+            }
+            if let Some(source) = self.progress_stale.take() {
+                source.remove();
             }
             // Drop the session before the widget so the reader thread's channel
             // closes and the shell gets its SIGHUP.
@@ -897,6 +922,12 @@ impl TuniTerminal {
             self.error_bell();
             self.emit_by_name::<()>("bell", &[]);
         }
+        for notification in &effects.notifications {
+            self.emit_by_name::<()>("desktop-notify", &[&notification.title, &notification.body]);
+        }
+        if let Some(progress) = effects.progress {
+            self.apply_progress(progress);
+        }
         for request in &effects.clipboard_writes {
             if std::env::var_os("TUNI_DEBUG_CLIPBOARD").is_some() {
                 eprintln!(
@@ -1203,7 +1234,11 @@ impl TuniTerminal {
         };
         let mut rows: Vec<String> = (0..grid.rows)
             .map(|row| {
-                let text: String = grid.row(row).iter().map(|cell| cell.text.as_str()).collect();
+                let text: String = grid
+                    .row(row)
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect();
                 text.trim_end().to_owned()
             })
             .collect();
@@ -2226,6 +2261,101 @@ impl TuniTerminal {
             .set(cursor.is_some_and(|cursor| cursor.blinking));
 
         self.draw_scrollbar(snapshot);
+        self.draw_progress(snapshot);
+    }
+
+    /// Takes a progress report (OSC 9;4) and puts the bar where it says.
+    ///
+    /// A state that reports no percentage keeps the last one, so a build that
+    /// fails at 60% shows a red bar three fifths of the way along rather than
+    /// an empty one.
+    fn apply_progress(&self, progress: Progress) {
+        let imp = self.imp();
+        if let Some(source) = imp.progress_stale.take() {
+            source.remove();
+        }
+        if progress == Progress::Remove {
+            imp.progress.set(None);
+            self.queue_draw();
+            return;
+        }
+        match progress {
+            Progress::Set(percent) => imp.progress_value.set(percent),
+            Progress::Error(Some(percent)) | Progress::Pause(Some(percent)) => {
+                imp.progress_value.set(percent);
+            }
+            _ => {}
+        }
+        imp.progress.set(Some(progress));
+
+        // Nothing obliges an application to clear its own bar, and a shell that
+        // was interrupted never will. Retire the report instead of leaving it
+        // to sit under the terminal for the rest of the session.
+        let source = glib::timeout_add_local_once(
+            PROGRESS_STALE,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move || {
+                    this.imp().progress_stale.replace(None);
+                    this.imp().progress.set(None);
+                    this.queue_draw();
+                }
+            ),
+        );
+        imp.progress_stale.replace(Some(source));
+        self.queue_draw();
+    }
+
+    /// The progress bar: a hairline along the bottom edge, in the theme's own
+    /// colors so it reads against the terminal rather than against the desktop.
+    fn draw_progress(&self, snapshot: &gtk::Snapshot) {
+        let imp = self.imp();
+        let Some(progress) = imp.progress.get() else {
+            return;
+        };
+        let width = self.width() as f32;
+        let top = self.height() as f32 - PROGRESS_HEIGHT;
+        if width <= 0.0 || top < 0.0 {
+            return;
+        }
+
+        let theme = imp.theme.borrow();
+        // Blue for running, red for failed, yellow for waiting: the palette's,
+        // not the desktop's, and each also differs in how much of the bar it
+        // fills, so the state does not rest on color alone.
+        let (color, fraction) = match progress {
+            Progress::Remove => return,
+            Progress::Set(percent) => (theme.palette[4], f32::from(percent) / 100.0),
+            Progress::Error(_) => (
+                theme.palette[1],
+                f32::from(imp.progress_value.get()) / 100.0,
+            ),
+            Progress::Pause(_) => (
+                theme.palette[3],
+                f32::from(imp.progress_value.get()) / 100.0,
+            ),
+            Progress::Indeterminate => (theme.palette[4], 1.0),
+        };
+        let mut color = rgba(theme_rgb(color));
+        if progress == Progress::Indeterminate {
+            // Nothing to measure, so the bar says "running" rather than "done".
+            color.set_alpha(0.45);
+        }
+
+        // The track, so a bar at 3% is still visibly a bar rather than a speck.
+        let mut track = rgba(theme_rgb(theme.foreground));
+        track.set_alpha(0.12);
+        drop(theme);
+        snapshot.append_color(
+            &track,
+            &graphene::Rect::new(0.0, top, width, PROGRESS_HEIGHT),
+        );
+        let filled = (width * fraction.clamp(0.0, 1.0)).max(1.0);
+        snapshot.append_color(
+            &color,
+            &graphene::Rect::new(0.0, top, filled, PROGRESS_HEIGHT),
+        );
     }
 
     /// The overlay thumb, drawn last so it floats over the text.

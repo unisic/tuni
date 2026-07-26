@@ -33,10 +33,11 @@ use crate::diff::TuniDiff;
 use crate::editor::TuniEditor;
 use crate::find::TuniFind;
 use crate::grid::{Message, TuniGrid};
+use crate::notify;
 use crate::palette;
 use crate::panel::TuniPanel;
-use crate::switcher::{Card, TuniSwitcher};
 use crate::preferences;
+use crate::switcher::{Card, TuniSwitcher};
 use crate::terminal::TuniTerminal;
 
 /// Sidebar width, and the range a narrow or a wide window may take it to.
@@ -60,23 +61,103 @@ const PANEL_POLL_SECONDS: u32 = 2;
 /// same thing so the palette teaches them. The shortcuts repeat `ACCELS` in
 /// main.rs, spelled the way a keycap is rather than the way GTK parses one.
 const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
-    ("New Tab", "tab-new-symbolic", Some("Ctrl+Shift+T"), "win.new-tab"),
-    ("New Project", "folder-new-symbolic", Some("Ctrl+Shift+N"), "win.new-project"),
-    ("Split Right", "view-right-pane-symbolic", Some("Ctrl+Shift+D"), "win.split-right"),
-    ("Split Down", "view-bottom-pane-symbolic", Some("Ctrl+Shift+E"), "win.split-down"),
-    ("Close Pane", "window-close-symbolic", Some("Ctrl+Shift+W"), "win.close-pane"),
-    ("Zoom Pane", "view-fullscreen-symbolic", Some("Ctrl+Shift+Enter"), "win.zoom-pane"),
-    ("Equalize Panes", "view-grid-symbolic", Some("Ctrl+Alt+="), "win.equalize-panes"),
-    ("Next Tab", "go-next-symbolic", Some("Ctrl+Page Down"), "win.next-tab"),
-    ("Previous Tab", "go-previous-symbolic", Some("Ctrl+Page Up"), "win.previous-tab"),
-    ("Rename Tab", "document-edit-symbolic", None, "win.tab-rename"),
+    (
+        "New Tab",
+        "tab-new-symbolic",
+        Some("Ctrl+Shift+T"),
+        "win.new-tab",
+    ),
+    (
+        "New Project",
+        "folder-new-symbolic",
+        Some("Ctrl+Shift+N"),
+        "win.new-project",
+    ),
+    (
+        "Split Right",
+        "view-right-pane-symbolic",
+        Some("Ctrl+Shift+D"),
+        "win.split-right",
+    ),
+    (
+        "Split Down",
+        "view-bottom-pane-symbolic",
+        Some("Ctrl+Shift+E"),
+        "win.split-down",
+    ),
+    (
+        "Close Pane",
+        "window-close-symbolic",
+        Some("Ctrl+Shift+W"),
+        "win.close-pane",
+    ),
+    (
+        "Zoom Pane",
+        "view-fullscreen-symbolic",
+        Some("Ctrl+Shift+Enter"),
+        "win.zoom-pane",
+    ),
+    (
+        "Equalize Panes",
+        "view-grid-symbolic",
+        Some("Ctrl+Alt+="),
+        "win.equalize-panes",
+    ),
+    (
+        "Next Tab",
+        "go-next-symbolic",
+        Some("Ctrl+Page Down"),
+        "win.next-tab",
+    ),
+    (
+        "Previous Tab",
+        "go-previous-symbolic",
+        Some("Ctrl+Page Up"),
+        "win.previous-tab",
+    ),
+    (
+        "Rename Tab",
+        "document-edit-symbolic",
+        None,
+        "win.tab-rename",
+    ),
     ("Close Tab", "window-close-symbolic", None, "win.tab-close"),
-    ("Find in Terminal", "edit-find-symbolic", Some("Ctrl+Shift+F"), "win.find"),
-    ("Save File", "document-save-symbolic", Some("Ctrl+S"), "win.save-file"),
-    ("Toggle Sidebar", "sidebar-show-symbolic", Some("F9"), "win.toggle-sidebar"),
-    ("Toggle Files Panel", "folder-symbolic", Some("Ctrl+Shift+B"), "win.toggle-panel"),
-    ("Show Git", "media-record-symbolic", Some("Ctrl+Shift+G"), "win.show-git"),
-    ("Preferences", "preferences-system-symbolic", Some("Ctrl+,"), "win.settings"),
+    (
+        "Find in Terminal",
+        "edit-find-symbolic",
+        Some("Ctrl+Shift+F"),
+        "win.find",
+    ),
+    (
+        "Save File",
+        "document-save-symbolic",
+        Some("Ctrl+S"),
+        "win.save-file",
+    ),
+    (
+        "Toggle Sidebar",
+        "sidebar-show-symbolic",
+        Some("F9"),
+        "win.toggle-sidebar",
+    ),
+    (
+        "Toggle Files Panel",
+        "folder-symbolic",
+        Some("Ctrl+Shift+B"),
+        "win.toggle-panel",
+    ),
+    (
+        "Show Git",
+        "media-record-symbolic",
+        Some("Ctrl+Shift+G"),
+        "win.show-git",
+    ),
+    (
+        "Preferences",
+        "preferences-system-symbolic",
+        Some("Ctrl+,"),
+        "win.settings",
+    ),
 ];
 
 mod imp {
@@ -590,10 +671,9 @@ impl TuniWindow {
             // and a diff is a rendering of a command's output rather than
             // something to search through.
             entry("find", None, |window, _| {
-                if let (Some(find), Some(terminal)) = (
-                    window.imp().find.borrow().clone(),
-                    window.active_terminal(),
-                ) {
+                if let (Some(find), Some(terminal)) =
+                    (window.imp().find.borrow().clone(), window.active_terminal())
+                {
                     find.open(&terminal);
                 }
             }),
@@ -1042,7 +1122,7 @@ impl TuniWindow {
             for pane in tab.layout().panes() {
                 imp.diffs.borrow_mut().remove(&pane.id());
                 imp.diffs.borrow_mut().remove(&pane.id());
-            if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane.id()) {
+                if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane.id()) {
                     terminal.shutdown();
                 }
                 imp.editors.borrow_mut().remove(&pane.id());
@@ -1651,12 +1731,33 @@ impl TuniWindow {
             glib::closure_local!(
                 #[weak(rename_to = this)]
                 self,
-                move |_: TuniTerminal| {
+                move |terminal: TuniTerminal| {
                     if let Some(page) = this.imp().pages.borrow().get(&tab)
                         && !page.is_selected()
                     {
                         page.set_needs_attention(true);
                     }
+                    // A bell in the pane being worked in has already been
+                    // heard. One from a pane that is out of sight — another
+                    // tab, another window on top — is the case the desktop is
+                    // for.
+                    if !terminal.has_focus() || !this.is_active() {
+                        let where_from =
+                            terminal.title().unwrap_or_else(|| "a terminal".to_owned());
+                        this.notify_desktop(pane, "Bell", &where_from);
+                    }
+                }
+            ),
+        );
+
+        terminal.connect_closure(
+            "desktop-notify",
+            false,
+            glib::closure_local!(
+                #[weak(rename_to = this)]
+                self,
+                move |_: TuniTerminal, title: String, body: String| {
+                    this.notify_desktop(pane, &title, &body);
                 }
             ),
         );
@@ -1701,6 +1802,19 @@ impl TuniWindow {
         // The panel follows whichever pane is being worked in, so moving
         // between two shells in different repositories moves the tree.
         self.sync_files();
+        // Whatever this pane was asking for attention about is now being
+        // looked at, so the banner has done its job.
+        if let Some(app) = self.application() {
+            notify::withdraw(app.upcast_ref(), pane);
+        }
+    }
+
+    /// Hands a pane's notification to the desktop.
+    fn notify_desktop(&self, pane: Id, title: &str, body: &str) {
+        let Some(app) = self.application() else {
+            return;
+        };
+        notify::post(app.upcast_ref(), pane, title, body);
     }
 
     /// Closes one pane, and the tab with it when it was the last one.
@@ -2192,7 +2306,10 @@ impl TuniWindow {
             switcher.close();
             return glib::Propagation::Stop;
         }
-        if !matches!(key, gdk::Key::Tab | gdk::Key::ISO_Left_Tab | gdk::Key::KP_Tab) {
+        if !matches!(
+            key,
+            gdk::Key::Tab | gdk::Key::ISO_Left_Tab | gdk::Key::KP_Tab
+        ) {
             return glib::Propagation::Proceed;
         }
         // `Ctrl+Alt+Tab` is the desktop's own, and `Ctrl+Shift+Tab` steps back.
@@ -2229,8 +2346,10 @@ impl TuniWindow {
         let chosen = switcher.highlighted();
         switcher.close();
         if let Some(tab) = chosen
-            && let (Some(view), Some(page)) =
-                (self.selected_view(), self.imp().pages.borrow().get(&tab).cloned())
+            && let (Some(view), Some(page)) = (
+                self.selected_view(),
+                self.imp().pages.borrow().get(&tab).cloned(),
+            )
         {
             view.set_selected_page(&page);
         }
@@ -2278,11 +2397,7 @@ impl TuniWindow {
                 .iter()
                 .find_map(|project| project.tabs().iter().find(|entry| entry.id() == tab))?;
             let pane = entry.layout().focused_pane()?;
-            (
-                entry.name().to_owned(),
-                pane.id(),
-                pane.content.clone(),
-            )
+            (entry.name().to_owned(), pane.id(), pane.content.clone())
         };
 
         let (icon, preview) = match &content {
@@ -2296,10 +2411,7 @@ impl TuniWindow {
                     .map(|terminal| terminal.preview(28))
                     .unwrap_or_default(),
             ),
-            Content::File(path) => (
-                "text-x-generic-symbolic",
-                shorten(&path.to_string_lossy()),
-            ),
+            Content::File(path) => ("text-x-generic-symbolic", shorten(&path.to_string_lossy())),
             Content::Diff { path, staged } => (
                 "media-record-symbolic",
                 format!(

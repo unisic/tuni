@@ -123,7 +123,23 @@ scrollback, and that last decision, writing each change to
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
 
-From here the work runs to full parity: desktop notifications and packaging.
+A pane nobody is looking at can still say something. The bell marks its tab as
+wanting attention, and when the window is not the focused one it arrives as a
+desktop notification named after the terminal that rang it. So does anything a
+program asks for outright — OSC 9, OSC 777, and kitty's OSC 99, which is what
+build tools and `notify-send`-alikes emit — and a progress report, OSC 9;4,
+draws a hairline along the bottom of the pane that printed it: blue while it
+runs, red when it failed, amber when it is paused, and the full width when the
+program only knows that it is busy. It clears when the program says so, or
+after fifteen seconds of nothing further. Each pane's notification replaces its
+own rather than stacking one banner per line of output, and focusing the pane
+withdraws it.
+
+That is kero's behavior, less the two pieces of it that are macOS by nature:
+the Sparkle auto-updater, which a package manager stands in for, and the window
+blur, which Wayland has no protocol for. Inline images are the one thing still
+outstanding — `libghostty-vt` parses the kitty graphics protocol, and nothing
+above it draws the result yet.
 
 Consuming a 200 MiB stream, measured with `scripts/throughput.sh` on this
 machine:
@@ -300,6 +316,33 @@ at all, the press only opens on release and only if the same link is still
 underneath, and the URI is handed to the desktop only when it carries no control
 character and its scheme is one of `http`, `https`, `mailto`, `ftp`, `ftps`, or
 a `file://` that names this machine.
+
+Notifications are read out of the PTY stream a second time rather than out of
+the terminal state, because at the pinned commit `libghostty-vt` recognizes
+OSC 9, OSC 99 and OSC 777 without handing their payloads back — the callbacks
+it offers are the title, the working directory, the bell, and the clipboard.
+So `tuni-vt` runs a small state machine over the same bytes it feeds the
+parser, and everything it learns arrives as part of the same `Effects` the rest
+of a write produces. It is deliberately incurious: a DCS, APC, PM or SOS body
+is skipped whole, so a tmux passing an inner program's OSC 9 through to the
+outer terminal cannot ring the window it is running in, and a payload is
+abandoned past 8 KiB so a program printing an escape it never terminates costs
+nothing to ignore.
+
+## Installing
+
+`make install` puts down the binary, the desktop entry, the AppStream data and
+the icons; nothing else is needed at runtime, since the themes are baked into
+the executable.
+
+```sh
+sudo make install PREFIX=/usr
+```
+
+`packaging/` holds a Flatpak manifest and an RPM spec that both call into that
+same target, and [packaging/README.md](packaging/README.md) says what each one
+needs — mainly Zig 0.15.2 and, unless it is given the offline paths, network
+during the build.
 
 ## Configuration
 
