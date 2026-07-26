@@ -19,13 +19,14 @@ use gtk::gio;
 use gtk::glib;
 
 use tuni_core::info::{self, Port, Process, Snapshot};
+use tuni_core::usage::{self, Agent};
 
 /// How many rows a section draws. A build spawning a compiler per core makes a
 /// long list, and past this many the count in the heading is the useful part.
 const MAX_ROWS: usize = 200;
 
 mod imp {
-    use super::{Cell, PathBuf, RefCell, Snapshot, gio, glib};
+    use super::{Cell, PathBuf, RefCell, Snapshot, gio, glib, usage};
     use adw::prelude::*;
     use adw::subclass::prelude::*;
 
@@ -45,6 +46,13 @@ mod imp {
         pub generation: Cell<u64>,
         pub loading: Cell<bool>,
 
+        /// What the coding agent in the pane has spent, and the reader that
+        /// works it out. The reader holds how far into each of the agent's logs
+        /// it has read, so it travels to the worker thread and back rather than
+        /// starting again every poll.
+        pub usage: RefCell<usage::Snapshot>,
+        pub reader: RefCell<usage::Reader>,
+
         /// The row a context menu was opened over.
         pub menu_pid: Cell<u32>,
         pub menu_port: Cell<u16>,
@@ -54,6 +62,7 @@ mod imp {
         pub subtitle: RefCell<Option<gtk::Label>>,
         pub cwd_group: RefCell<Option<super::Directory>>,
         pub root_group: RefCell<Option<super::Directory>>,
+        pub agent: RefCell<Option<super::AgentSection>>,
         pub processes: RefCell<Option<super::Section>>,
         pub ports: RefCell<Option<super::Section>>,
         pub menu: RefCell<Option<gtk::PopoverMenu>>,
@@ -91,6 +100,15 @@ pub struct Directory {
     container: gtk::Box,
     heading: gtk::Label,
     path: gtk::Label,
+}
+
+/// What the coding agent running under the shell has spent: a heading naming
+/// it and the model it is on, and a row per reading.
+#[derive(Clone)]
+pub struct AgentSection {
+    container: gtk::Box,
+    model: gtk::Label,
+    list: gtk::ListBox,
 }
 
 /// A heading with a count and a list under it.
@@ -159,6 +177,7 @@ impl TuniInfo {
              pinned from the project menu is used as it stands.",
         ));
 
+        let agent = self.agent_section();
         let processes = self.section("Processes", "Nothing is running under this shell");
         let ports = self.section("Ports", "Nothing is listening");
 
@@ -166,6 +185,7 @@ impl TuniInfo {
         content.set_margin_bottom(12);
         content.append(&cwd_group.container);
         content.append(&root_group.container);
+        content.append(&agent.container);
         content.append(&processes.container);
         content.append(&ports.container);
 
@@ -191,6 +211,7 @@ impl TuniInfo {
         imp.subtitle.replace(Some(subtitle));
         imp.cwd_group.replace(Some(cwd_group));
         imp.root_group.replace(Some(root_group));
+        imp.agent.replace(Some(agent));
         imp.processes.replace(Some(processes));
         imp.ports.replace(Some(ports));
         imp.menu.replace(Some(menu));
@@ -251,6 +272,40 @@ impl TuniInfo {
             container,
             heading,
             path,
+        }
+    }
+
+    fn agent_section(&self) -> AgentSection {
+        let name = gtk::Label::builder().label("Agent").xalign(0.0).build();
+        name.add_css_class("heading");
+        let model = gtk::Label::builder().hexpand(true).xalign(0.0).build();
+        model.add_css_class("caption");
+        model.add_css_class("dim-label");
+        model.set_ellipsize(gtk::pango::EllipsizeMode::End);
+
+        let heading = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        heading.append(&name);
+        heading.append(&model);
+
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.add_css_class("boxed-list");
+
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        container.set_margin_start(12);
+        container.set_margin_end(12);
+        container.set_visible(false);
+        container.set_tooltip_text(Some(
+            "Read from the agent's own session logs. Nothing here is asked of \
+             an account: no login, no key, and no request leaves this machine.",
+        ));
+        container.append(&heading);
+        container.append(&list);
+
+        AgentSection {
+            container,
+            model,
+            list,
         }
     }
 
@@ -322,6 +377,8 @@ impl TuniInfo {
         // answer to anything.
         imp.generation.set(imp.generation.get().wrapping_add(1));
         imp.snapshot.replace(Snapshot::default());
+        imp.usage.replace(usage::Snapshot::default());
+        self.draw_agent(&usage::Snapshot::default());
         self.draw_directories();
         self.reload();
     }
@@ -336,6 +393,8 @@ impl TuniInfo {
         let imp = self.imp();
         let pid = imp.shell_pid.get();
         if pid == 0 {
+            imp.usage.replace(usage::Snapshot::default());
+            self.draw_agent(&usage::Snapshot::default());
             self.draw(&Snapshot::default());
             return;
         }
@@ -344,23 +403,44 @@ impl TuniInfo {
         }
 
         let generation = imp.generation.get();
+        let cwd = imp.cwd.borrow().clone();
+        let reader = imp.reader.take();
         imp.loading.set(true);
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
             self,
             async move {
-                let snapshot = gio::spawn_blocking(move || info::snapshot(pid)).await;
-                this.imp().loading.set(false);
-                if this.imp().generation.get() != generation {
+                let read = gio::spawn_blocking(move || {
+                    let snapshot = info::snapshot(pid);
+                    // Whether an agent is running is a question the process
+                    // list has just been walked for anyway.
+                    let mut reader = reader;
+                    let usage = Agent::running(&snapshot.processes)
+                        .map(|agent| reader.read(agent, &cwd))
+                        .unwrap_or_default();
+                    (snapshot, usage, reader)
+                })
+                .await;
+                let imp = this.imp();
+                imp.loading.set(false);
+                let Ok((snapshot, usage, reader)) = read else {
+                    return;
+                };
+                // Back it goes whatever happens next, or the next poll reads
+                // every log from the top again.
+                imp.reader.replace(reader);
+                if imp.generation.get() != generation {
                     return;
                 }
-                if let Ok(snapshot) = snapshot {
-                    if *this.imp().snapshot.borrow() == snapshot {
-                        return;
-                    }
-                    this.imp().snapshot.replace(snapshot.clone());
-                    this.draw(&snapshot);
+                if *imp.usage.borrow() != usage {
+                    imp.usage.replace(usage.clone());
+                    this.draw_agent(&usage);
                 }
+                if *imp.snapshot.borrow() == snapshot {
+                    return;
+                }
+                imp.snapshot.replace(snapshot.clone());
+                this.draw(&snapshot);
             }
         ));
     }
@@ -426,6 +506,120 @@ impl TuniInfo {
                 }
             });
         }
+    }
+
+    /// Draws what the agent has spent, and hides the section when there is no
+    /// agent in the pane, which is most panes most of the time.
+    fn draw_agent(&self, usage: &usage::Snapshot) {
+        let Some(section) = self.imp().agent.borrow().clone() else {
+            return;
+        };
+        let Some(agent) = usage.agent.filter(|_| !usage.is_empty()) else {
+            section.container.set_visible(false);
+            return;
+        };
+
+        section.container.set_visible(true);
+        section.model.set_text(&match usage.model.as_deref() {
+            Some(model) => format!("{} · {model}", agent.label()),
+            None => agent.label().to_owned(),
+        });
+
+        while let Some(child) = section.list.first_child() {
+            section.list.remove(&child);
+        }
+        section.list.append(&self.agent_row(
+            "This session",
+            &tokens_label(usage.session.total()),
+            Some(&breakdown(usage.session)),
+            None,
+        ));
+        if let Some(recent) = usage.recent.filter(|recent| recent.total() > 0) {
+            let row = self.agent_row(
+                "Last 5 hours",
+                &tokens_label(recent.total()),
+                Some(&breakdown(recent)),
+                None,
+            );
+            row.set_tooltip_text(Some(
+                "Everything the agent spent in the last five hours, in every \
+                 directory it worked in. Its own limits are counted over a \
+                 window like this one, which a single pane is never the whole of.",
+            ));
+            section.list.append(&row);
+        }
+        if let Some(context) = usage.context {
+            let row = self.agent_row(
+                "Context",
+                &format!("{:.0}%", context.percent()),
+                Some(&format!(
+                    "{} of {}",
+                    tokens_label(context.used),
+                    tokens_label(context.total)
+                )),
+                Some(context.percent() / 100.0),
+            );
+            row.set_tooltip_text(Some(
+                "How much of the model's window the last turn carried.",
+            ));
+            section.list.append(&row);
+        }
+        for limit in &usage.limits {
+            section.list.append(&self.agent_row(
+                &format!("{} limit", limit.window),
+                &format!("{:.0}%", limit.used_percent),
+                limit.resets_at.and_then(resets_label).as_deref(),
+                Some(limit.used_percent / 100.0),
+            ));
+        }
+    }
+
+    /// A reading: what it is on the left, the number on the right, and under
+    /// them the detail and, for the readings that are a share of something, a
+    /// bar.
+    fn agent_row(
+        &self,
+        title: &str,
+        value: &str,
+        detail: Option<&str>,
+        fraction: Option<f64>,
+    ) -> gtk::ListBoxRow {
+        let name = gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+
+        let amount = gtk::Label::builder().label(value).xalign(1.0).build();
+        amount.add_css_class("monospace");
+        amount.add_css_class("numeric");
+
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        line.append(&name);
+        line.append(&amount);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_margin_top(6);
+        content.set_margin_bottom(6);
+        content.append(&line);
+
+        if let Some(fraction) = fraction {
+            let bar = gtk::ProgressBar::new();
+            bar.set_fraction(fraction.clamp(0.0, 1.0));
+            content.append(&bar);
+        }
+        if let Some(detail) = detail {
+            let caption = gtk::Label::builder().label(detail).xalign(0.0).build();
+            caption.add_css_class("caption");
+            caption.add_css_class("dim-label");
+            caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            content.append(&caption);
+        }
+
+        gtk::ListBoxRow::builder().child(&content).build()
     }
 
     fn fill(&self, section: &Section, count: usize, rows: impl FnOnce(&gtk::ListBox)) {
@@ -742,6 +936,50 @@ fn port_menu(port: u16) -> gio::Menu {
     signals.append(Some("Force Kill"), Some("info.kill"));
     menu.append_section(None, &signals);
     menu
+}
+
+/// A token count short enough for a row. The exact figure is out of date a
+/// second after it is drawn, so thousands and millions are as far as it goes.
+fn tokens_label(count: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let value = count as f64;
+    if count >= 1_000_000 {
+        format!("{:.1}M", value / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}k", value / 1_000.0)
+    } else {
+        count.to_string()
+    }
+}
+
+/// Where a total went. Cache reads are most of a long conversation and cost a
+/// fraction of what fresh input costs, so counting them as input would make the
+/// number look several times worse than it is.
+fn breakdown(tokens: usage::Tokens) -> String {
+    format!(
+        "in {} · out {} · cache {}",
+        tokens_label(tokens.input),
+        tokens_label(tokens.output),
+        tokens_label(tokens.cache_read + tokens.cache_write)
+    )
+}
+
+/// How long a plan window has left, in the largest unit that still says
+/// something. Nothing once the moment is past: the agent reports the window it
+/// is actually in, and a poll or two later it will say so.
+fn resets_label(at: i64) -> Option<String> {
+    let left = at - glib::real_time() / 1_000_000;
+    if left <= 0 {
+        return None;
+    }
+    let (count, unit) = if left >= 2 * 86_400 {
+        (left / 86_400, "days")
+    } else if left >= 2 * 3_600 {
+        (left / 3_600, "hours")
+    } else {
+        ((left / 60).max(1), "minutes")
+    };
+    Some(format!("resets in {count} {unit}"))
 }
 
 /// What `ps` would say, shortened: percent of a processor and resident memory.

@@ -31,6 +31,8 @@ BuildRequires:  make
 BuildRequires:  pkgconfig(gtk4)
 BuildRequires:  pkgconfig(libadwaita-1)
 BuildRequires:  pkgconfig(gtksourceview-5)
+# OpenCode keeps its sessions in SQLite, and the Info page reads them.
+BuildRequires:  pkgconfig(sqlite3)
 BuildRequires:  desktop-file-utils
 BuildRequires:  libappstream-glib
 

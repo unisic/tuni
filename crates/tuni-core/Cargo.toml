@@ -10,6 +10,10 @@ version.workspace = true
 [dependencies]
 # Signals and the two sysconf values /proc numbers are measured in.
 libc = "0.2"
+# OpenCode keeps its sessions in SQLite, and reading them is the only reason
+# this is here. The system library, not a bundled copy: every desktop this runs
+# on has one.
+rusqlite = { version = "0.40", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # Word-level comparison inside a changed line. Only that: the diff between two

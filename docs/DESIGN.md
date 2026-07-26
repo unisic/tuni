@@ -66,6 +66,17 @@ server prints its port and then scrolls away. A process can be asked to quit, or
 made to. Nothing here shells out: it is `/proc`, read on a worker thread while
 the page is showing and no more often than that.
 
+When a coding agent is running under that shell, the page grows an Agent section
+for it. Claude Code, Codex and OpenCode each keep a record of their own turns on
+disk, and that is where every figure comes from: what the session working in this
+directory has spent, split into fresh input, output and what came back from the
+cache, which is most of a long conversation and costs a fraction of the rest.
+Codex says how full the model's context is and how much of each plan window is
+gone, so those get a bar apiece; Claude Code's limits are counted over five hours
+across every directory it worked in, so that total is a row of its own. Tokens,
+never prices. And no account is asked anything: no login, no key, nothing over
+the network.
+
 A pane holds a file as readily as it holds a shell. Opening one from either page
 puts it where a terminal would have gone — syntax highlighting for whatever
 GtkSourceView recognizes, line numbers, undo, find and replace, and `Ctrl+S`.
@@ -306,6 +317,20 @@ the exact text a kernel writes, tested in `tuni-core` without a process tree to
 point them at, and the reads happen on a worker thread with the same generation
 stamp the git panel uses.
 
+The agent numbers are read the same way, off files the agent wrote for its own
+purposes. Claude Code and Codex append a line of JSON per turn; OpenCode keeps a
+row per session in SQLite, opened read-only so that a database being written to
+is safe to read. Which of those sessions belongs to the pane is settled by the
+working directory: Claude Code puts it in the transcript directory's name, Codex
+records it in the first line of a rollout, OpenCode stores it in a column. A
+transcript grows to tens of megabytes over an afternoon and the page polls every
+couple of seconds, so the reader remembers where in each file it stopped and what
+the file came to by then; a poll costs the bytes appended since the last one,
+which is milliseconds against a first read's hundred. A line that is half written
+when the read reaches it is left for next time, because the agent is appending
+while this reads. Claude Code writes several lines per reply and repeats the
+usage on a retry, so a request id already counted is counted once.
+
 The editor's keys belong to the pane rather than to the window, and that is the
 whole reason it can share a window with terminals: `Ctrl+S` is flow control to a
 shell and `Ctrl+F` is a page forward in `less`, so binding either one globally
@@ -519,14 +544,15 @@ not part of that, since a file is what is on disk.
 
 ## Building
 
-Requires a Rust toolchain, GTK4 and libadwaita development headers, and Zig —
-`libghostty-vt` is Zig source that is compiled during the build.
+Requires a Rust toolchain, GTK4, libadwaita and SQLite development headers, and
+Zig, since `libghostty-vt` is Zig source that is compiled during the build.
 
 Fedora ships Zig 0.16, which is too new; fetch 0.15.2 from ziglang.org and put
 it on `PATH`.
 
 ```sh
-sudo dnf install rustup gtk4-devel libadwaita-devel gtksourceview5-devel
+sudo dnf install rustup gtk4-devel libadwaita-devel gtksourceview5-devel \
+    sqlite-devel
 rustup-init -y
 
 cargo run --release

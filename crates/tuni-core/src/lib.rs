@@ -14,6 +14,7 @@ pub mod panes;
 pub mod session;
 pub mod settings;
 pub mod theme;
+pub mod usage;
 pub mod workspace;
 
 /// Point sizes a font may be zoomed to. Below the first the grid stops being

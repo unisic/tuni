@@ -36,11 +36,12 @@ target.
 
 ## Building
 
-Needs a Rust toolchain, GTK4, libadwaita and GtkSourceView headers, and Zig
-0.15.2 — `libghostty-vt` is Zig source compiled during the build.
+Needs a Rust toolchain, GTK4, libadwaita, GtkSourceView and SQLite headers, and
+Zig 0.15.2, since `libghostty-vt` is Zig source compiled during the build.
 
 ```sh
-sudo dnf install rustup gtk4-devel libadwaita-devel gtksourceview5-devel
+sudo dnf install rustup gtk4-devel libadwaita-devel gtksourceview5-devel \
+    sqlite-devel
 make zig
 cargo run --release
 ```
