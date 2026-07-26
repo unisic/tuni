@@ -98,6 +98,8 @@ const ACCELS: &[(&str, &[&str])] = &[
 ];
 
 fn main() -> glib::ExitCode {
+    quieten();
+
     // Not unique: a terminal launched from a shell must inherit *that* shell's
     // working directory, which a single primary instance could not see.
     let app = adw::Application::builder()
@@ -126,6 +128,41 @@ fn main() -> glib::ExitCode {
     });
     app.connect_activate(build_window);
     app.run()
+}
+
+/// The two lines a terminal on this desktop prints before it has drawn
+/// anything, neither of which is a fault of the program that lands in.
+///
+/// A desktop that dresses GTK3 in a dark theme writes
+/// `gtk-application-prefer-dark-theme` into `settings.ini` for GTK4 as well,
+/// and libadwaita — which decides light and dark for itself, out of
+/// `AdwStyleManager` and the desktop's own color scheme, and is doing that here
+/// too — warns once that the setting means nothing to it. It is answered by
+/// clearing the setting for this process before libadwaita ever looks at it,
+/// which is what the empty value would have been anyway. Nothing on screen
+/// moves: the property is the one libadwaita ignores.
+///
+/// Mesa's RADV prints a conformance notice for every Vulkan context, which is
+/// what GTK renders with. It is a statement about the driver's certification,
+/// not about this machine or this program, and Mesa has an environment
+/// variable for saying so once and not again. A value already in the
+/// environment is left alone: somebody who asked for the notice can have it.
+fn quieten() {
+    if std::env::var_os("MESA_VK_IGNORE_CONFORMANCE_WARNING").is_none() {
+        // SAFETY: nothing else has started yet — this is the first statement
+        // of `main`, before GTK, its renderer, or a thread of ours exists.
+        unsafe { std::env::set_var("MESA_VK_IGNORE_CONFORMANCE_WARNING", "1") };
+    }
+
+    // Before the application rather than inside its startup: libadwaita reads
+    // the setting while GtkApplication starts up, and a warning is only avoided
+    // by having answered it first. `gtk::init` is what opens the display the
+    // settings come from, and running it twice is a no-op.
+    if gtk::init().is_ok()
+        && let Some(settings) = gtk::Settings::default()
+    {
+        settings.set_gtk_application_prefer_dark_theme(false);
+    }
 }
 
 fn build_window(app: &adw::Application) {
