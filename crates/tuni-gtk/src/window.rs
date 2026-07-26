@@ -25,7 +25,7 @@ use gtk::glib;
 
 use tuni_core::panes::{Content, Edge, Layout, Pane};
 use tuni_core::session::{History, PaneState, Snapshot};
-use tuni_core::settings::{Appearance, HISTORY_LINE_LIMIT, Settings};
+use tuni_core::settings::{Appearance, HISTORY_LINE_LIMIT, NewTab, Settings};
 use tuni_core::theme::{Rgb, Theme};
 use tuni_core::workspace::{Id, Tab, Workspace};
 
@@ -1481,14 +1481,18 @@ impl TuniWindow {
     // --- tabs --------------------------------------------------------------
 
     /// Opens a tab in `project`, next to the selected one, with a single
-    /// terminal starting where the selected tab's shell is.
+    /// terminal starting where the selected tab's shell is, or with the host
+    /// list if that is what `new-tab` says a tab is.
     pub fn open_tab(&self, project: Id) {
         let imp = self.imp();
         let Some(view) = imp.views.borrow().get(&project).cloned() else {
             return;
         };
 
-        let tab = Tab::new();
+        let tab = match imp.settings.borrow().new_tab {
+            NewTab::Shell => Tab::new(),
+            NewTab::Hosts => Tab::with_pane(Pane::hosts()),
+        };
         let tab_id = tab.id();
         let position = view
             .selected_page()
@@ -1978,6 +1982,8 @@ impl TuniWindow {
     /// to answer a prompt. A window putting its panes back is not, so it
     /// dials only where a shared connection is already open and there is
     /// nothing left to authenticate; the rest come back as an offer.
+    /// `ssh-reconnect-on-restore` is how somebody whose hosts all answer to an
+    /// agent says they would rather have the panes than the question.
     fn start_session(
         &self,
         terminal: &TuniTerminal,
@@ -1999,6 +2005,9 @@ impl TuniWindow {
         };
         let alias = alias.clone();
         let name = alias.clone();
+        let settings = self.settings();
+        let term = settings.ssh_term.clone();
+        let dial = requested || settings.ssh_reconnect_on_restore;
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -2006,9 +2015,12 @@ impl TuniWindow {
             terminal,
             async move {
                 let Ok(argv) = gio::spawn_blocking(move || {
-                    let control = tuni_core::ssh::Control::new(true);
+                    let control = tuni_core::ssh::Control::new(
+                        settings.ssh_control_persist,
+                        settings.ssh_share_connections,
+                    );
                     let host = tuni_core::ssh::host(&alias);
-                    (requested || control.is_live(&host.target()))
+                    (dial || control.is_live(&host.target()))
                         .then(|| tuni_core::ssh::command(&host, &control))
                 })
                 .await
@@ -2030,7 +2042,7 @@ impl TuniWindow {
                     pane,
                     Launch {
                         argv,
-                        env: vec![("TERM".to_owned(), tuni_core::ssh::REMOTE_TERM.to_owned())],
+                        env: vec![("TERM".to_owned(), term)],
                         ..Launch::default()
                     },
                 );

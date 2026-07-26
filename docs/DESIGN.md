@@ -540,6 +540,11 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `terminal.restore-history` | `false` | Whether a restored pane replays what it had printed |
 | `editor.wrap-lines` | `false` | Whether a file pane folds a long line rather than scrolling sideways |
 | `window.auto-hide-tab-bar` | `false` | Whether the tab bar goes away while a window has one tab |
+| `new-tab` | `"shell"` | `shell` or `hosts`: what Ctrl+Shift+T opens. Ctrl+Shift+O opens the host list either way |
+| `ssh-term` | `"xterm-256color"` | What an ssh pane calls itself at the far end. Tuni's own `TERM` describes terminfo that is on this machine and not necessarily on the other one |
+| `ssh-share-connections` | `true` | Whether every pane on a host goes through one authenticated connection. Ignored for a host whose own configuration already sets `ControlPath`, which tuni adopts rather than overrides |
+| `ssh-control-persist` | `600` | Seconds a shared connection outlives the last pane using it, up to a day. Zero closes it with the pane |
+| `ssh-reconnect-on-restore` | `false` | Whether a restored ssh pane dials with nothing to attach to. Off, so a window putting eight panes back cannot start eight logins |
 
 A Ghostty configuration can be pasted in whole. Values do not need the quotes
 TOML would want, `theme` may name a theme instead of an appearance, in either

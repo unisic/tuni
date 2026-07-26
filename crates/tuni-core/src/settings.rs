@@ -51,11 +51,43 @@ impl Appearance {
     }
 }
 
+/// What `Ctrl+Shift+T` puts in the tab it opens.
+///
+/// A shell, which is what a terminal has always opened, or the list of
+/// everything there is to connect to, which is what somebody who works mostly
+/// on other machines wants their new tab to be.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NewTab {
+    #[default]
+    Shell,
+    Hosts,
+}
+
+impl NewTab {
+    #[must_use]
+    fn parse(name: &str) -> Option<Self> {
+        match name.trim() {
+            "shell" => Some(Self::Shell),
+            "hosts" => Some(Self::Hosts),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Hosts => "hosts",
+        }
+    }
+}
+
 /// Everything the settings window edits.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Settings {
     pub terminal: TerminalConfig,
     pub appearance: Appearance,
+    pub new_tab: NewTab,
     /// Whether a restored tab replays what its shell had printed before.
     ///
     /// Off by default, and deliberately so: it writes terminal output to disk,
@@ -74,12 +106,53 @@ pub struct Settings {
     /// window. KWin is the one that offers this; on a desktop without the
     /// protocol the request is dropped and the background stays clear.
     pub background_blur: bool,
+    /// What an ssh pane calls itself at the far end. See
+    /// [`crate::ssh::REMOTE_TERM`] for why it is not what tuni calls itself
+    /// here; anyone who pushes their own terminfo can say so.
+    pub ssh_term: String,
+    /// Whether one authenticated connection is shared by every pane, tunnel and
+    /// listing on a host. On, because the alternative is a password or a code
+    /// per pane.
+    pub ssh_share_connections: bool,
+    /// How long a shared connection outlives the last pane using it, in
+    /// seconds. Zero closes it with the pane, which costs an authentication the
+    /// next time and leaves nothing running behind the window.
+    pub ssh_control_persist: u32,
+    /// Whether a restored ssh pane dials even when nothing is open to attach
+    /// to. Off, because a window putting eight panes back would otherwise fire
+    /// off eight logins; on is for people whose every host answers to an agent
+    /// and who would rather not press Connect eight times.
+    pub ssh_reconnect_on_restore: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            terminal: TerminalConfig::default(),
+            appearance: Appearance::default(),
+            new_tab: NewTab::default(),
+            restore_history: false,
+            wrap_lines: false,
+            auto_hide_tab_bar: false,
+            background_blur: false,
+            ssh_term: crate::ssh::REMOTE_TERM.to_owned(),
+            ssh_share_connections: true,
+            ssh_control_persist: crate::ssh::CONTROL_PERSIST,
+            ssh_reconnect_on_restore: false,
+        }
+    }
 }
 
 /// How many lines of a pane's scrollback are kept for the replay. kero's own
 /// cap, and for the same reason: it bounds a file that would otherwise grow
 /// with the largest thing anyone ever `cat`ed.
 pub const HISTORY_LINE_LIMIT: usize = 500;
+
+/// The longest a shared connection may be asked to outlive its last pane, in
+/// seconds. A day, which is past any working session; a number beyond it is
+/// somebody meaning "forever", and forever is what the Disconnect action is
+/// for.
+pub const CONTROL_PERSIST_MAX: u32 = 86_400;
 
 impl Settings {
     /// `$XDG_CONFIG_HOME/tuni/config.toml`, or `~/.config/tuni/config.toml`.
@@ -208,6 +281,27 @@ impl Settings {
         if let Some(on) = table.boolean("window.auto-hide-tab-bar") {
             settings.auto_hide_tab_bar = on;
         }
+        if let Some(opens) = table.string("new-tab").and_then(NewTab::parse) {
+            settings.new_tab = opens;
+        }
+        if let Some(term) = table
+            .string("ssh-term")
+            .filter(|term| !term.trim().is_empty())
+        {
+            settings.ssh_term = term.trim().to_owned();
+        }
+        if let Some(on) = table.boolean("ssh-share-connections") {
+            settings.ssh_share_connections = on;
+        }
+        if let Some(seconds) = table
+            .number("ssh-control-persist")
+            .filter(|seconds| (0.0..=f64::from(CONTROL_PERSIST_MAX)).contains(seconds))
+        {
+            settings.ssh_control_persist = seconds as u32;
+        }
+        if let Some(on) = table.boolean("ssh-reconnect-on-restore") {
+            settings.ssh_reconnect_on_restore = on;
+        }
         settings
     }
 
@@ -315,6 +409,29 @@ impl Settings {
         }
         if self.auto_hide_tab_bar != default.auto_hide_tab_bar {
             let _ = writeln!(out, "window.auto-hide-tab-bar = {}", self.auto_hide_tab_bar);
+        }
+        if self.new_tab != default.new_tab {
+            let _ = writeln!(out, "new-tab = {}", toml::quote(self.new_tab.name()));
+        }
+        if self.ssh_term != default.ssh_term {
+            let _ = writeln!(out, "ssh-term = {}", toml::quote(&self.ssh_term));
+        }
+        if self.ssh_share_connections != default.ssh_share_connections {
+            let _ = writeln!(
+                out,
+                "ssh-share-connections = {}",
+                self.ssh_share_connections
+            );
+        }
+        if self.ssh_control_persist != default.ssh_control_persist {
+            let _ = writeln!(out, "ssh-control-persist = {}", self.ssh_control_persist);
+        }
+        if self.ssh_reconnect_on_restore != default.ssh_reconnect_on_restore {
+            let _ = writeln!(
+                out,
+                "ssh-reconnect-on-restore = {}",
+                self.ssh_reconnect_on_restore
+            );
         }
         out
     }
@@ -612,10 +729,15 @@ mod tests {
                 ..TerminalConfig::default()
             },
             appearance: Appearance::Dark,
+            new_tab: NewTab::Hosts,
             restore_history: true,
             wrap_lines: true,
             auto_hide_tab_bar: true,
             background_blur: true,
+            ssh_term: "xterm-ghostty".to_owned(),
+            ssh_share_connections: false,
+            ssh_control_persist: 30,
+            ssh_reconnect_on_restore: true,
         };
         let read = Settings::parse(&settings.to_toml());
 
@@ -638,6 +760,20 @@ mod tests {
         assert!(read.restore_history);
         assert!(read.wrap_lines);
         assert!(read.auto_hide_tab_bar);
+        assert_eq!(read.new_tab, NewTab::Hosts);
+        assert_eq!(read.ssh_term, "xterm-ghostty");
+        assert!(!read.ssh_share_connections);
+        assert_eq!(read.ssh_control_persist, 30);
+        assert!(read.ssh_reconnect_on_restore);
+    }
+
+    #[test]
+    fn a_new_tab_opens_a_shell_unless_the_file_says_otherwise() {
+        assert_eq!(Settings::default().new_tab, NewTab::Shell);
+        assert_eq!(Settings::parse("new-tab = hosts").new_tab, NewTab::Hosts);
+        // Neither of the two words it can be, so the default stands rather than
+        // a tab opening something nobody named.
+        assert_eq!(Settings::parse("new-tab = split").new_tab, NewTab::Shell);
     }
 
     #[test]

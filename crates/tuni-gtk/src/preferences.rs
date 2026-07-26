@@ -16,7 +16,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk::pango;
 
-use tuni_core::settings::{Appearance, Settings};
+use tuni_core::settings::{Appearance, NewTab, Settings};
 use tuni_core::theme;
 use tuni_core::{CursorStyle, FONT_SIZE_MAX, FONT_SIZE_MIN, OPACITY_MIN, PADDING_MAX};
 
@@ -26,6 +26,10 @@ const APPEARANCES: [(Appearance, &str); 3] = [
     (Appearance::Light, "Light"),
     (Appearance::Dark, "Dark"),
 ];
+
+/// What a new tab can open, in the order the dropdown lists them.
+const NEW_TABS: [(NewTab, &str); 2] =
+    [(NewTab::Shell, "A Shell"), (NewTab::Hosts, "The Host List")];
 
 /// Cursor shapes, in the order the dropdown lists them.
 const CURSOR_STYLES: [(CursorStyle, &str); 4] = [
@@ -529,8 +533,32 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
 
     let session = adw::PreferencesGroup::builder()
         .title("Session")
-        .description("The window's shape is always restored. Its output is not.")
+        .description("What a new tab opens, and how much of an old one comes back.")
         .build();
+
+    let new_tab = adw::ComboRow::builder()
+        .title("New Tab")
+        .subtitle("Ctrl+Shift+O opens the host list either way")
+        .model(&list(NEW_TABS.iter().map(|(_, label)| *label)))
+        .selected(
+            NEW_TABS
+                .iter()
+                .position(|(opens, _)| *opens == settings.new_tab)
+                .unwrap_or(0) as u32,
+        )
+        .build();
+    new_tab.connect_selected_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let Some((chosen, _)) = NEW_TABS.get(row.selected() as usize) else {
+                return;
+            };
+            edit(&window, |settings| settings.new_tab = *chosen);
+        }
+    ));
+    session.add(&new_tab);
+
     let restore = adw::SwitchRow::builder()
         .title("Restore Terminal Output")
         .subtitle("Writes what each terminal printed to disk, and replays it above the new prompt")

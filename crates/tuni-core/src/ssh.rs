@@ -86,7 +86,10 @@ pub fn run<S: AsRef<OsStr>>(args: &[S]) -> Output {
 pub const REMOTE_TERM: &str = "xterm-256color";
 
 /// How long a shared connection outlives the last pane using it, in seconds.
-const CONTROL_PERSIST: u32 = 600;
+/// Long enough that closing a tab and opening another does not re-authenticate,
+/// short enough that a forgotten window is not still holding a tunnel open an
+/// hour later.
+pub const CONTROL_PERSIST: u32 = 600;
 
 /// How long to wait for a connection that is not answering, in seconds.
 const CONNECT_TIMEOUT: u32 = 10;
@@ -100,12 +103,13 @@ const ALIVE_COUNT: u32 = 3;
 #[derive(Clone, Debug)]
 pub struct Control {
     directory: PathBuf,
+    persist: u32,
     enabled: bool,
 }
 
 impl Control {
     #[must_use]
-    pub fn new(enabled: bool) -> Self {
+    pub fn new(persist: u32, enabled: bool) -> Self {
         // `$XDG_RUNTIME_DIR` is the right home for a socket: tmpfs, 0700,
         // per-user, and emptied at logout, so a stale one cannot survive a
         // reboot. `~/.cache` is the fallback and the reason a sweep has to
@@ -115,7 +119,11 @@ impl Control {
             .filter(|path| path.is_absolute())
             .unwrap_or_else(|| crate::settings::home().join(".cache"))
             .join("tuni/ssh");
-        Self { directory, enabled }
+        Self {
+            directory,
+            persist,
+            enabled,
+        }
     }
 
     /// The `-o` settings every `ssh` tuni runs for `destination` carries,
@@ -161,7 +169,7 @@ impl Control {
                 "ControlPath={}",
                 self.directory.join("%C").display()
             ));
-            options.push(format!("ControlPersist={CONTROL_PERSIST}"));
+            options.push(format!("ControlPersist={}", self.persist));
         }
 
         // The one option that earns its place on merit. Without it a suspended
@@ -1209,7 +1217,7 @@ mod tests {
 
     #[test]
     fn a_connection_ends_in_the_host_it_opens() {
-        let control = Control::new(false);
+        let control = Control::new(CONTROL_PERSIST, false);
         let host = Host {
             alias: "tuni-no-such-alias".to_owned(),
             ..Host::default()
@@ -1243,7 +1251,7 @@ mod tests {
         // The whole restore rule hangs on this answering `false` rather than
         // hanging or dialling: `ssh -O check` talks to a socket that is not
         // there and gives up at once, without touching the network.
-        assert!(!Control::new(true).is_live("tuni-no-such-alias"));
-        assert!(!Control::new(false).is_live("tuni-no-such-alias"));
+        assert!(!Control::new(CONTROL_PERSIST, true).is_live("tuni-no-such-alias"));
+        assert!(!Control::new(CONTROL_PERSIST, false).is_live("tuni-no-such-alias"));
     }
 }
