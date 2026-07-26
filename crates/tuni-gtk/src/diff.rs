@@ -68,6 +68,11 @@ mod imp {
         /// Set while a read or an apply is in flight, so a second click does
         /// not start a second one.
         pub busy: Cell<bool>,
+        /// Which file the pane is pointed at, counted rather than named. A read
+        /// runs on a worker and answers about the path it was started with, so
+        /// a pane pointed somewhere else in the meantime has to be able to tell
+        /// that the answer is about the file before.
+        pub generation: Cell<u64>,
         pub colors: RefCell<Colors>,
 
         pub name: RefCell<Option<gtk::Label>>,
@@ -96,7 +101,14 @@ mod imp {
     impl ObjectImpl for TuniDiff {
         fn constructed(&self) {
             self.parent_constructed();
+            crate::debug::born("TuniDiff");
             self.obj().build();
+        }
+    }
+
+    impl Drop for TuniDiff {
+        fn drop(&mut self) {
+            crate::debug::died("TuniDiff");
         }
     }
 
@@ -159,6 +171,11 @@ impl TuniDiff {
 
     fn build(&self) {
         let imp = self.imp();
+
+        // The timer skips a diff nobody is looking at, so coming back into
+        // view is what asks for the re-read it did not do — selecting the tab
+        // again, or restoring the window.
+        self.connect_map(|this| this.reload());
 
         let hunks = gtk::Box::new(gtk::Orientation::Vertical, 10);
         hunks.set_margin_start(8);
@@ -318,6 +335,7 @@ impl TuniDiff {
         imp.path.replace(path.to_path_buf());
         imp.staged.set(staged);
         imp.loaded.set(false);
+        imp.generation.set(imp.generation.get().wrapping_add(1));
         self.refresh_header();
         self.reload();
     }
@@ -345,6 +363,7 @@ impl TuniDiff {
         }
         imp.busy.set(true);
         let staged = imp.staged.get();
+        let generation = imp.generation.get();
 
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
@@ -352,6 +371,14 @@ impl TuniDiff {
             async move {
                 let read = gio::spawn_blocking(move || git::diff(&path, staged)).await;
                 this.imp().busy.set(false);
+                // The pane was pointed at another file while this was in
+                // flight. Without this the answer about the old one would be
+                // parsed, drawn and left under the new one's header — and
+                // `open` clears `loaded`, so the same-text check below cannot
+                // catch it either.
+                if this.imp().generation.get() != generation {
+                    return;
+                }
                 match read {
                     Ok(Ok(file)) => {
                         let imp = this.imp();

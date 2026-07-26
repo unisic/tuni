@@ -311,6 +311,7 @@ mod imp {
     impl ObjectImpl for TuniWindow {
         fn constructed(&self) {
             self.parent_constructed();
+            crate::debug::born("TuniWindow");
             let obj = self.obj();
             obj.build_ui();
             obj.install_actions();
@@ -324,6 +325,12 @@ mod imp {
             if let Some(menu) = self.row_menu.take() {
                 menu.unparent();
             }
+        }
+    }
+
+    impl Drop for TuniWindow {
+        fn drop(&mut self) {
+            crate::debug::died("TuniWindow");
         }
     }
 
@@ -1085,7 +1092,13 @@ impl TuniWindow {
     /// comes back unchanged leaves the pane alone.
     fn poll_diffs(&self) {
         for diff in self.imp().diffs.borrow().values() {
-            diff.reload();
+            // Only the one on screen. A diff on a tab nobody has selected is
+            // unmapped, and re-reading it costs three git processes every two
+            // seconds for a pane whose content nobody can see. It catches up
+            // on `map`, which is what selecting the tab again does.
+            if diff.is_mapped() {
+                diff.reload();
+            }
         }
     }
 
@@ -1328,12 +1341,7 @@ impl TuniWindow {
         };
         for tab in project.tabs() {
             for pane in tab.layout().panes() {
-                imp.diffs.borrow_mut().remove(&pane.id());
-                imp.diffs.borrow_mut().remove(&pane.id());
-                if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane.id()) {
-                    terminal.shutdown();
-                }
-                imp.editors.borrow_mut().remove(&pane.id());
+                self.forget_pane(pane.id());
             }
             imp.grids.borrow_mut().remove(&tab.id());
             imp.pages.borrow_mut().remove(&tab.id());
@@ -2026,14 +2034,27 @@ impl TuniWindow {
         notify::post(app.upcast_ref(), pane, title, body);
     }
 
-    /// Closes one pane, and the tab with it when it was the last one.
-    fn close_pane(&self, project: Id, tab: Id, pane: Id) {
+    /// Forgets one pane's widgets and hangs up its shell.
+    ///
+    /// Every close path goes through here rather than repeating the three
+    /// registry removals, because a registry emptied on only some of them keeps
+    /// the widget alive for the life of the window — and `poll_diffs` visits
+    /// every diff it finds there, so a forgotten one keeps shelling out to git
+    /// every two seconds for a pane nobody can see.
+    fn forget_pane(&self, pane: Id) {
         let imp = self.imp();
         imp.diffs.borrow_mut().remove(&pane);
         if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane) {
             terminal.shutdown();
+            crate::debug::watch(&terminal, "TuniTerminal", pane.raw());
         }
         imp.editors.borrow_mut().remove(&pane);
+    }
+
+    /// Closes one pane, and the tab with it when it was the last one.
+    fn close_pane(&self, project: Id, tab: Id, pane: Id) {
+        let imp = self.imp();
+        self.forget_pane(pane);
         let alive = {
             let mut workspace = imp.workspace.borrow_mut();
             let Some(layout) = workspace
@@ -2220,10 +2241,7 @@ impl TuniWindow {
         };
 
         for pane in tab.layout().panes() {
-            if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane.id()) {
-                terminal.shutdown();
-            }
-            imp.editors.borrow_mut().remove(&pane.id());
+            self.forget_pane(pane.id());
         }
         imp.grids.borrow_mut().remove(&tab.id());
         imp.pages.borrow_mut().remove(&tab.id());
@@ -2765,7 +2783,12 @@ impl TuniWindow {
         };
 
         if imp.workspace.borrow().selected_id() != Some(project) {
-            if let Some(index) = imp.workspace.borrow().index_of(project) {
+            // Taken as its own statement: an `if let` holds its scrutinee's
+            // temporaries for the whole body, so borrowing here and asking for
+            // the mutable borrow inside would panic on the one path that
+            // reaches it — revealing a pane that lives in another project.
+            let index = imp.workspace.borrow().index_of(project);
+            if let Some(index) = index {
                 imp.workspace.borrow_mut().select_index(index);
             }
             self.show_selected_project();
