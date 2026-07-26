@@ -18,7 +18,7 @@ use gtk::pango;
 
 use tuni_core::settings::{Appearance, Settings};
 use tuni_core::theme;
-use tuni_core::{CursorStyle, FONT_SIZE_MAX, FONT_SIZE_MIN};
+use tuni_core::{CursorStyle, FONT_SIZE_MAX, FONT_SIZE_MIN, OPACITY_MIN, PADDING_MAX};
 
 /// Appearances, in the order the dropdown lists them.
 const APPEARANCES: [(Appearance, &str); 3] = [
@@ -101,7 +101,74 @@ fn appearance_page(
         }
     ));
     window_group.add(&tab_bar);
+
+    let padding = adw::SpinRow::builder()
+        .title("Padding")
+        .subtitle("Pixels of nothing between the window and the grid")
+        .adjustment(&gtk::Adjustment::new(
+            settings.terminal.padding,
+            0.0,
+            PADDING_MAX,
+            1.0,
+            4.0,
+            0.0,
+        ))
+        .build();
+    padding.connect_value_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let pixels = row.value();
+            edit(&window, |settings| settings.terminal.padding = pixels);
+        }
+    ));
+    window_group.add(&padding);
     page.add(&window_group);
+
+    let background_group = adw::PreferencesGroup::builder()
+        .title("Background")
+        .description("What the desktop does with the window is the compositor's call: one that does not composite leaves a transparent window black")
+        .build();
+
+    let opacity = adw::SpinRow::builder()
+        .title("Opacity")
+        .subtitle("Percent. The page color only, so colored text keeps its own background")
+        .adjustment(&gtk::Adjustment::new(
+            settings.terminal.background_opacity * 100.0,
+            OPACITY_MIN * 100.0,
+            100.0,
+            5.0,
+            10.0,
+            0.0,
+        ))
+        .build();
+    opacity.connect_value_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let percent = row.value() / 100.0;
+            edit(&window, |settings| {
+                settings.terminal.background_opacity = percent;
+            });
+        }
+    ));
+    background_group.add(&opacity);
+
+    let blur = adw::SwitchRow::builder()
+        .title("Blur")
+        .subtitle("Blurs what shows through, on a desktop that offers it. KDE does")
+        .active(settings.background_blur)
+        .build();
+    blur.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.background_blur = on);
+        }
+    ));
+    background_group.add(&blur);
+    page.add(&background_group);
 
     // Two themes rather than one: the desktop decides between light and dark
     // while the application is running, and a terminal that keeps one palette

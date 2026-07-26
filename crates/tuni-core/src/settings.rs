@@ -15,7 +15,9 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use crate::{CursorStyle, FONT_SIZE_MAX, FONT_SIZE_MIN, TerminalConfig, theme};
+use crate::{
+    CursorStyle, FONT_SIZE_MAX, FONT_SIZE_MIN, OPACITY_MIN, PADDING_MAX, TerminalConfig, theme,
+};
 
 /// Which appearance the window takes. `System` is the desktop's own choice,
 /// which is what a GNOME application is expected to follow; the other two are
@@ -68,6 +70,10 @@ pub struct Settings {
     /// bar that appears when a second tab opens moves the terminal under the
     /// pointer, and the row it costs is the row it is worth.
     pub auto_hide_tab_bar: bool,
+    /// Whether the compositor is asked to blur what shows through a translucent
+    /// window. KWin is the one that offers this; on a desktop without the
+    /// protocol the request is dropped and the background stays clear.
+    pub background_blur: bool,
 }
 
 /// How many lines of a pane's scrollback are kept for the replay. kero's own
@@ -156,6 +162,21 @@ impl Settings {
         if let Some(on) = table.boolean("editor.wrap-lines") {
             settings.wrap_lines = on;
         }
+        if let Some(opacity) = table
+            .number("background-opacity")
+            .filter(|opacity| (OPACITY_MIN..=1.0).contains(opacity))
+        {
+            settings.terminal.background_opacity = opacity;
+        }
+        if let Some(on) = table.boolean("background-blur") {
+            settings.background_blur = on;
+        }
+        if let Some(padding) = table
+            .number("window-padding")
+            .filter(|padding| (0.0..=PADDING_MAX).contains(padding))
+        {
+            settings.terminal.padding = padding;
+        }
         if let Some(on) = table.boolean("window.auto-hide-tab-bar") {
             settings.auto_hide_tab_bar = on;
         }
@@ -236,6 +257,23 @@ impl Settings {
         }
         if self.wrap_lines != default.wrap_lines {
             let _ = writeln!(out, "editor.wrap-lines = {}", self.wrap_lines);
+        }
+        if self.terminal.background_opacity != default.terminal.background_opacity {
+            let _ = writeln!(
+                out,
+                "background-opacity = {}",
+                toml::number(self.terminal.background_opacity)
+            );
+        }
+        if self.background_blur != default.background_blur {
+            let _ = writeln!(out, "background-blur = {}", self.background_blur);
+        }
+        if self.terminal.padding != default.terminal.padding {
+            let _ = writeln!(
+                out,
+                "window-padding = {}",
+                toml::number(self.terminal.padding)
+            );
         }
         if self.auto_hide_tab_bar != default.auto_hide_tab_bar {
             let _ = writeln!(out, "window.auto-hide-tab-bar = {}", self.auto_hide_tab_bar);
@@ -496,12 +534,15 @@ mod tests {
                 bell: false,
                 command: "/usr/bin/fish".to_owned(),
                 scrollback_lines: 50_000,
+                background_opacity: 0.85,
+                padding: 8.0,
                 ..TerminalConfig::default()
             },
             appearance: Appearance::Dark,
             restore_history: true,
             wrap_lines: true,
             auto_hide_tab_bar: true,
+            background_blur: true,
         };
         let read = Settings::parse(&settings.to_toml());
 
@@ -515,10 +556,19 @@ mod tests {
         assert!(!read.terminal.bell);
         assert_eq!(read.terminal.command, "/usr/bin/fish");
         assert_eq!(read.terminal.scrollback_lines, 50_000);
+        assert!((read.terminal.background_opacity - 0.85).abs() < f64::EPSILON);
+        assert!((read.terminal.padding - 8.0).abs() < f64::EPSILON);
+        assert!(read.background_blur);
         assert_eq!(read.appearance, Appearance::Dark);
         assert!(read.restore_history);
         assert!(read.wrap_lines);
         assert!(read.auto_hide_tab_bar);
+    }
+
+    #[test]
+    fn an_opacity_nothing_could_be_read_through_leaves_the_default() {
+        let read = Settings::parse("background-opacity = 0.02");
+        assert!((read.terminal.background_opacity - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

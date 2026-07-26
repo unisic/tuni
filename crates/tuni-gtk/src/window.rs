@@ -26,7 +26,7 @@ use gtk::glib;
 use tuni_core::panes::{Content, Edge, Layout, Pane};
 use tuni_core::session::{History, PaneState, Snapshot};
 use tuni_core::settings::{Appearance, HISTORY_LINE_LIMIT, Settings};
-use tuni_core::theme::Theme;
+use tuni_core::theme::{Rgb, Theme};
 use tuni_core::workspace::{Id, Tab, Workspace};
 
 use crate::diff::TuniDiff;
@@ -370,6 +370,17 @@ impl TuniWindow {
             bar.set_autohide(settings.auto_hide_tab_bar);
         }
         imp.settings.replace(settings);
+        // `constructed` painted the chrome before there were any settings to
+        // paint it from, so it is repainted here rather than at the first theme
+        // change the desktop happens to send.
+        let opacity = imp.settings.borrow().terminal.background_opacity;
+        apply_chrome(&window.theme(), opacity);
+        // There is no surface to ask about until the window is realized, and
+        // the setting was read before there was a window at all.
+        window.connect_realize(|window| {
+            let on = window.imp().settings.borrow().background_blur;
+            crate::blur::apply(window, on);
+        });
         window
     }
 
@@ -896,6 +907,7 @@ impl TuniWindow {
             #[weak(rename_to = this)]
             self,
             move |style: &adw::StyleManager| {
+                let opacity = this.imp().settings.borrow().terminal.background_opacity;
                 let theme = this.imp().settings.borrow().terminal.theme(style.is_dark());
                 for terminal in this.imp().terminals.borrow().values() {
                     terminal.set_theme(&theme);
@@ -906,7 +918,7 @@ impl TuniWindow {
                 for diff in this.imp().diffs.borrow().values() {
                     diff.set_theme(&theme);
                 }
-                apply_chrome(&theme);
+                apply_chrome(&theme, opacity);
             }
         );
         style.connect_dark_notify(recolor.clone());
@@ -955,7 +967,8 @@ impl TuniWindow {
         }
         crate::editor::apply_font(&settings.terminal);
         crate::diff::apply_colors(&theme);
-        apply_chrome(&theme);
+        apply_chrome(&theme, settings.terminal.background_opacity);
+        crate::blur::apply(self, settings.background_blur);
 
         // Turning history off should not leave the last session's output on
         // disk waiting for the setting to be turned back on.
@@ -3080,13 +3093,7 @@ impl TuniWindow {
                 &gtk::graphene::Point::new(x as f32, y as f32),
             )
             .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
-        menu.set_pointing_to(Some(&gdk::Rectangle::new(
-            point.x() as i32,
-            point.y() as i32,
-            1,
-            1,
-        )));
-        menu.popup();
+        crate::menu::popup_at(&menu, point);
     }
 
     // --- dialogs -----------------------------------------------------------
@@ -3555,29 +3562,44 @@ pub fn apply_appearance(appearance: Appearance) {
 /// Paint the window chrome from the terminal's theme.
 ///
 /// libadwaita builds its whole stylesheet out of named colors, so overriding
-/// those recolors the header bar, dialogs, and popovers consistently — far more
-/// robust than styling widgets one by one, and it keeps working as libadwaita
-/// adds widgets. One provider, reloaded, so switching themes does not stack
-/// stylesheets on the display.
-pub fn apply_chrome(theme: &Theme) {
+/// those recolors the header bar, dialogs, and popovers at once, and it keeps
+/// working as libadwaita adds widgets. One provider, reloaded, so switching
+/// themes does not stack stylesheets on the display.
+///
+/// The window background is the only color the opacity setting reaches, and it
+/// is the only one that may be translucent: the shades libadwaita paints on top
+/// of it are shades of the same color, and two translucent layers of one color
+/// leave that corner of the window more solid than the rest. Below full opacity
+/// they give way to the background instead, which is also the single layer the
+/// compositor is asked to blur. What is drawn over the window stays solid: a
+/// menu or a dialog is something to read, and reading it through the wallpaper
+/// is not a feature.
+pub fn apply_chrome(theme: &Theme, opacity: f64) {
     thread_local! {
         static PROVIDER: gtk::CssProvider = gtk::CssProvider::new();
     }
 
     let accent = theme.accent();
+    let over_background = |color: Rgb| {
+        if opacity < 1.0 {
+            "transparent".to_owned()
+        } else {
+            color.to_hex()
+        }
+    };
     let css = format!(
         "@define-color window_bg_color {bg};\n\
          @define-color window_fg_color {fg};\n\
-         @define-color view_bg_color {bg};\n\
+         @define-color view_bg_color {clear};\n\
          @define-color view_fg_color {fg};\n\
          @define-color headerbar_bg_color {header};\n\
          @define-color headerbar_fg_color {fg};\n\
          @define-color headerbar_border_color {border};\n\
-         @define-color headerbar_backdrop_color {bg};\n\
+         @define-color headerbar_backdrop_color {clear};\n\
          @define-color sidebar_bg_color {sidebar};\n\
          @define-color sidebar_fg_color {fg};\n\
          @define-color sidebar_border_color {border};\n\
-         @define-color sidebar_backdrop_color {bg};\n\
+         @define-color sidebar_backdrop_color {clear};\n\
          @define-color popover_bg_color {raised};\n\
          @define-color popover_fg_color {fg};\n\
          @define-color dialog_bg_color {raised};\n\
@@ -3587,10 +3609,14 @@ pub fn apply_chrome(theme: &Theme) {
          @define-color accent_color {accent};\n\
          @define-color accent_bg_color {accent};\n\
          @define-color accent_fg_color {on_accent};\n",
-        bg = theme.background.to_hex(),
+        bg = {
+            let Rgb { r, g, b } = theme.background;
+            format!("rgba({r},{g},{b},{opacity})")
+        },
+        clear = over_background(theme.background),
         fg = theme.foreground.to_hex(),
-        header = theme.surface(0.06).to_hex(),
-        sidebar = theme.surface(0.03).to_hex(),
+        header = over_background(theme.surface(0.06)),
+        sidebar = over_background(theme.surface(0.03)),
         raised = theme.surface(0.10).to_hex(),
         border = theme.surface(0.20).to_hex(),
         accent = accent.to_hex(),

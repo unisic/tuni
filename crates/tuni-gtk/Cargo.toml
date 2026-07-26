@@ -20,3 +20,6 @@ adw = { package = "libadwaita", version = "0.8", features = ["v1_6"] }
 gtk = { package = "gtk4", version = "0.10", features = ["v4_12"] }
 unicode-width = "0.2"
 sourceview5 = { version = "0.10", features = ["v5_10"] }
+gdk4-wayland = { version = "0.10", features = ["wayland_crate"] }
+wayland-client = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }

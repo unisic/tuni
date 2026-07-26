@@ -486,13 +486,7 @@ impl TuniFiles {
         let point = widget
             .compute_point(&list, &gtk::graphene::Point::new(x as f32, y as f32))
             .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
-        menu.set_pointing_to(Some(&gdk::Rectangle::new(
-            point.x() as i32,
-            point.y() as i32,
-            1,
-            1,
-        )));
-        menu.popup();
+        crate::menu::popup_at(&menu, point);
     }
 
     // --- acting on a file --------------------------------------------------

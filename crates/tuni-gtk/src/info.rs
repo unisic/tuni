@@ -603,9 +603,7 @@ impl TuniInfo {
         // coordinates.
         let point = gtk::graphene::Point::new(x as f32, y as f32);
         let point = over.compute_point(self, &point).unwrap_or(point);
-        let point = gdk::Rectangle::new(point.x() as i32, point.y() as i32, 1, 1);
-        menu.set_pointing_to(Some(&point));
-        menu.popup();
+        crate::menu::popup_at(&menu, point);
     }
 
     // --- what the rows can be told to do -----------------------------------

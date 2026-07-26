@@ -21,6 +21,14 @@ pub mod workspace;
 pub const FONT_SIZE_MIN: f64 = 4.0;
 pub const FONT_SIZE_MAX: f64 = 96.0;
 
+/// How transparent the background is allowed to get. Past this the text is
+/// being read against whatever happens to be behind the window rather than
+/// against a terminal.
+pub const OPACITY_MIN: f64 = 0.2;
+
+/// How much blank space may be left around the grid, in pixels.
+pub const PADDING_MAX: f64 = 40.0;
+
 /// The shape the cursor takes until the program running in the terminal asks
 /// for another one. DECSCUSR is the application's to send, so this is only what
 /// a screen nobody has asked anything of shows.
@@ -95,6 +103,19 @@ pub struct TerminalConfig {
     /// What to run instead of the login shell. Empty is the login shell, which
     /// is `$SHELL`, then the passwd entry. A bare name is looked up on `PATH`.
     pub command: String,
+    /// How opaque the background is, from [`OPACITY_MIN`] to 1.0. Only the
+    /// page color takes it: a cell an application colored itself is drawn
+    /// solid, or reverse video and a selection would come out as a tint of the
+    /// wallpaper.
+    ///
+    /// Whether anything is visible through the window is the compositor's to
+    /// decide, and a compositor that does not composite leaves the background
+    /// black. That is the same deal Ghostty's `background-opacity` offers.
+    pub background_opacity: f64,
+    /// Blank space between the edges of the terminal and the grid, in pixels,
+    /// up to [`PADDING_MAX`]. Zero, because the grid is the terminal and the
+    /// space around it is a preference rather than a default.
+    pub padding: f64,
     /// Bundled theme names, one per desktop appearance. The desktop decides
     /// which of the two is in use, so both are configured, as Ghostty and kero
     /// both do.
@@ -169,6 +190,8 @@ impl Default for TerminalConfig {
             copy_on_select: false,
             bell: true,
             command: String::new(),
+            background_opacity: 1.0,
+            padding: 0.0,
             theme_light: theme::DEFAULT_LIGHT.to_owned(),
             theme_dark: theme::DEFAULT_DARK.to_owned(),
         }

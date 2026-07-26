@@ -864,6 +864,16 @@ impl TuniTerminal {
                 .set_default_cursor_style(Some(cursor_style(config.cursor_style)));
         }
 
+        // Margin rather than an offset inside the widget: every coordinate in
+        // here is the grid's own, from a click to a selection to an image
+        // placement, and an origin that was not 0,0 would have to be taken back
+        // out of each of them.
+        let padding = config.padding as i32;
+        self.set_margin_start(padding);
+        self.set_margin_end(padding);
+        self.set_margin_top(padding);
+        self.set_margin_bottom(padding);
+
         self.setup_font();
         self.apply_size(self.width(), self.height());
         self.queue_resize();
@@ -2326,11 +2336,19 @@ impl TuniTerminal {
         // theme unless an application overrode it with OSC 11. Falling back to
         // the theme keeps the widget the right color before a shell starts and
         // after one exits, when there is no terminal to ask.
-        let background = grid.map_or_else(|| theme_rgb(imp.theme.borrow().background), |g| g.bg);
-        snapshot.append_color(
-            &rgba(background),
-            &graphene::Rect::new(0.0, 0.0, width, height),
-        );
+        let theme_background = theme_rgb(imp.theme.borrow().background);
+        let background = grid.map_or(theme_background, |g| g.bg);
+        // The window under the widget is painted in the theme's background
+        // color already. Painting it again is free when the color is opaque and
+        // wrong when it is not: two translucent layers of the same color leave
+        // the grid more solid than the header bar beside it. So the fill is for
+        // a page color the application chose itself, and for the opaque case.
+        let opacity = imp.config.borrow().background_opacity;
+        if opacity >= 1.0 || background != theme_background {
+            let mut page = rgba(background);
+            page.set_alpha(opacity as f32);
+            snapshot.append_color(&page, &graphene::Rect::new(0.0, 0.0, width, height));
+        }
 
         let Some(grid) = grid else {
             return;

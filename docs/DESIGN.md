@@ -456,6 +456,9 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `line-height` | `0` | Extra pixels between rows |
 | `cursor-blink` | `true` | And then only if the desktop blinks its own cursor, and only while the program running has no opinion |
 | `cursor-style` | `"block"` | `block`, `bar`, `underline`, or `block_hollow`, the shape until the program running asks for another |
+| `background-opacity` | `1` | How much of the desktop shows through the window, down to `0.2` |
+| `background-blur` | `false` | Whether the compositor blurs what shows through. KDE is asked in its own language; other desktops do not hear the question |
+| `window-padding` | `0` | Pixels of nothing between the window and the grid, up to `40` |
 | `copy-on-select` | `false` | Whether releasing a selection puts it on the clipboard |
 | `bell` | `true` | Whether `\a` rings the desktop's own bell |
 | `command` | `""` | The shell to run; empty means the login shell |

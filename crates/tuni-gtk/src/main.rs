@@ -2,6 +2,7 @@
 //!
 //! Everything the window does lives in `window.rs`; this file is the process.
 
+mod blur;
 mod diff;
 mod editor;
 mod files;
@@ -10,6 +11,7 @@ mod git;
 mod grid;
 mod info;
 mod keymap;
+mod menu;
 mod notify;
 mod palette;
 mod panel;
