@@ -66,7 +66,8 @@ GPLv3
 
 ## Credits
 
-Built by [@DeBondor](https://github.com/DeBondor). Behavior after
+Built by [@DeBondor](https://github.com/DeBondor) and
+[@D3anDark](https://github.com/D3anDark). Behavior after
 [kero](https://github.com/egoist/kero); terminal emulation by
 [Ghostty](https://ghostty.org/)'s `libghostty-vt`.
 
