@@ -971,13 +971,10 @@ pub fn diff(path: &Path, staged: bool) -> Result<FileDiff, String> {
     // the one form of diff that reads two paths rather than the index, and
     // `/dev/null` is the empty side.
     let untracked = !staged
-        && run(
-            &["--literal-pathspecs", "ls-files", "--", &relative],
-            &root,
-        )
-        .stdout
-        .trim()
-        .is_empty();
+        && run(&["--literal-pathspecs", "ls-files", "--", &relative], &root)
+            .stdout
+            .trim()
+            .is_empty();
 
     let output = if untracked {
         run(
@@ -1470,7 +1467,11 @@ mod tests {
         assert!(staged.text.contains("+line two"), "{}", staged.text);
         assert!(!staged.text.contains("eighteen"), "{}", staged.text);
         let unstaged = diff(&sandbox.path.join("file.txt"), false).expect("diff");
-        assert!(unstaged.text.contains("+line eighteen"), "{}", unstaged.text);
+        assert!(
+            unstaged.text.contains("+line eighteen"),
+            "{}",
+            unstaged.text
+        );
         assert!(!unstaged.text.contains("+line two"), "{}", unstaged.text);
 
         // And back out again, from the staged side.

@@ -43,7 +43,12 @@ pub struct Entry {
 
 impl Entry {
     /// A command, named by the action it runs.
-    pub fn command(title: &str, icon: &'static str, shortcut: Option<&'static str>, action: &'static str) -> Self {
+    pub fn command(
+        title: &str,
+        icon: &'static str,
+        shortcut: Option<&'static str>,
+        action: &'static str,
+    ) -> Self {
         Self {
             title: title.to_owned(),
             subtitle: None,

@@ -445,7 +445,11 @@ index 83db48f..bf269f4 100644
     fn a_hunk_carries_the_numbers_of_both_sides() {
         let diff = Diff::parse(SAMPLE);
         assert_eq!(diff.hunks.len(), 2);
-        assert_eq!(diff.preamble.len(), 4, "everything down to +++ is the header");
+        assert_eq!(
+            diff.preamble.len(),
+            4,
+            "everything down to +++ is the header"
+        );
 
         let hunk = &diff.hunks[0];
         assert_eq!(hunk.heading, "fn main() {");
@@ -520,9 +524,18 @@ diff --git a/a b/a
         let diff = Diff::parse(SAMPLE);
         let rows = diff.hunks[0].rows();
         assert_eq!(rows.len(), 5, "one row per line of the taller side");
-        assert_eq!(rows[1].old.as_ref().map(|line| line.text.as_str()), Some("let one = 1;"));
-        assert_eq!(rows[1].new.as_ref().map(|line| line.text.as_str()), Some("let one = 2;"));
-        assert!(rows[2].old.is_none(), "the second addition has nothing to pair with");
+        assert_eq!(
+            rows[1].old.as_ref().map(|line| line.text.as_str()),
+            Some("let one = 1;")
+        );
+        assert_eq!(
+            rows[1].new.as_ref().map(|line| line.text.as_str()),
+            Some("let one = 2;")
+        );
+        assert!(
+            rows[2].old.is_none(),
+            "the second addition has nothing to pair with"
+        );
         assert!(!rows[0].is_change());
         assert!(rows[1].is_change());
     }
@@ -531,7 +544,10 @@ diff --git a/a b/a
     fn a_deletion_alone_keeps_its_side() {
         let rows = Diff::parse(SAMPLE).hunks[1].rows();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[1].old.as_ref().map(|line| line.text.as_str()), Some("gone"));
+        assert_eq!(
+            rows[1].old.as_ref().map(|line| line.text.as_str()),
+            Some("gone")
+        );
         assert!(rows[1].new.is_none());
     }
 
@@ -559,7 +575,10 @@ diff --git a/a b/a
             "only the number differs"
         );
         assert_eq!(
-            before.iter().map(|span| span.text.as_str()).collect::<String>(),
+            before
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
             "let one = 1;",
             "the line comes back whole"
         );

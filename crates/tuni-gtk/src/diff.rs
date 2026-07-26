@@ -456,7 +456,10 @@ impl TuniDiff {
         let mut drawn = 0;
         for (index, hunk) in diff.hunks.iter().enumerate() {
             if drawn >= MAX_LINES {
-                let left: usize = diff.hunks[index..].iter().map(|hunk| hunk.lines.len()).sum();
+                let left: usize = diff.hunks[index..]
+                    .iter()
+                    .map(|hunk| hunk.lines.len())
+                    .sum();
                 container.append(&overflow_row(left, diff.hunks.len() - index));
                 break;
             }
@@ -622,7 +625,8 @@ impl TuniDiff {
                 for span in spans {
                     let text = glib::markup_escape_text(&span.text);
                     if span.changed {
-                        markup.push_str(&format!("<span background=\"{background}\">{text}</span>"));
+                        markup
+                            .push_str(&format!("<span background=\"{background}\">{text}</span>"));
                     } else {
                         markup.push_str(&text);
                     }
