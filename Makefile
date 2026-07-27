@@ -71,9 +71,7 @@ all: build
 build:
 	@zig version 2>/dev/null | grep -qx '$(ZIG_VERSION)' || \
 		echo "warning: zig $(ZIG_VERSION) is not on PATH; \`make zig\` installs it, \`make build-next\` builds with $(ZIG_NEXT_VERSION) instead"
-	@real=$$(command -v zig) || { echo "zig is not on PATH" >&2; exit 1; }; \
-	TUNI_REAL_ZIG="$$real" TUNI_ZIG_CPU='$(ZIG_CPU)' \
-	PATH="$(CURDIR)/scripts/zig-baseline:$$PATH" \
+	@TUNI_ZIG_CPU='$(ZIG_CPU)' PATH="$(CURDIR)/scripts/zig-baseline:$$PATH" \
 	$(CARGO) build --release --locked
 
 # The 0.16 route: that toolchain, the Ghostty commit that accepts it, and a

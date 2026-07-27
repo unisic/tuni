@@ -9,11 +9,33 @@
 # from -Dcpu and from no environment variable, and the build script has no way
 # to pass one through. So the flag goes on here, and the Makefile puts this
 # directory in front of the real toolchain.
+#
+# Which toolchain that is gets worked out here rather than being handed over by
+# the Makefile, so that a `make install` in a shell that no longer has zig on
+# its PATH, which is exactly what rpmbuild's %install is after %build fetched
+# one, reaches an up-to-date binary instead of an error about a compiler it was
+# never going to run.
 set -eu
+
+self=$(cd "$(dirname "$0")" && pwd)
+real=
+IFS=:
+for dir in $PATH; do
+    if [ "$dir" != "$self" ] && [ -x "$dir/zig" ]; then
+        real=$dir/zig
+        break
+    fi
+done
+unset IFS
+
+if [ -z "$real" ]; then
+    echo "zig is not on PATH; \`make zig\` installs the one this tree pins" >&2
+    exit 1
+fi
 
 if [ "${1-}" = build ]; then
     shift
-    exec "$TUNI_REAL_ZIG" build "-Dcpu=$TUNI_ZIG_CPU" "$@"
+    exec "$real" build "-Dcpu=${TUNI_ZIG_CPU:-baseline}" "$@"
 fi
 
-exec "$TUNI_REAL_ZIG" "$@"
+exec "$real" "$@"
