@@ -3694,6 +3694,27 @@ impl TuniWindow {
                 Some(gdk::ContentProvider::for_value(&index.to_value()))
             }
         ));
+        // A drag with no icon of its own gets the toolkit's, which is a picture
+        // of a document and says nothing about what is being carried. The row
+        // itself is the honest answer, at its own size and held at the point it
+        // was taken hold of, so what leaves under the pointer is what was
+        // pressed and it does not jump.
+        source.connect_drag_begin(glib::clone!(
+            #[weak]
+            row,
+            move |source, _| {
+                let size = (f64::from(row.width()), f64::from(row.height()));
+                let Some((texture, width, height)) = crate::grid::thumbnail(&row, size) else {
+                    return;
+                };
+                let (x, y) = source.point(None).unwrap_or((size.0 / 2.0, size.1 / 2.0));
+                source.set_icon(
+                    Some(&texture),
+                    (x as i32).clamp(0, width),
+                    (y as i32).clamp(0, height),
+                );
+            }
+        ));
         row.add_controller(source);
 
         let target = gtk::DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);

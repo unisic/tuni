@@ -263,7 +263,7 @@ impl TuniGrid {
             #[weak]
             pane,
             move |source, _| {
-                if let Some((texture, width, height)) = thumbnail(&pane) {
+                if let Some((texture, width, height)) = thumbnail(&pane, THUMBNAIL) {
                     source.set_icon(Some(&texture), width / 2, height / 2);
                 }
             }
@@ -350,19 +350,24 @@ fn show_preview(pane: &gtk::Box, preview: &gtk::Box, edge: Edge) {
     preview.set_visible(true);
 }
 
-/// The pane as a picture the drag can carry, scaled down to fit
-/// [`THUMBNAIL`].
-fn thumbnail(pane: &gtk::Box) -> Option<(gdk::Texture, i32, i32)> {
-    let width = f64::from(pane.width());
-    let height = f64::from(pane.height());
+/// A widget as a picture the drag can carry, scaled down to fit `at_most` and
+/// never scaled up. A pane asks to fit [`THUMBNAIL`] because a whole pane under
+/// the pointer is more picture than anyone needs; something already small asks
+/// for its own size and comes back untouched.
+pub(crate) fn thumbnail(
+    widget: &impl IsA<gtk::Widget>,
+    at_most: (f64, f64),
+) -> Option<(gdk::Texture, i32, i32)> {
+    let width = f64::from(widget.as_ref().width());
+    let height = f64::from(widget.as_ref().height());
     if width <= 0.0 || height <= 0.0 {
         return None;
     }
-    let scale = (THUMBNAIL.0 / width).min(THUMBNAIL.1 / height).min(1.0);
+    let scale = (at_most.0 / width).min(at_most.1 / height).min(1.0);
     let (width, height) = (width * scale, height * scale);
 
-    let renderer = pane.native()?.renderer()?;
-    let paintable = gtk::WidgetPaintable::new(Some(pane));
+    let renderer = widget.as_ref().native()?.renderer()?;
+    let paintable = gtk::WidgetPaintable::new(Some(widget.as_ref()));
     let snapshot = gtk::Snapshot::new();
     snapshot.scale(scale as f32, scale as f32);
     paintable.snapshot(&snapshot, width / scale, height / scale);
