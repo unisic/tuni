@@ -6,7 +6,7 @@
 # GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
 # populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.0.1/ -o tuni-1.0.1.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.1.0/ -o tuni-1.1.0.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.15.2
 
 Name:           tuni
-Version:        1.0.1
+Version:        1.1.0
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -81,6 +81,17 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/symbolic/apps/%{app_id}-symbolic.svg
 
 %changelog
+* Mon Jul 27 2026 Unisic <hello@unisic.dev> - 1.1.0-1
+- SSH: hosts read from the ssh configuration and from a hosts file of tuni's
+  own, a new tab that is a host list, one shared connection per host.
+- A file browser on a connection: step into directories at the far end, copy
+  files both ways, make, rename and delete them there.
+- Forwarded ports listed beside a connection, opened and closed while it is up.
+- Snippets typed into a pane by name, and the keys in ~/.ssh listed with the
+  commands that change them.
+- A menu on a right click in the terminal, and a pane that runs something other
+  than a login shell.
+
 * Mon Jul 27 2026 Unisic <hello@unisic.dev> - 1.0.1-1
 - Mouse reporting, focus reporting, and box drawing characters stroked in the
   terminal rather than left to the font.

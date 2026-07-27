@@ -67,6 +67,21 @@
   </provides>
 
   <releases>
+    <release version="1.1.0" date="2026-07-27">
+      <description>
+        <p>Tuni speaks SSH. Hosts come from the ssh configuration it already
+        reads and from a hosts file of its own, a new tab can be a host list,
+        and panes on the same host share one connection.</p>
+        <p>A connection carries a file browser. Step into directories at the
+        far end, drag files across in either direction, and make, rename or
+        delete them there.</p>
+        <p>Forwarded ports are listed beside the connection and open or close
+        while it is up.</p>
+        <p>Also: snippets typed into a pane by name, the keys in ~/.ssh listed
+        with the commands that change them, a menu on a right click in the
+        terminal, and a pane that runs something other than a login shell.</p>
+      </description>
+    </release>
     <release version="1.0.1" date="2026-07-27">
       <description>
         <p>The terminal gained mouse reporting, focus reporting, and box
