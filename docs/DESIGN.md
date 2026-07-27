@@ -201,6 +201,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+G` / `Ctrl+Shift+G` | Next match, previous match — in a file pane only |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection, paste |
 | Middle click | Paste the primary selection |
+| Right click | A menu of what these keys already do: copy, paste, select all, find, clear, the splits, and above them the hyperlink under the pointer when there is one |
 | `Ctrl+Shift+A` | Select everything, scrollback included |
 | Drag, double click, triple click | Select by character, word, line |
 | `Alt`+drag | Block selection |

@@ -10,6 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use gtk::gdk;
+use gtk::gio;
 use gtk::glib;
 use gtk::graphene;
 use gtk::pango;
@@ -299,6 +300,13 @@ mod imp {
         pub(super) link_hover: RefCell<Option<tuni_vt::LinkHover>>,
         pub(super) link_probe: Cell<Option<(u16, u16)>>,
         pub(super) link_valid: Cell<bool>,
+        /// The context menu, its actions, and the hyperlink it was opened over.
+        /// What the menu holds depends on where the pointer was, so the model
+        /// is built per press and the link the first section acts on is kept
+        /// here until the menu is done with it.
+        pub(super) menu: RefCell<Option<gtk::PopoverMenu>>,
+        pub(super) menu_actions: RefCell<Option<gio::SimpleActionGroup>>,
+        pub(super) menu_link: RefCell<Option<String>>,
         /// Scroll state as of the last feed. Upstream raises no notification
         /// when the viewport moves, so this is polled and diffed.
         pub(super) scroll: Cell<ScrollPosition>,
@@ -373,6 +381,9 @@ mod imp {
                 link_hover: RefCell::new(None),
                 link_probe: Cell::new(None),
                 link_valid: Cell::new(false),
+                menu: RefCell::new(None),
+                menu_actions: RefCell::new(None),
+                menu_link: RefCell::new(None),
                 scroll: Cell::new(ScrollPosition::default()),
                 bar_alpha: Cell::new(0.0),
                 bar_until: Cell::new(None),
@@ -462,6 +473,7 @@ mod imp {
             obj.set_focus_on_click(true);
             obj.setup_font();
             obj.setup_input();
+            obj.setup_menu();
             obj.watch_display();
         }
 
@@ -477,6 +489,10 @@ mod imp {
             }
             if let Some(source) = self.resize_timer.take() {
                 source.remove();
+            }
+            // Parented rather than packed, so it has to be taken off by hand.
+            if let Some(menu) = self.menu.take() {
+                menu.unparent();
             }
             // Drop the session before the widget so the reader thread's channel
             // closes and the shell gets its SIGHUP.
@@ -920,6 +936,110 @@ impl TuniTerminal {
             }
         ));
         self.add_controller(scroll);
+    }
+
+    /// The context menu and the actions its items name.
+    ///
+    /// The menu is made once and filled per press, because what belongs in it
+    /// depends on where the pointer was: a hyperlink under it adds a section,
+    /// and nothing selected greys Copy out rather than hiding it.
+    fn setup_menu(&self) {
+        let actions = gio::SimpleActionGroup::new();
+        actions.add_action_entries([
+            action("copy", self, |terminal| {
+                terminal.copy_selection();
+            }),
+            action("paste", self, TuniTerminal::paste_clipboard),
+            action("select-all", self, TuniTerminal::select_all),
+            action("open-link", self, |terminal| {
+                let uri = terminal.imp().menu_link.borrow().clone();
+                if let Some(uri) = uri {
+                    terminal.open_uri(&uri);
+                }
+            }),
+            action("copy-link", self, |terminal| {
+                if let Some(uri) = terminal.imp().menu_link.borrow().as_ref() {
+                    terminal.clipboard().set_text(uri);
+                }
+            }),
+        ]);
+        self.insert_action_group("term", Some(&actions));
+
+        let menu = gtk::PopoverMenu::from_model(None::<&gio::Menu>);
+        menu.set_has_arrow(false);
+        menu.set_halign(gtk::Align::Start);
+        menu.set_parent(self);
+
+        let imp = self.imp();
+        imp.menu_actions.replace(Some(actions));
+        imp.menu.replace(Some(menu));
+    }
+
+    /// Puts the context menu up over the cell that was clicked.
+    fn popup_menu(&self, x: f64, y: f64) {
+        let imp = self.imp();
+        let Some(menu) = imp.menu.borrow().clone() else {
+            return;
+        };
+
+        let link = self.link_at(x, y);
+        if let Some(action) = imp
+            .menu_actions
+            .borrow()
+            .as_ref()
+            .and_then(|actions| actions.lookup_action("copy"))
+            .and_downcast::<gio::SimpleAction>()
+        {
+            action.set_enabled(self.selection().is_some());
+        }
+
+        let model = gio::Menu::new();
+        if let Some(uri) = link.as_deref() {
+            let links = gio::Menu::new();
+            // A link the desktop would not be handed is still a link worth
+            // copying, so only the opening half waits on `can_open`.
+            if can_open(uri) {
+                links.append(Some("Open Link"), Some("term.open-link"));
+            }
+            links.append(Some("Copy Link Address"), Some("term.copy-link"));
+            model.append_section(None, &links);
+        }
+        imp.menu_link.replace(link);
+
+        let clipboard = gio::Menu::new();
+        clipboard.append(Some("Copy"), Some("term.copy"));
+        clipboard.append(Some("Paste"), Some("term.paste"));
+        clipboard.append(Some("Select All"), Some("term.select-all"));
+        model.append_section(None, &clipboard);
+
+        let screen = gio::Menu::new();
+        screen.append(Some("Find…"), Some("win.find"));
+        screen.append(Some("Clear"), Some("win.clear-terminal"));
+        model.append_section(None, &screen);
+
+        let panes = gio::Menu::new();
+        panes.append(Some("Split Right"), Some("win.split-right"));
+        panes.append(Some("Split Down"), Some("win.split-down"));
+        panes.append(Some("Close Pane"), Some("win.close-pane"));
+        model.append_section(None, &panes);
+
+        menu.set_menu_model(Some(&model));
+        crate::menu::popup_at(&menu, graphene::Point::new(x as f32, y as f32));
+    }
+
+    /// The hyperlink on the cell at a surface position, asked for without
+    /// disturbing the highlight: Ctrl is what arms a hover, and a menu is
+    /// opened without it.
+    fn link_at(&self, x: f64, y: f64) -> Option<String> {
+        let (col, row) = self.geometry().cell_at(x, y)?;
+        let mut guard = self.imp().session.borrow_mut();
+        let hover = guard
+            .as_mut()?
+            .term
+            .hyperlink_hover(col, row)
+            .ok()
+            .flatten()?;
+        Some(hover.uri)
     }
 
     fn grab_focus_self(&self) {
@@ -1994,23 +2114,8 @@ impl TuniTerminal {
     }
 
     /// Hand a hyperlink to the desktop, if it is one worth handing over.
-    ///
-    /// An OSC 8 URI is written by whatever holds the PTY, which over ssh is not
-    /// the person at the keyboard. So a control character anywhere in the
-    /// string disqualifies it, and only a short list of schemes is opened at
-    /// all — `file://` among them only when it names this machine, which is
-    /// what `local_file_path` checks.
     fn open_uri(&self, uri: &str) {
-        const SCHEMES: [&str; 5] = ["http://", "https://", "mailto:", "ftp://", "ftps://"];
-
-        if uri.is_empty() || uri.chars().any(char::is_control) {
-            return;
-        }
-        let allowed = SCHEMES
-            .iter()
-            .any(|scheme| starts_with_ignore_case(uri, scheme))
-            || (starts_with_ignore_case(uri, "file://") && tuni_vt::local_file_path(uri).is_some());
-        if !allowed {
+        if !can_open(uri) {
             return;
         }
 
@@ -2098,6 +2203,10 @@ impl TuniTerminal {
                 imp.pointer.set(Pointer::Selecting);
                 self.selection_press(x, y, Duration::from_millis(u64::from(time)));
             }
+            // An application tracking the mouse was handed this press further
+            // up, so the menu belongs to whoever is not in one, and to anyone
+            // holding Shift, which is the override everything else here takes.
+            gdk::BUTTON_SECONDARY => self.popup_menu(x, y),
             _ => {}
         }
     }
@@ -2304,6 +2413,16 @@ impl TuniTerminal {
         self.paste_from(&self.clipboard());
     }
 
+    /// Select everything there is, scrollback included.
+    pub fn select_all(&self) {
+        let mut guard = self.imp().session.borrow_mut();
+        if let Some(session) = guard.as_mut() {
+            let _ = session.term.select_all();
+        }
+        drop(guard);
+        self.queue_draw();
+    }
+
     fn paste_from(&self, clipboard: &gdk::Clipboard) {
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
@@ -2432,12 +2551,7 @@ impl TuniTerminal {
                     return glib::Propagation::Stop;
                 }
                 Key::A => {
-                    let mut guard = imp.session.borrow_mut();
-                    if let Some(session) = guard.as_mut() {
-                        let _ = session.term.select_all();
-                    }
-                    drop(guard);
-                    self.queue_draw();
+                    self.select_all();
                     return glib::Propagation::Stop;
                 }
                 _ => {}
@@ -3031,6 +3145,46 @@ fn style_key(cell: &tuni_vt::Cell, link: bool, mark: u8) -> StyleKey {
         link,
         mark,
     }
+}
+
+/// Whether a hyperlink is one the desktop may be handed.
+///
+/// An OSC 8 URI is written by whatever holds the PTY, which over ssh is not the
+/// person at the keyboard. So a control character anywhere in the string
+/// disqualifies it, and only a short list of schemes is opened at all, with
+/// `file://` among them only when it names this machine, which is what
+/// `local_file_path` checks.
+fn can_open(uri: &str) -> bool {
+    const SCHEMES: [&str; 5] = ["http://", "https://", "mailto:", "ftp://", "ftps://"];
+
+    if uri.is_empty() || uri.chars().any(char::is_control) {
+        return false;
+    }
+    SCHEMES
+        .iter()
+        .any(|scheme| starts_with_ignore_case(uri, scheme))
+        || (starts_with_ignore_case(uri, "file://") && tuni_vt::local_file_path(uri).is_some())
+}
+
+/// One menu action, holding the terminal weakly: the group is inserted into the
+/// widget, so anything stronger than this would be a cycle the widget never
+/// leaves.
+fn action<F>(
+    name: &str,
+    terminal: &TuniTerminal,
+    activate: F,
+) -> gio::ActionEntry<gio::SimpleActionGroup>
+where
+    F: Fn(&TuniTerminal) + 'static,
+{
+    let weak = terminal.downgrade();
+    gio::ActionEntry::builder(name)
+        .activate(move |_: &gio::SimpleActionGroup, _, _| {
+            if let Some(terminal) = weak.upgrade() {
+                activate(&terminal);
+            }
+        })
+        .build()
 }
 
 /// Case-insensitive prefix test over bytes. A URI arrives as arbitrary text, and
