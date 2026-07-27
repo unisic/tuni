@@ -211,6 +211,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Shift`+click | Select even while an application is following the pointer |
 | `Ctrl+Shift+M` | Take the mouse back from applications entirely, and hand it over again |
 | `Ctrl`+click | Open the hyperlink under the pointer |
+| Drop a file on a pane | Its path, quoted, onto the prompt as an argument, followed by a space |
 | `Shift+Page Up` / `Shift+Page Down` | Scroll the viewport by a page |
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
@@ -689,6 +690,16 @@ uses for the same setting. Turned off, no application is given the mouse
 however loudly it asks, and every drag selects. `Ctrl+Shift+M` turns it off
 and on again, because whether a program should have the mouse is a thing that
 changes several times an hour.
+
+A drag that ends on a pane is not a drag the shell can be told about, so it
+becomes text. Every file in it arrives as a quoted shell word with a space after
+it, which is the one reading that works whatever is waiting: a prompt with a
+command half typed, an editor, a program reading a filename. Uploading it would
+be a guess about what the shell is, and running it would be a guess about what
+the person meant. It goes in bracketed, like every other paste, so a name with a
+newline in it cannot run itself. A drag carrying text rather than files is that
+text, and one carrying a file the other side only holds in memory is its URI,
+which is the only name it has.
 
 The keyboard arriving and leaving is news as well, to the programs that asked
 for it with mode 1004: an editor rereads a file that changed while it was away,

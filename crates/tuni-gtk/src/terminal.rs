@@ -7,6 +7,7 @@
 //! this keeps up under a firehose is exactly what the Etap 0 benchmark decides.
 
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gtk::gdk;
@@ -936,6 +937,26 @@ impl TuniTerminal {
             }
         ));
         self.add_controller(scroll);
+
+        // A terminal has no idea what the shell running in it would do with a
+        // file, so a drop writes the path onto the prompt as an argument and
+        // leaves the running to whoever dropped it. It goes in as a paste, and
+        // is bracketed like any other, so a name with a newline in it cannot
+        // run itself.
+        let drop = gtk::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY);
+        drop.set_types(&[
+            gdk::FileList::static_type(),
+            gio::File::static_type(),
+            String::static_type(),
+        ]);
+        drop.connect_drop(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            false,
+            move |_, value, _, _| this.receive_drop(value)
+        ));
+        self.add_controller(drop);
     }
 
     /// The context menu and the actions its items name.
@@ -2439,6 +2460,34 @@ impl TuniTerminal {
         ));
     }
 
+    /// What a drag leaves on the prompt. Files come in as shell words, dragged
+    /// text as itself, and each file is followed by a space so the next word
+    /// does not land glued to the last path.
+    fn receive_drop(&self, dropped: &glib::Value) -> bool {
+        let text = if let Ok(list) = dropped.get::<gdk::FileList>() {
+            let files = list.files();
+            if files.is_empty() {
+                return false;
+            }
+            files.iter().fold(String::new(), |mut text, file| {
+                text.push_str(&dropped_word(file));
+                text.push(' ');
+                text
+            })
+        } else if let Ok(file) = dropped.get::<gio::File>() {
+            format!("{} ", dropped_word(&file))
+        } else if let Ok(text) = dropped.get::<String>() {
+            text
+        } else {
+            return false;
+        };
+        // The pane a drop landed on is the one about to be typed into, and it
+        // is not necessarily the one that had the keyboard when the drag began.
+        self.grab_focus();
+        self.paste_text(&text);
+        true
+    }
+
     /// Write pasted text to the shell, bracketed when the application asked for
     /// it so a multi-line paste cannot run itself.
     fn paste_text(&self, text: &str) {
@@ -3113,6 +3162,16 @@ fn mouse_button(button: u32) -> Option<MouseButton> {
         8 => Some(MouseButton::Four),
         9 => Some(MouseButton::Five),
         _ => None,
+    }
+}
+
+/// A dragged file as one shell word. A drag can carry something with no local
+/// path at all, a file inside an archive or a photo an application only holds
+/// in memory, and the URI is the only name that side has for one of those.
+fn dropped_word(file: &gio::File) -> String {
+    match file.path() {
+        Some(path) => tuni_core::files::shell_quote(&path),
+        None => tuni_core::files::shell_quote(Path::new(&file.uri())),
     }
 }
 
