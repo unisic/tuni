@@ -11,6 +11,12 @@
 # list below allows. simdutf, memchr, simd-adler32 and the Highway kernels
 # Ghostty carries all ask CPUID first and have a fallback behind them. A ymm
 # anywhere else got there because something compiled for the build machine.
+#
+# That question can only be asked of a binary that still has its symbols. Every
+# package strips, and objdump then files the whole program under `.text`, so
+# what is left there is the AVX-512 count: zero in a baseline build, hundreds in
+# one made on a runner, and enough to catch the thing that shipped in 1.1.1.
+# CI runs this on the build it just made, with symbols, for the rest.
 set -eu
 
 binary=${1:?usage: check-baseline.sh BINARY}
@@ -23,9 +29,12 @@ fi
 
 # AVX-512 has no runtime dispatch here at all, so any of it is a mistake.
 avx512=$(objdump -d "$binary" | grep -cE '%zmm|\bkmov[bwdq]\b' || true)
-stray=$(objdump -d "$binary" \
-    | awk '/^[0-9a-f]+ </ { symbol = $2 } /%[yz]mm/ { print symbol }' \
-    | grep -vE "$dispatched" | sort -u || true)
+stray=
+if readelf -S "$binary" | grep -q '\.symtab'; then
+    stray=$(objdump -d "$binary" \
+        | awk '/^[0-9a-f]+ </ { symbol = $2 } /%[yz]mm/ { print symbol }' \
+        | grep -vE "$dispatched" | sort -u || true)
+fi
 
 if [ "$avx512" -ne 0 ] || [ -n "$stray" ]; then
     echo "$binary was not built for the baseline CPU:" >&2
