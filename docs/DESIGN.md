@@ -102,6 +102,25 @@ window — happens without asking first. A picture opens in the pane too, and
 anything that is neither, or is past the 5 MiB the editor will read, says so and
 offers to hand the file to the desktop.
 
+When the machine has a language server for what the file is, the editor drives
+it: a mistake is underlined where it sits, with a sign in the gutter and the
+explanation in a popover when the pointer rests on it; completion opens on `.`,
+`::` and `->` or on Ctrl+Space, and narrows as the word grows without asking
+the server again; F12 or a Ctrl+click goes to where the thing under the cursor
+is defined, opening the file it lands in. The server gets the same deal git and
+ssh get, an external program found on `PATH` and driven as a process, so
+completion in a Rust file is whatever `rust-analyzer` says, with the exact
+configuration the command line's own tooling would have used. The built-in
+table covers the servers that are useful over stdio with no configuration:
+`rust-analyzer`, `clangd`, `gopls`, `zls`, and the Python, TypeScript, Lua and
+shell ones. One server runs per project and language, shared by every pane
+showing such a file, and hears about edits a beat behind the typing. Which
+directory is the project is read from the language's own marker, `Cargo.toml`
+or `go.mod` or `compile_commands.json`, then from `.git` when none is found,
+because the server builds its whole world from that answer once. A machine
+without a server simply has an editor without one, and closing the last file a
+server was watching shuts the server down rather than keeping it warm.
+
 A row on the Git page opens what changed in that file rather than the file, in a
 pane of the same kind: the working tree against the index, or — for a row that is
 already staged — the index against HEAD. Each hunk is headed by its `@@` line and

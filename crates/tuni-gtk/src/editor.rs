@@ -23,6 +23,7 @@ use sourceview5::prelude::*;
 
 use tuni_core::TerminalConfig;
 use tuni_core::editor::{self, Document};
+use tuni_core::lsp::Severity;
 
 /// The pages of the stack, by the names they are added under.
 const TEXT: &str = "text";
@@ -71,6 +72,17 @@ mod imp {
         pub changed: RefCell<Option<Handler>>,
         /// The window's, called when the text takes the keyboard.
         pub focused: RefCell<Option<Handler>>,
+
+        /// The language server watching this file, while one is.
+        pub lsp: RefCell<Option<crate::lsp::Attachment>>,
+        pub lsp_completion: RefCell<Option<crate::lsp::CompletionSource>>,
+        pub lsp_hover: RefCell<Option<crate::lsp::HoverSource>>,
+        /// The debounce behind `didChange`, so it can be cancelled by the next
+        /// keystroke or flushed by a save.
+        pub lsp_sync: RefCell<Option<glib::SourceId>>,
+        /// What the server last said about the file, in buffer terms, for the
+        /// hover to read back.
+        pub diagnostics: RefCell<Vec<crate::lsp::Shown>>,
     }
 
     #[glib::object_subclass]
@@ -85,6 +97,12 @@ mod imp {
             self.parent_constructed();
             crate::debug::born("TuniEditor");
             self.obj().build();
+        }
+
+        fn dispose(&self) {
+            // The server hears the file closed before the widget goes, and an
+            // idle server goes with it.
+            crate::lsp::detach(&self.obj());
         }
     }
 
@@ -208,6 +226,7 @@ impl TuniEditor {
 
         self.install_search(&buffer);
         self.install_actions();
+        self.install_language_help(&buffer, &view);
         self.watch(&buffer, &view);
         self.set_dark(adw::StyleManager::default().is_dark());
         self.refresh_header();
@@ -418,6 +437,7 @@ impl TuniEditor {
             entry("replace-all", self, TuniEditor::replace_all),
             entry("find-next", self, |editor| editor.find(true, true)),
             entry("find-previous", self, |editor| editor.find(false, true)),
+            entry("definition", self, TuniEditor::definition_at_cursor),
         ]);
         self.insert_action_group("editor", Some(&actions));
 
@@ -429,6 +449,7 @@ impl TuniEditor {
             ("<Ctrl>h", "editor.replace"),
             ("<Ctrl>g", "editor.find-next"),
             ("<Ctrl><Shift>g", "editor.find-previous"),
+            ("F12", "editor.definition"),
         ] {
             shortcuts.add_shortcut(gtk::Shortcut::new(
                 gtk::ShortcutTrigger::parse_string(keys),
@@ -438,6 +459,71 @@ impl TuniEditor {
         self.add_controller(shortcuts);
     }
 
+    /// What a language server adds to the text: squiggles and gutter signs
+    /// under the diagnostics, completion in sourceview's own popup, an answer
+    /// under the pointer, and a Ctrl+click that goes to a definition. All of
+    /// it is inert until [`crate::lsp::attach`] finds a server for the file.
+    fn install_language_help(&self, buffer: &sourceview5::Buffer, view: &sourceview5::View) {
+        let imp = self.imp();
+
+        // One tag per severity. The underline is Pango's error squiggle in
+        // all three; the color is what tells them apart, and it says the same
+        // thing the gutter icon says for readers who get both.
+        for (name, color) in [
+            ("tuni-lsp-error", "#e01b24"),
+            ("tuni-lsp-warning", "#e5a50a"),
+            ("tuni-lsp-note", "#3584e4"),
+        ] {
+            let rgba = gtk::gdk::RGBA::parse(color).unwrap_or(gtk::gdk::RGBA::RED);
+            buffer.create_tag(
+                Some(name),
+                &[
+                    ("underline", &gtk::pango::Underline::Error),
+                    ("underline-rgba", &rgba),
+                ],
+            );
+        }
+        // Notes stay out of the gutter: a hint on half the lines of a file is
+        // a column of icons saying nothing.
+        for (category, icon, priority) in [
+            ("tuni-lsp-error", "dialog-error-symbolic", 2),
+            ("tuni-lsp-warning", "dialog-warning-symbolic", 1),
+        ] {
+            let attributes = sourceview5::MarkAttributes::new();
+            attributes.set_icon_name(icon);
+            view.set_mark_attributes(category, &attributes, priority);
+        }
+        view.set_show_line_marks(true);
+
+        let completion = crate::lsp::CompletionSource::default();
+        view.completion().add_provider(&completion);
+        imp.lsp_completion.replace(Some(completion));
+
+        let hover = crate::lsp::HoverSource::for_editor(self);
+        view.hover().add_provider(&hover);
+        imp.lsp_hover.replace(Some(hover));
+
+        // A plain click still places the cursor and starts a selection; only
+        // the Ctrl variant is claimed, which is the convention every editor
+        // taught for "take me to where this is defined".
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        click.connect_pressed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |gesture, _, x, y| {
+                if gesture
+                    .current_event_state()
+                    .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    this.definition_at(x, y);
+                }
+            }
+        ));
+        view.add_controller(click);
+    }
+
     /// What the editor watches on its own: every edit changes whether the file
     /// is dirty, and the keyboard arriving in the text is the pane being worked
     /// in.
@@ -445,7 +531,10 @@ impl TuniEditor {
         buffer.connect_changed(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |_| this.refresh_dirty()
+            move |_| {
+                this.refresh_dirty();
+                crate::lsp::changed(&this);
+            }
         ));
         view.connect_has_focus_notify(glib::clone!(
             #[weak(rename_to = this)]
@@ -499,6 +588,9 @@ impl TuniEditor {
         let imp = self.imp();
         imp.path.replace(path.to_path_buf());
         self.hide_error();
+        // Whatever server watched the previous file stops here; a text file
+        // picks its own back up at the end of `fill`.
+        crate::lsp::detach(self);
 
         match editor::load(path) {
             Document::Text(text) => self.fill(path, &text),
@@ -542,6 +634,7 @@ impl TuniEditor {
 
         self.show_page(TEXT);
         self.refresh_dirty();
+        crate::lsp::attach(self, path, text);
     }
 
     /// Writes the buffer back, or says why it could not be written.
@@ -563,6 +656,7 @@ impl TuniEditor {
                 imp.saved.replace(text);
                 self.hide_error();
                 self.refresh_dirty();
+                crate::lsp::saved(self);
             }
             Err(error) => self.show_error(&format!("Cannot save {}: {error}", self.name())),
         }
@@ -700,6 +794,101 @@ impl TuniEditor {
                 .or_else(|| manager.scheme("classic"))
         };
         buffer.set_style_scheme(scheme.as_ref());
+    }
+
+    // --- what the language server sees and says ----------------------------
+
+    /// The buffer as it stands, for a server that needs the truth rather than
+    /// the last saved copy. `None` outside a text file.
+    pub(crate) fn text(&self) -> Option<String> {
+        let buffer = self.imp().buffer.borrow().clone()?;
+        self.is_editable().then(|| {
+            buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .to_string()
+        })
+    }
+
+    /// Redraws the squiggles and gutter signs from a fresh set. The whole set
+    /// every time, because diagnostics arrive as the whole truth about a file
+    /// and anything incremental would need the previous truth to diff against.
+    pub fn show_diagnostics(&self, diagnostics: Vec<crate::lsp::Shown>) {
+        let imp = self.imp();
+        let Some(buffer) = imp.buffer.borrow().clone() else {
+            return;
+        };
+        let (start, end) = (buffer.start_iter(), buffer.end_iter());
+        for name in ["tuni-lsp-error", "tuni-lsp-warning", "tuni-lsp-note"] {
+            if let Some(tag) = buffer.tag_table().lookup(name) {
+                buffer.remove_tag(&tag, &start, &end);
+            }
+            buffer.remove_source_marks(&start, &end, Some(name));
+        }
+        for diagnostic in &diagnostics {
+            let name = match diagnostic.severity {
+                Severity::Error => "tuni-lsp-error",
+                Severity::Warning => "tuni-lsp-warning",
+                _ => "tuni-lsp-note",
+            };
+            let from = crate::lsp::place(&buffer, diagnostic.start.0, diagnostic.start.1);
+            let mut to = crate::lsp::place(&buffer, diagnostic.end.0, diagnostic.end.1);
+            // A zero-width range is a place with nothing under it; one
+            // character wide is the least a squiggle can mark.
+            if from.offset() == to.offset() {
+                to.forward_char();
+            }
+            buffer.apply_tag_by_name(name, &from, &to);
+            if matches!(diagnostic.severity, Severity::Error | Severity::Warning) {
+                // At the start of the line, not at the diagnostic's column:
+                // the gutter renderer only draws a mark that sits there.
+                let line = crate::lsp::place(&buffer, diagnostic.start.0, 0);
+                buffer.create_source_mark(None, name, &line);
+            }
+        }
+        imp.diagnostics.replace(diagnostics);
+    }
+
+    /// The diagnostics under one position, for the hover to say in words what
+    /// the squiggle only points at.
+    #[must_use]
+    pub fn diagnostics_at(&self, line: usize, character: usize) -> Vec<crate::lsp::Shown> {
+        self.imp()
+            .diagnostics
+            .borrow()
+            .iter()
+            .filter(|diagnostic| {
+                (line, character) >= diagnostic.start && (line, character) <= diagnostic.end
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn definition_at_cursor(&self) {
+        let Some(buffer) = self.imp().buffer.borrow().clone() else {
+            return;
+        };
+        let iter = buffer.iter_at_mark(&buffer.get_insert());
+        crate::lsp::definition(
+            self,
+            iter.line().max(0) as usize,
+            iter.line_offset().max(0) as usize,
+        );
+    }
+
+    /// The Ctrl+click path: widget coordinates instead of the cursor.
+    fn definition_at(&self, x: f64, y: f64) {
+        let Some(view) = self.imp().view.borrow().clone() else {
+            return;
+        };
+        let (x, y) = view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+        let Some(iter) = view.iter_at_location(x, y) else {
+            return;
+        };
+        crate::lsp::definition(
+            self,
+            iter.line().max(0) as usize,
+            iter.line_offset().max(0) as usize,
+        );
     }
 
     // --- the state on screen -----------------------------------------------

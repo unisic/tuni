@@ -16,6 +16,7 @@ mod hosts;
 mod info;
 mod keymap;
 mod keys;
+mod lsp;
 mod menu;
 mod notify;
 mod palette;

@@ -17,6 +17,9 @@ tuni-pty.workspace = true
 tuni-vt.workspace = true
 
 adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
+# The same bridge tuni-pty crosses: a language server's reader thread feeds the
+# main loop through one of these.
+async-channel = "2"
 # 4.14 for the path API the box drawing characters are stroked with. No floor
 # is raised by it: libadwaita 1.6 already asks for a newer GTK than that.
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
@@ -26,5 +29,3 @@ gdk4-wayland = { version = "0.11", features = ["wayland_crate"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
-[dev-dependencies]
-async-channel = "2"
