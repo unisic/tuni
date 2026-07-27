@@ -67,6 +67,16 @@
   </provides>
 
   <releases>
+    <release version="1.1.1" date="2026-07-27">
+      <description>
+        <p>A file dragged onto a terminal pane now lands on the prompt as a
+        quoted argument, ready for whatever command is being typed, instead of
+        being refused.</p>
+        <p>A project dragged in the sidebar is carried as the row itself, held
+        at the point it was picked up, rather than as the toolkit's picture of
+        a document.</p>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-07-27">
       <description>
         <p>Tuni speaks SSH. Hosts come from the ssh configuration it already

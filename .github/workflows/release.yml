@@ -6,7 +6,7 @@ name: Release
 # job installs what it built before uploading it, because a package that has
 # never been installed is a claim rather than a package.
 #
-#   git tag v1.1.0 && git push origin v1.1.0
+#   git tag v1.1.1 && git push origin v1.1.1
 
 on:
   push:

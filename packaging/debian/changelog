@@ -1,3 +1,12 @@
+tuni (1.1.1) unstable; urgency=medium
+
+  * A file dropped on a terminal lands on the prompt as a quoted argument
+    instead of being ignored.
+  * A project dragged in the sidebar is carried as the row itself rather than
+    as a picture of a document.
+
+ -- Unisic <hello@unisic.dev>  Mon, 27 Jul 2026 21:00:00 +0000
+
 tuni (1.1.0) unstable; urgency=medium
 
   * SSH: hosts read from the ssh configuration and from a hosts file of tuni's
