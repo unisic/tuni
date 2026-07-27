@@ -36,6 +36,18 @@ jobs:
           tar xf "zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           echo "${GITHUB_WORKSPACE}/zig-x86_64-linux-${ZIG_VERSION}" >> "${GITHUB_PATH}"
 
+      # libghostty-vt-sys builds Ghostty for the host without naming a target,
+      # so zig compiles it for the exact CPU of the machine it ran on. The
+      # ubuntu-latest label hands out Intel and AMD parts with different
+      # instruction sets, and a target directory restored onto the other kind
+      # dies with SIGILL the first time anything calls in. Hashing the CPU's
+      # own feature list into the key keeps a cache on the machines it runs on.
+      - name: Identify the runner's instruction set
+        id: cpu
+        run: |
+          id="$(grep -m1 '^flags' /proc/cpuinfo | sha256sum | cut -c1-16)"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
       - name: Cache cargo and the Ghostty source
         uses: actions/cache@v6
         with:
@@ -43,8 +55,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-${{ steps.cpu.outputs.id }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ steps.cpu.outputs.id }}-
 
       - name: Format
         run: cargo fmt --check
