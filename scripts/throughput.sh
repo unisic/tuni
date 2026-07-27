@@ -15,7 +15,7 @@ TUNI=$ROOT/target/release/tuni
 WORK=${TMPDIR:-/tmp}/tuni-throughput
 PAYLOAD=$WORK/payload.txt
 MARKER=$WORK/done
-RUNS=2
+RUNS=${RUNS:-2}
 
 [ -x "$TUNI" ] || { echo "build first: cargo build --release"; exit 1; }
 mkdir -p "$WORK"
@@ -53,12 +53,24 @@ run_once() { # $1 = terminal, $2 = shell command
         TUNI_CAPTURE_INPUT="$2"$'\n' TUNI_CAPTURE_DELAY_MS=120000 \
         "$TUNI" >/dev/null 2>&1 &
       ;;
+    # kitty and foot spell the command as trailing arguments; -e is either
+    # ignored or an error depending on the version.
+    kitty|foot) "$1" sh -c "$2" >/dev/null 2>&1 & ;;
+    wezterm) wezterm start -- sh -c "$2" >/dev/null 2>&1 & ;;
+    # -e here takes one string and stops, so the command needs -x instead.
+    xfce4-terminal|terminator) "$1" -x sh -c "$2" >/dev/null 2>&1 & ;;
+    # These hand the window to a server and return, so without waiting the
+    # timer would stop before the window has read a byte.
+    gnome-terminal) gnome-terminal --wait -- sh -c "$2" >/dev/null 2>&1 & ;;
+    ptyxis) ptyxis --standalone -- sh -c "$2" >/dev/null 2>&1 & ;;
     *) "$1" -e sh -c "$2" >/dev/null 2>&1 & ;;
   esac
   pid=$!
-  for _ in $(seq 1 2400); do
+  # 5ms, because the poll interval is the resolution of the whole benchmark:
+  # at 50ms the fast terminals all landed in one bucket and read as a tie.
+  for _ in $(seq 1 24000); do
     [ -e "$MARKER" ] && break
-    sleep 0.05
+    sleep 0.005
   done
   end=$(date +%s.%N)
   kill "$pid" 2>/dev/null
