@@ -1,0 +1,19 @@
+name: Feature request
+description: Something tuni should do and does not
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: >-
+        The task, not the feature. What you do today instead is the useful part.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What tuni could do about it
+      description: >-
+        Optional. If another program already gets this right, say which.

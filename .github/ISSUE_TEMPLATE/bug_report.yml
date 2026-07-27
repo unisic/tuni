@@ -1,0 +1,39 @@
+name: Bug report
+description: Something in tuni behaves wrongly
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: debug
+    attributes:
+      label: Debug info
+      description: >-
+        The main menu → About Tuni → Troubleshooting → Debug Information, which
+        is the tuni, GTK, libadwaita, session and renderer versions in one
+        block. Add your distribution and how you installed tuni.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: shell
+    attributes:
+      label: Shell
+      description: And the program running in the pane, if it was not the shell.
+      placeholder: fish 4.0, running vim
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Anything tuni printed
+      description: >-
+        Run it from a terminal and paste what it wrote. If the window drew the
+        problem, a screenshot says it faster.
+      render: text
