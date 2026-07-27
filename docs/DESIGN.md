@@ -41,7 +41,7 @@ sizes by and what an undragged one should go on doing.
 On the other side, a panel under `Ctrl+Shift+B` shows the directory the focused
 shell is working in, or the project's own if one is pinned, and follows it as
 the focus moves. It stands beside the tab strip rather than under it, since the
-strip names the terminals and the panel is the same three pages whichever tab
+strip names the terminals and the panel is the same set of pages whichever tab
 is in front. Its Files page opens a directory in place under the chevron beside
 it and a file in a pane of its own, a double click on a directory makes it the
 root instead, and a right click opens a file beside what is already there,
@@ -131,6 +131,18 @@ the way the themes are, covering most of the same languages the servers do; a
 file outside that table keeps its ordinary selection keys and loses nothing
 else.
 
+Debugging is a page of the panel and a key in the editor. F8 puts a breakpoint
+on the cursor's line, drawn as a dot in the gutter and remembered per file, so
+a pane closed and reopened keeps its dots. The Debug page names a program, and
+Start hands it to the adapter that debugs such things, lldb-dap for a native
+binary and debugpy for a Python file, found on `PATH` and driven as a process
+like every other tool here. A stop lands the editor on the stopped line; the
+page shows the stack, a click opening any frame that has a file, the locals of
+the top frame, and everything the program printed. Four buttons continue and
+step, disabled while the program runs, because a step means nothing until it
+stops. Delve is missing on purpose: `dlv dap` only listens on a socket, and
+this client speaks stdio to a process it started.
+
 A row on the Git page opens what changed in that file rather than the file, in a
 pane of the same kind: the working tree against the index, or — for a row that is
 already staged — the index against HEAD. Each hunk is headed by its `@@` line and
@@ -161,7 +173,7 @@ host declared in `~/.ssh/config` is read, listed and connected to but never
 rewritten, and editing one opens that file at the line that declares it, in an
 editor pane. A session that ends leaves its last screen where it is with a
 Reconnect button over it, rather than closing the pane, since a connection that
-dropped has usually just said why. The panel grows a fourth page while a pane is
+dropped has usually just said why. The panel grows another page while a pane is
 on a host: the files at the other end, in the same tree the Files page draws,
 opened over the connection that is already there.
 

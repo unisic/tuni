@@ -447,6 +447,7 @@ impl TuniEditor {
             entry("definition", self, TuniEditor::definition_at_cursor),
             entry("grow-selection", self, TuniEditor::grow_selection),
             entry("shrink-selection", self, TuniEditor::shrink_selection),
+            entry("toggle-breakpoint", self, TuniEditor::toggle_breakpoint),
         ]);
         self.insert_action_group("editor", Some(&actions));
 
@@ -463,6 +464,9 @@ impl TuniEditor {
             // pair stays with GTK, which moves by words on it.
             ("<Alt>Up", "editor.grow-selection"),
             ("<Alt>Down", "editor.shrink-selection"),
+            // F9 belongs to the window's sidebar, so the breakpoint takes the
+            // key one over.
+            ("F8", "editor.toggle-breakpoint"),
         ] {
             shortcuts.add_shortcut(gtk::Shortcut::new(
                 gtk::ShortcutTrigger::parse_string(keys),
@@ -497,10 +501,12 @@ impl TuniEditor {
             );
         }
         // Notes stay out of the gutter: a hint on half the lines of a file is
-        // a column of icons saying nothing.
+        // a column of icons saying nothing. The breakpoint dot outranks both,
+        // since it is the one mark the user put there deliberately.
         for (category, icon, priority) in [
             ("tuni-lsp-error", "dialog-error-symbolic", 2),
             ("tuni-lsp-warning", "dialog-warning-symbolic", 1),
+            ("tuni-breakpoint", "media-record-symbolic", 3),
         ] {
             let attributes = sourceview5::MarkAttributes::new();
             attributes.set_icon_name(icon);
@@ -652,6 +658,7 @@ impl TuniEditor {
         self.show_page(TEXT);
         self.refresh_dirty();
         crate::lsp::attach(self, path, text);
+        self.redraw_breakpoints();
     }
 
     /// Writes the buffer back, or says why it could not be written.
@@ -878,6 +885,41 @@ impl TuniEditor {
             })
             .cloned()
             .collect()
+    }
+
+    /// Flips the breakpoint on the cursor's line. The record lives in the
+    /// debugger's registry; the gutter dot here is its reflection, which is
+    /// why the redraw reads the registry back instead of trusting the toggle.
+    fn toggle_breakpoint(&self) {
+        let imp = self.imp();
+        if !self.is_editable() {
+            return;
+        }
+        let Some(buffer) = imp.buffer.borrow().clone() else {
+            return;
+        };
+        let cursor = buffer.iter_at_mark(&buffer.get_insert());
+        let line = usize::try_from(cursor.line()).unwrap_or(0) + 1;
+        crate::debugger::toggle_breakpoint(&imp.path.borrow(), line);
+        self.redraw_breakpoints();
+    }
+
+    /// Repaints the gutter dots from the registry, on a toggle and on a file
+    /// arriving in the pane, so a reopened file keeps its breakpoints.
+    fn redraw_breakpoints(&self) {
+        let imp = self.imp();
+        let Some(buffer) = imp.buffer.borrow().clone() else {
+            return;
+        };
+        buffer.remove_source_marks(
+            &buffer.start_iter(),
+            &buffer.end_iter(),
+            Some("tuni-breakpoint"),
+        );
+        for line in crate::debugger::lines(&imp.path.borrow()) {
+            let iter = crate::lsp::place(&buffer, line.saturating_sub(1), 0);
+            buffer.create_source_mark(None, "tuni-breakpoint", &iter);
+        }
     }
 
     /// Selects the smallest syntax node strictly around the selection, from a

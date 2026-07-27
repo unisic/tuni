@@ -159,7 +159,8 @@ pub fn available_command(language: &Language) -> Option<&'static [&'static str]>
 
 /// Whether a program named in a server command is there to be run: the lookup
 /// a shell would do, minus the shell. A name with a slash is taken as written.
-fn runnable(program: &str) -> bool {
+/// The debug adapters answer the same question, hence the crate visibility.
+pub(crate) fn runnable(program: &str) -> bool {
     let executable = |path: &Path| {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::metadata(path)

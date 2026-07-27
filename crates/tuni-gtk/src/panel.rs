@@ -1,7 +1,8 @@
 //! The panel on the far side of the terminals: what the shell is running, the
-//! files beside it, and the repository they belong to.
+//! files beside it, the repository they belong to, and a debugger for the
+//! program being worked on.
 //!
-//! Three pages of one panel rather than three panels, because they answer the
+//! Pages of one panel rather than a panel each, because they answer the
 //! same question — what is going on where the shell is working — and a window
 //! only has so many sides.
 
@@ -12,6 +13,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib;
 
+use crate::debugger::TuniDebugger;
 use crate::files::TuniFiles;
 use crate::git::TuniGit;
 use crate::info::TuniInfo;
@@ -22,9 +24,10 @@ pub const FILES: &str = "files";
 pub const SFTP: &str = "sftp";
 pub const GIT: &str = "git";
 pub const INFO: &str = "info";
+pub const DEBUG: &str = "debug";
 
 mod imp {
-    use super::{RefCell, TuniFiles, TuniGit, TuniInfo, TuniSftp, glib};
+    use super::{RefCell, TuniDebugger, TuniFiles, TuniGit, TuniInfo, TuniSftp, glib};
     use adw::subclass::prelude::*;
 
     #[derive(Default)]
@@ -35,6 +38,7 @@ mod imp {
         pub git: RefCell<Option<TuniGit>>,
         pub git_page: RefCell<Option<adw::ViewStackPage>>,
         pub sftp: RefCell<Option<TuniSftp>>,
+        pub debugger: RefCell<Option<TuniDebugger>>,
         /// Held so the page can be taken off the switcher: there is nothing to
         /// browse until a pane is connected to something.
         pub sftp_page: RefCell<Option<adw::ViewStackPage>>,
@@ -83,6 +87,7 @@ impl TuniPanel {
         let files = TuniFiles::new();
         let git = TuniGit::new();
         let sftp = TuniSftp::new();
+        let debugger = TuniDebugger::new();
 
         // Files first, since it is the page the panel opens on and the one a
         // pane is opened from; Info last, as kero orders the same three.
@@ -102,6 +107,8 @@ impl TuniPanel {
             stack.add_titled_with_icon(&sftp, Some(SFTP), "Remote", "network-server-symbolic");
         sftp_page.set_visible(false);
         stack.add_titled_with_icon(&info, Some(INFO), "Info", "dialog-information-symbolic");
+        // Last: reached on purpose, not passed through on the way somewhere.
+        stack.add_titled_with_icon(&debugger, Some(DEBUG), "Debug", "system-run-symbolic");
 
         // How many files have changed, on the tab, so the number is readable
         // while the Files page is the one showing.
@@ -136,6 +143,7 @@ impl TuniPanel {
         imp.git_page.replace(Some(git_page));
         imp.sftp.replace(Some(sftp));
         imp.sftp_page.replace(Some(sftp_page));
+        imp.debugger.replace(Some(debugger));
     }
 
     #[must_use]
@@ -156,6 +164,11 @@ impl TuniPanel {
     #[must_use]
     pub fn sftp(&self) -> Option<TuniSftp> {
         self.imp().sftp.borrow().clone()
+    }
+
+    #[must_use]
+    pub fn debugger(&self) -> Option<TuniDebugger> {
+        self.imp().debugger.borrow().clone()
     }
 
     /// Points every page at a directory.

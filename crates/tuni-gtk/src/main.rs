@@ -4,6 +4,7 @@
 
 mod blur;
 mod debug;
+mod debugger;
 mod diff;
 mod editor;
 mod files;
