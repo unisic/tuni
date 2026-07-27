@@ -40,14 +40,17 @@ On the other side, a panel under `Ctrl+Shift+B` shows the directory the focused
 shell is working in, or the project's own if one is pinned, and follows it as
 the focus moves. It stands beside the tab strip rather than under it, since the
 strip names the terminals and the panel is the same three pages whichever tab
-is in front. Its Files page opens directories in place and files in a pane of
-their own, and a right click opens one beside what is already there, renames,
-creates, copies a path, shows a file in the desktop's file manager, moves one to
-the trash, or types a `cd` into the terminal that has the keyboard. The header
-steps to the parent directory, or takes a typed path the way a prompt would,
-`~` included; wandering off holds until the window has an actually different
-directory to show, so the focus moving between panes of one project does not
-snap the tree back.
+is in front. Its Files page opens a directory in place under the chevron beside
+it and a file in a pane of its own, a double click on a directory makes it the
+root instead, and a right click opens a file beside what is already there,
+renames, creates, copies a path, shows a file in the desktop's file manager,
+moves one to the trash, or types a `cd` into the terminal that has the keyboard.
+The header steps to the parent directory, or takes a typed path the way a prompt
+would, `~` included, and the two buttons under a thumb walk back and forward
+through the directories that have been the root, which is what a file manager
+and a browser both spend them on. Wandering off holds until the window has an
+actually different directory to show, so the focus moving between panes of one
+project does not snap the tree back.
 
 Its Git page, under `Ctrl+Shift+G`, is the repository that directory belongs to:
 the branch and how far it is from its upstream, what is in conflict, what is
@@ -526,8 +529,10 @@ keyring do that job already, and a wrong button in this window would be a
 security bug rather than a bad row.
 
 The files on the far machine are a fourth panel page, on the switcher while the
-pane holding the keyboard is on a host and off it the moment that pane is not.
-What fills it is a small client speaking version 3 of the SFTP protocol over
+pane holding the keyboard is on a host and off it the moment that pane is not,
+under a server icon rather than a second folder, because two folders a small
+badge apart are two pages nobody tells apart at sixteen pixels. What fills it is
+a small client speaking version 3 of the SFTP protocol over
 `ssh -s <host> sftp`, which on a live master is one more channel on the
 connection the panes already have, so nothing authenticates twice, and
 `BatchMode=yes` makes sure a file listing is never the thing that asks for a
@@ -542,7 +547,11 @@ directory announces nothing when it changes either, so this page stays out of th
 panel's two-second poll and reads on navigation and when asked. A symlink pays
 for a second round trip to learn whether it points at a directory, which is the
 trade the local tree makes for the same reason and for the same one entry in a
-hundred.
+hundred. Getting about is the local page's gestures over remote paths: the
+chevron opens a directory where it stands, a double click makes it the root, the
+header takes a typed path, and the buttons under the thumb walk the history,
+which empties with the session since every path in it names a machine this page
+has left.
 
 Files move one at a time. A download is written beside where it is going under a
 dotted name and renamed onto it once it is whole, the discipline the editor
@@ -556,9 +565,18 @@ integers a worker writes and a local timer reads, which is a timer over memory
 and not a poll of anything remote. What it is not is quick: one request is
 outstanding at a time, so a file crosses at one round trip per 32 KiB, roughly
 640 KB/s on a 50 ms link. The protocol's request ids exist so that sixty-four
-can be in the air at once and that is a later commit. Until then a second
-transfer is refused rather than queued, because one pipe carries one file and a
-request waiting behind a lock has nothing on screen to say so.
+can be in the air at once and that is a later commit. A second transfer waits
+behind the first in a queue the bar counts down, since one pipe carries one file
+and a request blocked on a lock is the thing with nothing on screen to say so. A
+failure empties that queue rather than trying the rest: whatever the far end
+refused this file for is what the ones behind it were about to meet, and the
+dialog says how many were left where they are.
+
+Files dragged onto the page go up. They land in the directory being shown, or in
+the one whose row they were dropped on, and they queue like any other transfer.
+A folder is refused, and the refusal says what to reach for instead: there is no
+recursive copy here, and one written on top of a single outstanding request
+would lose to `rsync` at the job `rsync` exists for.
 
 Making a directory, renaming and deleting are the rest of it. Deleting asks
 first, and the question says that there is no trash on the other machine, since

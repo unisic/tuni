@@ -39,10 +39,11 @@ whether the agent is holding them, and making one or copying one to a host is a
 command put on a prompt for you to read before it runs. While a pane is on a
 host the panel grows a page for that machine's files, read over the connection
 already open and never on the timer the local tree uses. Files move both ways
-over that connection, and a download takes the name you gave it only once it is
-whole. Making a folder, renaming and deleting are there too, and a refusal says
-what the far end would not: that the name is taken, or that the directory still
-has something in it.
+over that connection: drag some onto the page and they go up into whatever
+directory you dropped them on, one at a time with the rest waiting behind, and a
+download takes the name you gave it only once it is whole. Making a folder,
+renaming and deleting are there too, and a refusal says what the far end would
+not: that the name is taken, or that the directory still has something in it.
 
 Tuni is a ground-up Linux implementation of the workspace
 [egoist/kero](https://github.com/egoist/kero) built for macOS. Kero's Swift

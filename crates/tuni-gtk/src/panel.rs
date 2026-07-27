@@ -96,8 +96,10 @@ impl TuniPanel {
         // Beside Files, since it is the same page about another machine, and
         // hidden until there is a machine: a switcher with a page nothing can
         // fill is a dead tab.
+        // A server rather than a folder: beside the Files tab, two folders that
+        // differ by a small badge are two tabs nobody can tell apart at 16px.
         let sftp_page =
-            stack.add_titled_with_icon(&sftp, Some(SFTP), "Remote", "folder-remote-symbolic");
+            stack.add_titled_with_icon(&sftp, Some(SFTP), "Remote", "network-server-symbolic");
         sftp_page.set_visible(false);
         stack.add_titled_with_icon(&info, Some(INFO), "Info", "dialog-information-symbolic");
 

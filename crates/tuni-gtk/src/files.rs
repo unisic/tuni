@@ -25,6 +25,12 @@ use tuni_core::files::{Disk, Failure, Item, Tree};
 /// Pixels of indent per level of depth.
 const INDENT: i32 = 12;
 
+/// The two buttons under a thumb, which every file manager and every browser
+/// spends on the history. GDK names the first three and numbers the rest, and
+/// these are the numbers X11 gave them and Wayland kept.
+pub(crate) const BUTTON_BACK: u32 = 8;
+pub(crate) const BUTTON_FORWARD: u32 = 9;
+
 /// One row of the list, wrapped so a `GListModel` can hold it.
 pub(crate) mod row {
     use std::cell::{Cell, RefCell};
@@ -102,6 +108,12 @@ mod imp {
         /// and the window saying the same root again is not a reason to snap
         /// back; a root that actually changed is.
         pub given: RefCell<std::path::PathBuf>,
+        /// Where browsing has been, and where it was called back from. Two
+        /// stacks rather than one list with a cursor, because that is what
+        /// back and forward are: everything ahead is thrown away the moment a
+        /// step is taken somewhere else.
+        pub back: RefCell<Vec<std::path::PathBuf>>,
+        pub forward: RefCell<Vec<std::path::PathBuf>>,
         pub rows: RefCell<Option<gio::ListStore>>,
         pub list: RefCell<Option<gtk::ListView>>,
         pub title: RefCell<Option<gtk::Label>>,
@@ -311,6 +323,7 @@ impl TuniFiles {
         content.append(&scroller);
         self.set_child(Some(&content));
 
+        self.add_controller(history(self, "files"));
         self.install_actions();
 
         imp.rows.replace(Some(rows));
@@ -459,6 +472,8 @@ impl TuniFiles {
                     files.browse(&parent);
                 }
             }),
+            entry("back", self, |files| files.walk(false)),
+            entry("forward", self, |files| files.walk(true)),
             entry("location", self, |files| {
                 let bar = files.imp().location_bar.borrow().clone();
                 let open = bar.is_some_and(|bar| bar.reveals_child());
@@ -489,6 +504,10 @@ impl TuniFiles {
             return;
         }
         self.imp().given.replace(root.to_path_buf());
+        // Another project's tree, so the way back through this one leads
+        // somewhere the panel is no longer about.
+        self.imp().back.borrow_mut().clear();
+        self.imp().forward.borrow_mut().clear();
         self.show_location(false);
         let changed = self.imp().tree.borrow_mut().sync(root, &mut Disk);
         if changed {
@@ -497,8 +516,38 @@ impl TuniFiles {
         self.refresh_header();
     }
 
-    /// Steps the tree somewhere of the user's own choosing.
+    /// Steps the tree somewhere of the user's own choosing, and remembers
+    /// where it was standing.
     fn browse(&self, directory: &Path) {
+        let imp = self.imp();
+        let root = imp.tree.borrow().root().to_path_buf();
+        if root == directory {
+            return;
+        }
+        imp.back.borrow_mut().push(root);
+        imp.forward.borrow_mut().clear();
+        self.go(directory);
+    }
+
+    /// Back to the directory before this one, forward to the one it was left
+    /// for. Nothing at all when that end of the history is empty, which is
+    /// what a browser does with a greyed-out button.
+    fn walk(&self, forward: bool) {
+        let imp = self.imp();
+        let (from, to) = if forward {
+            (&imp.forward, &imp.back)
+        } else {
+            (&imp.back, &imp.forward)
+        };
+        let Some(directory) = from.borrow_mut().pop() else {
+            return;
+        };
+        to.borrow_mut().push(imp.tree.borrow().root().to_path_buf());
+        self.go(&directory);
+    }
+
+    /// The move itself, which the history is written around.
+    fn go(&self, directory: &Path) {
         if self.imp().tree.borrow_mut().sync(directory, &mut Disk) {
             self.reload();
         }
@@ -558,13 +607,17 @@ impl TuniFiles {
         }
     }
 
-    /// A directory opens or closes; a file goes to the editor, which is the
+    /// A directory is stepped into; a file goes to the editor, which is the
     /// window's to place. Something the editor will not show — a picture, a
     /// binary — is still opened in a pane, and the pane is where the offer to
     /// hand it to the desktop lives.
+    ///
+    /// Stepping in rather than opening in place, because two clicks are what
+    /// the parent button undoes and the chevron is already the one that opens a
+    /// directory without leaving the one above it.
     fn activate(&self, item: &Item) {
         if item.is_directory {
-            self.toggle(&item.path);
+            self.browse(&item.path);
             return;
         }
         self.send(Message::Open(item.path.clone()));
@@ -859,6 +912,36 @@ fn root_menu() -> gio::Menu {
     open.append(Some("Show in Files"), Some("files.reveal-here"));
     menu.append_section(None, &open);
     menu
+}
+
+/// The gesture the two buttons under a thumb arrive on, walking the history of
+/// whichever page it is added to. `group` is that page's action group, since
+/// the remote browser has the same two actions under a name of its own.
+///
+/// Captured rather than bubbled: a press lands on a row before it lands on the
+/// page, and a row that has already claimed the sequence would swallow it.
+/// Nothing under here wants either button, so taking them early costs nothing.
+pub(crate) fn history(widget: &impl IsA<gtk::Widget>, group: &'static str) -> gtk::GestureClick {
+    let widget = widget.as_ref().clone();
+    let gesture = gtk::GestureClick::new();
+    // Every button: GDK has a constant for the first three and these are not
+    // among them, so the button is read off the gesture instead.
+    gesture.set_button(0);
+    gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+    gesture.connect_pressed(glib::clone!(
+        #[weak]
+        widget,
+        move |gesture, _, _, _| {
+            let action = match gesture.current_button() {
+                BUTTON_BACK => "back",
+                BUTTON_FORWARD => "forward",
+                _ => return,
+            };
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            let _ = WidgetExt::activate_action(&widget, &format!("{group}.{action}"), None);
+        }
+    ));
+    gesture
 }
 
 /// A directory as a dialog can afford to show it: the last two components,

@@ -11,7 +11,7 @@
 //! reads on navigation, and when somebody asks it to.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,6 +41,14 @@ pub struct Moved {
     total: AtomicU64,
 }
 
+/// One file waiting its turn. A drop of five files is five of these, four of
+/// them behind the one the pipe is carrying.
+pub struct Job {
+    way: Way,
+    remote: String,
+    local: PathBuf,
+}
+
 /// The directories that have come back, which is everything there is to draw.
 #[derive(Default)]
 pub struct Listed(HashMap<PathBuf, Vec<Item>>);
@@ -52,7 +60,10 @@ impl Directory for Listed {
 }
 
 mod imp {
-    use super::{Arc, Cell, HashSet, Item, Link, Listed, Moved, PathBuf, RefCell, Tree, gio, glib};
+    use super::{
+        Arc, Cell, HashSet, Item, Job, Link, Listed, Moved, PathBuf, RefCell, Tree, VecDeque, gio,
+        glib,
+    };
     use adw::prelude::*;
     use adw::subclass::prelude::*;
 
@@ -82,6 +93,15 @@ mod imp {
         /// a second would sit behind the lock with nothing on screen saying
         /// why; this is what refuses it instead.
         pub moving: RefCell<Option<Arc<Moved>>>,
+        /// What is waiting for the pipe, in the order it was asked for. A drop
+        /// of a directory's worth of files fills this and empties it one file
+        /// at a time.
+        pub queue: RefCell<VecDeque<Job>>,
+        /// Where browsing has been, and where it was called back from, on the
+        /// host being browsed now. Emptied with the session, since both are
+        /// paths on a machine the page has left.
+        pub back: RefCell<Vec<PathBuf>>,
+        pub forward: RefCell<Vec<PathBuf>>,
         /// The row whose context menu is open, and so the one its actions act
         /// on.
         pub target: RefCell<Option<Item>>,
@@ -223,10 +243,12 @@ impl TuniSftp {
                     .model()
                     .and_then(|model| model.item(position))
                     .and_downcast::<Row>();
+                // Stepped into, which is what the parent button undoes. The
+                // chevron is the one that opens a directory in place.
                 if let Some(item) = row.and_then(|row| row.item())
                     && item.is_directory
                 {
-                    this.toggle(&item.path);
+                    this.browse(&item.path);
                 }
             }
         ));
@@ -242,8 +264,23 @@ impl TuniSftp {
             .child(&list)
             .build();
 
+        // Whatever a drop misses is still the directory the page is showing,
+        // so files dropped past the last row go where the header says.
+        let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        drop.connect_drop(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            false,
+            move |_, value, _, _| {
+                let root = this.imp().tree.borrow().root().to_path_buf();
+                this.receive(&root, value)
+            }
+        ));
+        scroller.add_controller(drop);
+
         let status = adw::StatusPage::builder()
-            .icon_name("folder-remote-symbolic")
+            .icon_name("network-server-symbolic")
             .vexpand(true)
             .build();
 
@@ -258,6 +295,7 @@ impl TuniSftp {
         content.append(&stack);
         self.set_child(Some(&content));
 
+        self.add_controller(crate::files::history(self, "sftp"));
         self.install_actions();
 
         imp.rows.replace(Some(rows));
@@ -341,6 +379,52 @@ impl TuniSftp {
         ));
         content.add_controller(press);
 
+        // Dropped on a directory the files go inside it, and dropped on a file
+        // they go beside it, which is where a file manager puts them.
+        let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        drop.connect_enter(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            list_item,
+            #[upgrade_or]
+            gdk::DragAction::empty(),
+            move |_, _, _| {
+                // Selected while the pointer is over it, since a row that is
+                // about to be dropped on should say so before the drop.
+                if let Some(list) = this.imp().list.borrow().as_ref()
+                    && let Some(selection) = list.model().and_downcast::<gtk::SingleSelection>()
+                {
+                    selection.set_selected(list_item.position());
+                }
+                gdk::DragAction::COPY
+            }
+        ));
+        drop.connect_drop(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            list_item,
+            #[upgrade_or]
+            false,
+            move |_, value, _, _| {
+                let Some(item) = list_item
+                    .item()
+                    .and_downcast::<Row>()
+                    .and_then(|row| row.item())
+                else {
+                    return false;
+                };
+                let directory = if item.is_directory {
+                    Some(item.path.clone())
+                } else {
+                    item.path.parent().map(Path::to_path_buf)
+                };
+                directory.is_some_and(|directory| this.receive(&directory, value))
+            }
+        ));
+        content.add_controller(drop);
+
         list_item.set_child(Some(&content));
     }
 
@@ -359,6 +443,8 @@ impl TuniSftp {
                     sftp.browse(&parent);
                 }
             }),
+            entry("back", self, |sftp| sftp.walk(false)),
+            entry("forward", self, |sftp| sftp.walk(true)),
             entry("refresh", self, TuniSftp::reread),
             entry("download", self, |sftp| {
                 let target = sftp.imp().target.borrow().clone();
@@ -423,6 +509,11 @@ impl TuniSftp {
         imp.generation.set(imp.generation.get().wrapping_add(1));
         imp.alias.replace(host.map(ToOwned::to_owned));
         imp.pending.borrow_mut().clear();
+        // Queued against the host that is going away, and every one of them
+        // names a path on it. The history goes with them, for the same reason.
+        imp.queue.borrow_mut().clear();
+        imp.back.borrow_mut().clear();
+        imp.forward.borrow_mut().clear();
         imp.listed.replace(Listed::default());
         // Dropped, which kills the child and lets the master close the
         // channel. A session is one host's, and this is another host now.
@@ -513,8 +604,37 @@ impl TuniSftp {
         }
     }
 
-    /// Puts the tree somewhere else on the same host.
+    /// Puts the tree somewhere else on the same host, and remembers where it
+    /// was standing.
     fn browse(&self, directory: &Path) {
+        let imp = self.imp();
+        let root = imp.tree.borrow().root().to_path_buf();
+        if root == directory {
+            return;
+        }
+        imp.back.borrow_mut().push(root);
+        imp.forward.borrow_mut().clear();
+        self.go(directory);
+    }
+
+    /// Back to the directory before this one, forward to the one it was left
+    /// for.
+    fn walk(&self, forward: bool) {
+        let imp = self.imp();
+        let (from, to) = if forward {
+            (&imp.forward, &imp.back)
+        } else {
+            (&imp.back, &imp.forward)
+        };
+        let Some(directory) = from.borrow_mut().pop() else {
+            return;
+        };
+        to.borrow_mut().push(imp.tree.borrow().root().to_path_buf());
+        self.go(&directory);
+    }
+
+    /// The move itself, which the history is written around.
+    fn go(&self, directory: &Path) {
         let imp = self.imp();
         if imp.link.borrow().is_none() {
             return;
@@ -617,7 +737,7 @@ impl TuniSftp {
                 self,
                 move |chosen| {
                     if let Some(local) = chosen.ok().and_then(|file| file.path()) {
-                        this.transfer(Way::Down, remote, local);
+                        this.start(Way::Down, remote, local);
                     }
                 }
             ),
@@ -649,24 +769,89 @@ impl TuniSftp {
                         return;
                     };
                     let remote = directory.join(name).to_string_lossy().into_owned();
-                    this.transfer(Way::Up, remote, local);
+                    this.start(Way::Up, remote, local);
                 }
             ),
         );
     }
 
+    /// Takes what a drag left: every file goes into `directory` under the name
+    /// it has here, and a folder goes nowhere at all.
+    fn receive(&self, directory: &Path, dropped: &glib::Value) -> bool {
+        if self.imp().link.borrow().is_none() {
+            return false;
+        }
+        let Ok(list) = dropped.get::<gdk::FileList>() else {
+            return false;
+        };
+        // A drag can carry something with no path at all, a file inside an
+        // archive or a photo an application only holds in memory, and there is
+        // nothing here to send for one of those.
+        let (files, folders): (Vec<PathBuf>, Vec<PathBuf>) = list
+            .files()
+            .iter()
+            .filter_map(gio::File::path)
+            .partition(|path| path.is_file());
+
+        for local in &files {
+            let Some(name) = local.file_name() else {
+                continue;
+            };
+            let remote = directory.join(name).to_string_lossy().into_owned();
+            self.start(Way::Up, remote, local.clone());
+        }
+
+        if let Some(first) = folders.first() {
+            let name = first.file_name().unwrap_or(first.as_os_str());
+            self.report(&Failure {
+                message: if folders.len() == 1 {
+                    format!("Couldn't send “{}”.", name.to_string_lossy())
+                } else {
+                    format!("Couldn't send {} folders.", folders.len())
+                },
+                detail: String::from(
+                    "This carries one file at a time and has no recursive copy \
+                     in it. Drop the files inside instead, or use rsync, which \
+                     is better at a whole directory than this would be.",
+                ),
+            });
+        }
+        !files.is_empty()
+    }
+
+    /// Puts one transfer at the back of the queue and starts it if the pipe is
+    /// free.
+    fn start(&self, way: Way, remote: String, local: PathBuf) {
+        self.imp()
+            .queue
+            .borrow_mut()
+            .push_back(Job { way, remote, local });
+        self.pump();
+    }
+
+    /// Starts the next transfer, if there is one and nothing else is going.
+    fn pump(&self) {
+        if self.imp().moving.borrow().is_some() {
+            return;
+        }
+        let next = self.imp().queue.borrow_mut().pop_front();
+        if let Some(job) = next {
+            self.transfer(job);
+        }
+    }
+
     /// Moves one file, and draws how far it has got while it goes.
     ///
     /// One at a time, since the session is a single pipe behind a lock: a
-    /// second transfer would wait there with nothing on screen to say why.
-    fn transfer(&self, way: Way, remote: String, local: PathBuf) {
+    /// second transfer would wait there with nothing on screen to say why. What
+    /// is waiting waits in [`imp::TuniSftp::queue`] instead, where the bar can
+    /// count it.
+    fn transfer(&self, job: Job) {
+        let Job { way, remote, local } = job;
         let imp = self.imp();
         let Some(link) = imp.link.borrow().clone() else {
             return;
         };
-        if imp.moving.borrow().is_some() {
-            return;
-        }
         let moved = Arc::new(Moved::default());
         imp.moving.replace(Some(Arc::clone(&moved)));
 
@@ -675,9 +860,15 @@ impl TuniSftp {
             || remote.clone(),
             |name| name.to_string_lossy().into_owned(),
         );
-        self.watch(&match way {
+        let label = match way {
             Way::Up => format!("Sending {name}"),
             Way::Down => format!("Fetching {name}"),
+        };
+        let waiting = imp.queue.borrow().len();
+        self.watch(&if waiting == 0 {
+            label
+        } else {
+            format!("{label}, {waiting} to go")
         });
 
         let generation = imp.generation.get();
@@ -729,7 +920,14 @@ impl TuniSftp {
                     return;
                 }
                 match moved {
-                    Ok(Err(failure)) => this.report(&failure),
+                    Ok(Err(failure)) => {
+                        // What was behind it goes no further. A connection that
+                        // died on the first file is going to die on the other
+                        // eleven, and eleven more dialogs is not eleven more
+                        // pieces of news.
+                        let waiting = this.imp().queue.borrow_mut().drain(..).count();
+                        this.report(&stopped(&failure, waiting));
+                    }
                     // The directory has something in it that it did not have,
                     // and nothing remote will say so on its own.
                     Ok(Ok(())) => {
@@ -739,6 +937,7 @@ impl TuniSftp {
                     }
                     Err(_) => {}
                 }
+                this.pump();
             }
         ));
     }
@@ -980,14 +1179,10 @@ impl TuniSftp {
         imp.target.replace(Some(item.clone()));
         let model = gio::Menu::new();
         let move_files = gio::Menu::new();
-        // Left off entirely while a transfer runs rather than shown and
-        // refused: one pipe carries one file at a time.
-        if imp.moving.borrow().is_none() {
-            if item.is_directory {
-                move_files.append(Some("Upload File Here…"), Some("sftp.upload"));
-            } else {
-                move_files.append(Some("Download…"), Some("sftp.download"));
-            }
+        if item.is_directory {
+            move_files.append(Some("Upload File Here…"), Some("sftp.upload"));
+        } else {
+            move_files.append(Some("Download…"), Some("sftp.download"));
         }
         if item.is_directory {
             move_files.append(Some("New Folder…"), Some("sftp.new-folder"));
@@ -1085,6 +1280,23 @@ fn partial(local: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("file");
     format!(".{name}.tuni-{}", std::process::id())
+}
+
+/// A failure that took a queue down with it, since what stopped the file being
+/// moved is what the ones behind it would have run into.
+fn stopped(failure: &Failure, waiting: usize) -> Failure {
+    if waiting == 0 {
+        return failure.clone();
+    }
+    let rest = if waiting == 1 {
+        String::from("The one behind it was left where it is.")
+    } else {
+        format!("The {waiting} behind it were left where they are.")
+    };
+    Failure {
+        message: failure.message.clone(),
+        detail: format!("{} {rest}", failure.detail),
+    }
 }
 
 /// Why a transfer stopped, in the two parts a dialog wants.
