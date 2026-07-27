@@ -293,6 +293,9 @@ mod imp {
         pub session_owner: Cell<bool>,
 
         pub split: RefCell<Option<adw::OverlaySplitView>>,
+        /// One overlay above the split raises every toast, so a copy
+        /// confirmation shows no matter which pane did the copying.
+        pub toasts: RefCell<Option<adw::ToastOverlay>>,
         pub sidebar: RefCell<Option<gtk::ListBox>>,
         /// The Files and Git panel, and the split it lives in, on the other
         /// side.
@@ -668,7 +671,10 @@ impl TuniWindow {
         breakpoint.add_setter(&split, "collapsed", Some(&true.to_value()));
         self.add_breakpoint(breakpoint);
 
-        self.set_content(Some(&split));
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&split));
+        self.imp().toasts.replace(Some(toasts.clone()));
+        self.set_content(Some(&toasts));
 
         // Re-reads the open directories while the panel is showing, so a file
         // written by the shell beside it appears without being asked for.
@@ -2547,6 +2553,22 @@ impl TuniWindow {
         );
 
         terminal.connect_closure(
+            "clipboard-copied",
+            false,
+            glib::closure_local!(
+                #[weak(rename_to = this)]
+                self,
+                move |_: TuniTerminal, cleared: bool| {
+                    this.toast(if cleared {
+                        "Cleared clipboard"
+                    } else {
+                        "Copied to clipboard"
+                    });
+                }
+            ),
+        );
+
+        terminal.connect_closure(
             "exited",
             false,
             glib::closure_local!(
@@ -2616,6 +2638,16 @@ impl TuniWindow {
             return;
         };
         notify::post(app.upcast_ref(), pane, title, body);
+    }
+
+    /// Raises a short-lived confirmation over the window's content: three
+    /// seconds, the same toast Ghostty shows for the same copy.
+    pub(crate) fn toast(&self, message: &str) {
+        if let Some(overlay) = self.imp().toasts.borrow().as_ref() {
+            let toast = adw::Toast::new(message);
+            toast.set_timeout(3);
+            overlay.add_toast(toast);
+        }
     }
 
     /// Forgets one pane's widgets and hangs up its shell.

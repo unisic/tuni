@@ -772,6 +772,15 @@ comes back. And typing clears the selection, as Ghostty's
 `selection-clear-on-typing` default does: the reply to the key is about to
 repaint what was selected anyway.
 
+A copy the eye cannot see is confirmed instead. Releasing a drag shows its
+selection, so it announces nothing; the Copy action, the menu's Copy Link and
+an application writing the clipboard through OSC 52 change something
+invisible, and each raises the three-second "Copied to clipboard" toast
+Ghostty raises. OSC 52 is the reason rather than a courtesy: the one copy the
+person at the keyboard did not perform is the one most worth announcing, and
+an empty write reads "Cleared clipboard", so a program blanking the clipboard
+is exactly as visible as one filling it.
+
 A drag that ends on a pane is not a drag the shell can be told about, so it
 becomes text. Every file in it arrives as a quoted shell word with a space after
 it, which is the one reading that works whatever is waiting: a prompt with a

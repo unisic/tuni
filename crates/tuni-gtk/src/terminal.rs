@@ -476,6 +476,15 @@ mod imp {
                     // reads the tally back rather than being handed it, because
                     // by the time it runs the terminal may have moved on again.
                     glib::subclass::Signal::builder("find-changed").build(),
+                    // Text went to the standard clipboard: the Copy action, the
+                    // menu, or an application writing OSC 52. The parameter is
+                    // whether the write emptied the clipboard, which only OSC 52
+                    // can do. Selection copies stay silent; the highlight is
+                    // already on screen, and toasting every drag would bury the
+                    // window in confirmations of what the eye just did.
+                    glib::subclass::Signal::builder("clipboard-copied")
+                        .param_types([bool::static_type()])
+                        .build(),
                 ]
             })
         }
@@ -999,8 +1008,10 @@ impl TuniTerminal {
                 }
             }),
             action("copy-link", self, |terminal| {
-                if let Some(uri) = terminal.imp().menu_link.borrow().as_ref() {
-                    terminal.clipboard().set_text(uri);
+                let uri = terminal.imp().menu_link.borrow().clone();
+                if let Some(uri) = uri {
+                    terminal.clipboard().set_text(&uri);
+                    terminal.emit_by_name::<()>("clipboard-copied", &[&false]);
                 }
             }),
         ]);
@@ -1401,7 +1412,12 @@ impl TuniTerminal {
             // OSC 52. Reads are refused by the VT itself, so nothing here can
             // leak the clipboard back to a remote shell.
             match request.target {
-                ClipboardTarget::Standard => self.clipboard().set_text(&request.text),
+                ClipboardTarget::Standard => {
+                    self.clipboard().set_text(&request.text);
+                    // The one copy the user did not perform, so the one most
+                    // worth announcing: an application just took the clipboard.
+                    self.emit_by_name::<()>("clipboard-copied", &[&request.text.is_empty()]);
+                }
                 ClipboardTarget::Selection | ClipboardTarget::Primary => {
                     self.primary_clipboard().set_text(&request.text);
                 }
@@ -2693,6 +2709,7 @@ impl TuniTerminal {
         match text.filter(|t| !t.is_empty()) {
             Some(text) => {
                 self.clipboard().set_text(&text);
+                self.emit_by_name::<()>("clipboard-copied", &[&false]);
                 true
             }
             None => false,
