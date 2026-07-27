@@ -1310,7 +1310,7 @@ pub fn check_port(forward: &Forward) -> Result<(), String> {
         Err(error) => error,
     };
     match error.kind() {
-        std::io::ErrorKind::AddrInUse => Err(match crate::info::listener(port) {
+        std::io::ErrorKind::AddrInUse => Err(match crate::info::listener(bind, port) {
             Some((pid, process)) => {
                 format!("Port {port} is already in use: {process} (pid {pid}) is listening on it")
             }

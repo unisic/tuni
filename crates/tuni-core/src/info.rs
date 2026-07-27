@@ -10,6 +10,7 @@
 //! strings a kernel writes.
 
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 /// One process running under the shell.
@@ -183,13 +184,24 @@ pub fn listening_ports() -> HashSet<u16> {
     let mut ports = HashSet::new();
     for family in ["/proc/net/tcp", "/proc/net/tcp6"] {
         if let Ok(text) = std::fs::read_to_string(family) {
-            ports.extend(parse_listening(&text).into_values());
+            ports.extend(parse_listening(&text).into_values().map(|(_, port)| port));
         }
     }
     ports
 }
 
-/// What is listening on `port`, by process id and the name to call it.
+/// Whether a socket bound to `address` answers for the address a bind just
+/// failed on. The wildcard answers for every address, a wildcard bind is
+/// answered by every listener, and a name that resolved to nothing leaves no
+/// address to compare, so every holder of the port counts.
+fn concerns(address: IpAddr, wanted: &[IpAddr]) -> bool {
+    address.is_unspecified()
+        || wanted.is_empty()
+        || wanted.iter().any(IpAddr::is_unspecified)
+        || wanted.contains(&address.to_canonical())
+}
+
+/// What is listening on `bind`:`port`, by process id and the name to call it.
 ///
 /// Every process this user can see rather than one shell's descendants,
 /// because whatever is holding a port a forward wanted has usually nothing to
@@ -200,7 +212,18 @@ pub fn listening_ports() -> HashSet<u16> {
 /// Nothing for a port held by another user: `/proc` shows the socket in
 /// `net/tcp` and then refuses the descriptor that would name the process.
 #[must_use]
-pub fn listener(port: u16) -> Option<(u32, String)> {
+pub fn listener(bind: &str, port: u16) -> Option<(u32, String)> {
+    // What the failed bind actually asked for. A listener on some other
+    // interface shares the number without holding this address, and naming
+    // its process would send somebody off to stop the wrong thing.
+    let wanted: Vec<IpAddr> = (bind, port)
+        .to_socket_addrs()
+        .map(|addresses| {
+            addresses
+                .map(|address| address.ip().to_canonical())
+                .collect()
+        })
+        .unwrap_or_default();
     let proc = Path::new("/proc");
     let mut inodes = HashSet::new();
     for family in ["net/tcp", "net/tcp6"] {
@@ -210,7 +233,9 @@ pub fn listener(port: u16) -> Option<(u32, String)> {
         inodes.extend(
             parse_listening(&text)
                 .into_iter()
-                .filter(|(_, listening)| *listening == port)
+                .filter(|(_, (address, listening))| {
+                    *listening == port && concerns(*address, &wanted)
+                })
                 .map(|(inode, _)| inode),
         );
     }
@@ -374,7 +399,7 @@ fn ports(
     let mut seen = HashSet::new();
     for pid in pids {
         for inode in socket_inodes(proc, *pid) {
-            let Some(port) = listening.get(&inode) else {
+            let Some((_, port)) = listening.get(&inode) else {
                 continue;
             };
             // One socket is listed once for IPv4 and once for IPv6, and a
@@ -424,13 +449,13 @@ pub fn socket_inode(target: &str) -> Option<u64> {
         .ok()
 }
 
-/// Inode to port, for every socket in `LISTEN`.
+/// Inode to local address and port, for every socket in `LISTEN`.
 ///
 /// The format is `/proc/net/tcp`: a header line, then one row a socket with
 /// the local address as `HEXADDR:HEXPORT`, the state in field 3, and the
 /// inode in field 9.
 #[must_use]
-pub fn parse_listening(text: &str) -> HashMap<u64, u16> {
+pub fn parse_listening(text: &str) -> HashMap<u64, (IpAddr, u16)> {
     const LISTEN: &str = "0A";
     let mut out = HashMap::new();
     for line in text.lines().skip(1) {
@@ -442,15 +467,41 @@ pub fn parse_listening(text: &str) -> HashMap<u64, u16> {
         if *state != LISTEN {
             continue;
         }
-        let Some((_, port)) = local.rsplit_once(':') else {
+        let Some((address, port)) = local.rsplit_once(':') else {
             continue;
         };
-        let (Ok(port), Ok(inode)) = (u16::from_str_radix(port, 16), inode.parse::<u64>()) else {
+        let (Some(address), Ok(port), Ok(inode)) = (
+            parse_address(address),
+            u16::from_str_radix(port, 16),
+            inode.parse::<u64>(),
+        ) else {
             continue;
         };
-        out.insert(inode, port);
+        out.insert(inode, (address, port));
     }
     out
+}
+
+/// The hex half of `local_address`: four bytes for IPv4, sixteen for IPv6.
+///
+/// The kernel prints the address as it holds it in memory, one native integer
+/// per 32-bit group, so `to_ne_bytes` reads the bytes back in their wire
+/// order on either endianness.
+fn parse_address(hex: &str) -> Option<IpAddr> {
+    match hex.len() {
+        8 => u32::from_str_radix(hex, 16)
+            .ok()
+            .map(|group| IpAddr::V4(Ipv4Addr::from(group.to_ne_bytes()))),
+        32 => {
+            let mut bytes = [0u8; 16];
+            for (index, group) in hex.as_bytes().chunks(8).enumerate() {
+                let group = u32::from_str_radix(std::str::from_utf8(group).ok()?, 16).ok()?;
+                bytes[index * 4..index * 4 + 4].copy_from_slice(&group.to_ne_bytes());
+            }
+            Some(IpAddr::V6(Ipv6Addr::from(bytes)))
+        }
+        _ => None,
+    }
 }
 
 /// The full path of what a process is running, when it can be read.
@@ -548,12 +599,47 @@ mod tests {
    2: 00000000:0FA0 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 54323 1 0000 100 0
 ";
         let listening = parse_listening(text);
-        assert_eq!(listening.get(&54321), Some(&8080));
-        assert_eq!(listening.get(&54323), Some(&4000));
+        let wildcard: IpAddr = "0.0.0.0".parse().expect("wildcard");
+        assert_eq!(listening.get(&54321), Some(&(wildcard, 8080)));
+        assert_eq!(listening.get(&54323), Some(&(wildcard, 4000)));
         assert!(
             !listening.contains_key(&54322),
             "an established connection is not a listening port"
         );
+    }
+
+    #[test]
+    fn a_proc_net_address_reads_back_as_the_ip_it_prints() {
+        // 127.0.0.1 and ::1 the way a little-endian kernel prints them, which
+        // is every machine this runs on; `to_ne_bytes` keeps big-endian right.
+        let text = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 111 1 0000 100 0
+   1: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 222 1 0000 100 0
+";
+        let listening = parse_listening(text);
+        let v4: IpAddr = "127.0.0.1".parse().expect("v4");
+        let v6: IpAddr = "::1".parse().expect("v6");
+        assert_eq!(listening.get(&111), Some(&(v4, 8080)));
+        assert_eq!(listening.get(&222), Some(&(v6, 8080)));
+    }
+
+    #[test]
+    fn a_listener_on_another_interface_does_not_hold_the_port() {
+        let parse = |text: &str| text.parse::<IpAddr>().expect("address");
+        let loopback = [parse("127.0.0.1")];
+        // The wildcard holds every address, and the mapped form of an address
+        // is that address.
+        assert!(concerns(parse("0.0.0.0"), &loopback));
+        assert!(concerns(parse("127.0.0.1"), &loopback));
+        assert!(concerns(parse("::ffff:127.0.0.1"), &loopback));
+        // Somebody else's interface: the bind that failed was not against it.
+        assert!(!concerns(parse("10.0.0.5"), &loopback));
+        assert!(!concerns(parse("::1"), &loopback));
+        // A wildcard bind is refused by any listener, and a bind address that
+        // resolved to nothing leaves everything suspect.
+        assert!(concerns(parse("10.0.0.5"), &[parse("0.0.0.0")]));
+        assert!(concerns(parse("10.0.0.5"), &[]));
     }
 
     #[test]
