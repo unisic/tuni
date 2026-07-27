@@ -304,6 +304,18 @@ pub fn present(parent: &impl IsA<gtk::Widget>, entries: Vec<Entry>) {
         }
     });
 
+    // The entry swallows Escape before the dialog can hear it and announces
+    // stop-search instead, so leaving without running anything has to be
+    // spelled out here.
+    search.connect_stop_search({
+        let dialog = dialog.downgrade();
+        move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        }
+    });
+
     OPEN.with_borrow_mut(|open| *open = Some((search.clone(), list.clone())));
     dialog.connect_closed(|_| OPEN.with_borrow_mut(|open| *open = None));
 
