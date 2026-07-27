@@ -25,6 +25,7 @@ mod panel;
 mod preferences;
 mod remote;
 mod sftp;
+mod shortcuts;
 mod snippets;
 mod sprites;
 mod switcher;
@@ -56,7 +57,7 @@ const APP_ID: &str = "dev.unisic.Tuni";
 /// onto `Ctrl+Alt+Page Up/Down`: moving between panes happens many times a
 /// minute and moving between projects a few times an hour, so the shorter
 /// shortcut goes to the shorter reach.
-const ACCELS: &[(&str, &[&str])] = &[
+pub(crate) const ACCELS: &[(&str, &[&str])] = &[
     ("win.new-tab", &["<Ctrl><Shift>t"]),
     // The host list, in a tab of its own. `Ctrl+Shift` had no `o` on it, and
     // "open a connection" is what the key says everywhere else.
@@ -132,9 +133,9 @@ fn main() -> glib::ExitCode {
         // it up in the icon theme, which is also where the notification daemon
         // and the window switcher look for it.
         gtk::Window::set_default_icon_name(APP_ID);
-        for (action, accels) in ACCELS {
-            app.set_accels_for_action(action, accels);
-        }
+        // The table with the config file's overrides on top; a change made in
+        // the settings window later reapplies the same way.
+        shortcuts::apply(app, &tuni_core::settings::Settings::load());
         // What a master killed rather than asked to leave left behind. Startup
         // runs once however many windows open, which is how often this is
         // worth doing, and on a thread of its own because the window is what

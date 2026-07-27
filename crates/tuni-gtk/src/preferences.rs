@@ -54,6 +54,7 @@ pub fn present(window: &crate::window::TuniWindow, settings: &Settings) {
     dialog.set_title("Preferences");
     dialog.add(&appearance_page(window, settings));
     dialog.add(&terminal_page(window, settings));
+    dialog.add(&shortcuts_page(window, settings));
     dialog.connect_closed(|_| PREVIEW.with_borrow_mut(|slot| *slot = None));
     dialog.present(Some(window));
 }
@@ -106,6 +107,54 @@ fn appearance_page(
     ));
     window_group.add(&tab_bar);
 
+    let panel_group = adw::PreferencesGroup::builder()
+        .title("Panel Pages")
+        .description(
+            "A page turned off leaves the switcher; its shortcut stays for whoever kept it",
+        )
+        .build();
+    for (title, subtitle, active, write) in [
+        (
+            "Files",
+            "The tree beside the terminals",
+            settings.panel_files,
+            (|settings: &mut Settings, on| settings.panel_files = on) as fn(&mut Settings, bool),
+        ),
+        (
+            "Git",
+            "The repository that directory belongs to",
+            settings.panel_git,
+            |settings, on| settings.panel_git = on,
+        ),
+        (
+            "Info",
+            "The shell, its processes and its ports",
+            settings.panel_info,
+            |settings, on| settings.panel_info = on,
+        ),
+        (
+            "Debug",
+            "Breakpoints, the stack and the locals",
+            settings.panel_debug,
+            |settings, on| settings.panel_debug = on,
+        ),
+    ] {
+        let row = adw::SwitchRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .active(active)
+            .build();
+        row.connect_active_notify(glib::clone!(
+            #[weak]
+            window,
+            move |row| {
+                let on = row.is_active();
+                edit(&window, |settings| write(settings, on));
+            }
+        ));
+        panel_group.add(&row);
+    }
+
     let padding_x = adw::SpinRow::builder()
         .title("Side padding")
         .subtitle("Pixels of nothing between the window and the grid")
@@ -149,6 +198,7 @@ fn appearance_page(
     ));
     window_group.add(&padding_y);
     page.add(&window_group);
+    page.add(&panel_group);
 
     let background_group = adw::PreferencesGroup::builder()
         .title("Background")
@@ -576,6 +626,187 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
     page.add(&session);
 
     page
+}
+
+/// The Shortcuts page: one row per window action, the key it answers to, and
+/// a click to change it. The editor's own keys are not here on purpose; they
+/// are scoped to the editor widget so a shell never loses them, and a list
+/// that mixes the two scopes would promise a configurability the design
+/// refuses.
+fn shortcuts_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("Shortcuts")
+        .icon_name("input-keyboard-symbolic")
+        .build();
+    let group = adw::PreferencesGroup::builder()
+        .title("Window Shortcuts")
+        .description("A row is clicked, the new key is pressed; Backspace turns one off")
+        .build();
+    for (action, defaults) in crate::ACCELS {
+        group.add(&shortcut_row(window, settings, action, defaults));
+    }
+    page.add(&group);
+    page
+}
+
+fn shortcut_row(
+    window: &crate::window::TuniWindow,
+    settings: &Settings,
+    action: &'static str,
+    defaults: &'static [&'static str],
+) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(crate::shortcuts::label(action))
+        .activatable(true)
+        .build();
+    let shortcut = gtk::ShortcutLabel::new("");
+    shortcut.set_disabled_text("Off");
+    shortcut.set_valign(gtk::Align::Center);
+    let reset = gtk::Button::builder()
+        .icon_name("edit-undo-symbolic")
+        .tooltip_text("Back to the Default")
+        .valign(gtk::Align::Center)
+        .build();
+    reset.add_css_class("flat");
+    row.add_suffix(&shortcut);
+    row.add_suffix(&reset);
+
+    refresh_shortcut(settings, action, defaults, &row, &shortcut, &reset);
+
+    reset.connect_clicked(glib::clone!(
+        #[weak]
+        window,
+        #[weak]
+        row,
+        #[weak]
+        shortcut,
+        #[weak(rename_to = undo)]
+        reset,
+        move |_| {
+            edit(&window, |settings| settings.set_key(action, None));
+            refresh_shortcut(&window.settings(), action, defaults, &row, &shortcut, &undo);
+        }
+    ));
+    row.connect_activated(glib::clone!(
+        #[weak]
+        window,
+        #[weak]
+        shortcut,
+        #[weak]
+        reset,
+        move |row| record_shortcut(&window, action, defaults, row, &shortcut, &reset)
+    ));
+    row
+}
+
+/// Redraws one row from the settings: the key in force, and under the title
+/// what happened to the default when something did.
+fn refresh_shortcut(
+    settings: &Settings,
+    action: &str,
+    defaults: &[&str],
+    row: &adw::ActionRow,
+    shortcut: &gtk::ShortcutLabel,
+    reset: &gtk::Button,
+) {
+    let over = settings.key_override(action);
+    shortcut.set_accelerator(
+        crate::shortcuts::effective(settings, action, defaults)
+            .as_deref()
+            .unwrap_or(""),
+    );
+    reset.set_visible(over.is_some());
+    let spoken = defaults
+        .first()
+        .and_then(|accel| gtk::accelerator_parse(*accel))
+        .map(|(key, mods)| gtk::accelerator_get_label(key, mods).to_string());
+    row.set_subtitle(&match (over, spoken) {
+        (Some(""), Some(default)) => format!("Off; the default is {default}"),
+        (Some(_), Some(default)) => format!("The default is {default}"),
+        _ => String::new(),
+    });
+}
+
+/// Takes one keypress and makes it the shortcut. A bare modifier is waited
+/// through, Escape keeps what there is, and Backspace turns the shortcut off,
+/// which the dialog itself says.
+fn record_shortcut(
+    window: &crate::window::TuniWindow,
+    action: &'static str,
+    defaults: &'static [&'static str],
+    row: &adw::ActionRow,
+    shortcut: &gtk::ShortcutLabel,
+    reset: &gtk::Button,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(format!(
+            "Set the Key for {}",
+            crate::shortcuts::label(action)
+        ))
+        .body("Press the new shortcut. Backspace turns it off, Escape changes nothing.")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.set_close_response("cancel");
+
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed(glib::clone!(
+        #[weak]
+        window,
+        #[weak]
+        dialog,
+        #[weak]
+        row,
+        #[weak]
+        shortcut,
+        #[weak]
+        reset,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |_, keyval, _, state| {
+            use gtk::gdk::Key;
+            if matches!(
+                keyval,
+                Key::Shift_L
+                    | Key::Shift_R
+                    | Key::Control_L
+                    | Key::Control_R
+                    | Key::Alt_L
+                    | Key::Alt_R
+                    | Key::Super_L
+                    | Key::Super_R
+                    | Key::Meta_L
+                    | Key::Meta_R
+                    | Key::Caps_Lock
+                    | Key::ISO_Level3_Shift
+            ) {
+                return glib::Propagation::Proceed;
+            }
+            let mods = state & gtk::accelerator_get_default_mod_mask();
+            let chosen = if keyval == Key::Escape && mods.is_empty() {
+                None
+            } else if keyval == Key::BackSpace && mods.is_empty() {
+                Some(String::new())
+            } else {
+                Some(gtk::accelerator_name(keyval, mods).to_string())
+            };
+            if let Some(accel) = chosen {
+                edit(&window, |settings| settings.set_key(action, Some(&accel)));
+                refresh_shortcut(
+                    &window.settings(),
+                    action,
+                    defaults,
+                    &row,
+                    &shortcut,
+                    &reset,
+                );
+            }
+            dialog.close();
+            glib::Propagation::Stop
+        }
+    ));
+    dialog.add_controller(keys);
+    dialog.present(Some(row));
 }
 
 /// Reads the settings in force, changes one thing, and hands them back.

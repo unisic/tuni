@@ -263,6 +263,14 @@ New Window, Show Files and Use Selection for Find have no key of their own —
 they are in the menu and in the palette, which is where anything without a
 shortcut can be reached by name.
 
+The window's shortcuts are a page of the settings. A row is clicked and the
+new key pressed; Backspace turns a shortcut off, which leaves the action in
+the menus and the palette but takes it off the keyboard, and a changed row
+says what the default was and offers it back. What is configurable is exactly
+the table above: the editor's own keys stay scoped to the editor so a shell
+never loses them, and the numbered tab and project keys move as a family or
+not at all.
+
 Coming back to the window hands the keyboard to the pane. GTK restores whatever
 had the focus when the window left, and after a click on the tab strip or a
 toolbar button that is something a keypress does nothing to, which reads as a
@@ -860,6 +868,8 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `ssh-share-connections` | `true` | Whether every pane on a host goes through one authenticated connection. Ignored for a host whose own configuration already sets `ControlPath`, which tuni adopts rather than overrides |
 | `ssh-control-persist` | `600` | Seconds a shared connection outlives the last pane using it, up to a day. Zero closes it with the pane |
 | `ssh-reconnect-on-restore` | `false` | Whether a restored ssh pane dials with nothing to attach to. Off, so a window putting eight panes back cannot start eight logins |
+| `panel.files`, `panel.git`, `panel.info`, `panel.debug` | `true` | Which pages the panel's switcher offers. The Remote page manages itself: it exists while a pane is on a host |
+| `key.<action>` | | A window shortcut changed from its default, in GTK accelerator spelling: `key.win.palette = "<Ctrl><Shift>p"`. An empty string turns the shortcut off |
 
 A Ghostty configuration can be pasted in whole. Values do not need the quotes
 TOML would want, `theme` may name a theme instead of an appearance, in either

@@ -13,6 +13,8 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib;
 
+use tuni_core::settings::Settings;
+
 use crate::debugger::TuniDebugger;
 use crate::files::TuniFiles;
 use crate::git::TuniGit;
@@ -36,7 +38,10 @@ mod imp {
         pub info: RefCell<Option<TuniInfo>>,
         pub files: RefCell<Option<TuniFiles>>,
         pub git: RefCell<Option<TuniGit>>,
+        pub files_page: RefCell<Option<adw::ViewStackPage>>,
         pub git_page: RefCell<Option<adw::ViewStackPage>>,
+        pub info_page: RefCell<Option<adw::ViewStackPage>>,
+        pub debug_page: RefCell<Option<adw::ViewStackPage>>,
         pub sftp: RefCell<Option<TuniSftp>>,
         pub debugger: RefCell<Option<TuniDebugger>>,
         /// Held so the page can be taken off the switcher: there is nothing to
@@ -92,7 +97,8 @@ impl TuniPanel {
         // Files first, since it is the page the panel opens on and the one a
         // pane is opened from; Info last, as kero orders the same three.
         let stack = adw::ViewStack::new();
-        stack.add_titled_with_icon(&files, Some(FILES), "Files", "folder-symbolic");
+        let files_page =
+            stack.add_titled_with_icon(&files, Some(FILES), "Files", "folder-symbolic");
         // Adwaita has no icon for a repository, and a switcher page without one
         // draws the missing-image glyph. A list of what changed is what the
         // page is, and it is an icon the theme actually has.
@@ -106,9 +112,11 @@ impl TuniPanel {
         let sftp_page =
             stack.add_titled_with_icon(&sftp, Some(SFTP), "Remote", "network-server-symbolic");
         sftp_page.set_visible(false);
-        stack.add_titled_with_icon(&info, Some(INFO), "Info", "dialog-information-symbolic");
+        let info_page =
+            stack.add_titled_with_icon(&info, Some(INFO), "Info", "dialog-information-symbolic");
         // Last: reached on purpose, not passed through on the way somewhere.
-        stack.add_titled_with_icon(&debugger, Some(DEBUG), "Debug", "system-run-symbolic");
+        let debug_page =
+            stack.add_titled_with_icon(&debugger, Some(DEBUG), "Debug", "system-run-symbolic");
 
         // How many files have changed, on the tab, so the number is readable
         // while the Files page is the one showing.
@@ -144,6 +152,43 @@ impl TuniPanel {
         imp.sftp.replace(Some(sftp));
         imp.sftp_page.replace(Some(sftp_page));
         imp.debugger.replace(Some(debugger));
+        imp.files_page.replace(Some(files_page));
+        imp.info_page.replace(Some(info_page));
+        imp.debug_page.replace(Some(debug_page));
+
+        // The window re-applies the settings whenever they change; what it
+        // cannot do is reach a panel that has not finished building, so the
+        // first read happens here.
+        self.apply_settings(&Settings::load());
+    }
+
+    /// Shows and hides pages as the settings say. A page someone turned off
+    /// while it was showing hands the panel to the first page still on the
+    /// switcher, the same move the Remote page makes when its host goes away.
+    pub fn apply_settings(&self, settings: &Settings) {
+        let imp = self.imp();
+        for (page, on) in [
+            (&imp.files_page, settings.panel_files),
+            (&imp.git_page, settings.panel_git),
+            (&imp.info_page, settings.panel_info),
+            (&imp.debug_page, settings.panel_debug),
+        ] {
+            if let Some(page) = page.borrow().as_ref() {
+                page.set_visible(on);
+            }
+        }
+        let showing = self.page();
+        let hidden = [
+            (FILES, settings.panel_files),
+            (GIT, settings.panel_git),
+            (INFO, settings.panel_info),
+            (DEBUG, settings.panel_debug),
+        ];
+        if hidden.iter().any(|(name, on)| *name == showing && !on)
+            && let Some((first, _)) = hidden.iter().find(|(_, on)| *on)
+        {
+            self.set_page(first);
+        }
     }
 
     #[must_use]

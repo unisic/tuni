@@ -1097,6 +1097,13 @@ impl TuniWindow {
         apply_chrome(&theme, settings.terminal.background_opacity);
         crate::blur::apply(self, settings.background_blur);
 
+        if let Some(panel) = imp.panel_view.borrow().as_ref() {
+            panel.apply_settings(&settings);
+        }
+        if let Some(application) = self.application() {
+            crate::shortcuts::apply(&application, &settings);
+        }
+
         // Turning history off should not leave the last session's output on
         // disk waiting for the setting to be turned back on.
         if !settings.restore_history {

@@ -123,6 +123,19 @@ pub struct Settings {
     /// off eight logins; on is for people whose every host answers to an agent
     /// and who would rather not press Connect eight times.
     pub ssh_reconnect_on_restore: bool,
+    /// Which pages the panel's switcher offers. All on by default; someone who
+    /// never debugs from here takes that page off and the switcher stops
+    /// asking. The Remote page is not among these because it manages its own
+    /// visibility: it exists exactly while a pane is on a host.
+    pub panel_files: bool,
+    pub panel_git: bool,
+    pub panel_info: bool,
+    pub panel_debug: bool,
+    /// Window shortcuts changed from the defaults: the action's full name and
+    /// what to press, in GTK's accelerator spelling. An empty accelerator is a
+    /// shortcut turned off. Sorted, so the file writes the same way twice; the
+    /// defaults themselves live beside the actions and are not repeated here.
+    pub keys: Vec<(String, String)>,
 }
 
 impl Default for Settings {
@@ -139,6 +152,11 @@ impl Default for Settings {
             ssh_share_connections: true,
             ssh_control_persist: crate::ssh::CONTROL_PERSIST,
             ssh_reconnect_on_restore: false,
+            panel_files: true,
+            panel_git: true,
+            panel_info: true,
+            panel_debug: true,
+            keys: Vec::new(),
         }
     }
 }
@@ -302,6 +320,22 @@ impl Settings {
         if let Some(on) = table.boolean("ssh-reconnect-on-restore") {
             settings.ssh_reconnect_on_restore = on;
         }
+        if let Some(on) = table.boolean("panel.files") {
+            settings.panel_files = on;
+        }
+        if let Some(on) = table.boolean("panel.git") {
+            settings.panel_git = on;
+        }
+        if let Some(on) = table.boolean("panel.info") {
+            settings.panel_info = on;
+        }
+        if let Some(on) = table.boolean("panel.debug") {
+            settings.panel_debug = on;
+        }
+        // Which actions exist is the window's business; anything spelled here
+        // is carried as written and simply finds no action to land on if a
+        // later version renames one.
+        settings.keys = table.strings_under("key.");
         settings
     }
 
@@ -433,7 +467,42 @@ impl Settings {
                 self.ssh_reconnect_on_restore
             );
         }
+        for (page, on) in [
+            ("panel.files", self.panel_files),
+            ("panel.git", self.panel_git),
+            ("panel.info", self.panel_info),
+            ("panel.debug", self.panel_debug),
+        ] {
+            if !on {
+                let _ = writeln!(out, "{page} = false");
+            }
+        }
+        for (action, accel) in &self.keys {
+            let _ = writeln!(out, "key.{action} = {}", toml::quote(accel));
+        }
         out
+    }
+
+    /// What an action's shortcut was changed to, if it was: the accelerator,
+    /// or an empty string for a shortcut turned off. `None` means the default
+    /// beside the action still stands.
+    #[must_use]
+    pub fn key_override(&self, action: &str) -> Option<&str> {
+        self.keys
+            .iter()
+            .find(|(name, _)| name == action)
+            .map(|(_, accel)| accel.as_str())
+    }
+
+    /// Changes one action's shortcut. `None` puts the default back; an empty
+    /// accelerator turns the shortcut off. The list stays sorted so the file
+    /// it becomes is stable.
+    pub fn set_key(&mut self, action: &str, accel: Option<&str>) {
+        self.keys.retain(|(name, _)| name != action);
+        if let Some(accel) = accel {
+            self.keys.push((action.to_owned(), accel.to_owned()));
+            self.keys.sort();
+        }
     }
 
     /// Writes the file, creating `~/.config/tuni` if it is not there yet.
@@ -541,6 +610,23 @@ mod toml {
                 Some(Value::Boolean(value)) => Some(*value),
                 _ => None,
             }
+        }
+
+        /// Every string under a key prefix, the prefix stripped, sorted so the
+        /// caller sees one order however the file was written.
+        pub fn strings_under(&self, prefix: &str) -> Vec<(String, String)> {
+            let mut found: Vec<(String, String)> = self
+                .0
+                .iter()
+                .filter_map(|(key, value)| match value {
+                    Value::String(value) => {
+                        Some((key.strip_prefix(prefix)?.to_owned(), value.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            found.sort();
+            found
         }
     }
 
@@ -738,11 +824,18 @@ mod tests {
             ssh_share_connections: false,
             ssh_control_persist: 30,
             ssh_reconnect_on_restore: true,
+            panel_files: true,
+            panel_git: true,
+            panel_info: true,
+            panel_debug: false,
+            keys: vec![("win.palette".to_owned(), "<Ctrl>p".to_owned())],
         };
         let read = Settings::parse(&settings.to_toml());
 
         assert_eq!(read.terminal.font_family, settings.terminal.font_family);
         assert!((read.terminal.font_size - 12.5).abs() < f64::EPSILON);
+        assert!(!read.panel_debug);
+        assert_eq!(read.key_override("win.palette"), Some("<Ctrl>p"));
         assert!(read.terminal.font_ligatures);
         assert!((read.terminal.line_height_extra - 2.0).abs() < f64::EPSILON);
         assert!(!read.terminal.cursor_blink);
@@ -835,6 +928,51 @@ mod tests {
                 .cursor_style,
             CursorStyle::Underline
         );
+    }
+
+    #[test]
+    fn a_panel_page_turned_off_survives_the_round_trip() {
+        let read = Settings::parse("panel.debug = false\npanel.info = false");
+        assert!(!read.panel_debug);
+        assert!(!read.panel_info);
+        assert!(read.panel_files && read.panel_git);
+        let written = read.to_toml();
+        assert!(written.contains("panel.debug = false"));
+        assert!(written.contains("panel.info = false"));
+        assert!(!written.contains("panel.files"));
+        assert_eq!(Settings::parse(&written).panel_debug, read.panel_debug);
+    }
+
+    #[test]
+    fn a_changed_shortcut_survives_the_round_trip_in_one_order() {
+        let read = Settings::parse(
+            "key.win.palette = \"<Ctrl>p\"\nkey.win.find = \"\"\nkey.win.new-tab = \"<Ctrl>t\"",
+        );
+        // Sorted however the file listed them.
+        assert_eq!(
+            read.keys,
+            vec![
+                ("win.find".to_owned(), String::new()),
+                ("win.new-tab".to_owned(), "<Ctrl>t".to_owned()),
+                ("win.palette".to_owned(), "<Ctrl>p".to_owned()),
+            ]
+        );
+        assert_eq!(read.key_override("win.palette"), Some("<Ctrl>p"));
+        assert_eq!(read.key_override("win.find"), Some(""));
+        assert_eq!(read.key_override("win.split-right"), None);
+        let again = Settings::parse(&read.to_toml());
+        assert_eq!(again.keys, read.keys);
+    }
+
+    #[test]
+    fn setting_a_key_replaces_and_unsetting_restores_the_default() {
+        let mut settings = Settings::default();
+        settings.set_key("win.palette", Some("<Ctrl>p"));
+        settings.set_key("win.palette", Some("<Ctrl>q"));
+        assert_eq!(settings.key_override("win.palette"), Some("<Ctrl>q"));
+        settings.set_key("win.palette", None);
+        assert_eq!(settings.key_override("win.palette"), None);
+        assert!(settings.to_toml().is_empty());
     }
 
     #[test]
