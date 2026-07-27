@@ -27,7 +27,10 @@ depends=('gtk4' 'libadwaita' 'gtksourceview5' 'sqlite' 'git' 'curl'
 makedepends=('rust' 'cargo' 'make' 'gcc' 'pkgconf')
 # !debug: makepkg would otherwise split out a tuni-debug package, which is one
 # more file on the release page than anyone downloading a terminal wants.
-options=('!debug')
+# !lto: the tree-sitter grammars are C compiled inside the cargo build, and
+# makepkg's default lto option turns their objects into GCC bitcode that the
+# linker rust brings cannot read, leaving every ts_ symbol undefined.
+options=('!debug' '!lto')
 source=("${pkgname}-${pkgver}.tar.gz")
 sha256sums=('SKIP')
 _zigver=0.15.2
