@@ -67,6 +67,19 @@
   </provides>
 
   <releases>
+    <release version="1.0.1" date="2026-07-27">
+      <description>
+        <p>The terminal gained mouse reporting, focus reporting, and box
+        drawing characters it strokes itself instead of asking the font.</p>
+        <p>The window gained background opacity, blur, and padding, an about
+        dialog, and a settings window that carries more of the settings.</p>
+        <p>The Files panel stands beside the tab strip at full height and takes
+        a typed path or a step to the parent directory the way a prompt
+        would.</p>
+        <p>Fixed: panes that closed without being forgotten, a command palette
+        that kept the window alive, and a resize that stranded the prompt.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-07-26">
       <description>
         <p>First release.</p>

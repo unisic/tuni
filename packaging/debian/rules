@@ -1,0 +1,25 @@
+#!/usr/bin/make -f
+# The top-level Makefile is what installs; debhelper only has to be told the
+# prefix, since its makefile buildsystem would otherwise pass none and land in
+# /usr/local. Zig 0.15.2 has to be on PATH before dpkg-buildpackage runs —
+# `make zig ZIG_PREFIX=/usr/local` does that. See ../README.md.
+
+# Compat 13 points HOME at a throwaway directory under debian/ for every
+# dh_auto_* step. rustup keeps the toolchain under the real home, and would
+# report no toolchain at all from there; cargo would re-fetch the registry into
+# a directory dh_clean then deletes.
+export RUSTUP_HOME ?= $(HOME)/.rustup
+export CARGO_HOME ?= $(HOME)/.cargo
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) build
+
+override_dh_auto_install:
+	$(MAKE) install PREFIX=/usr DESTDIR=debian/tuni
+
+# The tests are CI's job, and running them here would build the whole tree a
+# second time in debug.
+override_dh_auto_test:

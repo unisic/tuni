@@ -1,0 +1,202 @@
+name: Release
+
+# Push a tag, get the three native packages. Each one is built the same way a
+# user would build it — the RPM through packaging/tuni.spec, the deb through
+# packaging/debian, the Arch package through packaging/arch/PKGBUILD — and each
+# job installs what it built before uploading it, because a package that has
+# never been installed is a claim rather than a package.
+#
+#   git tag v1.0.1 && git push origin v1.0.1
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Four files carry the version and they are all written by hand. Disagreeing
+  # about it after three builds is worse than disagreeing about it now.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: v
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          check() {
+            [[ "$2" == "$version" ]] || {
+              echo "::error::$1 says $2, Cargo.toml says $version"
+              exit 1
+            }
+          }
+          check packaging/tuni.spec \
+            "$(sed -n 's/^Version: *//p' packaging/tuni.spec)"
+          check packaging/arch/PKGBUILD \
+            "$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)"
+          check packaging/debian/changelog \
+            "$(sed -n '1s/^tuni (\([^)]*\)).*/\1/p' packaging/debian/changelog)"
+          check data/dev.unisic.Tuni.metainfo.xml \
+            "$(sed -n '0,/<release /s/.*<release version="\([^"]*\)".*/\1/p' \
+              data/dev.unisic.Tuni.metainfo.xml)"
+
+          # workflow_dispatch has no tag to disagree with.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            check "the tag" "${GITHUB_REF#refs/tags/v}"
+          fi
+
+  rpm:
+    name: RPM (Fedora)
+    needs: version
+    runs-on: ubuntu-latest
+    container: fedora:44
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Install dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            rpm-build cargo rust gcc make git-core curl tar xz \
+            gtk4-devel libadwaita-devel gtksourceview5-devel sqlite-devel \
+            desktop-file-utils libappstream-glib
+
+      - uses: actions/checkout@v7
+
+      - name: Build the RPM
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          make dist
+          rpmbuild -bb \
+            --define "_topdir $PWD/rpmbuild" \
+            --define "_sourcedir $PWD" \
+            packaging/tuni.spec
+          # The main package only: rpmbuild also writes debuginfo and
+          # debugsource, which belong in a repository and not on a release page.
+          mkdir -p dist && cp "rpmbuild/RPMS/x86_64/tuni-${VERSION}-"*.rpm dist/
+
+      - name: Install what was built
+        run: dnf install -y ./dist/*.rpm && test -x /usr/bin/tuni
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tuni-rpm
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  deb:
+    name: deb (Ubuntu)
+    needs: version
+    runs-on: ubuntu-latest
+    # 26.04 is the floor: libadwaita there is 1.9, and every earlier Ubuntu is
+    # below the 1.6 this needs. The compiler is rustup's, not Ubuntu's — 26.04
+    # packages rustc 1.93 and rusqlite 0.40 wants 1.95.
+    container: ubuntu:26.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            build-essential debhelper dpkg-dev fakeroot pkg-config \
+            rustup libgtk-4-dev libadwaita-1-dev \
+            libgtksourceview-5-dev libsqlite3-dev \
+            curl ca-certificates xz-utils git
+          # Ubuntu's rustup ships the cargo and rustc in /usr/bin as shims, so
+          # this is all it takes for the build to find a current toolchain.
+          rustup default stable
+
+      - uses: actions/checkout@v7
+
+      - name: Build the deb
+        run: |
+          # Ubuntu's zig is too new for the pinned Ghostty source, so the build
+          # gets the one it wants first — debian/rules expects it on PATH.
+          make zig ZIG_PREFIX=/usr/local
+          cp -r packaging/debian debian
+          dpkg-buildpackage -b -us -uc
+          mkdir -p dist && mv ../*.deb dist/
+
+      - name: Install what was built
+        run: apt-get install -y ./dist/*.deb && test -x /usr/bin/tuni
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tuni-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  arch:
+    name: Arch package
+    needs: version
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Sy --noconfirm --needed archlinux-keyring
+          pacman -Syu --noconfirm --needed \
+            base-devel rust cargo make gcc pkgconf git curl \
+            gtk4 libadwaita gtksourceview5 sqlite
+
+      - uses: actions/checkout@v7
+
+      - name: Build the Arch package
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git archive --prefix="tuni-${VERSION}/" \
+            -o "packaging/arch/tuni-${VERSION}.tar.gz" HEAD
+          # makepkg refuses to run as root, and the container is root.
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- bash -lc \
+            "cd '$GITHUB_WORKSPACE/packaging/arch' && makepkg --noconfirm --clean --cleanbuild"
+          mkdir -p dist && cp packaging/arch/*.pkg.tar.zst dist/
+
+      - name: Install what was built
+        run: pacman -U --noconfirm ./dist/*.pkg.tar.zst && test -x /usr/bin/tuni
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tuni-arch
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: [version, rpm, deb, arch]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        run: |
+          ls -la dist
+          gh release create "v${VERSION}" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "Tuni ${VERSION}" \
+            --generate-notes

@@ -51,12 +51,23 @@ source is read as a specification of behavior, not translated.
 
 ## Install
 
+Every [release](https://github.com/unisic/tuni/releases) carries a package for
+Fedora, Ubuntu and Arch:
+
+```sh
+sudo dnf install ./tuni-*.rpm            # Fedora 44+
+sudo apt install ./tuni_*_amd64.deb      # Ubuntu 26.04+
+sudo pacman -U ./tuni-*-x86_64.pkg.tar.zst
+```
+
+Or from source, which is what all three do:
+
 ```sh
 sudo make install PREFIX=/usr
 ```
 
-`packaging/` holds a Flatpak manifest and an RPM spec that call into that same
-target.
+`packaging/` holds those three recipes and a Flatpak manifest, each calling
+into that same target.
 
 ## Building
 
@@ -70,9 +81,10 @@ make zig
 cargo run --release
 ```
 
-`make zig` fetches the official 0.15.2 tarball into `~/.local` — the
-distribution's own package is 0.16 by now, and the pinned Ghostty commit does
-not build against it.
+`make zig` fetches the official 0.15.2 tarball into `~/.local`, because the
+distribution's own package is 0.16 by now and the pinned Ghostty commit does
+not build against it. To build the 0.16 way instead — that toolchain, and the
+newer Ghostty commit which requires it — `make build-next`.
 
 ## Configuration
 

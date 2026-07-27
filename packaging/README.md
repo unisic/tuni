@@ -15,6 +15,13 @@ Two things beyond the usual GTK development headers:
   moved in 0.16, which is what Fedora 44 ships. Every build path here fetches
   the official tarball by URL and checksum rather than trusting `zig` on PATH,
   and `make zig` does the same thing for a working copy, into `~/.local`.
+
+  Zig 0.16 builds too, but only against a Ghostty new enough to want it —
+  Ghostty's main requires 0.16 and the commit `libghostty-rs` pins refuses it.
+  `make build-next` fetches both: the 0.16 toolchain, and the Ghostty commit
+  this tree was tested against, which it passes in as `GHOSTTY_SOURCE_DIR`.
+  Packages stay on the pinned pair, because that is the one the Rust bindings
+  are generated from and released with.
 - **Network**, unless it is given a way not to. `libghostty-vt-sys`'s build
   script fetches the pinned Ghostty source, and cargo fetches the registry.
 
@@ -56,10 +63,50 @@ For COPR with network enabled, or a local build. Koji builds offline, so a
 Fedora package proper would want the same offline sources the Flathub build
 does, plus `cargo vendor`.
 
+## deb — `debian/`
+
+```sh
+apt install rustup && rustup default stable   # Ubuntu's rustc is too old
+make zig ZIG_PREFIX=/usr/local                # Ubuntu's zig is too new
+cp -r packaging/debian debian
+dpkg-buildpackage -b -us -uc
+```
+
+Ubuntu 26.04 or later, for libadwaita 1.6; earlier releases are below it and
+the Flatpak is what covers them. Neither toolchain comes from the distribution:
+26.04 packages rustc 1.93 and rusqlite 0.40 wants 1.95, so `rustup` provides
+the compiler the same way the Flatpak's SDK extension does. `debian/rules` only
+tells debhelper the prefix; the top-level `Makefile` installs, as everywhere
+else here.
+
+It lives under `packaging/` with the rest and gets copied to the root for the
+build, rather than sitting at the top of the tree the whole time.
+
+## Arch — `arch/PKGBUILD`
+
+```sh
+make dist && mv tuni-1.0.1.tar.gz packaging/arch/
+cd packaging/arch && makepkg -si
+```
+
+The pinned Zig comes down as a second `source` entry, by URL and checksum,
+because Arch's own is 0.16. `build()` still wants the network for cargo and the
+Ghostty source.
+
+## Releases
+
+`.github/workflows/release.yml` builds all three on a `v*` tag and attaches
+them to the GitHub release. Every job installs what it built before uploading
+it. Five files carry the version — `Cargo.toml`, the spec, the PKGBUILD, the
+Debian changelog, and the AppStream metadata — and the first job in the
+workflow refuses to release if they disagree with each other or with the tag.
+
 ## Not here
 
-**deb** and **AppImage** are not in this directory. Both are reasonable and
-neither is written, because neither could be built and tested on the machine
-this was developed on — an unbuilt package file is a claim rather than a
-package. The `Makefile` is what either one would call, so adding them is a
-`debian/rules` and an AppDir recipe, not a change to how Tuni installs.
+**AppImage.** For a GTK 4 program it means bundling GTK, libadwaita and
+GtkSourceView, and then either building on something old enough to run
+everywhere and too old to have libadwaita 1.6, or building on something current
+and shipping a glibc floor no older distribution meets. Flatpak solves that
+problem properly and is already here. A terminal workspace is also the last
+program that wants to be relocatable and sandboxed away from the system it is
+working on.
