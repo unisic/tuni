@@ -81,10 +81,13 @@ jobs:
 
     steps:
       - name: Install dependencies
+        # The same libraries the job above links against, less the tools only a
+        # release build needs. `make test-next` runs the tests too, so sqlite is
+        # here for rusqlite to link and ssh for the test that reads `ssh -G`.
         run: |
           dnf install -y --setopt=install_weak_deps=False \
-            cargo rust gcc make git-core curl tar xz \
-            gtk4-devel libadwaita-devel gtksourceview5-devel
+            cargo rust gcc make git-core curl tar xz openssh-clients \
+            gtk4-devel libadwaita-devel gtksourceview5-devel sqlite-devel
 
       - uses: actions/checkout@v7
 
