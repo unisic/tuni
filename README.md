@@ -4,50 +4,47 @@
 
 # Tuni
 
-</div>
-
 A native terminal workspace for Linux.
 
-<img width="1100" height="700" alt="Unisic_2026-07-26_13-52-51" src="https://github.com/user-attachments/assets/06b27e07-bb6e-43b6-9cdf-5e6fadaa5434" />
+</div>
+
+<img width="1163" height="700" alt="tuni" src="https://github.com/user-attachments/assets/f8c7e78c-5007-4ff6-8680-9b078b6279d3" />
 
 ## Features
 
-- Rust + GTK4/libadwaita, with Ghostty's `libghostty-vt` doing the emulation
 - Split panes in a niri-style layout, grouped into projects and tabs
-- File tree, git panel, and a session inspector: processes and listening ports
-- Source editor and a hunk-staging diff viewer, in panes beside the shells
-- Command palette, tab switcher, find in whatever pane has the keyboard
-- A host list over the hosts `~/.ssh/config` already declares, one shared
-  connection per machine, and no password or passphrase held anywhere in tuni
+- File tree, git panel with hunk staging, and a source editor, in panes beside
+  the shells
+- Session inspector: what is running, what is listening, what a connection
+  forwards
+- Command palette, tab switcher, find in whichever pane has the keyboard
+- The hosts `~/.ssh/config` already declares, one shared connection per machine,
+  and an SFTP page for the machine a pane is on
 - Kitty graphics, OSC 8 hyperlinks, desktop notifications, progress bars
 - Ghostty's 574 themes, which paint the window chrome as well as the terminal
 - The window comes back as it was left
 
-Connecting to another machine is OpenSSH's job here, not tuni's. A host opens by
-running `ssh` in a pane, so `~/.ssh/config` still means what it always meant,
-the question about an unknown host's key is asked in a terminal, and a
-password, a passphrase, a hardware key or a 2FA push is answered where it has
-always been answered. Tuni stores no secret and has nowhere to put one: keys,
-`ssh-agent` and the desktop's keyring already do that job. It is also why hosts
-will never sync to a cloud account: syncing a credential means storing one.
-Panes on one machine share a single authenticated connection, so the second tab
-does not ask again. The session inspector lists what a connection forwards, and
-switches tuni's own ports on and off against it without reconnecting. Snippets
-are typed into the pane rather than run behind it, so the shell sees what you
-would have typed and so do you. Keys are listed with their fingerprints and
-whether the agent is holding them, and making one or copying one to a host is a
-command put on a prompt for you to read before it runs. While a pane is on a
-host the panel grows a page for that machine's files, read over the connection
-already open and never on the timer the local tree uses. Files move both ways
-over that connection: drag some onto the page and they go up into whatever
-directory you dropped them on, one at a time with the rest waiting behind, and a
-download takes the name you gave it only once it is whole. Making a folder,
-renaming and deleting are there too, and a refusal says what the far end would
-not: that the name is taken, or that the directory still has something in it.
+Rust and GTK4/libadwaita, with Ghostty's `libghostty-vt` doing the emulation.
+
+Connecting to another machine is OpenSSH's job here, not tuni's: a host opens by
+running `ssh` in a pane, so a password, a passphrase or a 2FA push is answered
+where it has always been answered. Tuni stores no secret and has nowhere to put
+one, which is also why hosts will never sync to a cloud account — syncing a
+credential means storing one.
 
 Tuni is a ground-up Linux implementation of the workspace
 [egoist/kero](https://github.com/egoist/kero) built for macOS. Kero's Swift
 source is read as a specification of behavior, not translated.
+
+## Performance
+
+<img width="1536" height="1024" alt="Uni-Bench 2.1: throughput of 17 terminal emulators consuming 200 MiB" src="https://github.com/user-attachments/assets/039da5aa-7b23-4c0e-82bb-6714cd04d78d" />
+
+Third of seventeen, within 10% of the fastest thing measured and ahead of both
+GPU terminals — with a whole workspace drawn around the terminal.
+
+[docs/BENCHMARK.md](docs/BENCHMARK.md) — method, environment, caveats, and the
+head-to-head with alacritty that the table above is too close to settle.
 
 ## Install
 
