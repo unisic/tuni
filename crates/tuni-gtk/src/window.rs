@@ -687,14 +687,28 @@ impl TuniWindow {
             ),
         );
 
-        // A host list reads files the user edits in some other window, and
-        // coming back to tuni is when they would expect to see the edit. It
-        // fires on losing the focus too, hence the question.
+        // What being given the window back is worth: a host list re-reads files
+        // the user edits somewhere else, since coming back is when they would
+        // expect to see the edit, and the keyboard goes where typing goes. It
+        // fires on losing the focus too, hence the first line.
         self.connect_is_active_notify(|window| {
-            if window.is_active() {
-                for hosts in window.imp().hosts.borrow().values() {
-                    hosts.refresh_if_stale();
-                }
+            if !window.is_active() {
+                return;
+            }
+            for hosts in window.imp().hosts.borrow().values() {
+                hosts.refresh_if_stale();
+            }
+            // Coming back to a terminal means typing into it. GTK restores the
+            // focus the window had when it left, which after a click on the tab
+            // strip or a toolbar button is a widget that does nothing with a
+            // keypress, so the pane takes the keyboard back. Unless something
+            // is holding it that would rather keep it: a dialog, or a place
+            // that takes typing, which is what a gtk::Text or a gtk::TextView
+            // is here. The find bar, the palette, the path in the Files panel.
+            let typing = gtk::prelude::GtkWindowExt::focus(window)
+                .is_some_and(|widget| widget.is::<gtk::Text>() || widget.is::<gtk::TextView>());
+            if !typing && window.visible_dialog().is_none() {
+                window.focus_pane();
             }
         });
 
@@ -3828,6 +3842,11 @@ impl TuniWindow {
         dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("rename"));
         dialog.set_close_response("cancel");
+        // Otherwise the keyboard starts on the Rename button, and a name is
+        // typed after a click or a Tab that nobody asked for. Focusing an entry
+        // selects what is in it, so the first keypress replaces the old name
+        // and the arrow keys keep it.
+        dialog.set_focus(Some(&entry));
         dialog.connect_response(
             None,
             glib::clone!(

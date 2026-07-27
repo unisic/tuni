@@ -26,8 +26,10 @@ color themes, which paint the window chrome as well as the terminal. `ls`,
 
 Around it: a sidebar of projects, each with its own strip of tabs, and inside a
 tab a niri-style layout of panes. A project is named by whatever its visible
-shell calls itself until you rename it, and a project directory can be pinned
-for the file tree and the git panel to stay on. A new tab starts where the
+shell calls itself until you rename it, which opens a prompt with the keyboard
+already in it and the old name selected, so the new one is typed and entered
+without touching the mouse again. A project directory can be pinned for the
+file tree and the git panel to stay on. A new tab starts where the
 visible one is, opens next to it, and closes when its last shell exits; a
 project whose tabs are all closed stays in the sidebar until it is closed on
 purpose: by its own button, by its menu, or by a middle click anywhere on the
@@ -219,6 +221,14 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 New Window, Show Files and Use Selection for Find have no key of their own —
 they are in the menu and in the palette, which is where anything without a
 shortcut can be reached by name.
+
+Coming back to the window hands the keyboard to the pane. GTK restores whatever
+had the focus when the window left, and after a click on the tab strip or a
+toolbar button that is something a keypress does nothing to, which reads as a
+terminal that has stopped listening. Anything that would rather keep the
+keyboard keeps it: an open dialog, and every place text is typed, so a search
+half entered in the find bar or a path in the Files panel survives a trip to
+another window.
 
 A pane nobody is looking at can still say something. The bell marks its tab as
 wanting attention, and when the window is not the focused one it arrives as a
