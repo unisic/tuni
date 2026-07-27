@@ -283,6 +283,11 @@ mod imp {
         /// How many mouse buttons are down, which mouse reporting needs in
         /// order to decide whether motion is worth sending.
         pub(super) buttons_down: Cell<u8>,
+        /// Which of them, one bit per button the encoder can name. A motion
+        /// report carries the first button held, the way Ghostty reads its
+        /// own click state, because button-event tracking reports nothing
+        /// for a motion with no button on it.
+        pub(super) buttons_held: Cell<u16>,
         /// Last known pointer position, because scroll events carry no
         /// coordinates but the application still expects them in the report.
         pub(super) pointer_pos: Cell<(f64, f64)>,
@@ -383,6 +388,7 @@ mod imp {
                 cwd: RefCell::new(None),
                 pointer: Cell::new(Pointer::default()),
                 buttons_down: Cell::new(0),
+                buttons_held: Cell::new(0),
                 pointer_pos: Cell::new((0.0, 0.0)),
                 mods: Cell::new(Mods::empty()),
                 last_left_press: Cell::new(None),
@@ -2014,9 +2020,10 @@ impl TuniTerminal {
         })
     }
 
-    /// Whether the wheel belongs to the application. Scroll is the one place
-    /// Ghostty does not let Shift take the mouse back, so neither does this.
-    fn reports_scroll(&self) -> bool {
+    /// Whether reporting is on at all, Shift notwithstanding: the wheel and
+    /// plain motion belong to the application even under Shift, which only
+    /// takes back a press and the drag hanging off it.
+    fn reporting_active(&self) -> bool {
         self.imp().config.borrow().mouse_reporting
             && self
                 .imp()
@@ -2024,6 +2031,34 @@ impl TuniTerminal {
                 .borrow()
                 .as_ref()
                 .is_some_and(|session| session.term.is_mouse_tracking())
+    }
+
+    fn captures_shift(&self) -> bool {
+        self.imp()
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| session.term.captures_shift())
+    }
+
+    /// The first button held, in the order Ghostty scans its own click state,
+    /// which is what a motion report carries while something is pressed.
+    fn first_held(&self) -> Option<MouseButton> {
+        const ORDER: [MouseButton; 9] = [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Six,
+            MouseButton::Seven,
+            MouseButton::Eight,
+            MouseButton::Nine,
+            MouseButton::Ten,
+            MouseButton::Eleven,
+        ];
+        let held = self.imp().buttons_held.get();
+        ORDER
+            .into_iter()
+            .find(|button| held & 1 << *button as u16 != 0)
     }
 
     fn report_mouse(
@@ -2208,6 +2243,10 @@ impl TuniTerminal {
         let imp = self.imp();
         imp.buttons_down
             .set(imp.buttons_down.get().saturating_add(1));
+        if let Some(held) = mouse_button(button) {
+            imp.buttons_held
+                .set(imp.buttons_held.get() | 1 << held as u16);
+        }
         imp.pointer_pos.set((x, y));
         imp.mods.set(mods);
 
@@ -2382,6 +2421,12 @@ impl TuniTerminal {
         let imp = self.imp();
         imp.buttons_down
             .set(imp.buttons_down.get().saturating_sub(1));
+        let was_held = mouse_button(button).is_some_and(|held| {
+            let bit = 1 << held as u16;
+            let before = imp.buttons_held.get();
+            imp.buttons_held.set(before & !bit);
+            before & bit != 0
+        });
         imp.pointer_pos.set((x, y));
 
         if imp.bar_drag.take().is_some() {
@@ -2426,7 +2471,13 @@ impl TuniTerminal {
                     }
                 }
             }
-            Pointer::Idle => {}
+            Pointer::Idle => {
+                // A second button coming up while the first still owns the
+                // gesture: its press was reported, so its release is too.
+                if was_held && self.reporting_active() {
+                    self.report_mouse(MouseAction::Release, mouse_button(button), mods, x, y);
+                }
+            }
         }
     }
 
@@ -2462,8 +2513,17 @@ impl TuniTerminal {
             }
             _ => {
                 self.refresh_links(mods);
-                if self.reports_mouse(mods) {
-                    self.report_mouse(MouseAction::Motion, None, mods, x, y);
+                if self.reporting_active() {
+                    // A motion report carries the button being held, without
+                    // which button-event tracking would drop it. Shift
+                    // escapes a drag's reports but not a bare motion's, the
+                    // distinction Ghostty takes from Kitty.
+                    let held = self.first_held();
+                    let escaped =
+                        mods.contains(Mods::SHIFT) && !self.captures_shift() && held.is_some();
+                    if !escaped {
+                        self.report_mouse(MouseAction::Motion, held, mods, x, y);
+                    }
                 }
             }
         }
@@ -2560,7 +2620,7 @@ impl TuniTerminal {
         // to the desktop's own gestures, as they do in Ghostty's GTK.
         let columns = if precision { 0 } else { dx.round() as isize };
 
-        if self.reports_scroll() {
+        if self.reporting_active() {
             // Wheel movement is reported as buttons: four and five upright,
             // six and seven sideways, one press per row. The selection goes
             // first, since with the mouse spoken for only Shift could have
