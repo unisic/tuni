@@ -28,4 +28,10 @@ sourceview5 = { version = "0.11", features = ["v5_10"] }
 gdk4-wayland = { version = "0.11", features = ["wayland_crate"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+# The X11 half of the blur ask. KWin reads a window property there rather than
+# a Wayland protocol, and writing one takes Xlib itself: GDK4 only sets the
+# properties it knows about. `x11-dl` is the flavor of Xlib binding gdk4-x11's
+# `xlib` feature speaks, and it finds the library at runtime the way GDK did.
+gdk4-x11 = { version = "0.11", features = ["xlib"] }
+x11-dl = "2.21"
 

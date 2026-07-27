@@ -299,9 +299,14 @@ else that transmits one lands in the pane at the size, position and stacking
 order it asked for — under the text, over it, or under the cell backgrounds —
 and scrolls with the text it was printed beside.
 
-That is kero's behavior, less the two pieces of it that are macOS by nature:
-the Sparkle auto-updater, which a package manager stands in for, and the window
-blur, which Wayland has no protocol for.
+That is kero's behavior, less the one piece of it that is macOS by nature: the
+Sparkle auto-updater, which a package manager stands in for. The window blur it
+gets from AppKit is asked for the two ways Ghostty asks on Linux: over
+`ext-background-effect-v1` on Wayland, once the manager's capabilities event
+has named blur among what it renders, and as KWin's
+`_KDE_NET_WM_BLUR_BEHIND_REGION` window property on X11. There is no third
+way. A desktop that answers neither, GNOME first among them, offers nothing to
+ask, so the switch quietly does nothing there.
 
 Consuming a 200 MiB stream, measured with `scripts/throughput.sh` on this
 machine:
@@ -892,7 +897,7 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `cursor-blink` | `true` | And then only if the desktop blinks its own cursor, and only while the program running has no opinion |
 | `cursor-style` | `"block"` | `block`, `bar`, `underline`, or `block_hollow`, the shape until the program running asks for another |
 | `background-opacity` | `1` | How much of the desktop shows through the window, down to `0.2` |
-| `background-blur` | `false` | Whether the compositor blurs what shows through, over `ext-background-effect-v1`. A number is read as Ghostty's blur intensity, which KWin decides for itself: any of them above zero means the same thing here |
+| `background-blur` | `false` | Whether the compositor blurs what shows through: `ext-background-effect-v1` on Wayland, the `_KDE_NET_WM_BLUR_BEHIND_REGION` property on X11. A number is read as Ghostty's blur intensity, which KWin decides for itself: any of them above zero means the same thing here |
 | `window-padding-x` | `0` | Pixels of nothing between the sides of the window and the grid, up to `40` |
 | `window-padding-y` | `0` | The same above and below |
 | `copy-on-select` | `false` | Whether releasing a selection puts it on the clipboard |
