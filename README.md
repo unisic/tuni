@@ -29,7 +29,7 @@ Rust and GTK4/libadwaita, with Ghostty's `libghostty-vt` doing the emulation.
 Connecting to another machine is OpenSSH's job here, not tuni's: a host opens by
 running `ssh` in a pane, so a password, a passphrase or a 2FA push is answered
 where it has always been answered. Tuni stores no secret and has nowhere to put
-one, which is also why hosts will never sync to a cloud account — syncing a
+one, which is also why hosts will never sync to a cloud account - syncing a
 credential means storing one.
 
 Tuni is a ground-up Linux implementation of the workspace
@@ -38,12 +38,33 @@ source is read as a specification of behavior, not translated.
 
 ## Performance
 
-<img width="1536" height="1024" alt="Uni-Bench 2.1: throughput of 17 terminal emulators consuming 200 MiB" src="https://github.com/user-attachments/assets/039da5aa-7b23-4c0e-82bb-6714cd04d78d" />
+200 MiB of mixed plain and SGR-colored output, best of two runs, on one
+machine. Time to consume it, so window and shell startup cancel out.
+
+| Terminal | Engine | Consume | Throughput |
+| --- | --- | ---: | ---: |
+| urxvt | X11, CPU | 1.579 s | 126.6 MiB/s |
+| foot | Wayland, CPU | 1.691 s | 118.3 MiB/s |
+| **tuni** | GTK4 + libghostty-vt | 1.723 s | **116.0 MiB/s** |
+| alacritty | GPU (OpenGL) | 1.785 s | 112.0 MiB/s |
+| kitty | GPU (OpenGL) | 1.807 s | 110.6 MiB/s |
+| st | X11, CPU | 2.215 s | 90.2 MiB/s |
+| ghostty | GTK4 + GPU | 2.785 s | 71.8 MiB/s |
+| terminator | VTE 0.84 | 2.829 s | 70.6 MiB/s |
+| ptyxis | VTE 0.84 | 2.835 s | 70.5 MiB/s |
+| gnome-terminal | VTE 0.84 | 2.852 s | 70.1 MiB/s |
+| tilix | VTE 0.84 | 2.884 s | 69.3 MiB/s |
+| sakura | VTE 0.84 | 2.892 s | 69.1 MiB/s |
+| xterm | X11, CPU | 3.726 s | 53.6 MiB/s |
+| qterminal | QTermWidget | 4.276 s | 46.7 MiB/s |
+| konsole | Qt | 4.634 s | 43.1 MiB/s |
+| lxterminal | VTE 0.84 | 9.825 s | 20.3 MiB/s |
+| xfce4-terminal | VTE 0.84 | 10.136 s | 19.7 MiB/s |
 
 Third of seventeen, within 10% of the fastest thing measured and ahead of both
-GPU terminals — with a whole workspace drawn around the terminal.
+GPU terminals - with a whole workspace drawn around the terminal.
 
-[docs/BENCHMARK.md](docs/BENCHMARK.md) — method, environment, caveats, and the
+[docs/BENCHMARK.md](docs/BENCHMARK.md) - method, environment, caveats, and the
 head-to-head with alacritty that the table above is too close to settle.
 
 ## Install
@@ -80,8 +101,8 @@ cargo run --release
 
 `make zig` fetches the official 0.15.2 tarball into `~/.local`, because the
 distribution's own package is 0.16 by now and the pinned Ghostty commit does
-not build against it. To build the 0.16 way instead — that toolchain, and the
-newer Ghostty commit which requires it — `make build-next`.
+not build against it. To build the 0.16 way instead - that toolchain, and the
+newer Ghostty commit which requires it - `make build-next`.
 
 ## Configuration
 
@@ -90,7 +111,7 @@ readable without it. The session lives under `~/.local/share/tuni`.
 
 ## Documentation
 
-[docs/DESIGN.md](docs/DESIGN.md) — every feature, every keyboard shortcut, and
+[docs/DESIGN.md](docs/DESIGN.md) - every feature, every keyboard shortcut, and
 why each piece is built the way it is.
 
 ## License
@@ -107,7 +128,7 @@ Built by [@DeBondor](https://github.com/DeBondor) and
 <div align="center">
 <br />
 
-<img src="docs/uni.png" width="230" alt="Uni, the Unisic mascot — a purple cat-girl sitting on a window" />
+<img src="docs/uni.png" width="230" alt="Uni, the Unisic mascot - a purple cat-girl sitting on a window" />
 
 *Uni approves this shell.*
 
