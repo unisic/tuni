@@ -67,7 +67,7 @@ Four crates, and the dependency arrow only points one way:
 | --- | --- |
 | `tuni-vt` | Facade over `libghostty-vt`. Nothing above this line imports it. |
 | `tuni-pty` | Shell process, PTY, reader thread, window resize. |
-| `tuni-core` | Portable models: settings, themes, projects, panes, session, git, ssh, sftp, lsp, `/proc`. No GTK. |
+| `tuni-core` | Portable models: settings, themes, projects, panes, session, git, ssh, sftp, lsp, syntax, `/proc`. No GTK. |
 | `tuni-gtk` | Widgets, window, actions, keybindings. The binary is `tuni`. |
 
 The upstream C API is pre-1.0 and expected to change, which is why the

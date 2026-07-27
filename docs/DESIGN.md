@@ -121,6 +121,16 @@ because the server builds its whole world from that answer once. A machine
 without a server simply has an editor without one, and closing the last file a
 server was watching shuts the server down rather than keeping it warm.
 
+A selection can follow the shape of the code rather than the reach of a drag.
+Alt+Up selects the smallest piece of syntax around the cursor, and pressed
+again the next one around that: the number, the expression, the statement, the
+function. Alt+Down retraces the growth one step at a time, and an edit or a
+click anywhere else retires the trail, since it described text that is gone.
+The shape comes from a real parse, tree-sitter with the grammars compiled in
+the way the themes are, covering most of the same languages the servers do; a
+file outside that table keeps its ordinary selection keys and loses nothing
+else.
+
 A row on the Git page opens what changed in that file rather than the file, in a
 pane of the same kind: the working tree against the index, or — for a row that is
 already staged — the index against HEAD. Each hunk is headed by its `@@` line and

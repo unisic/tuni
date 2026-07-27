@@ -19,3 +19,17 @@ serde_json = "1.0.151"
 # Word-level comparison inside a changed line. Only that: the diff between two
 # files is git's own, read as text.
 similar = "3.1"
+# The editor's structural selection asks a real parse tree what encloses the
+# cursor. The grammars are compiled in, like the themes: a fresh checkout works
+# offline and an installed build carries no grammar directory. One crate per
+# language the selection understands; a language without a maintained grammar
+# crate simply does not grow selections.
+tree-sitter = "0.26.11"
+tree-sitter-bash = "0.25.1"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-go = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"

@@ -83,6 +83,13 @@ mod imp {
         /// What the server last said about the file, in buffer terms, for the
         /// hover to read back.
         pub diagnostics: RefCell<Vec<crate::lsp::Shown>>,
+
+        /// Selections as they were before each grow, so a shrink is an exact
+        /// step back rather than a guess at the next node in.
+        pub selections: RefCell<Vec<(i32, i32)>>,
+        /// What the last grow selected. A shrink trusts the stack only while
+        /// this is still what is selected; a click elsewhere retires both.
+        pub grown: Cell<Option<(i32, i32)>>,
     }
 
     #[glib::object_subclass]
@@ -438,6 +445,8 @@ impl TuniEditor {
             entry("find-next", self, |editor| editor.find(true, true)),
             entry("find-previous", self, |editor| editor.find(false, true)),
             entry("definition", self, TuniEditor::definition_at_cursor),
+            entry("grow-selection", self, TuniEditor::grow_selection),
+            entry("shrink-selection", self, TuniEditor::shrink_selection),
         ]);
         self.insert_action_group("editor", Some(&actions));
 
@@ -450,6 +459,10 @@ impl TuniEditor {
             ("<Ctrl>g", "editor.find-next"),
             ("<Ctrl><Shift>g", "editor.find-previous"),
             ("F12", "editor.definition"),
+            // Alt with the vertical arrows reads as out and in; the horizontal
+            // pair stays with GTK, which moves by words on it.
+            ("<Alt>Up", "editor.grow-selection"),
+            ("<Alt>Down", "editor.shrink-selection"),
         ] {
             shortcuts.add_shortcut(gtk::Shortcut::new(
                 gtk::ShortcutTrigger::parse_string(keys),
@@ -533,6 +546,10 @@ impl TuniEditor {
             self,
             move |_| {
                 this.refresh_dirty();
+                // An edit moves everything after it; selections remembered
+                // against the old text would select the wrong characters.
+                this.imp().selections.borrow_mut().clear();
+                this.imp().grown.set(None);
                 crate::lsp::changed(&this);
             }
         ));
@@ -861,6 +878,69 @@ impl TuniEditor {
             })
             .cloned()
             .collect()
+    }
+
+    /// Selects the smallest syntax node strictly around the selection, from a
+    /// parse of the buffer as it stands. The selection it replaces goes on a
+    /// stack so the other key can walk back in.
+    fn grow_selection(&self) {
+        let imp = self.imp();
+        let Some(buffer) = imp.buffer.borrow().clone() else {
+            return;
+        };
+        if !self.is_editable() {
+            return;
+        }
+        let path = imp.path.borrow().clone();
+        let Some(language) = tuni_core::lsp::language_for_path(&path) else {
+            return;
+        };
+        let cursor = buffer.iter_at_mark(&buffer.get_insert());
+        let (start, end) = buffer
+            .selection_bounds()
+            .map_or((cursor, cursor), |bounds| bounds);
+        let (start, end) = (start.offset(), end.offset());
+        let Some(text) = self.text() else {
+            return;
+        };
+        let grown = tuni_core::syntax::grow_selection(
+            language.id,
+            &text,
+            start.max(0) as usize,
+            end.max(0) as usize,
+        );
+        let Some((from, to)) = grown else {
+            return;
+        };
+        let (Ok(from), Ok(to)) = (i32::try_from(from), i32::try_from(to)) else {
+            return;
+        };
+        imp.selections.borrow_mut().push((start, end));
+        imp.grown.set(Some((from, to)));
+        buffer.select_range(&buffer.iter_at_offset(from), &buffer.iter_at_offset(to));
+    }
+
+    /// Steps the selection back to what it was before the last grow.
+    fn shrink_selection(&self) {
+        let imp = self.imp();
+        let Some(buffer) = imp.buffer.borrow().clone() else {
+            return;
+        };
+        // Only a selection the grow key made is worth stepping back from;
+        // after a click somewhere else the stack is about a place gone by.
+        let current = buffer
+            .selection_bounds()
+            .map(|(start, end)| (start.offset(), end.offset()));
+        if current != imp.grown.get() {
+            imp.selections.borrow_mut().clear();
+            imp.grown.set(None);
+            return;
+        }
+        let Some((start, end)) = imp.selections.borrow_mut().pop() else {
+            return;
+        };
+        imp.grown.set(Some((start, end)));
+        buffer.select_range(&buffer.iter_at_offset(start), &buffer.iter_at_offset(end));
     }
 
     fn definition_at_cursor(&self) {
