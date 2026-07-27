@@ -8,8 +8,9 @@
 # died on SIGILL before the window appeared.
 #
 # Vector code that chooses itself at runtime is not the problem and is what the
-# list below allows. simdutf, memchr, simd-adler32 and the Highway kernels
-# Ghostty carries all ask CPUID first and have a fallback behind them. A ymm
+# list below allows. simdutf, memchr, simd-adler32, the Highway kernels
+# Ghostty carries, and aho-corasick's Teddy searcher (behind fancy-regex, which
+# matches URLs) all ask CPUID first and have a fallback behind them. A ymm
 # anywhere else got there because something compiled for the build machine.
 #
 # That question can only be asked of a binary that still has its symbols. Every
@@ -20,7 +21,7 @@
 set -eu
 
 binary=${1:?usage: check-baseline.sh BINARY}
-dispatched='simdutf|memchr|simd_adler32|N_AVX2|N_AVX3|hwy'
+dispatched='simdutf|memchr|simd_adler32|N_AVX2|N_AVX3|hwy|aho_corasick.*teddy'
 
 if [ "$(uname -m)" != x86_64 ]; then
     echo "$(uname -m) has no baseline to check against"
