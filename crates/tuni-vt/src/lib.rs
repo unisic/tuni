@@ -969,6 +969,61 @@ impl Terminal {
         }
     }
 
+    /// The soft-wrapped line one viewport row belongs to: its text, one
+    /// character per cell, and the viewport row it starts on.
+    ///
+    /// One character per cell is the contract that lets a character index name
+    /// a cell again: a spacer cell under a wide character contributes a space,
+    /// and a cell holding a grapheme cluster contributes the cluster's first
+    /// character. What that loses cannot be part of a URL anyway, which is
+    /// what this is read for. A run that began above the viewport starts at
+    /// the top edge here, the same place Ghostty's hover matching gives up.
+    ///
+    /// The text comes from the flattened grid of the last [`Self::snapshot`],
+    /// the same bargain [`Self::hyperlink_hover`] strikes: a hover is only
+    /// ever probed over something already drawn.
+    pub fn line_text(&mut self, row: u16) -> Result<(String, u16)> {
+        let row = row.min(self.grid.rows.saturating_sub(1));
+        let mut first = row;
+        while first > 0 && self.row_continues(first)? {
+            first -= 1;
+        }
+        let mut last = row;
+        while last + 1 < self.grid.rows && self.row_wraps(last)? {
+            last += 1;
+        }
+
+        let cols = usize::from(self.grid.cols);
+        let mut line = String::with_capacity(cols * usize::from(last - first + 1));
+        for y in first..=last {
+            for x in 0..self.grid.cols {
+                let text = self
+                    .grid
+                    .cell(x, y)
+                    .map(|cell| cell.text.as_str())
+                    .unwrap_or("");
+                line.push(text.chars().next().unwrap_or(' '));
+            }
+        }
+        Ok((line, first))
+    }
+
+    fn row_wraps(&self, row: u16) -> Result<bool> {
+        let point = Point::Viewport(PointCoordinate {
+            x: 0,
+            y: u32::from(row),
+        });
+        self.inner.grid_ref(point)?.row()?.is_wrapped()
+    }
+
+    fn row_continues(&self, row: u16) -> Result<bool> {
+        let point = Point::Viewport(PointCoordinate {
+            x: 0,
+            y: u32::from(row),
+        });
+        self.inner.grid_ref(point)?.row()?.is_wrap_continuation()
+    }
+
     /// The OSC 8 URI on one viewport cell, if it carries one.
     pub fn hyperlink_at(&mut self, col: u16, row: u16) -> Result<Option<String>> {
         let Some(len) = self.read_hyperlink(col, row)? else {

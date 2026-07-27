@@ -83,7 +83,10 @@ fn the_wheel_becomes_arrows_on_the_alternate_screen() {
     );
 
     terminal.feed(b"\x1b[?1049h");
-    assert_eq!(terminal.encode_alternate_scroll(1).expect("encode"), b"\x1b[B");
+    assert_eq!(
+        terminal.encode_alternate_scroll(1).expect("encode"),
+        b"\x1b[B"
+    );
     assert_eq!(
         terminal.encode_alternate_scroll(-2).expect("encode"),
         b"\x1b[A\x1b[A"
@@ -95,7 +98,10 @@ fn the_wheel_becomes_arrows_on_the_alternate_screen() {
 fn alternate_scroll_honors_cursor_key_application_mode() {
     let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
     terminal.feed(b"\x1b[?1049h\x1b[?1h");
-    assert_eq!(terminal.encode_alternate_scroll(1).expect("encode"), b"\x1bOB");
+    assert_eq!(
+        terminal.encode_alternate_scroll(1).expect("encode"),
+        b"\x1bOB"
+    );
 }
 
 #[test]
@@ -105,7 +111,10 @@ fn a_tracking_application_hears_the_wheel_as_buttons_not_arrows() {
     assert_eq!(terminal.encode_alternate_scroll(1).expect("encode"), b"");
 
     terminal.feed(b"\x1b[?1000l");
-    assert_eq!(terminal.encode_alternate_scroll(1).expect("encode"), b"\x1b[B");
+    assert_eq!(
+        terminal.encode_alternate_scroll(1).expect("encode"),
+        b"\x1b[B"
+    );
 }
 
 #[test]
@@ -220,6 +229,24 @@ fn ctrl_turns_the_third_click_into_the_command_output() {
 }
 
 #[test]
+fn a_wrapped_line_reads_back_as_one() {
+    let mut terminal = Terminal::new(10, 5, 100).expect("terminal");
+    terminal.feed(b"0123456789abcd\r\nplain");
+    // The line is read off the flattened grid, which a draw keeps current;
+    // here the snapshot stands in for the draw.
+    terminal.snapshot().expect("snapshot");
+
+    let (line, first) = terminal.line_text(1).expect("line");
+    assert_eq!(first, 0, "the run starts on its first row");
+    assert_eq!(line.len(), 20, "one character per cell, both rows");
+    assert!(line.starts_with("0123456789abcd"));
+
+    let (line, first) = terminal.line_text(2).expect("line");
+    assert_eq!(first, 2, "an unwrapped row is its own line");
+    assert!(line.starts_with("plain"));
+}
+
+#[test]
 fn a_drag_pinned_to_the_edge_asks_for_autoscroll() {
     let mut terminal = Terminal::new(20, 3, 100).expect("terminal");
     terminal.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
@@ -234,13 +261,17 @@ fn a_drag_pinned_to_the_edge_asks_for_autoscroll() {
 
     // Against the bottom edge: past `screen height - 1`, Ghostty's margin.
     let edge = f64::from(3 * CELL_H) - 0.5;
-    terminal.select_drag(x, edge, geometry, false).expect("drag");
+    terminal
+        .select_drag(x, edge, geometry, false)
+        .expect("drag");
     assert_eq!(terminal.selection_autoscroll(), Some(false));
 
     let before = terminal.scroll_position().offset;
-    assert!(terminal
-        .autoscroll_tick(x, edge, geometry, false)
-        .expect("tick"));
+    assert!(
+        terminal
+            .autoscroll_tick(x, edge, geometry, false)
+            .expect("tick")
+    );
     assert_eq!(
         terminal.scroll_position().offset,
         before + 1,

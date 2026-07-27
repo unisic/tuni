@@ -19,7 +19,8 @@ rendering, mouse selection with word and line clicks, clipboard and bracketed
 paste, SGR mouse reporting and focus reporting for applications that ask for
 them, an overlay
 scrollbar that fades when idle, a cursor that blinks by the desktop's own
-preference, OSC 8 hyperlinks opened with `Ctrl`+click, inline images over the
+preference, OSC 8 hyperlinks and plain-text URLs opened with `Ctrl`+click,
+inline images over the
 kitty graphics protocol, a configurable font with live zoom, and Ghostty's 574
 color themes, which paint the window chrome as well as the terminal. `ls`,
 `vi`, and `top` all render correctly.
@@ -789,10 +790,19 @@ the split beside it is a departure for the pane that had it.
 
 A hyperlink is whatever the program holding the PTY says it is, which over ssh
 is not the person at the keyboard. So `Ctrl` has to be held before one lights up
-at all, the press only opens on release and only if the same link is still
-underneath, and the URI is handed to the desktop only when it carries no control
-character and its scheme is one of `http`, `https`, `mailto`, `ftp`, `ftps`, or
-a `file://` that names this machine.
+at all, exactly `Ctrl`, since `Ctrl+Alt` is a block selection on its way; the
+press only opens on release and only if the same link is still underneath, and
+the URI is handed to the desktop only when it carries no control character and
+its scheme is one of `http`, `https`, `mailto`, `ftp`, `ftps`, or a `file://`
+that names this machine.
+
+A URL that is only text gets the same treatment. A cell with no OSC 8 on it is
+matched against Ghostty's URL regex, ported scheme branch for scheme branch,
+run over the whole soft-wrapped line so an address broken across rows still
+reads as one. Only the scheme branch: Ghostty also matches bare file paths, on
+heuristics its own comments call breakable, and a path in this workspace has
+better ways to open than a guess. A match whose scheme the opener above would
+refuse never lights up, because an underline is a promise the click keeps.
 
 Notifications are read out of the PTY stream a second time rather than out of
 the terminal state, because at the pinned commit `libghostty-vt` recognizes

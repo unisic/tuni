@@ -2101,12 +2101,29 @@ impl TuniTerminal {
 
         let hover = cell.and_then(|(col, row)| {
             let mut guard = imp.session.borrow_mut();
-            guard
-                .as_mut()?
-                .term
-                .hyperlink_hover(col, row)
-                .ok()
-                .flatten()
+            let session = guard.as_mut()?;
+            if let Some(hover) = session.term.hyperlink_hover(col, row).ok().flatten() {
+                return Some(hover);
+            }
+            // No OSC 8 on the cell: the URL the text itself spells, matched
+            // with Ghostty's regex over the soft-wrapped line. Only a URL the
+            // opener would accept lights up; a match it would refuse is a
+            // promise the click could not keep.
+            let (line, first) = session.term.line_text(row).ok()?;
+            let cols = usize::from(self.geometry().cols);
+            let index = usize::from(row - first) * cols + usize::from(col);
+            let found = tuni_core::links::url_at(&line, index)?;
+            if !can_open(&found.uri) {
+                return None;
+            }
+            let cells = found
+                .range
+                .map(|i| ((i % cols) as u16, first + (i / cols) as u16))
+                .collect();
+            Some(tuni_vt::LinkHover {
+                uri: found.uri,
+                cells,
+            })
         });
 
         if *imp.link_hover.borrow() == hover {

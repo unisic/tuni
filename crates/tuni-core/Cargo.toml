@@ -8,6 +8,9 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# Ghostty's URL regex ends on a lookbehind, which the plain `regex` crate
+# refuses on principle; this is the engine that takes it.
+fancy-regex = "0.16"
 # Signals and the two sysconf values /proc numbers are measured in.
 libc = "0.2"
 # OpenCode keeps its sessions in SQLite, and reading them is the only reason
