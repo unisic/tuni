@@ -50,6 +50,13 @@ ZIG_SHA256 = $(ZIG_SHA256_$(ZIG_VERSION)_$(ZIG_ARCH))
 # does not: it is for this build and not for everything else on the machine.
 ZIG_LINK ?= yes
 
+# Which CPU the Zig half is compiled for. Left alone, zig detects the machine
+# doing the building, which is right for a build that stays there and wrong for
+# a package: the 1.1.1 binaries were compiled on a runner with AVX-512 and died
+# on SIGILL on the first machine without it. baseline is what a package wants;
+# ZIG_CPU=native is for a build that never leaves this machine.
+ZIG_CPU ?= baseline
+
 # Ghostty's main branch moves and the C API the bindings are generated from
 # moves with it, so the 0.16 route is a commit that was built and tested
 # against this tree, not a branch name.
@@ -64,6 +71,9 @@ all: build
 build:
 	@zig version 2>/dev/null | grep -qx '$(ZIG_VERSION)' || \
 		echo "warning: zig $(ZIG_VERSION) is not on PATH; \`make zig\` installs it, \`make build-next\` builds with $(ZIG_NEXT_VERSION) instead"
+	@real=$$(command -v zig) || { echo "zig is not on PATH" >&2; exit 1; }; \
+	TUNI_REAL_ZIG="$$real" TUNI_ZIG_CPU='$(ZIG_CPU)' \
+	PATH="$(CURDIR)/scripts/zig-baseline:$$PATH" \
 	$(CARGO) build --release --locked
 
 # The 0.16 route: that toolchain, the Ghostty commit that accepts it, and a

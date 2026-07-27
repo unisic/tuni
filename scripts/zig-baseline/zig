@@ -1,0 +1,19 @@
+#!/bin/sh
+# The zig a packaged build sees, and it exists for one flag.
+#
+# libghostty-vt-sys runs `zig build` without naming a target, so zig compiles
+# Ghostty for the exact CPU of the machine doing the building. The memset that
+# ended up in the 1.1.1 packages was compiled on a GitHub runner with AVX-512
+# and killed the program with SIGILL on the first machine without it, before
+# the window appeared. Nothing but a build flag decides this: zig reads the CPU
+# from -Dcpu and from no environment variable, and the build script has no way
+# to pass one through. So the flag goes on here, and the Makefile puts this
+# directory in front of the real toolchain.
+set -eu
+
+if [ "${1-}" = build ]; then
+    shift
+    exec "$TUNI_REAL_ZIG" build "-Dcpu=$TUNI_ZIG_CPU" "$@"
+fi
+
+exec "$TUNI_REAL_ZIG" "$@"

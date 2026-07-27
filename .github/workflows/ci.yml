@@ -36,12 +36,13 @@ jobs:
           tar xf "zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           echo "${GITHUB_WORKSPACE}/zig-x86_64-linux-${ZIG_VERSION}" >> "${GITHUB_PATH}"
 
-      # libghostty-vt-sys builds Ghostty for the host without naming a target,
-      # so zig compiles it for the exact CPU of the machine it ran on. The
-      # ubuntu-latest label hands out Intel and AMD parts with different
-      # instruction sets, and a target directory restored onto the other kind
-      # dies with SIGILL the first time anything calls in. Hashing the CPU's
-      # own feature list into the key keeps a cache on the machines it runs on.
+      # `make build` pins the CPU the release binary is compiled for, but the
+      # tests below do not go through it and zig compiles those for whatever
+      # machine ran them. The ubuntu-latest label hands out Intel and AMD parts
+      # with different instruction sets, and a target directory restored onto
+      # the other kind dies with SIGILL the first time anything calls in.
+      # Hashing the CPU's own feature list into the key keeps a cache on the
+      # machines it runs on.
       - name: Identify the runner's instruction set
         id: cpu
         run: |
@@ -55,14 +56,20 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ steps.cpu.outputs.id }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-${{ steps.cpu.outputs.id }}-
+          key: ${{ runner.os }}-cargo-baseline-${{ steps.cpu.outputs.id }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-baseline-${{ steps.cpu.outputs.id }}-
 
       - name: Format
         run: cargo fmt --check
 
+      # `make build`, not plain cargo: the Makefile is what pins the CPU the
+      # Zig half compiles for, and a release built any other way is a release
+      # that only runs on the machine that built it.
       - name: Build
-        run: cargo build --release --locked
+        run: make build
+
+      - name: Check the binary against the baseline CPU
+        run: scripts/check-baseline.sh target/release/tuni
 
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings

@@ -6,7 +6,7 @@ name: Release
 # job installs what it built before uploading it, because a package that has
 # never been installed is a claim rather than a package.
 #
-#   git tag v1.1.1 && git push origin v1.1.1
+#   git tag v1.1.2 && git push origin v1.1.2
 
 on:
   push:
@@ -89,6 +89,9 @@ jobs:
       - name: Install what was built
         run: dnf install -y ./dist/*.rpm && test -x /usr/bin/tuni
 
+      - name: Check the binary against the baseline CPU
+        run: scripts/check-baseline.sh /usr/bin/tuni
+
       - uses: actions/upload-artifact@v7
         with:
           name: tuni-rpm
@@ -132,6 +135,9 @@ jobs:
       - name: Install what was built
         run: apt-get install -y ./dist/*.deb && test -x /usr/bin/tuni
 
+      - name: Check the binary against the baseline CPU
+        run: scripts/check-baseline.sh /usr/bin/tuni
+
       - uses: actions/upload-artifact@v7
         with:
           name: tuni-deb
@@ -169,6 +175,9 @@ jobs:
 
       - name: Install what was built
         run: pacman -U --noconfirm ./dist/*.pkg.tar.zst && test -x /usr/bin/tuni
+
+      - name: Check the binary against the baseline CPU
+        run: scripts/check-baseline.sh /usr/bin/tuni
 
       - uses: actions/upload-artifact@v7
         with:

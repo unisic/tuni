@@ -85,13 +85,35 @@ build, rather than sitting at the top of the tree the whole time.
 ## Arch — `arch/PKGBUILD`
 
 ```sh
-make dist && mv tuni-1.1.1.tar.gz packaging/arch/
+make dist && mv tuni-1.1.2.tar.gz packaging/arch/
 cd packaging/arch && makepkg -si
 ```
 
 The pinned Zig comes down as a second `source` entry, by URL and checksum,
 because Arch's own is 0.16. `build()` still wants the network for cargo and the
 Ghostty source.
+
+## Which CPU a package is built for
+
+`zig build` compiles for the machine it runs on unless told otherwise, and
+nothing in `libghostty-vt-sys` tells it otherwise. That is right for a build
+that stays where it was made and wrong for a package: 1.1.1 was compiled on a
+GitHub runner with AVX-512 and died with SIGILL, in `memset`, before the window
+appeared, on every machine without it.
+
+So `make build` puts `scripts/zig-baseline` in front of the real toolchain,
+which adds `-Dcpu=baseline` to the `zig build` the Cargo build script runs.
+Every package format here goes through `make build`, so there is one place
+where this is decided. `make build ZIG_CPU=native` is the other way, for a
+build that is not going anywhere.
+
+The Rust half needs nothing: rustc already targets the baseline unless asked
+for more. Vector code that dispatches on CPUID at runtime, which is most of
+what makes a terminal fast, is unaffected and still used.
+
+`scripts/check-baseline.sh` reads the instructions back out of a built binary
+and refuses one that went out compiled for its build machine. CI runs it, and
+so does every package job, on the binary it just installed.
 
 ## Releases
 
