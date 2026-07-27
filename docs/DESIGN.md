@@ -231,7 +231,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | Hold `Ctrl`, press `Tab` | The tab switcher: cards for every tab, most recently used first. `Shift+Tab` walks back, `Escape` cancels, letting `Ctrl` go switches |
 | `Alt+1` … `Alt+9` | Jump to a tab; `Alt+9` is the last one |
 | `Ctrl+Shift+N` | New project |
-| `Ctrl+Alt+Page Down` / `Ctrl+Alt+Page Up` | Next project, previous project |
+| `Ctrl+Alt+Page Down` / `Ctrl+Alt+Page Up`, `Ctrl+Shift+Down` / `Ctrl+Shift+Up` | Next project, previous project |
 | `Ctrl+Shift+1` … `Ctrl+Shift+9` | Jump to a project |
 | `F9` | Show or hide the sidebar |
 | `Ctrl+Shift+B` | Show or hide the panel |

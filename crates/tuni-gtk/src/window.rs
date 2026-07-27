@@ -301,6 +301,8 @@ mod imp {
         /// side.
         pub panel: RefCell<Option<adw::OverlaySplitView>>,
         pub panel_view: RefCell<Option<TuniPanel>>,
+        /// The panel's re-read poll, alive only while the panel is showing.
+        pub panel_timer: RefCell<Option<glib::SourceId>>,
         /// Project name labels, in sidebar order.
         pub labels: RefCell<Vec<gtk::Label>>,
         /// Shared context menu for the sidebar rows, parented once.
@@ -638,11 +640,34 @@ impl TuniWindow {
             .sync_create()
             .build();
         // Opening it is the moment its contents matter, and until then it is
-        // not reading the disk at all.
+        // not reading the disk at all — nor waking up to decide not to: the
+        // poll lives only for as long as the panel is showing.
         panel.connect_show_sidebar_notify(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |_| this.sync_files()
+            move |panel| {
+                this.sync_files();
+                let mut timer = this.imp().panel_timer.borrow_mut();
+                if panel.shows_sidebar() {
+                    if timer.is_none() {
+                        *timer = Some(glib::timeout_add_seconds_local(
+                            PANEL_POLL_SECONDS,
+                            glib::clone!(
+                                #[weak]
+                                this,
+                                #[upgrade_or]
+                                glib::ControlFlow::Break,
+                                move || {
+                                    this.poll_files();
+                                    glib::ControlFlow::Continue
+                                }
+                            ),
+                        ));
+                    }
+                } else if let Some(timer) = timer.take() {
+                    timer.remove();
+                }
+            }
         ));
 
         let content_view = adw::ToolbarView::new();
@@ -675,23 +700,6 @@ impl TuniWindow {
         toasts.set_child(Some(&split));
         self.imp().toasts.replace(Some(toasts.clone()));
         self.set_content(Some(&toasts));
-
-        // Re-reads the open directories while the panel is showing, so a file
-        // written by the shell beside it appears without being asked for.
-        glib::timeout_add_seconds_local(
-            PANEL_POLL_SECONDS,
-            glib::clone!(
-                #[weak(rename_to = this)]
-                self,
-                #[upgrade_or]
-                glib::ControlFlow::Break,
-                move || {
-                    this.poll_files();
-                    this.poll_diffs();
-                    glib::ControlFlow::Continue
-                }
-            ),
-        );
 
         // What being given the window back is worth: a host list re-reads files
         // the user edits somewhere else, since coming back is when they would
@@ -1219,36 +1227,15 @@ impl TuniWindow {
 
     /// The timer's half of that: the root cannot have moved without something
     /// else having said so, but what is inside it can.
+    /// Re-reads the open directories, so a file written by the shell beside
+    /// the panel appears without being asked for. Runs on a timer that exists
+    /// only while the panel is showing.
     fn poll_files(&self) {
-        let imp = self.imp();
-        if !imp
-            .panel
-            .borrow()
-            .as_ref()
-            .is_some_and(adw::OverlaySplitView::shows_sidebar)
-        {
-            return;
-        }
         // Cheap when the root has not moved, and it is what catches a `cd`
         // into a different repository.
         self.sync_files();
-        if let Some(panel) = imp.panel_view.borrow().as_ref() {
+        if let Some(panel) = self.imp().panel_view.borrow().as_ref() {
             panel.poll();
-        }
-    }
-
-    /// A diff is over a file the shell beside it can edit, and nothing else
-    /// says when that happened, so the same timer re-reads it. A read that
-    /// comes back unchanged leaves the pane alone.
-    fn poll_diffs(&self) {
-        for diff in self.imp().diffs.borrow().values() {
-            // Only the one on screen. A diff on a tab nobody has selected is
-            // unmapped, and re-reading it costs three git processes every two
-            // seconds for a pane whose content nobody can see. It catches up
-            // on `map`, which is what selecting the tab again does.
-            if diff.is_mapped() {
-                diff.reload();
-            }
         }
     }
 
@@ -2654,9 +2641,9 @@ impl TuniWindow {
     ///
     /// Every close path goes through here rather than repeating the three
     /// registry removals, because a registry emptied on only some of them keeps
-    /// the widget alive for the life of the window — and `poll_diffs` visits
-    /// every diff it finds there, so a forgotten one keeps shelling out to git
-    /// every two seconds for a pane nobody can see.
+    /// the widget alive for the life of the window — and a mapped diff polls
+    /// its file, so a forgotten one keeps shelling out to git every two
+    /// seconds for a pane nobody can see.
     fn forget_pane(&self, pane: Id) {
         let imp = self.imp();
         imp.diffs.borrow_mut().remove(&pane);

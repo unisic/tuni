@@ -40,6 +40,11 @@ const MAX_LINES: usize = 4000;
 const ROW_TINT: f64 = 0.16;
 const SPAN_TINT: f64 = 0.38;
 
+/// How often a diff on screen re-reads its file. The poll belongs to the pane
+/// rather than to a window-wide timer, so a diff nobody is looking at — its
+/// tab unmapped — costs no wakeup at all.
+const POLL_SECONDS: u32 = 2;
+
 mod imp {
     use super::{Cell, Colors, Diff, PathBuf, Rc, RefCell, glib};
     use adw::subclass::prelude::*;
@@ -74,6 +79,8 @@ mod imp {
         /// that the answer is about the file before.
         pub generation: Cell<u64>,
         pub colors: RefCell<Colors>,
+        /// The re-read poll, alive only while the pane is mapped.
+        pub timer: RefCell<Option<glib::SourceId>>,
 
         pub name: RefCell<Option<gtk::Label>>,
         pub place: RefCell<Option<gtk::Label>>,
@@ -172,10 +179,34 @@ impl TuniDiff {
     fn build(&self) {
         let imp = self.imp();
 
-        // The timer skips a diff nobody is looking at, so coming back into
-        // view is what asks for the re-read it did not do — selecting the tab
-        // again, or restoring the window.
-        self.connect_map(|this| this.reload());
+        // Coming back into view asks for the re-read the time away did not
+        // do — selecting the tab again, or restoring the window — and starts
+        // the poll that catches the shell beside it editing the file. Leaving
+        // stops it: an unmapped pane has nothing to redraw for.
+        self.connect_map(|this| {
+            this.reload();
+            let mut timer = this.imp().timer.borrow_mut();
+            if timer.is_none() {
+                *timer = Some(glib::timeout_add_seconds_local(
+                    POLL_SECONDS,
+                    glib::clone!(
+                        #[weak]
+                        this,
+                        #[upgrade_or]
+                        glib::ControlFlow::Break,
+                        move || {
+                            this.reload();
+                            glib::ControlFlow::Continue
+                        }
+                    ),
+                ));
+            }
+        });
+        self.connect_unmap(|this| {
+            if let Some(timer) = this.imp().timer.borrow_mut().take() {
+                timer.remove();
+            }
+        });
 
         let hunks = gtk::Box::new(gtk::Orientation::Vertical, 10);
         hunks.set_margin_start(8);

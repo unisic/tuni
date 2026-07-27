@@ -25,6 +25,18 @@ impl From<libghostty_vt::style::RgbColor> for Rgb {
     }
 }
 
+impl Rgb {
+    /// `amount` of `other`, the rest of `self`.
+    pub fn blend(self, other: Self, amount: f64) -> Self {
+        let mix = |a: u8, b: u8| (f64::from(a) * (1.0 - amount) + f64::from(b) * amount) as u8;
+        Self {
+            r: mix(self.r, other.r),
+            g: mix(self.g, other.g),
+            b: mix(self.b, other.b),
+        }
+    }
+}
+
 impl From<Rgb> for libghostty_vt::style::RgbColor {
     fn from(c: Rgb) -> Self {
         Self {

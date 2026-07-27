@@ -2976,6 +2976,12 @@ impl TuniTerminal {
 
         match session.term.encode_key(&input) {
             Ok(bytes) if !bytes.is_empty() => {
+                if std::env::var_os("TUNI_DEBUG_KEYS").is_some() {
+                    eprintln!(
+                        "key {key:?} mods {mods:?} -> {:?}",
+                        String::from_utf8_lossy(bytes).escape_default().to_string()
+                    );
+                }
                 send(&mut session.pty, bytes);
                 // Typing pulls the viewport back down: the answer is about to
                 // arrive at the bottom. It also takes the selection with it,
@@ -2992,7 +2998,12 @@ impl TuniTerminal {
                 self.queue_draw();
                 true
             }
-            _ => false,
+            result => {
+                if std::env::var_os("TUNI_DEBUG_KEYS").is_some() {
+                    eprintln!("key {key:?} mods {mods:?} -> nothing ({result:?})");
+                }
+                false
+            }
         }
     }
 

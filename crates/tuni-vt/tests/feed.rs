@@ -59,6 +59,19 @@ fn sgr_sets_color_and_attributes() {
 }
 
 #[test]
+fn faint_text_draws_halfway_to_the_background() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    terminal.feed(b"\x1b[2mdim\x1b[0mfull");
+
+    let grid = terminal.snapshot().expect("snapshot");
+    let dim = grid.cell(0, 0).expect("cell 0");
+    let full = grid.cell(3, 0).expect("cell 3");
+    let expected = grid.fg.blend(grid.bg, 0.5);
+    assert_eq!(dim.fg, expected, "faint halves the way to the background");
+    assert_eq!(full.fg, grid.fg, "reset restores full strength");
+}
+
+#[test]
 fn inverse_video_swaps_foreground_and_background() {
     let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
     terminal.feed(b"\x1b[7mx");

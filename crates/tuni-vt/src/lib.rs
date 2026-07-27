@@ -1285,6 +1285,15 @@ impl Terminal {
                     out.italic = style.italic;
                     out.strikethrough = style.strikethrough;
                     out.underline = style.underline != libghostty_vt::style::Underline::None;
+                    if style.faint {
+                        // Half-way to the background, the share Ghostty's
+                        // renderer gives a faint cell. Without this a faint
+                        // run — a completion's placeholder, a suggestion —
+                        // draws at full strength and reads as typed text.
+                        fg = Rgb::from(fg)
+                            .blend(Rgb::from(bg.unwrap_or(colors.background)), 0.5)
+                            .into();
+                    }
                 }
 
                 if selected {

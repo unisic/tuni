@@ -71,8 +71,16 @@ pub(crate) const ACCELS: &[(&str, &[&str])] = &[
     ("win.next-tab", &["<Ctrl>Page_Down"]),
     ("win.previous-tab", &["<Ctrl>Page_Up"]),
     ("win.new-project", &["<Ctrl><Shift>n"]),
-    ("win.next-project", &["<Ctrl><Alt>Page_Down"]),
-    ("win.previous-project", &["<Ctrl><Alt>Page_Up"]),
+    // `Ctrl+Shift`+arrow is the pair the project row order suggests: up the
+    // list, down the list. Numbers on the same modifier pick one directly.
+    (
+        "win.next-project",
+        &["<Ctrl><Alt>Page_Down", "<Ctrl><Shift>Down"],
+    ),
+    (
+        "win.previous-project",
+        &["<Ctrl><Alt>Page_Up", "<Ctrl><Shift>Up"],
+    ),
     ("win.toggle-sidebar", &["F9"]),
     // kero's own key for the panel on the other side.
     ("win.toggle-panel", &["<Ctrl><Shift>b"]),
