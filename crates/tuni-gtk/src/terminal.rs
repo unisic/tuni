@@ -67,7 +67,10 @@ pub struct Launch {
 }
 
 /// What the pointer is doing between press and release. A drag either paints a
-/// selection or is reported to the application; never both.
+/// selection or is reported to the application; never both, which is decided
+/// at the press the way Ghostty decides it: an application that turned on
+/// mouse tracking hears the press immediately, and selection is what happens
+/// everywhere else.
 #[derive(Clone, Copy, Default)]
 enum Pointer {
     #[default]
@@ -78,14 +81,6 @@ enum Pointer {
     /// where Ghostty opens it and where a press that slid off can still be
     /// taken back.
     Link,
-    /// Pressed where an application listens for clicks but not for motion. The
-    /// press waits: leaving the cell makes it a selection, lifting inside the
-    /// cell makes it the click the application was listening for.
-    Held {
-        x: f64,
-        y: f64,
-        time: u32,
-    },
 }
 
 /// The overlay scrollbar's thumb, in widget pixels.
@@ -294,6 +289,17 @@ mod imp {
         /// Modifiers as of the last event, so pressing Ctrl with a stationary
         /// pointer can light up the hyperlink under it.
         pub(super) mods: Cell<Mods>,
+        /// When the left button last began a selection press, in event time,
+        /// so a Shift+click can tell "extend the selection" apart from "the
+        /// third click of a triple".
+        pub(super) last_left_press: Cell<Option<u32>>,
+        /// Wheel and touchpad movement not yet a whole row, in pixels. Ghostty
+        /// accumulates the same way, which is what lets a slow touchpad drag
+        /// eventually move a line instead of never moving at all.
+        pub(super) pending_scroll: Cell<f64>,
+        /// The timer that scrolls a drag pinned against the top or bottom
+        /// edge, alive only while the gesture wants it.
+        pub(super) autoscroll: RefCell<Option<glib::SourceId>>,
         /// The hyperlink under the pointer, the cell it was found on, and
         /// whether that answer still stands. Output, scrolling, and resizing
         /// all move what a viewport coordinate means, so each of them retires
@@ -379,6 +385,9 @@ mod imp {
                 buttons_down: Cell::new(0),
                 pointer_pos: Cell::new((0.0, 0.0)),
                 mods: Cell::new(Mods::empty()),
+                last_left_press: Cell::new(None),
+                pending_scroll: Cell::new(0.0),
+                autoscroll: RefCell::new(None),
                 link_hover: RefCell::new(None),
                 link_probe: Cell::new(None),
                 link_valid: Cell::new(false),
@@ -480,6 +489,9 @@ mod imp {
 
         fn dispose(&self) {
             if let Some(source) = self.blink_source.take() {
+                source.remove();
+            }
+            if let Some(source) = self.autoscroll.take() {
                 source.remove();
             }
             if let Some(tick) = self.bar_tick.take() {
@@ -925,14 +937,16 @@ impl TuniTerminal {
         ));
         self.add_controller(motion);
 
-        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        // Both axes: a tilt wheel's sideways clicks are reported to an
+        // application that tracks the mouse, as buttons six and seven.
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
         scroll.connect_scroll(glib::clone!(
             #[weak(rename_to = this)]
             self,
             #[upgrade_or]
             glib::Propagation::Proceed,
-            move |controller, _, dy| {
-                this.on_scroll(controller, dy);
+            move |controller, dx, dy| {
+                this.on_scroll(controller, dx, dy);
                 glib::Propagation::Stop
             }
         ));
@@ -1987,25 +2001,29 @@ impl TuniTerminal {
 
     /// Whether this event belongs to the application rather than to selection.
     /// Shift is the standard override: it takes the mouse back even while an
-    /// application is tracking it.
+    /// application is tracking it, unless the application sent XTSHIFTESCAPE
+    /// to ask for Shift, which is the same bargain Ghostty's default
+    /// `mouse-shift-capture` strikes.
     fn reports_mouse(&self, mods: Mods) -> bool {
-        if mods.contains(Mods::SHIFT) || !self.imp().config.borrow().mouse_reporting {
+        if !self.imp().config.borrow().mouse_reporting {
             return false;
         }
-        self.imp()
-            .session
-            .borrow()
-            .as_ref()
-            .is_some_and(|session| session.term.is_mouse_tracking())
+        self.imp().session.borrow().as_ref().is_some_and(|session| {
+            session.term.is_mouse_tracking()
+                && (!mods.contains(Mods::SHIFT) || session.term.captures_shift())
+        })
     }
 
-    /// Whether a drag is something the application can hear at all.
-    fn tracks_motion(&self) -> bool {
-        self.imp()
-            .session
-            .borrow()
-            .as_ref()
-            .is_some_and(|session| session.term.tracks_mouse_motion())
+    /// Whether the wheel belongs to the application. Scroll is the one place
+    /// Ghostty does not let Shift take the mouse back, so neither does this.
+    fn reports_scroll(&self) -> bool {
+        self.imp().config.borrow().mouse_reporting
+            && self
+                .imp()
+                .session
+                .borrow()
+                .as_ref()
+                .is_some_and(|session| session.term.is_mouse_tracking())
     }
 
     fn report_mouse(
@@ -2064,7 +2082,10 @@ impl TuniTerminal {
     /// is reused rather than asked for again.
     fn refresh_links(&self, mods: Mods) {
         let imp = self.imp();
-        let armed = mods.contains(Mods::CTRL) && !self.reports_mouse(mods);
+        // Exactly Ctrl, the way Ghostty compares its link modifiers: Ctrl+Alt
+        // is a block selection on its way, not a link.
+        let held = mods.intersection(Mods::SHIFT | Mods::CTRL | Mods::ALT | Mods::SUPER);
+        let armed = held == Mods::CTRL && !self.reports_mouse(mods);
         let cell = armed
             .then(|| {
                 let (x, y) = imp.pointer_pos.get();
@@ -2197,18 +2218,46 @@ impl TuniTerminal {
             return;
         }
 
-        if self.reports_mouse(mods) {
-            // Ghostty hands every press to an application that tracks the
-            // mouse, which leaves Shift as the only way to select in one. That
-            // is the right answer while the application follows the pointer,
-            // and a poor one while it only listens for clicks: the drag it is
-            // being given is a drag it will never be told about. So a press of
-            // the selecting button waits, and becomes whichever of the two the
-            // pointer turns out to be doing.
-            if button == gdk::BUTTON_PRIMARY && !self.tracks_motion() {
-                imp.pointer.set(Pointer::Held { x, y, time });
+        // Shift on a left press extends the selection that is already there,
+        // from the anchor the first click dropped, at whatever granularity
+        // that click chose. Only after the repeat interval, because inside it
+        // this press is a double or triple click still being counted, and
+        // Ghostty makes the same distinction on the same clock.
+        if button == gdk::BUTTON_PRIMARY
+            && mods.contains(Mods::SHIFT)
+            && imp
+                .last_left_press
+                .get()
+                .is_some_and(|last| time.wrapping_sub(last) > 500)
+        {
+            let extend = {
+                let guard = imp.session.borrow();
+                guard.as_ref().is_some_and(|session| {
+                    !session.term.captures_shift()
+                        && session.term.click_count() > 0
+                        && session.term.has_selection()
+                })
+            };
+            if extend {
+                imp.pointer.set(Pointer::Selecting);
+                self.selection_drag(x, y, rectangle_selection(mods));
                 return;
             }
+        }
+
+        if self.reports_mouse(mods) {
+            // The application hears the press the moment it happens, drags
+            // and all, which is what Ghostty gives a tracking application.
+            // Whatever selection was on screen goes: the mouse is spoken for.
+            // Shift still takes the mouse back for selection, unless the
+            // application asked to see Shift too, and `Ctrl+Shift+M` takes it
+            // back wholesale.
+            let mut guard = imp.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                let _ = session.term.clear_selection();
+            }
+            drop(guard);
+            self.queue_draw();
             imp.pointer.set(Pointer::Reporting);
             self.report_mouse(MouseAction::Press, mouse_button(button), mods, x, y);
             return;
@@ -2217,27 +2266,65 @@ impl TuniTerminal {
         match button {
             gdk::BUTTON_MIDDLE => {
                 // The primary selection, pasted by middle click: the X11
-                // convention Wayland kept.
-                self.paste_from(&self.primary_clipboard());
+                // convention Wayland kept, behind the desktop's own switch
+                // for it, which is where Ghostty keeps it too.
+                if gtk::Settings::default()
+                    .is_none_or(|settings| settings.is_gtk_enable_primary_paste())
+                {
+                    self.paste_from(&self.primary_clipboard());
+                }
             }
             gdk::BUTTON_PRIMARY => {
                 imp.pointer.set(Pointer::Selecting);
-                self.selection_press(x, y, Duration::from_millis(u64::from(time)));
+                imp.last_left_press.set(Some(time));
+                self.selection_press(
+                    x,
+                    y,
+                    Duration::from_millis(u64::from(time)),
+                    mods.contains(Mods::CTRL) || mods.contains(Mods::SUPER),
+                );
             }
             // An application tracking the mouse was handed this press further
             // up, so the menu belongs to whoever is not in one, and to anyone
             // holding Shift, which is the override everything else here takes.
-            gdk::BUTTON_SECONDARY => self.popup_menu(x, y),
+            // Before it opens, the click chooses what Copy acts on, the way
+            // Ghostty's does: a click inside the selection keeps it, a click
+            // outside takes the word under the pointer instead.
+            gdk::BUTTON_SECONDARY => {
+                let geometry = self.geometry();
+                let mut guard = imp.session.borrow_mut();
+                let selected = guard.as_mut().and_then(|session| {
+                    session
+                        .term
+                        .right_click_select(x, y, geometry)
+                        .ok()
+                        .filter(|changed| *changed)
+                        .and_then(|_| session.term.selection_text().ok().flatten())
+                        .filter(|text| !text.is_empty())
+                });
+                drop(guard);
+                if let Some(text) = selected {
+                    self.primary_clipboard().set_text(&text);
+                    if imp.config.borrow().copy_on_select {
+                        self.clipboard().set_text(&text);
+                    }
+                    self.queue_draw();
+                }
+                self.popup_menu(x, y);
+            }
             _ => {}
         }
     }
 
-    /// Anchor a selection at a surface position.
-    fn selection_press(&self, x: f64, y: f64, time: Duration) {
+    /// Anchor a selection at a surface position. `output_on_triple` is what
+    /// Ctrl asks of a third click: one command's output rather than one line.
+    fn selection_press(&self, x: f64, y: f64, time: Duration, output_on_triple: bool) {
         let geometry = self.geometry();
         let mut guard = self.imp().session.borrow_mut();
         if let Some(session) = guard.as_mut() {
-            let _ = session.term.select_press(x, y, geometry, time);
+            let _ = session
+                .term
+                .select_press(x, y, geometry, time, output_on_triple);
         }
         drop(guard);
         self.queue_draw();
@@ -2311,18 +2398,8 @@ impl TuniTerminal {
             Pointer::Reporting => {
                 self.report_mouse(MouseAction::Release, mouse_button(button), mods, x, y);
             }
-            Pointer::Held {
-                x: press_x,
-                y: press_y,
-                ..
-            } => {
-                // The pointer stayed in its cell, so the press was a click
-                // after all and the application gets both halves of it now.
-                let button = mouse_button(button);
-                self.report_mouse(MouseAction::Press, button, mods, press_x, press_y);
-                self.report_mouse(MouseAction::Release, button, mods, x, y);
-            }
             Pointer::Selecting => {
+                self.stop_autoscroll();
                 // Selecting fills the primary selection, so a middle click in
                 // any other window pastes what was just highlighted.
                 if let Some(text) = self.selection_finish() {
@@ -2362,19 +2439,9 @@ impl TuniTerminal {
         }
 
         match imp.pointer.get() {
-            // Alt turns the drag into a block selection, as in Ghostty.
-            Pointer::Selecting => self.selection_drag(x, y, mods.contains(Mods::ALT)),
-            Pointer::Held {
-                x: press_x,
-                y: press_y,
-                time,
-            } => {
-                let geometry = self.geometry();
-                if geometry.cell_at(press_x, press_y) != geometry.cell_at(x, y) {
-                    imp.pointer.set(Pointer::Selecting);
-                    self.selection_press(press_x, press_y, Duration::from_millis(u64::from(time)));
-                    self.selection_drag(x, y, mods.contains(Mods::ALT));
-                }
+            Pointer::Selecting => {
+                self.selection_drag(x, y, rectangle_selection(mods));
+                self.sync_autoscroll();
             }
             _ => {
                 self.refresh_links(mods);
@@ -2385,30 +2452,155 @@ impl TuniTerminal {
         }
     }
 
-    fn on_scroll(&self, controller: &gtk::EventControllerScroll, dy: f64) {
+    /// Start or stop the drag-past-the-edge timer to match what the gesture
+    /// asks for. Each tick moves the viewport one row toward the pointer and
+    /// drags the selection onto it, at the cadence Ghostty suggests for its
+    /// own ticks.
+    fn sync_autoscroll(&self) {
+        let imp = self.imp();
+        let wanted = imp
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|session| session.term.selection_autoscroll())
+            .is_some();
+        if !wanted {
+            self.stop_autoscroll();
+            return;
+        }
+        if imp.autoscroll.borrow().is_some() {
+            return;
+        }
+        let source = glib::timeout_add_local(
+            std::time::Duration::from_millis(15),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    let imp = this.imp();
+                    let (x, y) = imp.pointer_pos.get();
+                    let rectangle = rectangle_selection(imp.mods.get());
+                    let geometry = this.geometry();
+                    let mut guard = imp.session.borrow_mut();
+                    let alive = guard.as_mut().is_some_and(|session| {
+                        session
+                            .term
+                            .autoscroll_tick(x, y, geometry, rectangle)
+                            .unwrap_or(false)
+                    });
+                    if let Some(session) = guard.as_mut() {
+                        imp.scroll.set(session.term.scroll_position());
+                    }
+                    drop(guard);
+                    this.invalidate_links();
+                    this.queue_draw();
+                    if alive {
+                        glib::ControlFlow::Continue
+                    } else {
+                        imp.autoscroll.replace(None);
+                        glib::ControlFlow::Break
+                    }
+                }
+            ),
+        );
+        imp.autoscroll.replace(Some(source));
+    }
+
+    fn stop_autoscroll(&self) {
+        if let Some(source) = self.imp().autoscroll.take() {
+            source.remove();
+        }
+    }
+
+    fn on_scroll(&self, controller: &gtk::EventControllerScroll, dx: f64, dy: f64) {
         let imp = self.imp();
         let mods = keymap::mods_from_state(controller.current_event_state());
 
-        if self.reports_mouse(mods) {
-            // Wheel up and down are reported as buttons four and five.
-            let button = if dy < 0.0 {
+        // Everything is normalized to pixels and accumulated, which is
+        // Ghostty's arithmetic exactly: a touchpad reports pixels and gets
+        // the tenfold boost its GTK layer applies, a wheel notch is worth
+        // three rows of them, and whatever falls short of a row is kept for
+        // the next event, so slow touchpad scrolling still arrives.
+        let precision = controller.unit() == gdk::ScrollUnit::Surface;
+        let cell_height = f64::from(self.imp().metrics.get().cell_height).max(1.0);
+        let adjusted = if precision {
+            dy * 10.0
+        } else {
+            dy * cell_height * 3.0
+        };
+        let pending = imp.pending_scroll.get() + adjusted;
+        let rows = if pending.abs() < cell_height {
+            imp.pending_scroll.set(pending);
+            0
+        } else {
+            let rows = (pending / cell_height).trunc();
+            imp.pending_scroll.set(pending - rows * cell_height);
+            rows as isize
+        };
+        // A tilt wheel's sideways clicks; a touchpad's sideways pixels belong
+        // to the desktop's own gestures, as they do in Ghostty's GTK.
+        let columns = if precision { 0 } else { dx.round() as isize };
+
+        if self.reports_scroll() {
+            // Wheel movement is reported as buttons: four and five upright,
+            // six and seven sideways, one press per row. The selection goes
+            // first, since with the mouse spoken for only Shift could have
+            // painted it.
+            let mut guard = imp.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                let _ = session.term.clear_selection();
+            }
+            drop(guard);
+            let (x, y) = imp.pointer_pos.get();
+            let vertical = if rows < 0 {
                 MouseButton::Four
             } else {
                 MouseButton::Five
             };
-            let (x, y) = imp.pointer_pos.get();
-            let notches = (dy.abs().round() as u32).clamp(1, 8);
-            for _ in 0..notches {
-                self.report_mouse(MouseAction::Press, Some(button), mods, x, y);
+            for _ in 0..rows.unsigned_abs() {
+                self.report_mouse(MouseAction::Press, Some(vertical), mods, x, y);
+            }
+            let sideways = if columns < 0 {
+                MouseButton::Six
+            } else {
+                MouseButton::Seven
+            };
+            for _ in 0..columns.unsigned_abs() {
+                self.report_mouse(MouseAction::Press, Some(sideways), mods, x, y);
             }
             return;
         }
 
-        // Three lines per notch, the X11 convention every toolkit inherited.
-        let lines = (dy * 3.0).round() as isize;
-        if lines != 0 {
-            self.scroll_by(lines);
+        if rows == 0 {
+            return;
         }
+
+        // On the alternate screen the wheel becomes arrow keys, which is how
+        // `less` scrolls without asking for the mouse.
+        let sent = {
+            let mut guard = imp.session.borrow_mut();
+            guard.as_mut().is_some_and(|session| {
+                let sent = match session.term.encode_alternate_scroll(rows) {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        send(&mut session.pty, bytes);
+                        true
+                    }
+                    _ => false,
+                };
+                if sent {
+                    let _ = session.term.clear_selection();
+                }
+                sent
+            })
+        };
+        if sent {
+            self.queue_draw();
+            return;
+        }
+
+        self.scroll_by(rows);
     }
 
     // --- clipboard -----------------------------------------------------------
@@ -2692,7 +2884,13 @@ impl TuniTerminal {
             Ok(bytes) if !bytes.is_empty() => {
                 send(&mut session.pty, bytes);
                 // Typing pulls the viewport back down: the answer is about to
-                // arrive at the bottom.
+                // arrive at the bottom. It also takes the selection with it,
+                // as Ghostty's `selection-clear-on-typing` does by default:
+                // the reply to the key is about to repaint what was selected.
+                // A bare modifier encodes nothing and so never gets here.
+                if !is_modifier(key) && session.term.has_selection() {
+                    let _ = session.term.clear_selection();
+                }
                 session.term.scroll_to_bottom();
                 imp.scroll.set(session.term.scroll_position());
                 drop(guard);
@@ -3155,14 +3353,44 @@ struct StyleKey {
 }
 
 fn mouse_button(button: u32) -> Option<MouseButton> {
+    // Ghostty's own table. Four and five are missing on purpose: as X11
+    // button numbers they are the wheel, and the wheel arrives as scroll
+    // events here, never as a click.
     match button {
         gdk::BUTTON_PRIMARY => Some(MouseButton::Left),
         gdk::BUTTON_MIDDLE => Some(MouseButton::Middle),
         gdk::BUTTON_SECONDARY => Some(MouseButton::Right),
-        8 => Some(MouseButton::Four),
-        9 => Some(MouseButton::Five),
+        6 => Some(MouseButton::Six),
+        7 => Some(MouseButton::Seven),
+        8 => Some(MouseButton::Eight),
+        9 => Some(MouseButton::Nine),
+        10 => Some(MouseButton::Ten),
+        11 => Some(MouseButton::Eleven),
         _ => None,
     }
+}
+
+/// Whether these modifiers ask a drag for a block rather than a run: Ctrl+Alt
+/// (or Super+Alt), which is Ghostty's Linux spelling. Read at every drag
+/// event, so the block can be picked up and put down mid-drag.
+fn rectangle_selection(mods: Mods) -> bool {
+    (mods.contains(Mods::CTRL) || mods.contains(Mods::SUPER)) && mods.contains(Mods::ALT)
+}
+
+/// The eight keys that are only ever half of a chord. Ghostty spells the same
+/// list, to decide which presses leave the selection alone.
+fn is_modifier(key: Key) -> bool {
+    matches!(
+        key,
+        Key::ShiftLeft
+            | Key::ShiftRight
+            | Key::ControlLeft
+            | Key::ControlRight
+            | Key::AltLeft
+            | Key::AltRight
+            | Key::MetaLeft
+            | Key::MetaRight
+    )
 }
 
 /// A dragged file as one shell word. A drag can carry something with no local

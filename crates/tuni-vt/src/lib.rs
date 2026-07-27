@@ -28,10 +28,11 @@ use std::time::Duration;
 
 use libghostty_vt::fmt::Format;
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
-use libghostty_vt::selection::FormatOptions;
 use libghostty_vt::selection::gesture::{
-    DragEvent, Geometry as GestureGeometry, Gesture, PressEvent, ReleaseEvent,
+    Autoscroll, AutoscrollTickEvent, Behavior, Behaviors, DragEvent, Geometry as GestureGeometry,
+    Gesture, PressEvent, ReleaseEvent,
 };
+use libghostty_vt::selection::{FormatOptions, SelectWordOptions};
 use libghostty_vt::terminal::{
     ClipboardLocation, Mode, Options as TerminalOptions, Point, PointCoordinate, ScrollViewport,
     Terminal as VtTerminal,
@@ -321,6 +322,11 @@ pub struct Terminal {
     press_event: PressEvent<'static>,
     drag_event: DragEvent<'static>,
     release_event: ReleaseEvent<'static>,
+    autoscroll_event: AutoscrollTickEvent<'static>,
+    /// What XTSHIFTESCAPE last asked, `None` until an application asks.
+    /// Upstream parses the sequence into a flag its C API never exposes, so
+    /// the sniffer keeps this copy.
+    shift_capture: Option<bool>,
     effects: Rc<RefCell<Effects>>,
     grid: Grid,
     /// Scratch buffer for encoder output, reused across events.
@@ -431,12 +437,11 @@ impl Terminal {
         inner.vt_write(b"\x1b]133;A;redraw=1\x1b\\\x1b]133;C\x1b\\");
 
         // Click repeat is untimed until told otherwise, which would leave
-        // double- and triple-click dead. These are the GTK defaults
-        // (gtk-double-click-time, gtk-double-click-distance).
+        // double- and triple-click dead. 500ms is what Ghostty resolves its
+        // `click-repeat-interval` to on Linux; the distance allowance is one
+        // cell width, set per press because the cell is sized per press.
         let mut press_event = PressEvent::new()?;
-        press_event
-            .set_repeat_interval(Duration::from_millis(400))?
-            .set_repeat_distance(5.0)?;
+        press_event.set_repeat_interval(Duration::from_millis(500))?;
 
         Ok(Self {
             inner,
@@ -451,6 +456,8 @@ impl Terminal {
             press_event,
             drag_event: DragEvent::new()?,
             release_event: ReleaseEvent::new()?,
+            autoscroll_event: AutoscrollTickEvent::new()?,
+            shift_capture: None,
             effects,
             grid: Grid::default(),
             encoded: Vec::with_capacity(64),
@@ -510,8 +517,18 @@ impl Terminal {
             match event {
                 osc::Event::Notify(notification) => effects.notifications.push(notification),
                 osc::Event::Progress(progress) => effects.progress = Some(progress),
+                osc::Event::ShiftCapture(wanted) => self.shift_capture = Some(wanted),
+                osc::Event::Reset => self.shift_capture = None,
             }
         }
+    }
+
+    /// Whether the application asked to see Shift on mouse events, with
+    /// XTSHIFTESCAPE. Until one asks, Shift belongs to the user, which is how
+    /// Ghostty resolves its `mouse-shift-capture = false` default.
+    #[must_use]
+    pub fn captures_shift(&self) -> bool {
+        self.shift_capture.unwrap_or(false)
     }
 
     pub fn resize(
@@ -695,6 +712,40 @@ impl Terminal {
         Ok(&self.encoded)
     }
 
+    /// Encode a wheel movement as arrow keys, mode 1007's bargain: an
+    /// application that switched to the alternate screen scrolls by arrows,
+    /// because it has no scrollback for a viewport to move over. `rows_down`
+    /// is positive toward the bottom.
+    ///
+    /// Empty unless all three of Ghostty's conditions hold: the alternate
+    /// screen is active, no mouse tracking is on (a tracking application
+    /// hears the wheel as buttons instead), and mode 1007 is set, which it is
+    /// by default. The arrows honor DECCKM the way real arrow keys do.
+    pub fn encode_alternate_scroll(&mut self, rows_down: isize) -> Result<&[u8]> {
+        self.encoded.clear();
+        let alternate = self.inner.mode(Mode::ALT_SCREEN_LEGACY).unwrap_or(false)
+            || self.inner.mode(Mode::ALT_SCREEN).unwrap_or(false)
+            || self.inner.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false);
+        if rows_down == 0
+            || !alternate
+            || self.inner.is_mouse_tracking().unwrap_or(false)
+            || !self.inner.mode(Mode::ALT_SCROLL).unwrap_or(false)
+        {
+            return Ok(&self.encoded);
+        }
+        let application = self.inner.mode(Mode::DECCKM).unwrap_or(false);
+        let arrow: &[u8] = match (application, rows_down > 0) {
+            (true, true) => b"\x1bOB",
+            (true, false) => b"\x1bOA",
+            (false, true) => b"\x1b[B",
+            (false, false) => b"\x1b[A",
+        };
+        for _ in 0..rows_down.unsigned_abs() {
+            self.encoded.extend_from_slice(arrow);
+        }
+        Ok(&self.encoded)
+    }
+
     // --- selection ---------------------------------------------------------
 
     /// Begin a selection at a surface-space position.
@@ -703,15 +754,35 @@ impl Terminal {
     /// third click at the same spot select a word and a line without the widget
     /// having to know anything about word boundaries. `time` is a monotonic
     /// event timestamp; without it only single clicks are possible.
+    ///
+    /// `output_on_triple` turns the third click into a selection of one
+    /// command's output rather than one line, which is what it does under
+    /// Ctrl in Ghostty. It only reaches as far as the shell marks its prompts
+    /// with OSC 133.
     pub fn select_press(
         &mut self,
         x: f64,
         y: f64,
         geometry: Geometry,
         time: Duration,
+        output_on_triple: bool,
     ) -> Result<()> {
         let grid_ref = self.inner.grid_ref(geometry.point(x, y))?;
-        self.press_event.set_position(x, y)?.set_time(time)?;
+        // A repeat click may land this far from the first one and still
+        // count: one cell, which is Ghostty's allowance.
+        let behaviors = Behaviors::new()
+            .with_single_click_behavior(Behavior::Cell)
+            .with_double_click_behavior(Behavior::Word)
+            .with_triple_click_behavior(if output_on_triple {
+                Behavior::Output
+            } else {
+                Behavior::Line
+            });
+        self.press_event
+            .set_position(x, y)?
+            .set_time(time)?
+            .set_repeat_distance(f64::from(geometry.cell_width_px.max(1)))?
+            .set_behaviors(&behaviors)?;
         let selection = self
             .press_event
             .apply(&mut self.gesture, &self.inner, grid_ref)?;
@@ -719,6 +790,13 @@ impl Terminal {
         // and any previous selection goes away.
         self.inner.set_selection(selection.as_ref())?;
         Ok(())
+    }
+
+    /// How many clicks the gesture is at, once a press has been fed to it:
+    /// 1 for a click, 2 for a double, 3 from there on.
+    #[must_use]
+    pub fn click_count(&self) -> u8 {
+        self.gesture.click_count(&self.inner).unwrap_or(0)
     }
 
     /// Extend the selection to a surface-space position. `rectangle` selects a
@@ -749,6 +827,50 @@ impl Terminal {
             .apply(&mut self.gesture, &self.inner, None)
     }
 
+    /// Whether the drag in progress is pinned against the top or bottom edge
+    /// and wants the viewport moved. `Some(true)` is upward.
+    #[must_use]
+    pub fn selection_autoscroll(&self) -> Option<bool> {
+        match self.gesture.autoscroll(&self.inner) {
+            Ok(Autoscroll::Up) => Some(true),
+            Ok(Autoscroll::Down) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// One tick of drag autoscroll: scroll the viewport a row toward the
+    /// pointer and carry the selection onto what just came into view.
+    ///
+    /// Answers whether the gesture is still alive; `false` says the timer
+    /// driving these ticks should stop.
+    pub fn autoscroll_tick(
+        &mut self,
+        x: f64,
+        y: f64,
+        geometry: Geometry,
+        rectangle: bool,
+    ) -> Result<bool> {
+        let Point::Viewport(viewport) = geometry.point(x, y) else {
+            return Ok(false);
+        };
+        self.autoscroll_event
+            .set_position(x, y)?
+            .set_rectangle(rectangle)?;
+        let selection = self.autoscroll_event.apply(
+            &mut self.gesture,
+            &self.inner,
+            viewport,
+            geometry.into(),
+        )?;
+        match selection {
+            Some(selection) => {
+                self.inner.set_selection(Some(&selection))?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     pub fn select_all(&mut self) -> Result<()> {
         let selection = self.inner.select_all()?;
         self.inner.set_selection(selection.as_ref())?;
@@ -759,6 +881,27 @@ impl Terminal {
         self.gesture.reset(&self.inner);
         self.inner.set_selection(None)?;
         Ok(())
+    }
+
+    /// What a right click selects before its menu opens, as Ghostty does it:
+    /// a click inside the selection keeps it, a click anywhere else selects
+    /// the word under the pointer, and a click on nothing clears. Answers
+    /// whether the selection changed.
+    ///
+    /// Ghostty tries the hyperlink under the pointer before the word; a link
+    /// here is a set of viewport cells rather than a range, so the word is
+    /// what stands in for it, and is almost always the same run of cells.
+    pub fn right_click_select(&mut self, x: f64, y: f64, geometry: Geometry) -> Result<bool> {
+        let point = geometry.point(x, y);
+        if let Some(selection) = self.inner.selection()?
+            && selection.contains(&self.inner, point)?
+        {
+            return Ok(false);
+        }
+        let grid_ref = self.inner.grid_ref(point)?;
+        let selection = self.inner.select_word(SelectWordOptions::new(grid_ref))?;
+        self.inner.set_selection(selection.as_ref())?;
+        Ok(true)
     }
 
     pub fn has_selection(&self) -> bool {

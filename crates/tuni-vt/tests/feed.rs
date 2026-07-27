@@ -292,7 +292,7 @@ fn dragging_selects_the_dragged_over_text() {
     let geometry = geometry(20, 5);
     let (x, y) = at(0, 0);
     terminal
-        .select_press(x, y, geometry, Duration::from_millis(0))
+        .select_press(x, y, geometry, Duration::from_millis(0), false)
         .expect("press");
     // Past the middle of the fifth cell, so that cell is included.
     let (x, y) = at(4, 0);
@@ -316,11 +316,11 @@ fn a_double_click_selects_a_word() {
     let geometry = geometry(20, 5);
     let (x, y) = at(7, 0);
     terminal
-        .select_press(x, y, geometry, Duration::from_millis(0))
+        .select_press(x, y, geometry, Duration::from_millis(0), false)
         .expect("first press");
     terminal.select_release().expect("release");
     terminal
-        .select_press(x, y, geometry, Duration::from_millis(100))
+        .select_press(x, y, geometry, Duration::from_millis(100), false)
         .expect("second press");
 
     assert_eq!(
@@ -337,7 +337,7 @@ fn selection_is_marked_on_the_grid_and_can_be_cleared() {
     let geometry = geometry(20, 5);
     let (x, y) = at(0, 0);
     terminal
-        .select_press(x, y, geometry, Duration::from_millis(0))
+        .select_press(x, y, geometry, Duration::from_millis(0), false)
         .expect("press");
     let (x, y) = at(2, 0);
     terminal.select_drag(x, y, geometry, false).expect("drag");
@@ -549,7 +549,7 @@ fn a_theme_recolors_the_selection_instead_of_inverting_it() {
     let geometry = geometry(20, 5);
     let (x, y) = at(0, 0);
     terminal
-        .select_press(x, y, geometry, Duration::from_millis(0))
+        .select_press(x, y, geometry, Duration::from_millis(0), false)
         .expect("press");
     let (x, y) = at(2, 0);
     terminal.select_drag(x, y, geometry, false).expect("drag");
@@ -574,7 +574,7 @@ fn a_theme_with_no_selection_colors_still_inverts() {
     let geometry = geometry(20, 5);
     let (x, y) = at(0, 0);
     terminal
-        .select_press(x, y, geometry, Duration::from_millis(0))
+        .select_press(x, y, geometry, Duration::from_millis(0), false)
         .expect("press");
     let (x, y) = at(2, 0);
     terminal.select_drag(x, y, geometry, false).expect("drag");

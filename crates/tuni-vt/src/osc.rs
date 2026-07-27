@@ -1,4 +1,4 @@
-//! The OSC sequences the terminal library parses but does not hand back.
+//! The sequences the terminal library parses but does not hand back.
 //!
 //! Upstream's terminal dispatches a callback for a title, a working directory
 //! and a clipboard write, and swallows the rest. Its standalone OSC parser
@@ -6,13 +6,16 @@
 //! `CONEMU_PROGRESS_REPORT` — but the only payload it will hand out at this
 //! pin is a window title, so knowing the shape buys nothing.
 //!
-//! So this reads the stream alongside the parser. It watches for the three
+//! So this reads the stream alongside the parser. It watches for the
 //! sequences a terminal is expected to act on and nobody else can see:
 //!
 //! - `OSC 9 ; text` — a desktop notification, iTerm2's spelling
 //! - `OSC 777 ; notify ; title ; body` — rxvt's, which carries a title
 //! - `OSC 99 ; metadata ; payload` — kitty's, which arrives in chunks
 //! - `OSC 9 ; 4 ; state ; percent` — ConEmu's progress report
+//! - `CSI > Ps s`: XTSHIFTESCAPE, an application asking to see Shift on
+//!   mouse events, which upstream records in a flag the C API never shows
+//! - `ESC c`: a full reset, which takes that request back
 //!
 //! Everything else is skipped, including the bodies of the string sequences
 //! (DCS, APC, PM, SOS) so that a `tmux` passthrough carrying an OSC cannot
@@ -49,6 +52,10 @@ pub enum Progress {
 pub(crate) enum Event {
     Notify(Notification),
     Progress(Progress),
+    /// XTSHIFTESCAPE: whether the application asked for Shift on mouse events.
+    ShiftCapture(bool),
+    /// `ESC c`, which resets the terminal and the request above with it.
+    Reset,
 }
 
 /// Where the scan is in the stream. PTY output arrives in arbitrary chunks, so
@@ -61,6 +68,8 @@ enum State {
     Escape,
     /// Inside `OSC …`, collecting the payload.
     Osc,
+    /// Inside `CSI …`, collecting parameter and intermediate bytes.
+    Csi,
     /// An `ESC` inside an OSC payload: `ESC \` ends it, anything else means
     /// the sequence was abandoned mid-way.
     OscEscape,
@@ -117,8 +126,19 @@ impl Sniffer {
                     self.overflow = false;
                     self.state = State::Osc;
                 }
+                b'[' => {
+                    self.payload.clear();
+                    self.overflow = false;
+                    self.state = State::Csi;
+                }
                 // DCS, SOS, PM, APC: a string whose contents are not ours.
                 b'P' | b'X' | b'^' | b'_' => self.state = State::Skip,
+                // RIS. Upstream resets the whole terminal on it, including the
+                // XTSHIFTESCAPE flag only this scan remembers.
+                b'c' => {
+                    out.push(Event::Reset);
+                    self.state = State::Ground;
+                }
                 // Another `ESC` starts over; anything else is a short escape
                 // sequence, and a CSI cannot contain an `ESC` to confuse us.
                 0x1b => self.state = State::Escape,
@@ -151,6 +171,27 @@ impl Sniffer {
                     self.step(byte, out);
                 }
             }
+            State::Csi => match byte {
+                // Parameter and intermediate bytes accumulate; the final byte
+                // names the control and ends the sequence.
+                0x20..=0x3f => {
+                    if self.payload.len() < MAX_PAYLOAD {
+                        self.payload.push(byte);
+                    } else {
+                        self.overflow = true;
+                    }
+                }
+                0x40..=0x7e => {
+                    self.finish_csi(byte, out);
+                    self.state = State::Ground;
+                }
+                // CAN and SUB abort a control sequence; ESC starts a new one.
+                0x18 | 0x1a => self.state = State::Ground,
+                0x1b => self.state = State::Escape,
+                // Any other C0 control executes and the sequence carries on,
+                // which is what the parser this scan shadows does with them.
+                _ => {}
+            },
             State::Skip => {
                 if byte == 0x1b {
                     self.state = State::SkipEscape;
@@ -163,6 +204,22 @@ impl Sniffer {
                     State::Skip
                 };
             }
+        }
+    }
+
+    /// A CSI ended. The only one read is XTSHIFTESCAPE, `CSI > Ps s`: `Ps`
+    /// absent or `0` means Shift stays the user's, `1` asks to see it.
+    /// Ghostty accepts exactly these and logs anything else, so anything else
+    /// is dropped here too.
+    fn finish_csi(&mut self, final_byte: u8, out: &mut Vec<Event>) {
+        let payload = std::mem::take(&mut self.payload);
+        if std::mem::take(&mut self.overflow) || final_byte != b's' {
+            return;
+        }
+        match payload.as_slice() {
+            b">" | b">0" => out.push(Event::ShiftCapture(false)),
+            b">1" => out.push(Event::ShiftCapture(true)),
+            _ => {}
         }
     }
 

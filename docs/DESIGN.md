@@ -247,16 +247,17 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+G` / `Ctrl+Shift+G` | Next match, previous match — in a file pane only |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection, paste |
 | Middle click | Paste the primary selection |
-| Right click | A menu of what these keys already do: copy, paste, select all, find, clear, the splits, and above them the hyperlink under the pointer when there is one |
+| Right click | The word under the pointer is selected, a click inside the selection keeps it, and a menu of what these keys already do opens: copy, paste, select all, find, clear, the splits, and above them the hyperlink under the pointer when there is one |
 | `Ctrl+Shift+A` | Select everything, scrollback included |
-| Drag, double click, triple click | Select by character, word, line |
-| `Alt`+drag | Block selection |
-| `Shift`+click | Select even while an application is following the pointer |
+| Drag, double click, triple click | Select by character, word, line. `Ctrl`+triple click selects one command's output where the shell marks its prompts. A repeat counts within half a second and one cell of the first, Ghostty's clock |
+| `Ctrl+Alt`+drag | Block selection |
+| `Shift`+click | Extend the selection to the click, at the granularity it was made at. While an application is tracking the mouse this is also how selecting works at all |
 | `Ctrl+Shift+M` | Take the mouse back from applications entirely, and hand it over again |
 | `Ctrl`+click | Open the hyperlink under the pointer |
 | Drop a file on a pane | Its path, quoted, onto the prompt as an argument, followed by a space |
 | `Shift+Page Up` / `Shift+Page Down` | Scroll the viewport by a page |
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
+| Wheel | Three rows a notch, pixel for pixel on a touchpad. On the alternate screen it becomes arrow keys, which is how `less` scrolls without taking the mouse |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
 
 New Window, Show Files and Use Selection for Find have no key of their own —
@@ -731,24 +732,44 @@ on a Cyrillic layout arrives as `Ctrl+C`, and the modifiers the keymap already
 folded into the character are the ones GDK says it consumed rather than a guess
 at Shift.
 
-An application that asks for the mouse gets it, and Shift is how the person at
-the keyboard takes it back. That is the convention, and it is a poor deal when
-the application asked for less than it is being given. Button-event and
-any-event tracking follow the pointer, so a drag inside one is the thing it
-asked for and selecting there needs Shift. The older click-only modes hear
-about buttons and nothing else, and a drag handed to a program that cannot be
-told the pointer moved is a drag nobody receives while a selection nobody made
-is lost. So there the press waits: leaving the cell makes it a selection, and
-lifting inside the cell makes it a click, which the application then gets
-whole.
+An application that asks for the mouse gets it the moment it asks: a press is
+reported as it happens, drags and all, which is what Ghostty hands a tracking
+application and what lets vim paint a visual selection by mouse. Shift is how
+the person at the keyboard takes the mouse back, and a Shift press or drag
+selects under any tracking mode, unless the application sent XTSHIFTESCAPE to
+say it wants Shift too. That is the bargain Ghostty's default
+`mouse-shift-capture` strikes. Upstream parses the sequence into a flag its C
+API never shows, so the facade reads the stream for it alongside the parser,
+the way it already reads for notifications it swallows.
 
-That leaves the programs that do follow the pointer, and there is no reading
-of a drag that serves both sides: it is either theirs or it is a selection.
-Shift is one answer and `mouse-reporting` is the other, the same key Ghostty
-uses for the same setting. Turned off, no application is given the mouse
-however loudly it asks, and every drag selects. `Ctrl+Shift+M` turns it off
-and on again, because whether a program should have the mouse is a thing that
-changes several times an hour.
+There is no reading of a drag that serves both sides: it is either the
+application's or it is a selection. Shift is one answer and `mouse-reporting`
+is the other, the same key Ghostty uses for the same setting. Turned off, no
+application is given the mouse however loudly it asks, and every drag selects.
+`Ctrl+Shift+M` turns it off and on again, because whether a program should
+have the mouse is a thing that changes several times an hour.
+
+The wheel is Ghostty's arithmetic. Movement is normalized to pixels (a
+touchpad's deltas tenfold, a wheel notch worth three rows of them),
+accumulated, and spent a whole row at a time with the remainder kept, so slow
+touchpad scrolling arrives eventually instead of never. A tracking
+application hears the result as buttons, 64 and 65 upright and 66 and 67
+sideways, one press per row; the wheel is the one place Shift does not take
+the mouse back, because Ghostty's does not either. On the alternate screen,
+where there is no scrollback for a viewport to move over, mode 1007 turns the
+wheel into arrow keys for everything else, which is how `less` scrolls
+without asking for the mouse, and the arrows honor DECCKM the way the real
+keys do.
+
+The rest of the click grammar is Ghostty's as well. A repeat click counts
+within half a second and one cell of the first. A third click with Ctrl held
+selects one command's output, reaching as far as the shell marks its prompts
+with OSC 133. A right click selects the word under the pointer before its
+menu opens, and keeps a selection it landed inside. A drag pinned against the
+top or bottom edge scrolls a row toward the pointer every few frames until it
+comes back. And typing clears the selection, as Ghostty's
+`selection-clear-on-typing` default does: the reply to the key is about to
+repaint what was selected anyway.
 
 A drag that ends on a pane is not a drag the shell can be told about, so it
 becomes text. Every file in it arrives as a quoted shell word with a space after
