@@ -6,7 +6,7 @@
 # GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
 # populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.1.1/ -o tuni-1.1.1.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.1.2/ -o tuni-1.1.2.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.15.2
 
 Name:           tuni
-Version:        1.1.1
+Version:        1.1.2
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -81,6 +81,11 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/symbolic/apps/%{app_id}-symbolic.svg
 
 %changelog
+* Mon Jul 27 2026 Unisic <hello@unisic.dev> - 1.1.2-1
+- Packages are compiled for the baseline CPU instead of the machine that built
+  them, so tuni starts on processors without AVX-512 rather than dying on an
+  illegal instruction.
+
 * Mon Jul 27 2026 Unisic <hello@unisic.dev> - 1.1.1-1
 - A file dropped on a terminal lands on the prompt as a quoted argument
   instead of being ignored.

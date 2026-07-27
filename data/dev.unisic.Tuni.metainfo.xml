@@ -67,6 +67,15 @@
   </provides>
 
   <releases>
+    <release version="1.1.2" date="2026-07-27">
+      <description>
+        <p>The packages are compiled for the baseline processor rather than for
+        the machine that built them. Until now a build made on a host with
+        AVX-512 carried instructions that older and smaller processors do not
+        have, and tuni stopped with an illegal instruction before its window
+        appeared. Anyone who saw that crash wants this build.</p>
+      </description>
+    </release>
     <release version="1.1.1" date="2026-07-27">
       <description>
         <p>A file dragged onto a terminal pane now lands on the prompt as a

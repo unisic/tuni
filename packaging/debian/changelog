@@ -1,3 +1,11 @@
+tuni (1.1.2) unstable; urgency=medium
+
+  * Packages are compiled for the baseline CPU instead of the machine that
+    built them, so tuni starts on processors without AVX-512 rather than
+    dying on an illegal instruction.
+
+ -- Unisic <hello@unisic.dev>  Mon, 27 Jul 2026 22:30:00 +0000
+
 tuni (1.1.1) unstable; urgency=medium
 
   * A file dropped on a terminal lands on the prompt as a quoted argument
