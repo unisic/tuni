@@ -67,6 +67,26 @@
   </provides>
 
   <releases>
+    <release version="1.2.0" date="2026-07-28">
+      <description>
+        <p>Clicks, drags and the wheel behave the way Ghostty's do. A press
+        reaches the application the moment it happens, Shift takes the mouse
+        back unless the application asked to keep it, a third click with Ctrl
+        selects one command's output, a right click selects the word under the
+        pointer, and the wheel spends its pixels a whole row at a time. A URL
+        that is only text opens with Ctrl+click.</p>
+        <p>A copy is confirmed with a toast, including the copy an application
+        makes over OSC 52, so a program that takes or clears the clipboard is
+        seen doing it.</p>
+        <p>The editor drives a language server and a debugger with breakpoints,
+        and a selection grows by syntax with Alt+Up. The settings choose the
+        panel's pages and the window's shortcuts.</p>
+        <p>The window blur asks X11 as well as Wayland, and only a compositor
+        that can blur is asked. Faint text draws halfway to the background.</p>
+        <p>Fixed: Escape closes the command palette, and a taken forward port
+        names the process that actually holds the address.</p>
+      </description>
+    </release>
     <release version="1.1.2" date="2026-07-27">
       <description>
         <p>The packages are compiled for the baseline processor rather than for

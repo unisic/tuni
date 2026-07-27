@@ -6,7 +6,7 @@
 # GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
 # populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.1.2/ -o tuni-1.1.2.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.2.0/ -o tuni-1.2.0.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.15.2
 
 Name:           tuni
-Version:        1.1.2
+Version:        1.2.0
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -81,6 +81,19 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/symbolic/apps/%{app_id}-symbolic.svg
 
 %changelog
+* Tue Jul 28 2026 Unisic <hello@unisic.dev> - 1.2.0-1
+- Clicks, drags and the wheel behave the way Ghostty's do, and a URL that is
+  only text opens with Ctrl+click.
+- A copy is confirmed with a toast, including one an application makes over
+  OSC 52.
+- The editor drives a language server and a debugger, and a selection grows by
+  syntax with Alt+Up. The settings choose the panel's pages and the window's
+  shortcuts.
+- The window blur asks X11 as well as Wayland, and faint text draws halfway to
+  the background.
+- Escape closes the command palette, and a taken forward port names the
+  process that actually holds the address.
+
 * Mon Jul 27 2026 Unisic <hello@unisic.dev> - 1.1.2-1
 - Packages are compiled for the baseline CPU instead of the machine that built
   them, so tuni starts on processors without AVX-512 rather than dying on an

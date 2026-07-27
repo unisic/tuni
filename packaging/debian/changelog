@@ -1,3 +1,19 @@
+tuni (1.2.0) unstable; urgency=medium
+
+  * Clicks, drags and the wheel behave the way Ghostty's do, and a URL that
+    is only text opens with Ctrl+click.
+  * A copy is confirmed with a toast, including one an application makes over
+    OSC 52.
+  * The editor drives a language server and a debugger, and a selection grows
+    by syntax with Alt+Up. The settings choose the panel's pages and the
+    window's shortcuts.
+  * The window blur asks X11 as well as Wayland, and faint text draws halfway
+    to the background.
+  * Escape closes the command palette, and a taken forward port names the
+    process that actually holds the address.
+
+ -- Unisic <hello@unisic.dev>  Tue, 28 Jul 2026 00:16:00 +0200
+
 tuni (1.1.2) unstable; urgency=medium
 
   * Packages are compiled for the baseline CPU instead of the machine that
