@@ -3,7 +3,7 @@
 How fast does a terminal consume PTY output? `scripts/throughput.sh` times each
 terminal twice: once running only the marker `touch`, once running `cat` over
 the payload first. The difference is time spent consuming output, so window and
-shell startup cancel out. Each phase runs twice and the best time is kept.
+shell startup cancel out. Each phase runs five times and the best time is kept.
 
 Payload: 200 MiB (209 715 216 bytes) of mixed plain and SGR-colored lines, so
 the parser does real work rather than `memcpy`. Every terminal runs `/bin/sh`,
@@ -12,7 +12,7 @@ not an interactive shell.
 ```sh
 scripts/throughput.sh 200 alacritty ghostty kitty foot konsole ptyxis \
   gnome-terminal xfce4-terminal tilix terminator qterminal sakura \
-  lxterminal st urxvt xterm
+  lxterminal st urxvt xterm wezterm
 ```
 
 ## Environment
@@ -24,62 +24,72 @@ scripts/throughput.sh 200 alacritty ghostty kitty foot konsole ptyxis \
 | GPU | AMD Radeon RX 9070 XT (Navi 48) |
 | Kernel | 7.1.5-200.fc44.x86_64, Fedora 44 |
 | Session | KDE Plasma on Wayland (KWin); the X11 terminals run through Xwayland |
-| Date | 2026-07-27 |
+| Date | 2026-07-28 |
 
 ## Results
 
-200 MiB payload, best of two runs, sorted by throughput.
+200 MiB payload, best of five runs (`RUNS=5`), sorted by throughput.
 
 | Terminal | Version | Engine | Startup | Consume | Throughput |
 | --- | --- | --- | ---: | ---: | ---: |
-| urxvt | 9.31 | X11, CPU | 0.023 s | 1.579 s | **126.6 MiB/s** |
-| foot | 1.27.0 | Wayland, CPU | 0.017 s | 1.691 s | **118.3 MiB/s** |
-| **tuni** | 1.1.2 | GTK4 + libghostty-vt | 0.609 s | 1.723 s | **116.0 MiB/s** |
-| alacritty | 0.17.0 | GPU (OpenGL) | 0.056 s | 1.785 s | **112.0 MiB/s** |
-| kitty | 0.47.1 | GPU (OpenGL) | 0.109 s | 1.807 s | **110.6 MiB/s** |
-| st | 0.9.2 | X11, CPU | 0.018 s | 2.215 s | **90.2 MiB/s** |
-| ghostty | 1.3.1 | GTK4 + GPU | 0.189 s | 2.785 s | **71.8 MiB/s** |
-| terminator | 2.1.5 | VTE 0.84 | 0.181 s | 2.829 s | **70.6 MiB/s** |
-| ptyxis | 50.1 | VTE 0.84 | 0.217 s | 2.835 s | **70.5 MiB/s** |
-| gnome-terminal | 3.60.0 | VTE 0.84 | 0.167 s | 2.852 s | **70.1 MiB/s** |
-| tilix | 1.9.6 | VTE 0.84 | 0.081 s | 2.884 s | **69.3 MiB/s** |
-| sakura | 3.8.9 | VTE 0.84 | 0.063 s | 2.892 s | **69.1 MiB/s** |
-| xterm | 406 | X11, CPU | 0.013 s | 3.726 s | **53.6 MiB/s** |
-| qterminal | 2.4.0 | QTermWidget | 0.079 s | 4.276 s | **46.7 MiB/s** |
-| konsole | 26.04.3 | Qt | 0.114 s | 4.634 s | **43.1 MiB/s** |
-| lxterminal | 0.4.1 | VTE 0.84 | 0.052 s | 9.825 s | **20.3 MiB/s** |
-| xfce4-terminal | 1.2.0 | VTE 0.84 | 0.085 s | 10.136 s | **19.7 MiB/s** |
+| foot | 1.27.0 | Wayland, CPU | 0.016 s | 1.502 s | **133.1 MiB/s** |
+| urxvt | 9.31 | X11, CPU | 0.022 s | 1.617 s | **123.6 MiB/s** |
+| **tuni** | 1.2.0 | GTK4 + libghostty-vt | 0.620 s | 1.706 s | **117.2 MiB/s** |
+| alacritty | 0.17.0 | GPU (OpenGL) | 0.044 s | 1.790 s | **111.7 MiB/s** |
+| kitty | 0.47.1 | GPU (OpenGL) | 0.108 s | 1.908 s | **104.8 MiB/s** |
+| st | 0.9.2 | X11, CPU | 0.019 s | 2.210 s | **90.4 MiB/s** |
+| ghostty | 1.3.1 | GTK4 + GPU | 0.202 s | 2.524 s | **79.2 MiB/s** |
+| sakura | 3.8.9 | VTE 0.84 | 0.068 s | 2.955 s | **67.6 MiB/s** |
+| ptyxis | 50.1 | VTE 0.84 | 0.224 s | 2.982 s | **67.0 MiB/s** |
+| gnome-terminal | 3.60.0 | VTE 0.84 | 0.170 s | 2.995 s | **66.7 MiB/s** |
+| terminator | 2.1.5 | VTE 0.84 | 0.189 s | 2.998 s | **66.7 MiB/s** |
+| tilix | 1.9.6 | VTE 0.84 | 0.073 s | 3.082 s | **64.9 MiB/s** |
+| xterm | 406 | X11, CPU | 0.017 s | 3.798 s | **52.6 MiB/s** |
+| qterminal | 2.4.0 | QTermWidget | 0.073 s | 4.242 s | **47.1 MiB/s** |
+| konsole | 26.04.3 | Qt | 0.108 s | 4.786 s | **41.7 MiB/s** |
+| wezterm | 20260716-nightly | GPU (wgpu) | 0.034 s | 6.134 s | **32.6 MiB/s** |
+| lxterminal | 0.4.1 | VTE 0.84 | 0.046 s | 10.186 s | **19.6 MiB/s** |
+| xfce4-terminal | 1.2.0 | VTE 0.84 | 0.084 s | 10.242 s | **19.5 MiB/s** |
 
 Reading it:
 
-- tuni sits third, inside 10% of the fastest thing measured and ahead of both
-  GPU terminals. Nothing here is a landslide: the top five span 13%.
-- The five stock VTE frontends land within 4% of each other at ~70 MiB/s, which
-  is the reassuring part — they share an engine, and the benchmark says so.
-  lxterminal and xfce4-terminal use the same VTE and are 3.5× slower than their
-  siblings, so that gap is configuration (scrollback, rewrap), not the engine.
-- ghostty measures at 72 MiB/s while tuni, which uses ghostty's VT parser
-  through `libghostty-vt`, measures at 116. The parser is not what separates
+- tuni sits third, inside 12% of the fastest thing measured and ahead of both
+  GPU terminals. Only foot pulls away; urxvt, tuni, alacritty and kitty sit
+  within 15% of each other. tuni's numbers are from the build that keeps the
+  full configured scrollback (10,000 lines) while it consumes — the honest
+  configuration, and within noise of the build before it.
+- The five stock VTE frontends land within 4% of each other at ~66 MiB/s,
+  which is the reassuring part — they share an engine, and the benchmark says
+  so. lxterminal and xfce4-terminal use the same VTE and are 3.4× slower than
+  their siblings, so that gap is configuration (scrollback, rewrap), not the
+  engine.
+- ghostty measures at 79 MiB/s while tuni, which uses ghostty's VT parser
+  through `libghostty-vt`, measures at 119. The parser is not what separates
   them; the difference is on the drawing side of the same library.
+- wezterm is the surprise at the bottom: a GPU renderer consuming at 33 MiB/s,
+  behind every VTE frontend that isn't misconfigured. A GPU pipeline says
+  nothing about how fast the reader thread drains the PTY. (Nightly build,
+  since that is what the wezterm repo ships for Fedora 44.)
 - tuni's startup number is not comparable: it is a GTK4 window plus the capture
   harness, and the payload run subtracts it anyway.
 
 ## tuni against alacritty
 
-The two are close enough in the table above that one run does not settle it, so
-the pair was run on its own with `RUNS=5 scripts/throughput.sh 200 alacritty`:
+The two are close enough in the table above that one pass does not settle it,
+so the pair was also run on its own with
+`RUNS=5 scripts/throughput.sh 200 alacritty`:
 
 | Pass | tuni | alacritty | Winner |
 | --- | ---: | ---: | --- |
-| table above, best of 2 | 116.0 MiB/s | 112.0 MiB/s | tuni, +3.6% |
-| head-to-head, best of 5 | 127.2 MiB/s | 122.2 MiB/s | tuni, +4.1% |
-| head-to-head, best of 5 | 121.4 MiB/s | 124.4 MiB/s | alacritty, +2.5% |
+| table above, best of 5 | 117.2 MiB/s | 111.7 MiB/s | tuni, +4.9% |
+| head-to-head, best of 5 | 112.4 MiB/s | 105.9 MiB/s | tuni, +6.1% |
+| head-to-head, best of 5 | 108.4 MiB/s | 116.1 MiB/s | alacritty, +7.1% |
 
-It is a tie. The order flips between passes and the run-to-run spread on either
-terminal (~5%) is wider than the gap between them, so any single number picked
-out of this is a coin toss dressed up as a result. What can be said is that a
-GTK4 window with a full workspace around it keeps up with a terminal that draws
-nothing else, which is the interesting part.
+Even at best of five the order can flip: tuni takes two passes, alacritty the
+third, and the swing between passes is wider than any single gap. The honest
+claim is a dead heat — neither is reliably ahead of the other on this payload.
+Which is still the interesting part: a GTK4 window with a full workspace around
+it keeps pace with a terminal that draws nothing else.
 
 Caveats worth keeping in mind:
 
@@ -97,10 +107,13 @@ Caveats worth keeping in mind:
 
 ## Not measured
 
-- **WezTerm** — Flathub only (`flatpak install flathub org.wezfurlong.wezterm`).
-  The sandbox does not see the host `/tmp`, so the payload has to move somewhere
-  the app can read before the numbers mean anything.
-- **Rio** — not packaged for Fedora; `cargo install rioterm`.
+- **Rio** — installed as a Flatpak (`com.rioterm.Rio`), which cannot be driven:
+  that build ignores `-e` and any configured `shell`, and always spawns the
+  user's login shell on the host through `flatpak-spawn --host`, so no command
+  reaches it. (`RIO_CONFIG_HOME` does make it honor a config `shell`, but then
+  it spawns inside the sandbox and never produced output here.) Measuring Rio
+  means `cargo install rioterm` and adding it to the list; the default
+  `rio -e sh -c …` case in the script already fits its CLI.
 - **blackbox-terminal**, **guake**, **tilda**, **deepin-terminal** — VTE
   frontends again, and the five already in the table say what VTE does.
 
