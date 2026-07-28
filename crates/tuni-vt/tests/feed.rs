@@ -898,3 +898,35 @@ fn retransmitting_an_image_changes_its_cache_key() {
         "same id, same pixels, different picture — only the generation says so"
     );
 }
+
+#[test]
+fn ten_thousand_lines_of_scrollback_hold_ten_thousand_lines() {
+    // The number the app hands over is a line count, and upstream's budget is
+    // bytes: this is the test that fails when one is passed off as the other.
+    // Before the conversion, "10,000 lines" bought one 64 KiB page — about
+    // 430 rows at this width — and everything older was silently gone.
+    let mut terminal = Terminal::new(200, 60, 10_000).expect("terminal");
+    for i in 0..12_000 {
+        terminal.feed(format!("line-{i:06} alpha beta gamma delta epsilon\r\n").as_bytes());
+    }
+    let hits = terminal.search("line-002500").expect("search");
+    assert_eq!(hits.len(), 1, "a line 9,500 rows back is still there");
+    assert!(
+        terminal.scroll_position().total > 10_000,
+        "the scrollable area holds what the setting promised, got {}",
+        terminal.scroll_position().total
+    );
+}
+
+#[test]
+fn zero_scrollback_lines_means_none_not_unlimited() {
+    let mut terminal = Terminal::new(80, 24, 0).expect("terminal");
+    for i in 0..5_000 {
+        terminal.feed(format!("line-{i:06}\r\n").as_bytes());
+    }
+    let position = terminal.scroll_position();
+    assert_eq!(
+        position.total, position.len,
+        "nothing above the viewport to scroll to"
+    );
+}
