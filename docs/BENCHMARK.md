@@ -20,10 +20,10 @@ scripts/throughput.sh 200 alacritty ghostty kitty foot konsole ptyxis \
 | | |
 | --- | --- |
 | CPU | Intel Core i7-13700F (24 threads) |
-| RAM | 31 GiB |
-| GPU | AMD Radeon RX 9070 (Navi 48) |
+| RAM | 32 GiB |
+| GPU | AMD Radeon RX 9070 XT (Navi 48) |
 | Kernel | 7.1.5-200.fc44.x86_64, Fedora 44 |
-| Session | Wayland; the X11 terminals run through Xwayland |
+| Session | KDE Plasma on Wayland (KWin); the X11 terminals run through Xwayland |
 | Date | 2026-07-27 |
 
 ## Results
