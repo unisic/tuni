@@ -271,8 +271,10 @@ impl TuniEditor {
             .build();
         find.add_css_class("flat");
 
+        // The floppy rather than "document-save": Adwaita draws that one as an
+        // arrow into a tray, which everyone reads as a download.
         let save = gtk::Button::builder()
-            .icon_name("document-save-symbolic")
+            .icon_name("media-floppy-symbolic")
             .tooltip_text("Save (Ctrl+S)")
             .valign(gtk::Align::Center)
             .sensitive(false)

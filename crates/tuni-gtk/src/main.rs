@@ -141,6 +141,13 @@ fn main() -> glib::ExitCode {
         // it up in the icon theme, which is also where the notification daemon
         // and the window switcher look for it.
         gtk::Window::set_default_icon_name(APP_ID);
+        // The icons Adwaita does not have, like the Git page's commit graph.
+        // An installed build finds them in hicolor beside the app icon; this
+        // path is for a checkout run, and points at nothing anywhere else.
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::IconTheme::for_display(&display)
+                .add_search_path(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/icons"));
+        }
         // The table with the config file's overrides on top; a change made in
         // the settings window later reapplies the same way.
         shortcuts::apply(app, &tuni_core::settings::Settings::load());

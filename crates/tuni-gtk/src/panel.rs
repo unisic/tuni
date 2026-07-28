@@ -99,11 +99,11 @@ impl TuniPanel {
         let stack = adw::ViewStack::new();
         let files_page =
             stack.add_titled_with_icon(&files, Some(FILES), "Files", "folder-symbolic");
-        // Adwaita has no icon for a repository, and a switcher page without one
-        // draws the missing-image glyph. A list of what changed is what the
-        // page is, and it is an icon the theme actually has.
-        let git_page =
-            stack.add_titled_with_icon(&git, Some(GIT), "Git", "view-list-bullet-symbolic");
+        // Adwaita has no icon for a repository, so tuni ships one: the
+        // commit-graph everyone draws when they say "git". Installed builds
+        // find it in hicolor; a checkout run finds it via the search path
+        // main.rs adds.
+        let git_page = stack.add_titled_with_icon(&git, Some(GIT), "Git", "tuni-git-symbolic");
         // Beside Files, since it is the same page about another machine, and
         // hidden until there is a machine: a switcher with a page nothing can
         // fill is a dead tab.
@@ -136,6 +136,11 @@ impl TuniPanel {
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         bar.set_margin_top(6);
         bar.set_margin_bottom(6);
+        // Room at the sides too: a panel narrow enough to squeeze the
+        // switcher otherwise presses the first and last page against the
+        // panel's edges.
+        bar.set_margin_start(12);
+        bar.set_margin_end(12);
         bar.set_halign(gtk::Align::Center);
         bar.append(&switcher);
 

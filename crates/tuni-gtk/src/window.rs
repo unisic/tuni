@@ -199,7 +199,7 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
     ),
     (
         "Save File",
-        "document-save-symbolic",
+        "media-floppy-symbolic",
         Some("Ctrl+S"),
         "win.save-file",
     ),
@@ -218,7 +218,7 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
     ("Show Files", "folder-symbolic", None, "win.show-files"),
     (
         "Show Git",
-        "media-record-symbolic",
+        "tuni-git-symbolic",
         Some("Ctrl+Shift+G"),
         "win.show-git",
     ),
@@ -499,24 +499,37 @@ impl TuniWindow {
         row_menu.set_halign(gtk::Align::Start);
         row_menu.set_parent(&sidebar);
 
-        let scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .child(&sidebar)
-            .build();
-
+        // Under the last project, where the row it creates will appear — but
+        // outside the scroller, so a list long enough to scroll cannot carry
+        // the button out of the window: the scroller below takes its natural
+        // height and no more, which leaves the button hugging the last row
+        // until there is no room left, and pinned to the bottom edge after.
         let new_project = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
+            .child(
+                // Start-aligned inside a full-width button, so the button is
+                // as wide as the project rows above it and reads as one more.
+                &adw::ButtonContent::builder()
+                    .icon_name("list-add-symbolic")
+                    .label("New Project")
+                    .halign(gtk::Align::Start)
+                    .build(),
+            )
             .tooltip_text("New Project (Ctrl+Shift+N)")
             .action_name("win.new-project")
             .build();
         new_project.add_css_class("flat");
-        let footer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        footer.set_margin_start(6);
-        footer.set_margin_end(6);
-        footer.set_margin_top(3);
-        footer.set_margin_bottom(3);
-        footer.append(&new_project);
+        new_project.set_margin_start(6);
+        new_project.set_margin_end(6);
+        new_project.set_margin_top(3);
+        new_project.set_margin_bottom(3);
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .child(&sidebar)
+            .build();
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        column.append(&scroller);
+        column.append(&new_project);
 
         let sidebar_header = adw::HeaderBar::builder()
             .show_end_title_buttons(false)
@@ -525,8 +538,7 @@ impl TuniWindow {
         drop_window_icon(&sidebar_header);
         let sidebar_view = adw::ToolbarView::new();
         sidebar_view.add_top_bar(&sidebar_header);
-        sidebar_view.add_bottom_bar(&footer);
-        sidebar_view.set_content(Some(&scroller));
+        sidebar_view.set_content(Some(&column));
 
         // --- content
 
@@ -4282,9 +4294,13 @@ fn load_css() {
              .tuni-pane.ringed { border-radius: 8px; border: 1px solid alpha(currentColor, 0.14); }\n\
              .tuni-pane.ringed.focused { border-color: alpha(@accent_color, 0.85); }\n\
              .tuni-pane > .tuni-grip { min-height: 6px; opacity: 0; }\n\
-             .tuni-pane.ringed:hover > .tuni-grip { opacity: 0.35; \
-              background-image: radial-gradient(circle, currentColor 1px, transparent 1px); \
-              background-size: 4px 4px; }\n\
+             /* Lit only under the pointer, not with the whole pane: lit with\n\
+                the pane it reads as stray marks over whatever sits below it.\n\
+                A plain strip, because the dotted texture this used to be\n\
+                aliased into speckles on fractional scales. */\n\
+             .tuni-pane.ringed > .tuni-grip:hover { \
+              background-color: alpha(currentColor, 0.25); \
+              border-radius: 3px; opacity: 1; }\n\
              /* Invisible until it is pointed at, like the edge of a window:\n\
                 the sidebar already has a border there, and a second line\n\
                 drawn over it would only say the same thing twice. */\n\
@@ -4390,7 +4406,21 @@ pub fn apply_chrome(theme: &Theme, opacity: f64) {
          @define-color card_fg_color {fg};\n\
          @define-color accent_color {accent};\n\
          @define-color accent_bg_color {accent};\n\
-         @define-color accent_fg_color {on_accent};\n",
+         @define-color accent_fg_color {on_accent};\n\
+         /* A dialog is something to read, and under a translucent window\n\
+            every chrome color it inherits carries the window's alpha — a\n\
+            preferences page over the wallpaper is the tab bar showing\n\
+            through the settings. Inside one, the same colors go solid. */\n\
+         dialog {{\n\
+           --window-bg-color: {solid_bg};\n\
+           --view-bg-color: {solid_bg};\n\
+           --headerbar-bg-color: {solid_header};\n\
+           --headerbar-backdrop-color: {solid_header};\n\
+           --sidebar-bg-color: {solid_sidebar};\n\
+           --sidebar-backdrop-color: {solid_sidebar};\n\
+           --secondary-sidebar-bg-color: {solid_sidebar};\n\
+           --secondary-sidebar-backdrop-color: {solid_sidebar};\n\
+         }}\n",
         bg = {
             let Rgb { r, g, b } = theme.background;
             format!("rgba({r},{g},{b},{opacity})")
@@ -4403,6 +4433,9 @@ pub fn apply_chrome(theme: &Theme, opacity: f64) {
         border = theme.surface(0.20).to_hex(),
         accent = accent.to_hex(),
         on_accent = accent.contrasting().to_hex(),
+        solid_bg = theme.background.to_hex(),
+        solid_header = theme.surface(0.06).to_hex(),
+        solid_sidebar = theme.surface(0.03).to_hex(),
     );
 
     let Some(display) = gdk::Display::default() else {

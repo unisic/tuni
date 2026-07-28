@@ -148,6 +148,8 @@ install-data:
 		$(icondir)/scalable/apps/$(APP_ID).svg
 	install -Dm644 data/icons/hicolor/symbolic/apps/$(APP_ID)-symbolic.svg \
 		$(icondir)/symbolic/apps/$(APP_ID)-symbolic.svg
+	install -Dm644 data/icons/hicolor/scalable/actions/tuni-git-symbolic.svg \
+		$(icondir)/scalable/actions/tuni-git-symbolic.svg
 
 uninstall:
 	rm -f $(bindir)/tuni
@@ -155,6 +157,7 @@ uninstall:
 	rm -f $(datadir)/metainfo/$(APP_ID).metainfo.xml
 	rm -f $(icondir)/scalable/apps/$(APP_ID).svg
 	rm -f $(icondir)/symbolic/apps/$(APP_ID)-symbolic.svg
+	rm -f $(icondir)/scalable/actions/tuni-git-symbolic.svg
 
 check:
 	$(CARGO) fmt --check
