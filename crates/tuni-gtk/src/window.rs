@@ -729,6 +729,12 @@ impl TuniWindow {
             for hosts in window.imp().hosts.borrow().values() {
                 hosts.refresh_if_stale();
             }
+            // The panel poll skips its tick while the window is inactive, and
+            // this is the catch-up that keeps that from showing: the timer is
+            // Some exactly while the panel is on screen.
+            if window.imp().panel_timer.borrow().is_some() {
+                window.poll_files();
+            }
             // Coming back to a terminal means typing into it. GTK restores the
             // focus the window had when it left, which after a click on the tab
             // strip or a toolbar button is a widget that does nothing with a
@@ -1248,6 +1254,14 @@ impl TuniWindow {
     /// the panel appears without being asked for. Runs on a timer that exists
     /// only while the panel is showing.
     fn poll_files(&self) {
+        // A window on another workspace, or minimized, is not being read, so
+        // its panel has nobody to be fresh for — the same bargain the Info
+        // page's ssh check strikes. The timer stays armed; the tick costs a
+        // property read. Coming back polls at once, from the is-active
+        // handler, so the panel is not up to two seconds stale on return.
+        if !self.is_active() {
+            return;
+        }
         // Cheap when the root has not moved, and it is what catches a `cd`
         // into a different repository.
         self.sync_files();
@@ -1585,8 +1599,13 @@ impl TuniWindow {
             }
             imp.grids.borrow_mut().remove(&tab.id());
             imp.pages.borrow_mut().remove(&tab.id());
+            imp.recent.borrow_mut().retain(|id| *id != tab.id());
         }
-        if let Some(view) = imp.views.borrow_mut().remove(&id)
+        // Bound before the if so the RefMut on views ends first: dropping the
+        // view at the end of the block can be the TabView's last reference,
+        // and its dispose detaches pages into handlers that read the registry.
+        let view = imp.views.borrow_mut().remove(&id);
+        if let Some(view) = view
             && let Some(stack) = imp.stack.borrow().as_ref()
         {
             stack.remove(&view);
@@ -2314,13 +2333,16 @@ impl TuniWindow {
             #[weak]
             terminal,
             move || {
+                // Taken out before the start is attempted: a shell that fails
+                // to start is a pane that will never replay this, and the
+                // entry would otherwise sit in the map for the window's life.
+                let history = this.imp().pending_history.borrow_mut().remove(&pane);
                 if let Err(error) = terminal.start(&launch) {
                     let dialog = adw::AlertDialog::new(Some("Cannot start shell"), Some(&error));
                     dialog.add_response("close", "Close");
                     dialog.present(Some(&this));
                     return;
                 }
-                let history = this.imp().pending_history.borrow_mut().remove(&pane);
                 if let Some(text) = history {
                     terminal.restore_history(&text);
                 }
@@ -2664,7 +2686,11 @@ impl TuniWindow {
     fn forget_pane(&self, pane: Id) {
         let imp = self.imp();
         imp.diffs.borrow_mut().remove(&pane);
-        if let Some(terminal) = imp.terminals.borrow_mut().remove(&pane) {
+        // Bound first so the registry borrow ends before shutdown() runs:
+        // an if-let scrutinee's temporary lives to the end of the block, and
+        // everything Session's drop does would otherwise run under it.
+        let terminal = imp.terminals.borrow_mut().remove(&pane);
+        if let Some(terminal) = terminal {
             terminal.shutdown();
             crate::debug::watch(&terminal, "TuniTerminal", pane.raw());
         }
@@ -2691,7 +2717,12 @@ impl TuniWindow {
 
         if !alive {
             let page = imp.pages.borrow().get(&tab).cloned();
-            if let (Some(view), Some(page)) = (imp.views.borrow().get(&project).cloned(), page) {
+            // Bound before the call: close_page synchronously runs the whole
+            // close-page → page-detached chain, which empties registries, and
+            // the if-let would otherwise hold the views borrow across all of
+            // it.
+            let view = imp.views.borrow().get(&project).cloned();
+            if let (Some(view), Some(page)) = (view, page) {
                 view.close_page(&page);
             }
             return;
@@ -2867,6 +2898,10 @@ impl TuniWindow {
         }
         imp.grids.borrow_mut().remove(&tab.id());
         imp.pages.borrow_mut().remove(&tab.id());
+        // The recency list only ever inserted; a session's worth of closed
+        // tabs would otherwise pile up as ids the switcher filters out on
+        // every walk.
+        imp.recent.borrow_mut().retain(|id| *id != tab.id());
         self.refresh();
     }
 

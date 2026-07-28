@@ -157,6 +157,12 @@ fn send(pty: &mut Option<Pty>, bytes: &[u8]) {
 /// past a picture costs; it is not a limit on how many a terminal may hold.
 const TEXTURE_CACHE: usize = 16;
 
+/// And how much decoded RGBA those entries may hold between them. Sixteen
+/// entries sounds bounded until each one is a screenshot: sixteen 4K frames
+/// are half a gigabyte held beside the copies libghostty already stores. The
+/// entry cap keeps the map small; this keeps it honest.
+const TEXTURE_CACHE_BYTES: usize = 64 << 20;
+
 /// How often a widget that is still being resized passes its size on, and how
 /// often it is looked at to see whether it has stopped. Two quiet ticks end the
 /// wait, so the shell hears about the size a drag finished on between one and
@@ -174,6 +180,8 @@ struct Textures {
     map: std::collections::HashMap<tuni_vt::ImageKey, gdk::MemoryTexture>,
     /// Insertion order, for evicting the oldest when the map is full.
     order: std::collections::VecDeque<tuni_vt::ImageKey>,
+    /// Decoded bytes currently held, against `TEXTURE_CACHE_BYTES`.
+    bytes: usize,
 }
 
 impl Textures {
@@ -183,6 +191,7 @@ impl Textures {
 
     fn insert(&mut self, key: tuni_vt::ImageKey, pixels: &tuni_vt::Pixels) {
         let stride = pixels.width as usize * 4;
+        let size = pixels.rgba.len();
         let bytes = glib::Bytes::from(&pixels.rgba[..]);
         let texture = gdk::MemoryTexture::new(
             pixels.width as i32,
@@ -192,12 +201,19 @@ impl Textures {
             &bytes,
             stride,
         );
-        while self.order.len() >= TEXTURE_CACHE {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
+        while self.order.len() >= TEXTURE_CACHE
+            || (!self.order.is_empty() && self.bytes + size > TEXTURE_CACHE_BYTES)
+        {
+            if let Some(oldest) = self.order.pop_front()
+                && let Some(gone) = self.map.remove(&oldest)
+            {
+                self.bytes = self.bytes.saturating_sub(
+                    gone.height().max(0) as usize * gone.width().max(0) as usize * 4,
+                );
             }
         }
         self.order.push_back(key);
+        self.bytes += size;
         self.map.insert(key, texture);
     }
 }
@@ -356,6 +372,11 @@ mod imp {
         /// expensive half.
         pub(super) images: RefCell<Vec<tuni_vt::Placement>>,
         pub(super) textures: RefCell<Textures>,
+        /// Handlers this widget added to the process-global `gtk::Settings`,
+        /// taken off in `dispose`: the global outlives every terminal, so a
+        /// handler left on it is a closure that survives every pane it was
+        /// made for.
+        pub(super) settings_handlers: RefCell<Vec<glib::SignalHandlerId>>,
         /// Draw timings, collected only when TUNI_DEBUG_FRAME_TIME is set.
         /// This is the measurement that decides whether Pango can keep up. The
         /// value is how many frames go into one report, so a scenario that
@@ -418,6 +439,7 @@ mod imp {
                 progress_stale: RefCell::new(None),
                 images: RefCell::new(Vec::new()),
                 textures: RefCell::new(Textures::default()),
+                settings_handlers: RefCell::new(Vec::new()),
                 frame_batch: match std::env::var("TUNI_DEBUG_FRAME_TIME") {
                     Ok(value) => value.trim().parse().unwrap_or(120).max(2),
                     Err(_) => 0,
@@ -521,6 +543,14 @@ mod imp {
             // Parented rather than packed, so it has to be taken off by hand.
             if let Some(menu) = self.menu.take() {
                 menu.unparent();
+            }
+            // The display-settings handlers live on a process-global object
+            // and would otherwise be one dead closure per closed pane, fired
+            // on every font-rendering change for the life of the process.
+            if let Some(settings) = gtk::Settings::default() {
+                for id in self.settings_handlers.take() {
+                    settings.disconnect(id);
+                }
             }
             // Drop the session before the widget so the reader thread's channel
             // closes and the shell gets its SIGHUP.
@@ -707,7 +737,7 @@ impl TuniTerminal {
             return;
         };
         for property in ["gtk-xft-dpi", "gtk-font-rendering", "gtk-xft-antialias"] {
-            settings.connect_notify_local(
+            let id = settings.connect_notify_local(
                 Some(property),
                 glib::clone!(
                     #[weak(rename_to = this)]
@@ -715,6 +745,9 @@ impl TuniTerminal {
                     move |_, _| this.remeasure()
                 ),
             );
+            // Kept so dispose can take them off: `gtk::Settings` is
+            // process-global, and every handler left on it outlives the pane.
+            self.imp().settings_handlers.borrow_mut().push(id);
         }
     }
 
@@ -947,6 +980,9 @@ impl TuniTerminal {
                 // zero, and the tick callback repaints the whole viewport at
                 // the frame clock for as long as the pane exists.
                 this.imp().bar_hover.set(false);
+                // The fade tick parks itself while the hover pins the thumb
+                // solid, so leaving has to put the fade back on the clock.
+                this.reveal_scrollbar();
                 this.clear_links();
             }
         ));
@@ -1234,6 +1270,16 @@ impl TuniTerminal {
                     match event {
                         PtyEvent::Output(bytes) => {
                             this.feed(&bytes);
+                            // A closed pane's session is gone, but a shell
+                            // that ignored its SIGHUP can keep printing, and
+                            // every chunk it prints would keep this future —
+                            // and the strong reference it holds on a disposed
+                            // widget — alive. Feeding a session that is not
+                            // there does nothing, so the loop has nothing left
+                            // to do either.
+                            if this.imp().session.borrow().is_none() {
+                                break;
+                            }
                             if served.elapsed() >= FEED_BUDGET {
                                 // Below the frame clock's redraw idle, not at
                                 // the default priority a plain yield uses:
@@ -1380,11 +1426,18 @@ impl TuniTerminal {
             self.reveal_scrollbar();
         }
 
-        if let Some(title) = title {
+        // The VT's flag says an OSC arrived, not that the value moved: a shell
+        // re-announcing the same title before every prompt would otherwise run
+        // the window's whole title-and-labels refresh each time.
+        if let Some(title) = title
+            && imp.title.borrow().as_deref() != Some(title.as_str())
+        {
             imp.title.replace(Some(title));
             self.notify("title");
         }
-        if let Some(cwd) = cwd {
+        if let Some(cwd) = cwd
+            && imp.cwd.borrow().as_deref() != Some(cwd.as_str())
+        {
             imp.cwd.replace(Some(cwd));
             self.notify("cwd");
         }
@@ -1736,10 +1789,21 @@ impl TuniTerminal {
         } else {
             (imp.bar_alpha.get() - step).max(target)
         };
-        imp.bar_alpha.set(alpha);
-        self.queue_draw();
+        if alpha != imp.bar_alpha.replace(alpha) {
+            self.queue_draw();
+        }
 
         if alpha <= 0.0 && target <= 0.0 {
+            imp.bar_tick.replace(None);
+            return glib::ControlFlow::Break;
+        }
+        // A thumb pinned solid by a pointer parked on it can stay that way for
+        // minutes, and a tick that wakes every frame to change nothing keeps
+        // the frame clock — and the compositor — running the whole time. Parked
+        // is safe because every way out of the hover goes through the motion
+        // or the leave handler, and both re-arm the fade. A drag stays on the
+        // clock: it is actively repainting anyway.
+        if alpha >= 1.0 && imp.bar_hover.get() && imp.bar_drag.get().is_none() {
             imp.bar_tick.replace(None);
             return glib::ControlFlow::Break;
         }
@@ -1967,19 +2031,22 @@ impl TuniTerminal {
         if imp.find.borrow().needle.is_empty() || imp.find_pending.replace(true) {
             return;
         }
-        glib::idle_add_local_once(glib::clone!(
-            #[weak(rename_to = this)]
-            self,
-            move || {
-                this.imp().find_pending.set(false);
-                let before = this.find_status();
-                this.refind();
-                if this.find_status() != before {
-                    this.emit_by_name::<()>("find-changed", &[]);
-                }
-                this.queue_draw();
+        // On the frame clock rather than the idle loop: the PTY pump yields
+        // every FEED_BUDGET, so under a firehose the idle loop turns about
+        // twice per presented frame, and each turn would run a whole-scrollback
+        // search whose result the frame in between never draws. A tick callback
+        // runs in the update phase, once per frame, right before the paint that
+        // will actually show the hits.
+        self.add_tick_callback(|this, _clock| {
+            this.imp().find_pending.set(false);
+            let before = this.find_status();
+            this.refind();
+            if this.find_status() != before {
+                this.emit_by_name::<()>("find-changed", &[]);
             }
-        ));
+            this.queue_draw();
+            glib::ControlFlow::Break
+        });
     }
 
     /// Run the live search again over what the terminal now holds.

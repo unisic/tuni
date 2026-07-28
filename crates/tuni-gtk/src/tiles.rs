@@ -31,7 +31,7 @@ mod imp {
     /// from, so the pointer's total travel is always measured against a fixed
     /// baseline rather than against weights it is itself changing.
     /// Told the weights a divider drag settled on.
-    pub type Resized = Box<dyn Fn(&[f64])>;
+    pub type Resized = std::rc::Rc<dyn Fn(&[f64])>;
 
     pub struct Drag {
         pub index: usize,
@@ -209,7 +209,7 @@ impl TuniTiles {
 
     /// Called once when a divider drag ends, with the weights it settled on.
     pub fn connect_resized<F: Fn(&[f64]) + 'static>(&self, callback: F) {
-        self.imp().resized.replace(Some(Box::new(callback)));
+        self.imp().resized.replace(Some(std::rc::Rc::new(callback)));
     }
 
     /// Which divider a press at (`x`, `y`) grabs: the gap it landed in.
@@ -275,7 +275,11 @@ impl TuniTiles {
             return;
         }
         let weights = self.imp().weights.borrow().clone();
-        if let Some(callback) = self.imp().resized.borrow().as_ref() {
+        // Cloned out before the call, the way every other handler slot in the
+        // crate is, so a handler that reaches back into this widget does not
+        // find the slot still borrowed.
+        let callback = self.imp().resized.borrow().clone();
+        if let Some(callback) = callback {
             callback(&weights);
         }
     }
