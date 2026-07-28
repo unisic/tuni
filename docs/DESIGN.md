@@ -949,7 +949,8 @@ configuration file: `TUNI_THEME` names one of the bundled themes for the run
 and `TUNI_FONT` a font the way Pango writes one (`"JetBrains Mono 13"`), with
 `TUNI_LIGATURES=1` to let them fire; `TUNI_SESSION=0` neither restores the
 saved session nor overwrites it; `TUNI_DEBUG_FRAME_TIME` prints draw-time
-percentiles;
+percentiles; `TUNI_DEBUG_STARTUP` prints how many milliseconds each phase
+before the first frame took;
 `TUNI_DEBUG_PTY_WRITE` logs what the terminal answers back to the shell; and
 `TUNI_CAPTURE_PNG` renders the widget to a file and exits — useful on
 compositors with no screenshot protocol.

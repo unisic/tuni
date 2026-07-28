@@ -115,6 +115,13 @@ mod imp {
         pub editor_command: RefCell<String>,
         pub editor_image: RefCell<Option<gtk::Image>>,
         pub editor_label: RefCell<Option<gtk::Label>>,
+        /// The editor images still wearing the fallback pencil, and which
+        /// editor each is waiting for. Finding the real icons means parsing
+        /// every desktop file on the machine, which is the most expensive
+        /// thing this page does and pointless until somebody looks at it, so
+        /// the list is filled at construction and emptied the first time the
+        /// page is mapped.
+        pub pending_icons: RefCell<Vec<(gtk::Image, tuni_core::editors::Editor)>>,
     }
 
     #[glib::object_subclass]
@@ -286,7 +293,13 @@ impl TuniInfo {
                 .find(|editor| editor.command == remembered)
                 .unwrap_or(&editors[0]);
 
-            let image = gtk::Image::from_gicon(&editor_icon(chosen));
+            // Every image starts as the fallback pencil and is corrected on
+            // first map; see `editor_icons` for why the real ones are not
+            // worth a window's startup.
+            let image = gtk::Image::from_gicon(&fallback_editor_icon());
+            imp.pending_icons
+                .borrow_mut()
+                .push((image.clone(), *chosen));
             let label = gtk::Label::new(Some(chosen.name));
             let face = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             face.append(&image);
@@ -300,7 +313,9 @@ impl TuniInfo {
                 row.set_margin_end(10);
                 row.set_margin_top(4);
                 row.set_margin_bottom(4);
-                row.append(&gtk::Image::from_gicon(&editor_icon(editor)));
+                let icon = gtk::Image::from_gicon(&fallback_editor_icon());
+                imp.pending_icons.borrow_mut().push((icon.clone(), *editor));
+                row.append(&icon);
                 row.append(&gtk::Label::new(Some(editor.name)));
                 list.append(&row);
             }
@@ -340,6 +355,27 @@ impl TuniInfo {
             imp.editor_image.replace(Some(image));
             imp.editor_label.replace(Some(label));
             root_group.buttons.append(&open);
+
+            // The desktop-file walk, paid once, the first time somebody opens
+            // this page. A view stack maps only the child it is showing, so a
+            // window that never leaves Files never runs it at all. The capture
+            // is weak because the images in the list are this widget's own
+            // descendants, and a handler on it holding them strongly would be
+            // a cycle that outlives the page.
+            self.connect_map(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_| {
+                    let pending = std::mem::take(&mut *this.imp().pending_icons.borrow_mut());
+                    if pending.is_empty() {
+                        return;
+                    }
+                    let editors: Vec<_> = pending.iter().map(|(_, editor)| *editor).collect();
+                    for ((image, _), icon) in pending.iter().zip(editor_icons(&editors)) {
+                        image.set_from_gicon(&icon);
+                    }
+                }
+            ));
         }
 
         let tunnels = self.tunnel_section();
@@ -1418,8 +1454,10 @@ impl TuniInfo {
                 if let Some(label) = self.imp().editor_label.borrow().as_ref() {
                     label.set_text(editor.name);
                 }
-                if let Some(image) = self.imp().editor_image.borrow().as_ref() {
-                    image.set_from_gicon(&editor_icon(&editor));
+                if let Some(image) = self.imp().editor_image.borrow().as_ref()
+                    && let Some(icon) = editor_icons(&[editor]).pop()
+                {
+                    image.set_from_gicon(&icon);
                 }
             }
             let mut settings = tuni_core::settings::Settings::load();
@@ -1643,22 +1681,39 @@ impl TuniInfo {
     }
 }
 
-/// The icon the editor's own desktop file names, or a plain pencil for one
-/// installed without a desktop entry — a tarball whose command is on `PATH`
-/// still opens, it just has no face of its own to show. The walk over every
-/// installed application is what the gio crate leaves after dropping
-/// `DesktopAppInfo`, and it runs a dozen times when the panel is built, not
-/// per frame.
-fn editor_icon(editor: &tuni_core::editors::Editor) -> gio::Icon {
+/// A plain pencil, for an editor installed without a desktop entry — a tarball
+/// whose command is on `PATH` still opens, it just has no face of its own to
+/// show — and for one whose real icon has not been looked up yet.
+fn fallback_editor_icon() -> gio::Icon {
+    gio::ThemedIcon::new("document-edit-symbolic").upcast()
+}
+
+/// The icon each editor's own desktop file names, resolved in a single pass.
+///
+/// The walk over every installed application is what the gio crate leaves
+/// after dropping `DesktopAppInfo`: there is no binding left that opens one
+/// desktop file by id, so the only route is to enumerate them all — four
+/// hundred key files parsed on an ordinary machine. Doing that once per editor
+/// made it 56% of the CPU spent before tuni's first frame, for a page that
+/// opens last and often not at all. One walk answers for every editor at once,
+/// and [`TuniInfo::build`] only asks when the page is first mapped.
+fn editor_icons(editors: &[tuni_core::editors::Editor]) -> Vec<gio::Icon> {
+    let mut found: Vec<Option<gio::Icon>> = vec![None; editors.len()];
     for app in gio::AppInfo::all() {
-        if let Some(id) = app.id()
-            && editor.desktop.iter().any(|want| *want == id)
-            && let Some(icon) = app.icon()
-        {
-            return icon;
+        if found.iter().all(Option::is_some) {
+            break;
+        }
+        let Some(id) = app.id() else { continue };
+        for (slot, editor) in found.iter_mut().zip(editors) {
+            if slot.is_none() && editor.desktop.iter().any(|want| *want == id) {
+                *slot = app.icon();
+            }
         }
     }
-    gio::ThemedIcon::new("document-edit-symbolic").upcast()
+    found
+        .into_iter()
+        .map(|icon| icon.unwrap_or_else(fallback_editor_icon))
+        .collect()
 }
 
 fn entry<F: Fn(&TuniInfo) + 'static>(

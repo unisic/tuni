@@ -160,8 +160,11 @@ separated action names, one step apart), `_OPEN`, `_DIFF`, `_STAGE`, `_FIND`,
 Others: `TUNI_DEBUG_LIFETIME` prints a line per construction and destruction
 with a live count per type, which is how "the closed pane should be gone" turns
 into something readable. `TUNI_THEME`, `TUNI_FONT`, `TUNI_LIGATURES` override
-settings for one run. `TUNI_DEBUG_FRAME_TIME`, `TUNI_DEBUG_PTY_WRITE`,
-`TUNI_DEBUG_CLIPBOARD` are per-area traces.
+settings for one run. `TUNI_DEBUG_STARTUP` stamps each phase before the first
+frame with the milliseconds a person waited for it, which a flat profile cannot
+say because the phases are nested inside GTK's own initialisation.
+`TUNI_DEBUG_FRAME_TIME`, `TUNI_DEBUG_PTY_WRITE`, `TUNI_DEBUG_CLIPBOARD` are
+per-area traces.
 
 ## Conventions
 

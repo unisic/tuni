@@ -344,6 +344,7 @@ mod imp {
             crate::debug::born("TuniWindow");
             let obj = self.obj();
             obj.build_ui();
+            crate::debug::mark("  build_ui");
             obj.install_actions();
             obj.install_switcher();
             obj.watch_appearance();
@@ -474,6 +475,7 @@ impl TuniWindow {
 
     fn build_ui(&self) {
         let imp = self.imp();
+        crate::debug::mark("   build_ui begin");
         load_css();
         crate::editor::apply_font(&imp.settings.borrow().terminal);
         crate::diff::apply_colors(&self.theme());
@@ -615,7 +617,9 @@ impl TuniWindow {
 
         // --- the Files and Git panel, on the far side of the terminals
 
+        crate::debug::mark("   panel begin");
         let panel_view = TuniPanel::new();
+        crate::debug::mark("   panel end");
         if let Some(files) = panel_view.files() {
             files.connect_message(glib::clone!(
                 #[weak(rename_to = this)]
@@ -712,6 +716,7 @@ impl TuniWindow {
         toasts.set_child(Some(&split));
         self.imp().toasts.replace(Some(toasts.clone()));
         self.set_content(Some(&toasts));
+        crate::debug::mark("   set_content");
 
         // What being given the window back is worth: a host list re-reads files
         // the user edits somewhere else, since coming back is when they would

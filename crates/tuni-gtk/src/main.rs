@@ -127,7 +127,9 @@ pub(crate) const ACCELS: &[(&str, &[&str])] = &[
 ];
 
 fn main() -> glib::ExitCode {
+    debug::mark("main");
     quieten();
+    debug::mark("gtk::init");
 
     // Not unique: a terminal launched from a shell must inherit *that* shell's
     // working directory, which a single primary instance could not see.
@@ -137,6 +139,7 @@ fn main() -> glib::ExitCode {
         .build();
 
     app.connect_startup(|app| {
+        debug::mark("startup begin");
         // Names the installed icon rather than carrying one: the desktop looks
         // it up in the icon theme, which is also where the notification daemon
         // and the window switcher look for it.
@@ -173,6 +176,7 @@ fn main() -> glib::ExitCode {
                 &[&format!("<Ctrl><Shift>{number}")],
             );
         }
+        debug::mark("startup end");
     });
     app.connect_activate(build_window);
     app.run()
@@ -214,13 +218,23 @@ fn quieten() {
 }
 
 fn build_window(app: &adw::Application) {
+    debug::mark("activate");
     let settings = settings();
     window::apply_appearance(settings.appearance);
     let window = TuniWindow::new(app, settings);
+    debug::mark("window built");
     // The window the application opens with is the one the saved session
     // belongs to. Windows opened beside it neither restore it nor write it.
     window.own_session();
     window.present();
+    debug::mark("presented");
+    // The first frame is what the person is waiting for, and `present` only
+    // asks for it. The frame clock says when it arrived.
+    window.connect_map(|window| {
+        if let Some(clock) = window.frame_clock() {
+            clock.connect_after_paint(|_| debug::mark("first frame"));
+        }
+    });
 
     // The first project's shell learns its size from the first allocation, so
     // it opens after the window is on screen rather than before.
@@ -233,6 +247,7 @@ fn build_window(app: &adw::Application) {
             if !window::session_enabled() || !window.restore_session() {
                 window.open_project();
             }
+            debug::mark("project open");
             // A window restored onto a file or a diff has no terminal in the
             // pane that is focused, and a capture of it is still a capture.
             maybe_capture(&window, window.active_terminal().as_ref());

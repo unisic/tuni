@@ -55,6 +55,31 @@ pub fn watch<T: IsA<glib::Object>>(object: &T, kind: &'static str, id: u64) {
     });
 }
 
+/// Where the milliseconds before the first frame go.
+///
+/// A profiler answers this one badly. The phases are nested inside GTK's own
+/// initialisation, so a flat profile attributes the cost to `g_key_file` and
+/// `FcCharSetIsSubset` rather than to whoever asked for them, and a percentage
+/// of a run says nothing about how long a person waited. So the phases are
+/// stamped by hand and printed as wall-clock milliseconds, which is the number
+/// the complaint is about.
+///
+/// The clock starts at the first mark rather than at process start: the
+/// dynamic linker has already run by then, and nothing this program does can
+/// change that part.
+pub fn mark(phase: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("TUNI_DEBUG_STARTUP").is_some()) {
+        return;
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+    eprintln!(
+        "tuni startup {:>8.1}ms {phase}",
+        elapsed.as_secs_f64() * 1000.0
+    );
+}
+
 /// A one-off line about something that happened, for the same runs.
 pub fn note(what: &str) {
     if enabled() {
