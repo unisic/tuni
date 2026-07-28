@@ -13,7 +13,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use adw::prelude::*;
@@ -39,6 +39,9 @@ type Link = Arc<Mutex<Session>>;
 pub struct Moved {
     done: AtomicU64,
     total: AtomicU64,
+    /// Raised by the bar's cancel button, read by the transfer at every
+    /// chunk, which is as promptly as a blocking pipe can honor it.
+    stop: AtomicBool,
 }
 
 /// One file waiting its turn. A drop of five files is five of these, four of
@@ -89,6 +92,8 @@ mod imp {
         pub subtitle: RefCell<Option<gtk::Label>>,
         pub menu: RefCell<Option<gtk::PopoverMenu>>,
         pub progress: RefCell<Option<gtk::ProgressBar>>,
+        /// The bar and its cancel button, shown and hidden as one.
+        pub progress_row: RefCell<Option<gtk::Box>>,
         /// The transfer running, if one is. One pipe carries one at a time, so
         /// a second would sit behind the lock with nothing on screen saying
         /// why; this is what refuses it instead.
@@ -208,11 +213,27 @@ impl TuniSftp {
 
         let progress = gtk::ProgressBar::builder()
             .show_text(true)
-            .visible(false)
+            .hexpand(true)
+            .valign(gtk::Align::Center)
             .build();
-        progress.set_margin_start(12);
-        progress.set_margin_end(12);
-        progress.set_margin_bottom(6);
+        let cancel = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Cancel Transfer")
+            .valign(gtk::Align::Center)
+            .build();
+        cancel.add_css_class("flat");
+        cancel.connect_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.cancel_transfer()
+        ));
+        let progress_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        progress_row.set_margin_start(12);
+        progress_row.set_margin_end(12);
+        progress_row.set_margin_bottom(6);
+        progress_row.set_visible(false);
+        progress_row.append(&progress);
+        progress_row.append(&cancel);
 
         let rows = gio::ListStore::new::<Row>();
         let selection = gtk::SingleSelection::builder()
@@ -291,7 +312,7 @@ impl TuniSftp {
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&header);
-        content.append(&progress);
+        content.append(&progress_row);
         content.append(&stack);
         self.set_child(Some(&content));
 
@@ -306,6 +327,7 @@ impl TuniSftp {
         imp.subtitle.replace(Some(subtitle));
         imp.menu.replace(Some(menu));
         imp.progress.replace(Some(progress));
+        imp.progress_row.replace(Some(progress_row));
 
         self.say(
             "No Connection",
@@ -829,6 +851,17 @@ impl TuniSftp {
         self.pump();
     }
 
+    /// The button on the bar. Stops the transfer at its next chunk and
+    /// forgets the ones queued behind it: the press means "stop
+    /// transferring", and eleven files nobody wants any more would otherwise
+    /// start the moment this one dies.
+    fn cancel_transfer(&self) {
+        self.imp().queue.borrow_mut().clear();
+        if let Some(moved) = self.imp().moving.borrow().as_ref() {
+            moved.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Starts the next transfer, if there is one and nothing else is going.
     fn pump(&self) {
         if self.imp().moving.borrow().is_some() {
@@ -872,6 +905,7 @@ impl TuniSftp {
         });
 
         let generation = imp.generation.get();
+        let flag = Arc::clone(&moved);
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -886,40 +920,62 @@ impl TuniSftp {
                     let mut note = |done: u64, total: u64| {
                         moved.done.store(done, Ordering::Relaxed);
                         moved.total.store(total, Ordering::Relaxed);
+                        !moved.stop.load(Ordering::Relaxed)
                     };
                     match way {
-                        Way::Up => session
-                            .put(&local, &remote, &mut note)
-                            .ok_or_else(|| failed(&session)),
+                        Way::Up => {
+                            let sent = session
+                                .put(&local, &remote, &mut note)
+                                .ok_or_else(|| failed(&session));
+                            // A cancelled upload has left a truncated file
+                            // under the real name at the far end; sweep it so
+                            // nothing over there opens half a file as the
+                            // whole thing.
+                            if sent.is_err() && moved.stop.load(Ordering::Relaxed) {
+                                let _ = session.remove(&remote);
+                            }
+                            sent
+                        }
                         Way::Down => {
                             // Written beside where it is going and moved onto
                             // it when it is whole, which is how the editor
                             // saves: a transfer that dies leaves nothing under
                             // a name something else would open.
                             let part = local.with_file_name(partial(&local));
-                            session
+                            let got = session
                                 .get(&remote, &part, &mut note)
-                                .ok_or_else(|| failed(&session))?;
-                            std::fs::rename(&part, &local).map_err(|error| {
+                                .ok_or_else(|| failed(&session));
+                            if got.is_err() {
+                                // Dead or cancelled either way, and nothing is
+                                // coming back for the half that landed.
                                 let _ = std::fs::remove_file(&part);
-                                Failure {
-                                    message: format!("Couldn't finish {}.", local.display()),
-                                    detail: error.to_string(),
-                                }
-                            })
+                                got
+                            } else {
+                                std::fs::rename(&part, &local).map_err(|error| {
+                                    let _ = std::fs::remove_file(&part);
+                                    Failure {
+                                        message: format!("Couldn't finish {}.", local.display()),
+                                        detail: error.to_string(),
+                                    }
+                                })
+                            }
                         }
                     }
                 })
                 .await;
 
                 this.imp().moving.replace(None);
-                if let Some(bar) = this.imp().progress.borrow().as_ref() {
-                    bar.set_visible(false);
+                if let Some(row) = this.imp().progress_row.borrow().as_ref() {
+                    row.set_visible(false);
                 }
                 if generation != this.imp().generation.get() {
                     return;
                 }
                 match moved {
+                    // The cancel button doing its job is not news: the press
+                    // already emptied the queue, and a dialog would only
+                    // repeat what the hand that pressed it knows.
+                    Ok(Err(_)) if flag.stop.load(Ordering::Relaxed) => {}
                     Ok(Err(failure)) => {
                         // What was behind it goes no further. A connection that
                         // died on the first file is going to die on the other
@@ -1090,7 +1146,11 @@ impl TuniSftp {
         };
         bar.set_text(Some(label));
         bar.set_fraction(0.0);
-        bar.set_visible(true);
+        if let Some(row) = self.imp().progress_row.borrow().as_ref() {
+            row.set_visible(true);
+        }
+        let label = label.to_owned();
+        let started = std::time::Instant::now();
         glib::timeout_add_local(
             std::time::Duration::from_millis(100),
             glib::clone!(
@@ -1105,13 +1165,29 @@ impl TuniSftp {
                     let done = moved.done.load(Ordering::Relaxed);
                     let total = moved.total.load(Ordering::Relaxed);
                     if let Some(bar) = this.imp().progress.borrow().as_ref() {
+                        // Bytes over the whole run rather than over the last
+                        // tick: an average settles where a 100ms sample
+                        // flickers between a stall and a burst. Held back for
+                        // the first moment because dividing by almost no time
+                        // opens every transfer on a nonsense number.
+                        let elapsed = started.elapsed().as_secs_f64();
+                        let speed = if elapsed < 0.5 {
+                            String::new()
+                        } else {
+                            let rate = done as f64 / elapsed;
+                            format!(" · {}/s", glib::format_size(rate as u64))
+                        };
                         // A server that did not say how big a file is leaves
                         // nothing to draw a fraction from, so the bar moves
                         // without claiming to know how far along it is.
                         if total == 0 {
                             bar.pulse();
+                            bar.set_text(Some(&format!("{label}{speed}")));
                         } else {
-                            bar.set_fraction(done as f64 / total as f64);
+                            let fraction = done as f64 / total as f64;
+                            bar.set_fraction(fraction);
+                            let percent = (fraction * 100.0) as u32;
+                            bar.set_text(Some(&format!("{label} — {percent}%{speed}")));
                         }
                     }
                     glib::ControlFlow::Continue

@@ -217,7 +217,10 @@ impl Session {
     }
 
     /// Copies a remote file to `local`, calling `progress` with how much has
-    /// arrived and how much there is.
+    /// arrived and how much there is. `progress` answering `false` stops the
+    /// transfer where it stands: the handle is closed, the half-written local
+    /// file is left for the caller (who named it), and the failure says
+    /// cancelled.
     ///
     /// The caller decides what `local` is named. Nothing here renames anything,
     /// so a caller that wants a half-written file to be unopenable writes to a
@@ -226,7 +229,7 @@ impl Session {
         &mut self,
         remote: &str,
         local: &Path,
-        progress: &mut dyn FnMut(u64, u64),
+        progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Option<()> {
         let total = self.stat(remote).map_or(0, |entry| entry.size);
         let handle = self.open_file(remote, READABLE, None)?;
@@ -247,7 +250,9 @@ impl Session {
     }
 
     /// Copies a local file to `remote`, calling `progress` with how much has
-    /// gone and how much there is.
+    /// gone and how much there is. `progress` answering `false` stops the
+    /// transfer where it stands, leaving a truncated file at the far end for
+    /// the caller to keep or sweep.
     ///
     /// The file arrives with the permission bits it has here, which is what the
     /// `sftp` program does too: a script that is executable on this machine is
@@ -256,7 +261,7 @@ impl Session {
         &mut self,
         local: &Path,
         remote: &str,
-        progress: &mut dyn FnMut(u64, u64),
+        progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Option<()> {
         let file = match File::open(local) {
             Ok(file) => file,
@@ -463,10 +468,12 @@ impl Session {
         mut file: File,
         remote: &str,
         total: u64,
-        progress: &mut dyn FnMut(u64, u64),
+        progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Option<()> {
         let mut at = 0_u64;
-        progress(0, total);
+        if !progress(0, total) {
+            return self.cancelled();
+        }
         loop {
             let mut request = encode_string_bytes(handle);
             request.extend_from_slice(&at.to_be_bytes());
@@ -497,7 +504,9 @@ impl Session {
                 return None;
             }
             at += chunk.len() as u64;
-            progress(at, total.max(at));
+            if !progress(at, total.max(at)) {
+                return self.cancelled();
+            }
         }
         if let Err(error) = file.flush() {
             self.wrote(&error.to_string());
@@ -514,11 +523,13 @@ impl Session {
         local: &Path,
         remote: &str,
         total: u64,
-        progress: &mut dyn FnMut(u64, u64),
+        progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Option<()> {
         let mut buffer = vec![0_u8; CHUNK];
         let mut at = 0_u64;
-        progress(0, total);
+        if !progress(0, total) {
+            return self.cancelled();
+        }
         loop {
             let read = match file.read(&mut buffer) {
                 Ok(0) => break,
@@ -541,9 +552,22 @@ impl Session {
                 return None;
             }
             at += read as u64;
-            progress(at, total.max(at));
+            if !progress(at, total.max(at)) {
+                return self.cancelled();
+            }
         }
         Some(())
+    }
+
+    /// The failure a refused `progress` callback turns into. A message all the
+    /// same, because a transfer that returns `None` is expected to have one;
+    /// the caller that cancelled knows it did and can choose not to show it.
+    fn cancelled(&mut self) -> Option<()> {
+        self.failure = Some(Failure::new(
+            String::from("The transfer was cancelled."),
+            String::new(),
+        ));
+        None
     }
 
     fn close(&mut self, handle: &[u8]) {
@@ -886,6 +910,7 @@ mod tests {
         let mut seen = Vec::new();
         let done = session.get("/home/dean/notes.txt", &local, &mut |at, total| {
             seen.push((at, total));
+            true
         });
         assert_eq!(done, Some(()));
         assert_eq!(std::fs::read(&local).expect("the file"), b"hello");
@@ -895,6 +920,40 @@ mod tests {
         let asked = far.join().expect("the far end");
         assert_eq!(asked[2].0, OPEN);
         assert_eq!(asked[3].0, READ);
+        let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn a_refused_progress_callback_cancels_the_transfer() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-stop-{}", std::process::id()));
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let mut attributes = (SIZE | PERMISSIONS).to_be_bytes().to_vec();
+        attributes.extend_from_slice(&5_u64.to_be_bytes());
+        attributes.extend_from_slice(&0o100_644_u32.to_be_bytes());
+        // No data reply on the script: a cancel at the first progress call
+        // means nothing is ever read, only opened and closed again.
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_ATTRS, body(1, &attributes)),
+            (REPLY_HANDLE, body(2, &encode_string("h"))),
+            (REPLY_STATUS, body(3, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+
+        let done = session.get("/home/dean/notes.txt", &local, &mut |_, _| false);
+        assert_eq!(done, None);
+        assert!(
+            session
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.message.contains("cancelled"))
+        );
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        assert!(asked.iter().all(|(kind, _)| *kind != READ));
         let _ = std::fs::remove_file(&local);
     }
 
@@ -913,7 +972,7 @@ mod tests {
         ]);
         assert!(session.handshake());
         assert_eq!(
-            session.put(&local, "/tmp/notes.txt", &mut |_, _| {}),
+            session.put(&local, "/tmp/notes.txt", &mut |_, _| true),
             Some(())
         );
 
@@ -944,7 +1003,11 @@ mod tests {
             (REPLY_STATUS, body(1, &status)),
         ]);
         assert!(session.handshake());
-        assert!(session.put(&local, "/etc/passwd", &mut |_, _| {}).is_none());
+        assert!(
+            session
+                .put(&local, "/etc/passwd", &mut |_, _| true)
+                .is_none()
+        );
 
         let failure = session.failure().expect("a reason");
         assert_eq!(failure.message, "Couldn't write /etc/passwd.");
