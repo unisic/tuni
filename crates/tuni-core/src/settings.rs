@@ -131,6 +131,11 @@ pub struct Settings {
     pub panel_git: bool,
     pub panel_info: bool,
     pub panel_debug: bool,
+    /// The command of the editor last opened from the Info page, so the split
+    /// button opens the same one next time. Empty until one is chosen; a
+    /// command that is no longer installed is simply not found and the button
+    /// falls back to the first editor that is.
+    pub info_editor: String,
     /// Window shortcuts changed from the defaults: the action's full name and
     /// what to press, in GTK's accelerator spelling. An empty accelerator is a
     /// shortcut turned off. Sorted, so the file writes the same way twice; the
@@ -156,6 +161,7 @@ impl Default for Settings {
             panel_git: true,
             panel_info: true,
             panel_debug: true,
+            info_editor: String::new(),
             keys: Vec::new(),
         }
     }
@@ -332,6 +338,12 @@ impl Settings {
         if let Some(on) = table.boolean("panel.debug") {
             settings.panel_debug = on;
         }
+        if let Some(command) = table
+            .string("info-editor")
+            .filter(|command| !command.trim().is_empty())
+        {
+            settings.info_editor = command.trim().to_owned();
+        }
         // Which actions exist is the window's business; anything spelled here
         // is carried as written and simply finds no action to land on if a
         // later version renames one.
@@ -476,6 +488,9 @@ impl Settings {
             if !on {
                 let _ = writeln!(out, "{page} = false");
             }
+        }
+        if self.info_editor != default.info_editor {
+            let _ = writeln!(out, "info-editor = {}", toml::quote(&self.info_editor));
         }
         for (action, accel) in &self.keys {
             let _ = writeln!(out, "key.{action} = {}", toml::quote(accel));
@@ -828,6 +843,7 @@ mod tests {
             panel_git: true,
             panel_info: true,
             panel_debug: false,
+            info_editor: "zed".to_owned(),
             keys: vec![("win.palette".to_owned(), "<Ctrl>p".to_owned())],
         };
         let read = Settings::parse(&settings.to_toml());
@@ -858,6 +874,7 @@ mod tests {
         assert!(!read.ssh_share_connections);
         assert_eq!(read.ssh_control_persist, 30);
         assert!(read.ssh_reconnect_on_restore);
+        assert_eq!(read.info_editor, "zed");
     }
 
     #[test]

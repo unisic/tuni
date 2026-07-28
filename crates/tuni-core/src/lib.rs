@@ -7,6 +7,7 @@
 pub mod dap;
 pub mod diff;
 pub mod editor;
+pub mod editors;
 pub mod files;
 pub mod fuzzy;
 pub mod git;

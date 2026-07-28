@@ -109,6 +109,12 @@ mod imp {
         pub ports: RefCell<Option<super::Section>>,
         pub menu: RefCell<Option<gtk::PopoverMenu>>,
         pub actions: RefCell<Option<gio::SimpleActionGroup>>,
+
+        /// The editor the split button opens, and the button's face, so a
+        /// pick from its list can swap the icon and the name.
+        pub editor_command: RefCell<String>,
+        pub editor_image: RefCell<Option<gtk::Image>>,
+        pub editor_label: RefCell<Option<gtk::Label>>,
     }
 
     #[glib::object_subclass]
@@ -183,6 +189,8 @@ pub struct Directory {
     container: gtk::Box,
     heading: gtk::Label,
     path: gtk::Label,
+    /// The row of buttons under the path, so a group can grow one more.
+    buttons: gtk::Box,
 }
 
 /// What the coding agent running under the shell has spent: a heading naming
@@ -262,6 +270,77 @@ impl TuniInfo {
              closest repository above the shell's own directory; a directory \
              pinned from the project menu is used as it stands.",
         ));
+
+        // The project directory is what an editor opens, so the button to do
+        // that sits in the row beside Files and Copy. A split button wearing
+        // the editor's own face — the icon its desktop file names and its
+        // name, for the one picked last, remembered across runs — with the
+        // rest behind the arrow as icon-and-name rows: the machine says
+        // which editors exist, and a machine with none gets no button at
+        // all.
+        let editors = tuni_core::editors::installed();
+        if !editors.is_empty() {
+            let remembered = tuni_core::settings::Settings::load().info_editor;
+            let chosen = editors
+                .iter()
+                .find(|editor| editor.command == remembered)
+                .unwrap_or(&editors[0]);
+
+            let image = gtk::Image::from_gicon(&editor_icon(chosen));
+            let label = gtk::Label::new(Some(chosen.name));
+            let face = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            face.append(&image);
+            face.append(&label);
+
+            let list = gtk::ListBox::new();
+            list.set_selection_mode(gtk::SelectionMode::None);
+            for editor in &editors {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                row.set_margin_start(4);
+                row.set_margin_end(10);
+                row.set_margin_top(4);
+                row.set_margin_bottom(4);
+                row.append(&gtk::Image::from_gicon(&editor_icon(editor)));
+                row.append(&gtk::Label::new(Some(editor.name)));
+                list.append(&row);
+            }
+            let popover = gtk::Popover::new();
+            popover.set_child(Some(&list));
+            let listed = editors.clone();
+            list.connect_row_activated(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[weak]
+                popover,
+                move |_, row| {
+                    popover.popdown();
+                    if let Ok(index) = usize::try_from(row.index())
+                        && let Some(editor) = listed.get(index)
+                    {
+                        this.open_in_editor(editor.command);
+                    }
+                }
+            ));
+
+            let open = adw::SplitButton::builder()
+                .popover(&popover)
+                .tooltip_text("Open in Editor")
+                .build();
+            open.set_child(Some(&face));
+            open.add_css_class("flat");
+            open.connect_clicked(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_| {
+                    let command = this.imp().editor_command.borrow().clone();
+                    this.open_in_editor(&command);
+                }
+            ));
+            imp.editor_command.replace(chosen.command.to_owned());
+            imp.editor_image.replace(Some(image));
+            imp.editor_label.replace(Some(label));
+            root_group.buttons.append(&open);
+        }
 
         let tunnels = self.tunnel_section();
         let agent = self.agent_section();
@@ -415,9 +494,10 @@ impl TuniInfo {
         path.add_css_class("dim-label");
 
         // An icon and a word each, with the whole sentence in the tooltip: two
-        // spelled-out labels are wider than the panel is meant to be.
+        // spelled-out labels are wider than the panel is meant to be. Natural
+        // widths rather than homogeneous, so a longer neighbor — the editor
+        // button wearing its editor's name — does not stretch the others.
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        buttons.set_homogeneous(true);
         let show = gtk::Button::builder()
             .child(
                 &adw::ButtonContent::builder()
@@ -455,6 +535,7 @@ impl TuniInfo {
             container,
             heading,
             path,
+            buttons,
         }
     }
 
@@ -1322,6 +1403,49 @@ impl TuniInfo {
         self.imp().actions.replace(Some(actions));
     }
 
+    /// Opens the project directory in one of the installed editors, and makes
+    /// that editor the split button's own: face, next click, and — written to
+    /// the settings file — next run. Spawned through glib so the editor is its
+    /// own process with its own life: closing tuni does not close it, and
+    /// glib reaps what exits so nothing lingers as a zombie.
+    fn open_in_editor(&self, command: &str) {
+        if *self.imp().editor_command.borrow() != command {
+            self.imp().editor_command.replace(command.to_owned());
+            if let Some(editor) = tuni_core::editors::installed()
+                .into_iter()
+                .find(|editor| editor.command == command)
+            {
+                if let Some(label) = self.imp().editor_label.borrow().as_ref() {
+                    label.set_text(editor.name);
+                }
+                if let Some(image) = self.imp().editor_image.borrow().as_ref() {
+                    image.set_from_gicon(&editor_icon(&editor));
+                }
+            }
+            let mut settings = tuni_core::settings::Settings::load();
+            settings.info_editor = command.to_owned();
+            let _ = settings.save();
+        }
+        let root = self.imp().root.borrow().clone();
+        if root.as_os_str().is_empty() {
+            return;
+        }
+        // The command comes from the static table behind the menu; the path
+        // is the only thing here anyone else had a hand in, so it is the one
+        // that gets quoted.
+        let line = format!("{command} {}", glib::shell_quote(&root).to_string_lossy());
+        if let Err(error) = glib::spawn_command_line_async(line) {
+            let dialog = adw::AlertDialog::new(
+                Some(&format!("Couldn't start {command}.")),
+                Some(&error.to_string()),
+            );
+            dialog.add_response("close", "Close");
+            dialog.set_default_response(Some("close"));
+            dialog.set_close_response("close");
+            dialog.present(Some(self));
+        }
+    }
+
     // --- forwarded ports ---------------------------------------------------
 
     /// Asks the master to open or close a forward.
@@ -1517,6 +1641,24 @@ impl TuniInfo {
     fn window(&self) -> Option<gtk::Window> {
         self.root().and_downcast::<gtk::Window>()
     }
+}
+
+/// The icon the editor's own desktop file names, or a plain pencil for one
+/// installed without a desktop entry — a tarball whose command is on `PATH`
+/// still opens, it just has no face of its own to show. The walk over every
+/// installed application is what the gio crate leaves after dropping
+/// `DesktopAppInfo`, and it runs a dozen times when the panel is built, not
+/// per frame.
+fn editor_icon(editor: &tuni_core::editors::Editor) -> gio::Icon {
+    for app in gio::AppInfo::all() {
+        if let Some(id) = app.id()
+            && editor.desktop.iter().any(|want| *want == id)
+            && let Some(icon) = app.icon()
+        {
+            return icon;
+        }
+    }
+    gio::ThemedIcon::new("document-edit-symbolic").upcast()
 }
 
 fn entry<F: Fn(&TuniInfo) + 'static>(
