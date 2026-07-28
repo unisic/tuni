@@ -104,9 +104,20 @@ impl Default for PtyConfig {
     fn default() -> Self {
         let mut env = HashMap::new();
         // libghostty-vt implements Ghostty's terminal, so its terminfo is the
-        // honest description. Ghostty installs `xterm-ghostty` system-wide;
-        // shipping our own copy is Etap 10 work.
-        env.insert("TERM".to_owned(), "xterm-ghostty".to_owned());
+        // honest description — when this machine has it. The packages ask for
+        // it (Recommends/optdepends on ghostty's terminfo), but a machine
+        // without it would otherwise greet every ncurses program with
+        // "unknown terminal type", which is strictly worse than the slightly
+        // less honest xterm-256color.
+        env.insert(
+            "TERM".to_owned(),
+            if terminfo_installed("xterm-ghostty") {
+                "xterm-ghostty"
+            } else {
+                "xterm-256color"
+            }
+            .to_owned(),
+        );
         env.insert("COLORTERM".to_owned(), "truecolor".to_owned());
         env.insert("TERM_PROGRAM".to_owned(), "tuni".to_owned());
 
@@ -121,6 +132,45 @@ impl Default for PtyConfig {
             cell_height_px: 16,
         }
     }
+}
+
+/// Whether ncurses would find a terminfo entry by this name, by looking where
+/// ncurses looks: `$TERMINFO`, `~/.terminfo`, `$TERMINFO_DIRS`, then the
+/// compiled-in defaults every distribution uses.
+///
+/// A hashed `terminfo.db` is not read; a system odd enough to have one
+/// without the directory tree falls back to xterm-256color, which is the safe
+/// direction to be wrong in.
+fn terminfo_installed(name: &str) -> bool {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::var_os("TERMINFO") {
+        dirs.push(dir.into());
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".terminfo"));
+    }
+    if let Some(list) = std::env::var_os("TERMINFO_DIRS") {
+        // An empty entry in the list means "the default place", per terminfo(5).
+        for dir in std::env::split_paths(&list) {
+            if dir.as_os_str().is_empty() {
+                dirs.push(PathBuf::from("/usr/share/terminfo"));
+            } else {
+                dirs.push(dir);
+            }
+        }
+    }
+    for fallback in ["/etc/terminfo", "/lib/terminfo", "/usr/share/terminfo"] {
+        dirs.push(PathBuf::from(fallback));
+    }
+    dirs.iter().any(|dir| terminfo_under(dir, name))
+}
+
+/// One directory's answer: entries live at `<dir>/<first letter>/<name>`.
+fn terminfo_under(dir: &std::path::Path, name: &str) -> bool {
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+    dir.join(first.to_string()).join(name).is_file()
 }
 
 pub struct Pty {
@@ -370,6 +420,19 @@ mod tests {
         assert_eq!(resolve_shell("tuni-no-such-shell"), None);
         assert_eq!(resolve_shell("/etc/hostname"), None);
         assert_eq!(resolve_shell("   "), None);
+    }
+
+    #[test]
+    fn a_terminfo_entry_is_found_under_its_first_letter() {
+        let dir = std::env::temp_dir().join(format!("tuni-terminfo-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("x")).unwrap();
+        std::fs::write(dir.join("x").join("xterm-ghostty"), b"").unwrap();
+
+        assert!(terminfo_under(&dir, "xterm-ghostty"));
+        assert!(!terminfo_under(&dir, "xterm-256color"));
+        assert!(!terminfo_under(&dir, ""));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Drains a PTY until it says the program is gone, and answers with

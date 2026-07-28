@@ -43,6 +43,10 @@ Requires:       git-core
 Requires:       /usr/bin/curl
 Requires:       openssh-clients
 Requires:       hicolor-icon-theme
+# Panes say TERM=xterm-ghostty, which is this package's terminfo. Recommends
+# rather than Requires: without it tuni falls back to xterm-256color, so a
+# minimal install still works.
+Recommends:     ghostty-terminfo
 
 %description
 Tuni is a terminal workspace: a window of projects, each with tabs, each tab a

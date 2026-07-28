@@ -24,6 +24,9 @@ license=('GPL-3.0-or-later')
 # shelled out to by the Git panel and the plan bars on the Info page.
 depends=('gtk4' 'libadwaita' 'gtksourceview5' 'sqlite' 'git' 'curl'
          'hicolor-icon-theme')
+# Panes say TERM=xterm-ghostty; without the terminfo tuni falls back to
+# xterm-256color, which is why this is optional rather than hard.
+optdepends=('ghostty-terminfo: terminfo for the TERM tuni panes advertise')
 makedepends=('rust' 'cargo' 'make' 'gcc' 'pkgconf')
 # !debug: makepkg would otherwise split out a tuni-debug package, which is one
 # more file on the release page than anyone downloading a terminal wants.
