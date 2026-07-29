@@ -67,6 +67,39 @@
   </provides>
 
   <releases>
+    <release version="1.3.0" date="2026-07-29">
+      <description>
+        <p>The scrollback is the depth the setting names. Upstream spends
+        max_scrollback as bytes, so ten thousand lines used to buy about nine
+        hundred rows and everything older was gone; the conversion now happens
+        where every caller goes through, and a hit nine and a half thousand rows
+        back is found.</p>
+        <p>An SFTP transfer says how far along it is, how fast it is going, and
+        can be cancelled. A cancelled upload sweeps the truncated file at the
+        far end, a cancelled download sweeps the local part file, and the press
+        empties the queue behind it.</p>
+        <p>The Info page opens the project in an installed code editor, wearing
+        the icon and name of the one picked last; the arrow lists the rest.
+        Which editors exist is a PATH scan, so every install method is found.</p>
+        <p>A pane falls back to xterm-256color where xterm-ghostty has no
+        terminfo, instead of buying "unknown terminal type" from every ncurses
+        program.</p>
+        <p>The window chrome: the Git page wears a commit graph, New Project
+        sits under the last project and stays sticky, dialogs go solid under a
+        translucent window, and the pane grip lights only under the pointer
+        rather than aliasing over whatever sits beneath it.</p>
+        <p>The window goes quiet when nobody is looking. The panel and diff
+        polls skip their tick while it is inactive and catch up when activity
+        returns, the scrollbar fade redraws only when its alpha moved, and the
+        live search re-runs on the frame clock. The Info page's editor icons
+        are looked up when the page first opens rather than before the first
+        frame, which was 43 of the 49 milliseconds the panel cost at
+        startup.</p>
+        <p>Fixed: a closed pane lets go of its handlers, its place in the tab
+        recency list, its replay text and its textures, and a git child whose
+        stdin write failed is reaped and reports what git itself said.</p>
+      </description>
+    </release>
     <release version="1.2.0" date="2026-07-28">
       <description>
         <p>Clicks, drags and the wheel behave the way Ghostty's do. A press
