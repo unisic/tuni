@@ -15,6 +15,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -4396,6 +4397,19 @@ pub fn apply_appearance(appearance: Appearance) {
 /// working as libadwaita adds widgets. One provider, reloaded, so switching
 /// themes does not stack stylesheets on the display.
 ///
+/// Each color is written twice, because libadwaita changed how it reads them.
+/// Up to 1.7 the stylesheet resolved `@window_bg_color`, which an
+/// `@define-color` of that name overrode. From 1.8 it resolves
+/// `var(--window-bg-color)` instead, and an `@define-color` no longer feeds it:
+/// the override parses, applies to nothing, and the window keeps libadwaita's
+/// own gray. That is not a cosmetic loss here, since the window background is
+/// where the opacity setting lives — losing it takes translucency with it, and
+/// the blur behind an opaque window with it in turn. Writing both spellings
+/// covers both, and the one that is not understood is ignored rather than
+/// fought over. Neither is redundant either way: the `@define-color` form is
+/// still what makes this file's own `alpha(@accent_color, …)` resolve, since
+/// that is GTK's mechanism rather than libadwaita's, and GTK kept it.
+///
 /// The window background is the only color the opacity setting reaches, and it
 /// is the only one that may be translucent: the shades libadwaita paints on top
 /// of it are shades of the same color, and two translucent layers of one color
@@ -4417,41 +4431,76 @@ pub fn apply_chrome(theme: &Theme, opacity: f64) {
             color.to_hex()
         }
     };
-    let css = format!(
-        "@define-color window_bg_color {bg};\n\
-         @define-color window_fg_color {fg};\n\
-         @define-color view_bg_color {clear};\n\
-         @define-color view_fg_color {fg};\n\
-         @define-color headerbar_bg_color {header};\n\
-         @define-color headerbar_fg_color {fg};\n\
-         @define-color headerbar_border_color {border};\n\
-         @define-color headerbar_backdrop_color {clear};\n\
-         @define-color sidebar_bg_color {sidebar};\n\
-         @define-color sidebar_fg_color {fg};\n\
-         @define-color sidebar_border_color {border};\n\
-         @define-color sidebar_backdrop_color {clear};\n\
-         /* The Files panel is a sidebar inside the projects sidebar's\n\
-            content, which libadwaita paints as a secondary sidebar: its own\n\
-            gray unless these say otherwise, and solid where everything else\n\
-            went translucent. */\n\
-         @define-color secondary_sidebar_bg_color {sidebar};\n\
-         @define-color secondary_sidebar_fg_color {fg};\n\
-         @define-color secondary_sidebar_border_color {border};\n\
-         @define-color secondary_sidebar_backdrop_color {clear};\n\
-         @define-color popover_bg_color {raised};\n\
-         @define-color popover_fg_color {fg};\n\
-         @define-color dialog_bg_color {raised};\n\
-         @define-color dialog_fg_color {fg};\n\
-         @define-color card_bg_color {raised};\n\
-         @define-color card_fg_color {fg};\n\
-         @define-color accent_color {accent};\n\
-         @define-color accent_bg_color {accent};\n\
-         @define-color accent_fg_color {on_accent};\n\
-         /* A dialog is something to read, and under a translucent window\n\
-            every chrome color it inherits carries the window's alpha — a\n\
-            preferences page over the wallpaper is the tab bar showing\n\
-            through the settings. Inside one, the same colors go solid. */\n\
-         dialog {{\n\
+
+    let bg = {
+        let Rgb { r, g, b } = theme.background;
+        format!("rgba({r},{g},{b},{opacity})")
+    };
+    let clear = over_background(theme.background);
+    let fg = theme.foreground.to_hex();
+    let header = over_background(theme.surface(0.06));
+    let sidebar = over_background(theme.surface(0.03));
+    let raised = theme.surface(0.10).to_hex();
+    let border = theme.surface(0.20).to_hex();
+    let on_accent = accent.contrasting().to_hex();
+    let accent = accent.to_hex();
+    let solid_bg = theme.background.to_hex();
+    let solid_header = theme.surface(0.06).to_hex();
+    let solid_sidebar = theme.surface(0.03).to_hex();
+
+    // Named in libadwaita's underscored spelling, which is also the custom
+    // property's spelling with the dashes put back.
+    let colors = [
+        ("window_bg_color", bg.as_str()),
+        ("window_fg_color", fg.as_str()),
+        ("view_bg_color", clear.as_str()),
+        ("view_fg_color", fg.as_str()),
+        ("headerbar_bg_color", header.as_str()),
+        ("headerbar_fg_color", fg.as_str()),
+        ("headerbar_border_color", border.as_str()),
+        ("headerbar_backdrop_color", clear.as_str()),
+        ("sidebar_bg_color", sidebar.as_str()),
+        ("sidebar_fg_color", fg.as_str()),
+        ("sidebar_border_color", border.as_str()),
+        ("sidebar_backdrop_color", clear.as_str()),
+        // The Files panel is a sidebar inside the projects sidebar's content,
+        // which libadwaita paints as a secondary sidebar: its own gray unless
+        // these say otherwise, and solid where everything else went
+        // translucent.
+        ("secondary_sidebar_bg_color", sidebar.as_str()),
+        ("secondary_sidebar_fg_color", fg.as_str()),
+        ("secondary_sidebar_border_color", border.as_str()),
+        ("secondary_sidebar_backdrop_color", clear.as_str()),
+        ("popover_bg_color", raised.as_str()),
+        ("popover_fg_color", fg.as_str()),
+        ("dialog_bg_color", raised.as_str()),
+        ("dialog_fg_color", fg.as_str()),
+        ("card_bg_color", raised.as_str()),
+        ("card_fg_color", fg.as_str()),
+        ("accent_color", accent.as_str()),
+        ("accent_bg_color", accent.as_str()),
+        ("accent_fg_color", on_accent.as_str()),
+    ];
+
+    let mut css = String::new();
+    for (name, value) in colors {
+        let _ = writeln!(css, "@define-color {name} {value};");
+    }
+    // The same list as custom properties. They go on `:root`, which is where
+    // libadwaita defines them, so this provider's higher priority is what
+    // decides between the two rather than one selector being narrower.
+    css.push_str(":root {\n");
+    for (name, value) in colors {
+        let _ = writeln!(css, "  --{}: {value};", name.replace('_', "-"));
+    }
+    css.push_str("}\n");
+    // A dialog is something to read, and under a translucent window every
+    // chrome color it inherits carries the window's alpha — a preferences page
+    // over the wallpaper is the tab bar showing through the settings. Inside
+    // one, the same colors go solid.
+    let _ = write!(
+        css,
+        "dialog {{\n\
            --window-bg-color: {solid_bg};\n\
            --view-bg-color: {solid_bg};\n\
            --headerbar-bg-color: {solid_header};\n\
@@ -4460,22 +4509,7 @@ pub fn apply_chrome(theme: &Theme, opacity: f64) {
            --sidebar-backdrop-color: {solid_sidebar};\n\
            --secondary-sidebar-bg-color: {solid_sidebar};\n\
            --secondary-sidebar-backdrop-color: {solid_sidebar};\n\
-         }}\n",
-        bg = {
-            let Rgb { r, g, b } = theme.background;
-            format!("rgba({r},{g},{b},{opacity})")
-        },
-        clear = over_background(theme.background),
-        fg = theme.foreground.to_hex(),
-        header = over_background(theme.surface(0.06)),
-        sidebar = over_background(theme.surface(0.03)),
-        raised = theme.surface(0.10).to_hex(),
-        border = theme.surface(0.20).to_hex(),
-        accent = accent.to_hex(),
-        on_accent = accent.contrasting().to_hex(),
-        solid_bg = theme.background.to_hex(),
-        solid_header = theme.surface(0.06).to_hex(),
-        solid_sidebar = theme.surface(0.03).to_hex(),
+         }}\n"
     );
 
     let Some(display) = gdk::Display::default() else {
