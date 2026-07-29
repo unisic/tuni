@@ -81,8 +81,12 @@ appstream-util validate-relax --nonet \
 %{_bindir}/%{name}
 %{_datadir}/applications/%{app_id}.desktop
 %{_datadir}/metainfo/%{app_id}.metainfo.xml
-%{_datadir}/icons/hicolor/scalable/apps/%{app_id}.svg
-%{_datadir}/icons/hicolor/symbolic/apps/%{app_id}-symbolic.svg
+# Globbed rather than listed: the icons come from `make install-data`, which is
+# the one list of installed files, and naming them a second time here is a list
+# that goes stale silently — a new icon fails the build as unpackaged, which is
+# how the Git page's icon broke the 1.3.0 RPM. Nothing else writes into this
+# directory in the buildroot, so the glob is exactly tuni's icons.
+%{_datadir}/icons/hicolor/*/*/*.svg
 
 %changelog
 * Wed Jul 29 2026 Unisic <hello@unisic.dev> - 1.3.0-1
