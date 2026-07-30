@@ -293,7 +293,8 @@ fn settings() -> tuni_core::settings::Settings {
 /// `TUNI_CAPTURE_STAGE`, `TUNI_CAPTURE_FIND`, `TUNI_CAPTURE_SEARCH`,
 /// `TUNI_CAPTURE_PALETTE`, `TUNI_CAPTURE_SWITCHER`,
 /// `TUNI_CAPTURE_EDIT`, `TUNI_CAPTURE_ZOOM`, `TUNI_CAPTURE_SCROLL`,
-/// `TUNI_CAPTURE_RESIZE`, `TUNI_CAPTURE_HOVER`, and `TUNI_CAPTURE_SELECT`.
+/// `TUNI_CAPTURE_WHEEL`, `TUNI_CAPTURE_RESIZE`, `TUNI_CAPTURE_HOVER`, and
+/// `TUNI_CAPTURE_SELECT`.
 fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
     let Ok(path) = std::env::var("TUNI_CAPTURE_PNG") else {
         return;
@@ -653,6 +654,25 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                 #[weak]
                 terminal,
                 move || terminal.scroll_lines(lines)
+            ),
+        );
+    }
+
+    // A scripted wheel, in notches, negative for up. Unlike `_SCROLL`, which
+    // moves the scrollback directly, this walks the wheel's own decision: an
+    // application that tracks the mouse is sent button four or five, everyone
+    // else gets the scrollback. That difference is exactly what it exists to
+    // test, since a wheel cannot be injected on a locked-down Wayland session.
+    if let Ok(notches) = std::env::var("TUNI_CAPTURE_WHEEL")
+        && let Ok(notches) = notches.trim().parse::<f64>()
+        && let Some(terminal) = terminal
+    {
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(delay.saturating_sub(200)),
+            glib::clone!(
+                #[weak]
+                terminal,
+                move || terminal.scroll_input(false, tuni_vt::Mods::empty(), 0.0, notches)
             ),
         );
     }

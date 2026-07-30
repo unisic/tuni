@@ -2608,15 +2608,22 @@ impl TuniTerminal {
     }
 
     fn on_scroll(&self, controller: &gtk::EventControllerScroll, dx: f64, dy: f64) {
-        let imp = self.imp();
         let mods = keymap::mods_from_state(controller.current_event_state());
+        let precision = controller.unit() == gdk::ScrollUnit::Surface;
+        self.scroll_input(precision, mods, dx, dy);
+    }
+
+    /// The wheel with the controller peeled off, so the debug capture harness
+    /// can turn it: a scripted notch and a real one meet the same reporting
+    /// decision, the same arithmetic and the same scrollback.
+    pub(crate) fn scroll_input(&self, precision: bool, mods: Mods, dx: f64, dy: f64) {
+        let imp = self.imp();
 
         // Everything is normalized to pixels and accumulated, which is
         // Ghostty's arithmetic exactly: a touchpad reports pixels and gets
         // the tenfold boost its GTK layer applies, a wheel notch is worth
         // three rows of them, and whatever falls short of a row is kept for
         // the next event, so slow touchpad scrolling still arrives.
-        let precision = controller.unit() == gdk::ScrollUnit::Surface;
         let cell_height = f64::from(self.imp().metrics.get().cell_height).max(1.0);
         let adjusted = if precision {
             dy * 10.0

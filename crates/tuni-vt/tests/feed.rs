@@ -898,3 +898,46 @@ fn retransmitting_an_image_changes_its_cache_key() {
         "same id, same pixels, different picture — only the generation says so"
     );
 }
+
+#[test]
+fn a_wheel_press_survives_the_pointer_resting_in_the_same_cell() {
+    // The scenario every scroll starts from: any-motion tracking is on, the
+    // pointer has just reported the cell it rests in, and then the wheel
+    // turns without the pointer moving. The wheel press must not be eaten by
+    // the motion deduplication, or scrolling only works while the mouse is
+    // in flight.
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    let geometry = geometry(20, 5);
+    let (x, y) = at(2, 1);
+    terminal.feed(b"\x1b[?1000h\x1b[?1003h\x1b[?1006h");
+
+    let motion = MouseInput {
+        action: MouseAction::Motion,
+        button: None,
+        mods: Mods::empty(),
+        x,
+        y,
+        any_button_pressed: false,
+    };
+    assert_eq!(
+        terminal.encode_mouse(&motion, geometry).expect("encode"),
+        b"\x1b[<35;3;2M",
+        "any-motion tracking reports the resting cell first"
+    );
+
+    let wheel = MouseInput {
+        action: MouseAction::Press,
+        button: Some(MouseButton::Four),
+        ..motion
+    };
+    assert_eq!(
+        terminal.encode_mouse(&wheel, geometry).expect("encode"),
+        b"\x1b[<64;3;2M",
+        "the wheel in the same cell must still be reported"
+    );
+    assert_eq!(
+        terminal.encode_mouse(&wheel, geometry).expect("encode"),
+        b"\x1b[<64;3;2M",
+        "and so must the next notch"
+    );
+}

@@ -154,8 +154,9 @@ TUNI_CAPTURE_DELAY_MS=1500 cargo run --release
 `TUNI_CAPTURE_WIDGET=window|active` decides whether the chrome is in the shot.
 The rest of the family drives one part each: `TUNI_CAPTURE_ACTIONS` (comma
 separated action names, one step apart), `_OPEN`, `_DIFF`, `_STAGE`, `_FIND`,
-`_SEARCH`, `_PALETTE`, `_SWITCHER`, `_EDIT`, `_ZOOM`, `_SCROLL`, `_RESIZE`,
-`_HOVER`, `_SELECT`. See `maybe_capture` in `crates/tuni-gtk/src/main.rs`.
+`_SEARCH`, `_PALETTE`, `_SWITCHER`, `_EDIT`, `_ZOOM`, `_SCROLL`, `_WHEEL`,
+`_RESIZE`, `_HOVER`, `_SELECT`. See `maybe_capture` in
+`crates/tuni-gtk/src/main.rs`.
 
 Others: `TUNI_DEBUG_LIFETIME` prints a line per construction and destruction
 with a live count per type, which is how "the closed pane should be gone" turns
