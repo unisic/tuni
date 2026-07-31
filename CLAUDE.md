@@ -164,8 +164,9 @@ into something readable. `TUNI_THEME`, `TUNI_FONT`, `TUNI_LIGATURES` override
 settings for one run. `TUNI_DEBUG_STARTUP` stamps each phase before the first
 frame with the milliseconds a person waited for it, which a flat profile cannot
 say because the phases are nested inside GTK's own initialisation.
-`TUNI_DEBUG_FRAME_TIME`, `TUNI_DEBUG_PTY_WRITE`, `TUNI_DEBUG_CLIPBOARD` are
-per-area traces.
+`TUNI_DEBUG_FRAME_TIME`, `TUNI_DEBUG_PTY_WRITE`, `TUNI_DEBUG_CLIPBOARD` and
+`TUNI_DEBUG_SCROLL` (unit, deltas and whether a tracking application gets the
+wheel, one line per scroll event) are per-area traces.
 
 ## Conventions
 

@@ -2610,6 +2610,13 @@ impl TuniTerminal {
     fn on_scroll(&self, controller: &gtk::EventControllerScroll, dx: f64, dy: f64) {
         let mods = keymap::mods_from_state(controller.current_event_state());
         let precision = controller.unit() == gdk::ScrollUnit::Surface;
+        if std::env::var_os("TUNI_DEBUG_SCROLL").is_some() {
+            eprintln!(
+                "scroll: unit={:?} dx={dx} dy={dy} reporting={}",
+                controller.unit(),
+                self.reporting_active(),
+            );
+        }
         self.scroll_input(precision, mods, dx, dy);
     }
 
