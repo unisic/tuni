@@ -1,6 +1,6 @@
 ---
-name: perf-audit
-description: Full performance/concurrency audit of Tuni (Rust/GTK4/libadwaita terminal workspace). Use when the user asks for a performance audit, "make app fast", idle CPU/memory investigation, memory leaks, Rc cycles, RefCell borrow panics, main-thread stalls, terminal throughput, or invokes /perf-audit. Measurement-first — never guess; produces a structured report and minimal fixes.
+name: tuni-perf-audit
+description: Full performance/concurrency audit of Tuni specifically (Rust/GTK4/libadwaita terminal workspace), with this repository's file:line landmarks, harnesses and known suspects already written in. Use when the user asks for a performance audit of Tuni, "make app fast", idle CPU/memory investigation, Rc cycles, RefCell borrow panics, main-thread stalls, terminal throughput, or invokes /tuni-perf-audit. Measurement-first - never guess; produces a structured report and minimal fixes. For any other codebase use /perf-audit, which detects the stack instead of assuming it.
 ---
 
 You are a senior Linux desktop performance engineer and a Rust/GTK4 ownership and main-loop expert.
