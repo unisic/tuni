@@ -6,7 +6,7 @@
 # GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
 # populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.2.0/ -o tuni-1.2.0.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.3.0/ -o tuni-1.3.0.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.15.2
 
 Name:           tuni
-Version:        1.2.0
+Version:        1.3.0
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -81,10 +81,31 @@ appstream-util validate-relax --nonet \
 %{_bindir}/%{name}
 %{_datadir}/applications/%{app_id}.desktop
 %{_datadir}/metainfo/%{app_id}.metainfo.xml
-%{_datadir}/icons/hicolor/scalable/apps/%{app_id}.svg
-%{_datadir}/icons/hicolor/symbolic/apps/%{app_id}-symbolic.svg
+# Globbed rather than listed: the icons come from `make install-data`, which is
+# the one list of installed files, and naming them a second time here is a list
+# that goes stale silently — a new icon fails the build as unpackaged, which is
+# how the Git page's icon broke the 1.3.0 RPM. Nothing else writes into this
+# directory in the buildroot, so the glob is exactly tuni's icons.
+%{_datadir}/icons/hicolor/*/*/*.svg
 
 %changelog
+* Wed Jul 29 2026 Unisic <hello@unisic.dev> - 1.3.0-1
+- The scrollback keeps the number of lines the setting names, where a
+  ten-thousand-line setting used to hold about nine hundred rows.
+- An SFTP transfer shows percent and speed and can be cancelled, and a
+  cancelled transfer leaves no half file at either end.
+- The Info page opens the project in an installed code editor.
+- A pane falls back to xterm-256color where xterm-ghostty has no terminfo.
+- The window chrome: a commit graph on the Git page, a sticky New Project under
+  the last project, solid dialogs under a translucent window, and a pane grip
+  that lights only under the pointer.
+- The window goes quiet when it is not active: the panel and diff polls skip
+  their tick, the scrollbar fade redraws only when it moved, and the live search
+  re-runs on the frame clock. The Info page's editor icons are looked up when
+  the page opens rather than before the first frame.
+- A closed pane lets go of its handlers, its replay text and its textures, and a
+  git child whose stdin write failed is reaped and reports what git itself said.
+
 * Tue Jul 28 2026 Unisic <hello@unisic.dev> - 1.2.0-1
 - Clicks, drags and the wheel behave the way Ghostty's do, and a URL that is
   only text opens with Ctrl+click.

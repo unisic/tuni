@@ -351,7 +351,21 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Result<Self> {
+    pub fn new(cols: u16, rows: u16, scrollback_lines: usize) -> Result<Self> {
+        // Upstream's `max_scrollback` is a byte budget, whatever the binding's
+        // doc comment says about lines — Screen.zig spells it out, and pages
+        // are allocated against it. Handing it the line count directly is how
+        // "10,000 lines" of scrollback silently became one 64 KiB page: about
+        // 900 rows at 80 columns, 430 at 200. The budget below is sixteen
+        // bytes per cell — a cell is a packed u64, and the doubling covers row
+        // metadata, style pages and the rounding up to whole pages — measured
+        // to retain the full count at both 80 and 200 columns (see git history
+        // for the probe). A pane made narrow and resized wide keeps the budget
+        // it was born with, so it may retain proportionally fewer lines than
+        // asked; a budget can be exact or cheap to compute, not both. Zero
+        // passes through: upstream reads zero as "no scrollback at all",
+        // which is also what zero means in the preferences.
+        let max_scrollback = scrollback_lines.saturating_mul(usize::from(cols.max(80)) * 16);
         let mut inner = VtTerminal::new(TerminalOptions {
             cols: cols.max(1),
             rows: rows.max(1),

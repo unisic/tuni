@@ -89,10 +89,14 @@ pub fn run_with_input<S: AsRef<OsStr>>(
         Ok(child) => child,
         Err(error) => return failure(&error.to_string()),
     };
-    if let Some(mut stdin) = child.stdin.take()
-        && let Err(error) = stdin.write_all(input.as_bytes())
-    {
-        return failure(&error.to_string());
+    // A failed write is not returned early: EPIPE here means git exited before
+    // reading everything, and the child still has to be reaped — an early
+    // return would leave a zombie until this process exits. Whatever git had
+    // to say about why it quit is on stderr, which the wait below surfaces,
+    // and that is the better error anyway. Dropping stdin at the end of the
+    // scope is what lets a child still reading see EOF and finish.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input.as_bytes());
     }
     finish(child.wait_with_output())
 }

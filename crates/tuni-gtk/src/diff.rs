@@ -195,7 +195,17 @@ impl TuniDiff {
                         #[upgrade_or]
                         glib::ControlFlow::Break,
                         move || {
-                            this.reload();
+                            // A minimized or backgrounded window's diff has
+                            // nobody reading it; the next tick after the
+                            // window comes back is at most two seconds away,
+                            // which is the staleness the poll allows anyway.
+                            let active = this
+                                .root()
+                                .and_downcast::<gtk::Window>()
+                                .is_none_or(|window| window.is_active());
+                            if active {
+                                this.reload();
+                            }
                             glib::ControlFlow::Continue
                         }
                     ),
