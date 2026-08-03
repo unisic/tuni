@@ -206,6 +206,23 @@ fn quieten() {
         unsafe { std::env::set_var("MESA_VK_IGNORE_CONFORMANCE_WARNING", "1") };
     }
 
+    // A translucent window has no opaque chrome: every bar's background is
+    // `transparent` and the only paint under a label is the window's own
+    // color, so a pixel GSK's damage tracking leaves out is never covered
+    // again and a sliver of text that has since changed stays on screen. Full
+    // redraws are the one lever GSK offers against that, and the window is
+    // already repainting whole for every terminal frame, so the added work is
+    // the chrome around it. An opaque window paints its own backgrounds and is
+    // left with damage tracking on, because it does not have the problem.
+    // `TUNI_PARTIAL_REDRAW=1` puts it back either way.
+    if std::env::var_os("GSK_DEBUG").is_none()
+        && std::env::var_os("TUNI_PARTIAL_REDRAW").is_none()
+        && tuni_core::settings::Settings::load().terminal.background_opacity < 1.0
+    {
+        // SAFETY: as above — still before GTK, its renderer, or any thread.
+        unsafe { std::env::set_var("GSK_DEBUG", "full-redraw") };
+    }
+
     // Before the application rather than inside its startup: libadwaita reads
     // the setting while GtkApplication starts up, and a warning is only avoided
     // by having answered it first. `gtk::init` is what opens the display the
