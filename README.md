@@ -109,16 +109,29 @@ Needs a Rust toolchain, GTK4, libadwaita, GtkSourceView and SQLite headers, and
 Zig 0.15.2, since `libghostty-vt` is Zig source compiled during the build.
 
 ```sh
-sudo dnf install rustup gtk4-devel libadwaita-devel gtksourceview5-devel \
-    sqlite-devel
+sudo dnf install cargo rust gcc make git-core curl tar xz \
+    gtk4-devel libadwaita-devel gtksourceview5-devel sqlite-devel
 make zig
 cargo run --release
 ```
+
+That is the list CI installs, so a machine with it builds what the release
+builds. Fedora's own `rust` is new enough; on a distribution whose is not,
+`rustup` puts a current toolchain beside it.
 
 `make zig` fetches the official 0.15.2 tarball into `~/.local`, because the
 distribution's own package is 0.16 by now and the pinned Ghostty commit does
 not build against it. To build the 0.16 way instead - that toolchain, and the
 newer Ghostty commit which requires it - `make build-next`.
+
+`make check` is what CI runs: format, clippy, tests, and the desktop and
+AppStream files. It needs four more packages, and none of them are needed to
+build:
+
+```sh
+sudo dnf install rustfmt clippy desktop-file-utils appstream
+make check
+```
 
 ## Configuration
 

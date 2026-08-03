@@ -1003,12 +1003,30 @@ Fedora ships Zig 0.16, which is too new; fetch 0.15.2 from ziglang.org and put
 it on `PATH`.
 
 ```sh
-sudo dnf install rustup gtk4-devel libadwaita-devel gtksourceview5-devel \
-    sqlite-devel
-rustup-init -y
+sudo dnf install cargo rust gcc make git-core curl tar xz \
+    gtk4-devel libadwaita-devel gtksourceview5-devel sqlite-devel
+make zig
 
 cargo run --release
 ```
+
+The same list CI installs, which is what makes it the tested one. `curl`, `tar`
+and `xz` are there for `make zig` rather than for the compiler, and `git`
+because `libghostty-vt` is a git dependency pinned to a revision, which cargo
+clones rather than downloads.
+
+`make check` runs what CI runs — `cargo fmt --check`, `cargo clippy
+--all-targets -- -D warnings`, `cargo test`, then `desktop-file-validate` and
+`appstreamcli` over the two data files — and wants four packages that a build
+does not:
+
+```sh
+sudo dnf install rustfmt clippy desktop-file-utils appstream
+```
+
+Running it before a push is the point: clippy's `-D warnings` and the format
+check fail the build for a nested `if` or a line rustfmt would wrap, neither of
+which a plain `cargo build` says a word about.
 
 Debugging aids, all off unless set, and none of them written back to the
 configuration file: `TUNI_THEME` names one of the bundled themes for the run

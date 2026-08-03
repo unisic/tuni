@@ -16,6 +16,10 @@ cargo run --release
 make check                # fmt --check, clippy -D warnings, test, desktop/AppStream validation
 ```
 
+`make check` is what CI runs, so run it before pushing rather than reading the
+failure in a mail. It needs four packages a build does not: `rustfmt`, `clippy`,
+`desktop-file-utils` and `appstream`. README lists both sets for Fedora.
+
 Tests:
 
 ```sh
