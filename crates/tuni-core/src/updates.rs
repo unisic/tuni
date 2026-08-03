@@ -129,7 +129,10 @@ mod tests {
             parse_tag(r#"{"tag_name": "v1.3.0", "name": "Tuni 1.3.0"}"#).as_deref(),
             Some("1.3.0")
         );
-        assert_eq!(parse_tag(r#"{"tag_name": "1.3.0"}"#).as_deref(), Some("1.3.0"));
+        assert_eq!(
+            parse_tag(r#"{"tag_name": "1.3.0"}"#).as_deref(),
+            Some("1.3.0")
+        );
     }
 
     #[test]

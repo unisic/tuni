@@ -217,7 +217,10 @@ fn quieten() {
     // `TUNI_PARTIAL_REDRAW=1` puts it back either way.
     if std::env::var_os("GSK_DEBUG").is_none()
         && std::env::var_os("TUNI_PARTIAL_REDRAW").is_none()
-        && tuni_core::settings::Settings::load().terminal.background_opacity < 1.0
+        && tuni_core::settings::Settings::load()
+            .terminal
+            .background_opacity
+            < 1.0
     {
         // SAFETY: as above — still before GTK, its renderer, or any thread.
         unsafe { std::env::set_var("GSK_DEBUG", "full-redraw") };
