@@ -10,11 +10,11 @@
 #     libghostty-vt-sys build script fetches the pinned Ghostty source. Set
 #     CARGO_HOME and GHOSTTY_SOURCE_DIR to build without it.
 #
-#   make -C ../.. dist && mv ../../tuni-1.3.0.tar.gz . && makepkg -si
+#   make -C ../.. dist && mv ../../tuni-1.4.0.tar.gz . && makepkg -si
 
 pkgname=tuni
 # Plain literal: the release workflow seds the Cargo.toml version in here.
-pkgver=1.3.0
+pkgver=1.4.0
 pkgrel=1
 pkgdesc='Terminals, projects, files, and Git in one window'
 arch=('x86_64' 'aarch64')

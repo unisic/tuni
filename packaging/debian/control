@@ -1,7 +1,7 @@
 Source: tuni
 Section: utils
 Priority: optional
-Maintainer: Unisic <hello@unisic.dev>
+Maintainer: Unisic <contact@unisic.app>
 # Ubuntu 26.04 or later, for libadwaita 1.6. The compiler comes from rustup,
 # because no Ubuntu packages a rustc new enough — 26.04 is on 1.93 and rusqlite
 # 0.40 wants 1.95. `apt install rustup && rustup default stable` puts cargo and

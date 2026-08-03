@@ -67,6 +67,30 @@
   </provides>
 
   <releases>
+    <release version="1.4.0" date="2026-08-03">
+      <description>
+        <p>Tuni checks whether a newer Tuni has been released. No package
+        repository carries it yet, so nothing on the machine would otherwise
+        notice one; the window asks the release page once per run and offers an
+        Update button that opens the installer in a tab of its own, where sudo
+        has somewhere to ask for a password. The check turns off under
+        Preferences, Terminal, Updates.</p>
+        <p>That installer is a script anyone can run on its own. It opens a
+        menu: what is installed, install or update to the newest release,
+        install an older one from the list, or remove Tuni with or without its
+        settings. It installs the package built for the distribution it is run
+        on, the RPM on Fedora, the deb on Debian and Ubuntu, the pkg.tar.zst on
+        Arch.</p>
+        <p>A project can opt out of starting a new tab where the visible shell
+        is, which is the exception the global setting has no way to express: one
+        project opens its tabs where a fresh terminal would while the rest go on
+        following the shell.</p>
+        <p>Fixed: a translucent window repaints whole, so a sliver of text no
+        longer survives on chrome that has nothing opaque under it, and a glyph
+        whose ink reaches past its cell is clipped to the grid instead of
+        landing on the tab bar.</p>
+      </description>
+    </release>
     <release version="1.3.0" date="2026-07-29">
       <description>
         <p>The scrollback is the depth the setting names. Upstream spends

@@ -6,7 +6,7 @@
 # GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
 # populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.3.0/ -o tuni-1.3.0.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.4.0/ -o tuni-1.4.0.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.15.2
 
 Name:           tuni
-Version:        1.3.0
+Version:        1.4.0
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -89,7 +89,22 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/*/*/*.svg
 
 %changelog
-* Wed Jul 29 2026 Unisic <hello@unisic.dev> - 1.3.0-1
+* Mon Aug 03 2026 Unisic <contact@unisic.app> - 1.4.0-1
+- Tuni checks whether a newer Tuni has been released, once per run, and offers
+  an Update button that runs the installer in a tab where sudo can ask for a
+  password. Preferences, Terminal, Updates turns the check off.
+- scripts/install.sh opens a menu: what is installed, install or update,
+  install an older version from the release page, or remove Tuni with or
+  without its settings. It installs the package built for the distribution it
+  runs on.
+- A project can opt out of starting a new tab where the visible shell is, while
+  the rest of them go on following it.
+- A translucent window repaints whole, so a sliver of text no longer survives on
+  chrome with nothing opaque under it.
+- A glyph whose ink reaches past its cell is clipped to the grid instead of
+  landing on the tab bar.
+
+* Wed Jul 29 2026 Unisic <contact@unisic.app> - 1.3.0-1
 - The scrollback keeps the number of lines the setting names, where a
   ten-thousand-line setting used to hold about nine hundred rows.
 - An SFTP transfer shows percent and speed and can be cancelled, and a
@@ -106,7 +121,7 @@ appstream-util validate-relax --nonet \
 - A closed pane lets go of its handlers, its replay text and its textures, and a
   git child whose stdin write failed is reaped and reports what git itself said.
 
-* Tue Jul 28 2026 Unisic <hello@unisic.dev> - 1.2.0-1
+* Tue Jul 28 2026 Unisic <contact@unisic.app> - 1.2.0-1
 - Clicks, drags and the wheel behave the way Ghostty's do, and a URL that is
   only text opens with Ctrl+click.
 - A copy is confirmed with a toast, including one an application makes over
@@ -119,18 +134,18 @@ appstream-util validate-relax --nonet \
 - Escape closes the command palette, and a taken forward port names the
   process that actually holds the address.
 
-* Mon Jul 27 2026 Unisic <hello@unisic.dev> - 1.1.2-1
+* Mon Jul 27 2026 Unisic <contact@unisic.app> - 1.1.2-1
 - Packages are compiled for the baseline CPU instead of the machine that built
   them, so tuni starts on processors without AVX-512 rather than dying on an
   illegal instruction.
 
-* Mon Jul 27 2026 Unisic <hello@unisic.dev> - 1.1.1-1
+* Mon Jul 27 2026 Unisic <contact@unisic.app> - 1.1.1-1
 - A file dropped on a terminal lands on the prompt as a quoted argument
   instead of being ignored.
 - A project dragged in the sidebar is carried as the row itself rather than as
   a picture of a document.
 
-* Mon Jul 27 2026 Unisic <hello@unisic.dev> - 1.1.0-1
+* Mon Jul 27 2026 Unisic <contact@unisic.app> - 1.1.0-1
 - SSH: hosts read from the ssh configuration and from a hosts file of tuni's
   own, a new tab that is a host list, one shared connection per host.
 - A file browser on a connection: step into directories at the far end, copy
@@ -141,7 +156,7 @@ appstream-util validate-relax --nonet \
 - A menu on a right click in the terminal, and a pane that runs something other
   than a login shell.
 
-* Mon Jul 27 2026 Unisic <hello@unisic.dev> - 1.0.1-1
+* Mon Jul 27 2026 Unisic <contact@unisic.app> - 1.0.1-1
 - Mouse reporting, focus reporting, and box drawing characters stroked in the
   terminal rather than left to the font.
 - Background opacity, blur, and padding; the font list the machine actually has.
@@ -152,5 +167,5 @@ appstream-util validate-relax --nonet \
 - Fixes: panes that closed without being forgotten, a command palette that kept
   the window alive, a resize that stranded the prompt.
 
-* Sun Jul 26 2026 Unisic <hello@unisic.dev> - 1.0.0-1
+* Sun Jul 26 2026 Unisic <contact@unisic.app> - 1.0.0-1
 - First release.
