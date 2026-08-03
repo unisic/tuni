@@ -6,7 +6,7 @@
 # GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
 # populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.4.0/ -o tuni-1.4.0.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.4.1/ -o tuni-1.4.1.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.15.2
 
 Name:           tuni
-Version:        1.4.0
+Version:        1.4.1
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -89,6 +89,13 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/*/*/*.svg
 
 %changelog
+* Mon Aug 03 2026 Unisic <contact@unisic.app> - 1.4.1-1
+- The install command in the README runs in fish, which has no process
+  substitution: it is a pipe into bash rather than bash reading a substituted
+  file.
+- The build instructions name every package a build needs, and the four more
+  that `make check` wants.
+
 * Mon Aug 03 2026 Unisic <contact@unisic.app> - 1.4.0-1
 - Tuni checks whether a newer Tuni has been released, once per run, and offers
   an Update button that runs the installer in a tab where sudo can ask for a

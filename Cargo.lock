@@ -1377,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "tuni-core"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "fancy-regex",
  "libc",
@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "tuni-gtk"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "async-channel",
  "gdk4-wayland",
@@ -1417,7 +1417,7 @@ dependencies = [
 
 [[package]]
 name = "tuni-pty"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "async-channel",
  "libc",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "tuni-vt"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "libghostty-vt",
  "png",

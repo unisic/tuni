@@ -67,6 +67,20 @@
   </provides>
 
   <releases>
+    <release version="1.4.1" date="2026-08-03">
+      <description>
+        <p>The install command works in fish. It was written as
+        <code>bash &lt;(curl ...)</code>, which is process substitution and
+        something fish does not have, so the shell answered "Invalid
+        redirection target" instead of installing anything. It is a pipe into
+        bash now, which every shell understands and which costs nothing here:
+        the installer's menu reads its keys from the terminal rather than from
+        standard input.</p>
+        <p>The build instructions name every package a build needs rather than
+        four of them, and name separately the ones that only the checks
+        want.</p>
+      </description>
+    </release>
     <release version="1.4.0" date="2026-08-03">
       <description>
         <p>Tuni checks whether a newer Tuni has been released. No package
