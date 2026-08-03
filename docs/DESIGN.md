@@ -879,6 +879,57 @@ a shallow checkout of the Ghostty commit this tree is tested against, and
 which is why both are commits rather than branches; releases are built from the
 0.15.2 one, since that is what the checked-in bindings were generated from.
 
+### Updating
+
+No package repository carries Tuni yet: no COPR, no AUR, no PPA. A release
+therefore does not arrive with the rest of a system's updates, and an installed
+copy would stay the version it was installed at forever. `scripts/install.sh`
+stands in for the package repository that does not exist:
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/unisic/tuni/main/scripts/install.sh)
+```
+
+It asks the GitHub release page what the newest version is, compares it with
+what the package manager says is installed, and installs the asset built for
+this distribution — the RPM on Fedora, the deb on Debian and Ubuntu, the
+`pkg.tar.zst` on Arch. Installing over an older copy is what an update is, so
+there is one code path rather than two. A Flatpak is left alone, because a
+sandbox cannot install packages on the host.
+
+Run with no arguments it opens a menu on the terminal's alternate screen, the
+way `top` does, and leaving it puts back the command that was typed. The person
+running an installer is at a terminal by definition, and a menu is what lets it
+say which version is installed before anything happens, offer an older release
+from the same page, or remove Tuni again — three things a bare prompt would
+have to become three flags to reach. The whole run happens in that one window:
+the menu morphs between the main view, the version list and the remove view
+rather than scrolling a transcript, and a full redraw on every key means a list
+that changes length cannot leave debris behind. Removing with settings is the
+only irreversible choice, so it is confirmed on the normal screen, where the
+question survives long enough to read; the rest is confirmed by `sudo` asking
+for a password.
+
+The flags are for everything that is not a person: `-y` installs or updates
+without a menu, which is what the Update button runs, and `--check` reports
+both versions and exits 10 when an update is available.
+
+The window does the asking, once per run, and offers the Update button that
+runs the installer in a tab of its own. That is where it belongs: every route
+here writes to `/usr`, `sudo` therefore wants a password, and a terminal is the
+one program in a position to offer it somewhere to ask — the same reason
+`ssh-keygen` gets a pane instead of a dialog. It is also why there is no
+background timer: a timer has nobody to ask for the password, so the only thing
+it could automate is the half that costs nothing, which the window already
+does.
+
+The check is one request per run to a public release page and sends nothing
+about the machine, but it is still a program reaching the network on its own,
+so `check-updates = false` turns it off and the menu's "Check for Updates"
+keeps working. `TUNI_UPDATE_API` points both halves at another release
+document, including a `file://` one, which is how the dialog is exercised
+without waiting for a release.
+
 ## Configuration
 
 `~/.config/tuni/config.toml`, written by the settings window and readable

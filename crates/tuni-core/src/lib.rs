@@ -23,6 +23,7 @@ pub mod snippets;
 pub mod ssh;
 pub mod syntax;
 pub mod theme;
+pub mod updates;
 pub mod usage;
 pub mod workspace;
 

@@ -625,6 +625,31 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
     session.add(&restore);
     page.add(&session);
 
+    // Not a page of its own for one switch, and not on Appearance, which is
+    // about what the window looks like. This is what tuni does on its own
+    // behalf, next to the rest of what a session does without being asked.
+    let updates = adw::PreferencesGroup::builder()
+        .title("Updates")
+        .description(
+            "No distribution ships Tuni yet, so a system update will never bring a new one.",
+        )
+        .build();
+    let check = adw::SwitchRow::builder()
+        .title("Check for Updates at Startup")
+        .subtitle("One request to the GitHub release page per run; \"Check for Updates\" still works when this is off")
+        .active(settings.check_updates)
+        .build();
+    check.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.check_updates = on);
+        }
+    ));
+    updates.add(&check);
+    page.add(&updates);
+
     page
 }
 

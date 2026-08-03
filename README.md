@@ -69,8 +69,24 @@ head-to-head with alacritty that the table above is too close to settle.
 
 ## Install
 
-Every [release](https://github.com/unisic/tuni/releases) carries a package for
-Fedora, Ubuntu and Arch:
+One line, which opens a menu and installs the package your distribution wants:
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/unisic/tuni/main/scripts/install.sh)
+```
+
+The menu says which version is installed, installs or updates to the newest
+one, offers an older release from the list, and removes Tuni again with or
+without your settings. `-y` does the install with no menu and `--check` only
+reports.
+
+Run it again to update, or let Tuni do it: it checks the release page once per
+run and offers an Update button that opens the installer in a tab, where sudo
+has somewhere to ask for your password. Preferences - Terminal - Updates turns
+the check off.
+
+Every [release](https://github.com/unisic/tuni/releases) carries the same three
+packages for installing by hand:
 
 ```sh
 sudo dnf install ./tuni-*.rpm            # Fedora 44+

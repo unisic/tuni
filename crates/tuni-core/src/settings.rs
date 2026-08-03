@@ -123,6 +123,15 @@ pub struct Settings {
     /// off eight logins; on is for people whose every host answers to an agent
     /// and who would rather not press Connect eight times.
     pub ssh_reconnect_on_restore: bool,
+    /// Whether the window asks GitHub for the newest release once at startup.
+    ///
+    /// On, because no distribution packages Tuni yet and an installed copy would
+    /// otherwise stay the version it was installed at forever. It is one
+    /// request per run to a public release page, it sends nothing about the
+    /// machine, and a check that fails is silent — but it is still a program
+    /// reaching the network on its own, so the switch is there and the manual
+    /// "Check for Updates" keeps working when it is off.
+    pub check_updates: bool,
     /// Which pages the panel's switcher offers. All on by default; someone who
     /// never debugs from here takes that page off and the switcher stops
     /// asking. The Remote page is not among these because it manages its own
@@ -157,6 +166,7 @@ impl Default for Settings {
             ssh_share_connections: true,
             ssh_control_persist: crate::ssh::CONTROL_PERSIST,
             ssh_reconnect_on_restore: false,
+            check_updates: true,
             panel_files: true,
             panel_git: true,
             panel_info: true,
@@ -326,6 +336,9 @@ impl Settings {
         if let Some(on) = table.boolean("ssh-reconnect-on-restore") {
             settings.ssh_reconnect_on_restore = on;
         }
+        if let Some(on) = table.boolean("check-updates") {
+            settings.check_updates = on;
+        }
         if let Some(on) = table.boolean("panel.files") {
             settings.panel_files = on;
         }
@@ -478,6 +491,9 @@ impl Settings {
                 "ssh-reconnect-on-restore = {}",
                 self.ssh_reconnect_on_restore
             );
+        }
+        if self.check_updates != default.check_updates {
+            let _ = writeln!(out, "check-updates = {}", self.check_updates);
         }
         for (page, on) in [
             ("panel.files", self.panel_files),
@@ -839,6 +855,7 @@ mod tests {
             ssh_share_connections: false,
             ssh_control_persist: 30,
             ssh_reconnect_on_restore: true,
+            check_updates: false,
             panel_files: true,
             panel_git: true,
             panel_info: true,

@@ -243,6 +243,12 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         Some("Ctrl+,"),
         "win.settings",
     ),
+    (
+        "Check for Updates",
+        "software-update-available-symbolic",
+        None,
+        "win.check-updates",
+    ),
     ("About Tuni", "help-about-symbolic", None, "win.about"),
 ];
 
@@ -440,6 +446,13 @@ impl TuniWindow {
             }
         });
         window.connect_unrealize(crate::blur::forget);
+        // Nothing on the machine notices a release while no distribution
+        // packages tuni, so the window asks once itself. It is the last thing
+        // `new` does and it answers on another thread, so a slow network
+        // delays no part of the first frame.
+        if window.imp().settings.borrow().check_updates {
+            window.check_updates(false);
+        }
         window
     }
 
@@ -995,6 +1008,9 @@ impl TuniWindow {
                 );
             }),
             entry("settings", None, |window, _| window.show_preferences()),
+            entry("check-updates", None, |window, _| {
+                window.check_updates(true);
+            }),
             entry("about", None, |window, _| window.show_about()),
             entry("toggle-sidebar", None, |window, _| {
                 if let Some(split) = window.imp().split.borrow().as_ref() {
@@ -1183,6 +1199,101 @@ impl TuniWindow {
         about.present(Some(self));
     }
 
+    // --- updates -------------------------------------------------------------
+
+    /// Asks the release page whether a newer Tuni exists, and offers to
+    /// install it.
+    ///
+    /// `manual` is the difference between somebody asking and the window
+    /// asking on its own. An automatic check that finds nothing — or cannot
+    /// reach the network at all — says nothing, because a terminal that
+    /// reports "you are up to date" every morning is a terminal that has
+    /// started talking to itself; a check somebody asked for always answers,
+    /// including when the answer is that it could not ask.
+    pub(crate) fn check_updates(&self, manual: bool) {
+        if !manual {
+            // Once per process rather than once per window: a second window is
+            // not a second reason to ask GitHub the same question.
+            thread_local! {
+                static ASKED: Cell<bool> = const { Cell::new(false) };
+            }
+            if ASKED.with(|asked| asked.replace(true)) {
+                return;
+            }
+        }
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                // curl and a network round trip, so off the main loop like
+                // every other thing here that can block.
+                let Ok(latest) = gio::spawn_blocking(tuni_core::updates::latest).await else {
+                    return;
+                };
+                let current = env!("CARGO_PKG_VERSION");
+                match latest {
+                    Some(latest) if tuni_core::updates::is_newer(&latest, current) => {
+                        this.offer_update(&latest);
+                    }
+                    Some(_) if manual => {
+                        this.toast(&format!("Tuni {current} is the newest version."));
+                    }
+                    None if manual => this.toast("Couldn't reach the release page."),
+                    _ => {}
+                }
+            }
+        ));
+    }
+
+    /// The dialog a newer release raises, and the tab the Update button opens.
+    ///
+    /// The installer runs in a pane rather than behind the window because it
+    /// writes to `/usr` and `sudo` has to ask for a password somewhere; a
+    /// terminal is the one program that can offer it a place to ask. A Flatpak
+    /// is told rather than offered a button that could not work: the sandbox
+    /// cannot install packages on the host, and pretending otherwise would
+    /// leave somebody watching a command fail.
+    fn offer_update(&self, latest: &str) {
+        let current = env!("CARGO_PKG_VERSION");
+        let sandboxed = tuni_core::updates::in_flatpak();
+        let body = if sandboxed {
+            format!(
+                "You are running {current}. This copy is a Flatpak, and a sandboxed app cannot \
+                 install packages on the host; rebuild it from the manifest to move to {latest}."
+            )
+        } else {
+            format!(
+                "You are running {current}. Updating downloads the package built for this system \
+                 and installs it in a tab of its own, where it can ask for your password."
+            )
+        };
+        let heading = format!("Tuni {latest} Is Available");
+        let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
+        if sandboxed {
+            dialog.add_response("close", "Close");
+            dialog.set_close_response("close");
+        } else {
+            dialog.add_response("later", "Not Now");
+            dialog.add_response("update", "Update");
+            dialog.set_response_appearance("update", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("update"));
+            dialog.set_close_response("later");
+            dialog.connect_response(
+                None,
+                glib::clone!(
+                    #[weak(rename_to = this)]
+                    self,
+                    move |_, response| {
+                        if response == "update" {
+                            this.run_line(&tuni_core::updates::install_command(), true);
+                        }
+                    }
+                ),
+            );
+        }
+        dialog.present(Some(self));
+    }
+
     // --- the Info, Files and Git panel --------------------------------------
 
     /// Points the panel at the project's directory.
@@ -1297,6 +1408,14 @@ impl TuniWindow {
     /// commands about this machine. Typed and not run, for the reason a snippet
     /// without a newline is not run: the line is somebody's to read first.
     fn run_locally(&self, argv: &[String]) {
+        self.run_line(&tuni_core::ssh::shell_line(argv), false);
+    }
+
+    /// Opens a pane of its own and puts `line` on its prompt, either run or
+    /// left there to be read first. Everything that asks a question a window
+    /// cannot answer — a passphrase, a `sudo` password, whether to overwrite
+    /// something — goes through here rather than behind the window.
+    fn run_line(&self, line: &str, run: bool) {
         let Some(project) = self.imp().workspace.borrow().selected_id() else {
             return;
         };
@@ -1308,7 +1427,11 @@ impl TuniWindow {
         let Some(terminal) = self.imp().terminals.borrow().get(&pane_id).cloned() else {
             return;
         };
-        let line = tuni_core::ssh::shell_line(argv);
+        let line = if run {
+            format!("{line}\n")
+        } else {
+            line.to_owned()
+        };
         // The shell is not there yet: `start_terminal` puts starting it on the
         // idle loop, and this queues behind it.
         glib::idle_add_local_once(move || {
@@ -4099,6 +4222,7 @@ fn main_menu() -> gio::Menu {
 
     let application = gio::Menu::new();
     application.append(Some("Preferences"), Some("win.settings"));
+    application.append(Some("Check for Updates"), Some("win.check-updates"));
     application.append(Some("About Tuni"), Some("win.about"));
 
     let menu = gio::Menu::new();
