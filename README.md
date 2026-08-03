@@ -143,6 +143,9 @@ readable without it. The session lives under `~/.local/share/tuni`.
 [docs/DESIGN.md](docs/DESIGN.md) - every feature, every keyboard shortcut, and
 why each piece is built the way it is.
 
+[AGENTS.md](AGENTS.md) - the map a coding agent is handed: the commands, the
+four crates, and the rules that span files. `CLAUDE.md` is a symlink to it.
+
 ## License
 
 GPLv3
