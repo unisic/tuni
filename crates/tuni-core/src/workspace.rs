@@ -268,10 +268,11 @@ impl Project {
     /// pinned directory if there is one, otherwise the caller's fallback.
     #[must_use]
     pub fn directory_for_new_tab(&self, inherit: bool) -> Option<&str> {
-        if inherit && self.inherit_directory {
-            if let Some(directory) = self.selected_tab().and_then(Tab::directory) {
-                return Some(directory);
-            }
+        if inherit
+            && self.inherit_directory
+            && let Some(directory) = self.selected_tab().and_then(Tab::directory)
+        {
+            return Some(directory);
         }
         non_empty(self.custom_directory.as_deref())
     }
