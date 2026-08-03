@@ -896,8 +896,12 @@ copy would stay the version it was installed at forever. `scripts/install.sh`
 stands in for the package repository that does not exist:
 
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/unisic/tuni/main/scripts/install.sh)
+curl -fsSL https://raw.githubusercontent.com/unisic/tuni/main/scripts/install.sh | bash
 ```
+
+A pipe rather than `bash <(curl ...)`: fish has no process substitution, and
+the pipe takes nothing away, because every key the menu reads is read from
+`/dev/tty` rather than from standard input.
 
 It asks the GitHub release page what the newest version is, compares it with
 what the package manager says is installed, and installs the asset built for

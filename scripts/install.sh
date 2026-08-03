@@ -2,7 +2,11 @@
 #
 # Tuni installer and updater.
 #
-#     bash <(curl -fsSL https://raw.githubusercontent.com/unisic/tuni/main/scripts/install.sh)
+#     curl -fsSL https://raw.githubusercontent.com/unisic/tuni/main/scripts/install.sh | bash
+#
+# A pipe rather than `bash <(curl ...)`, because fish has no process
+# substitution and the pipe costs nothing here: every key the menu reads comes
+# from /dev/tty, so a script arriving on stdin takes nothing away.
 #
 # or, from a checkout:
 #

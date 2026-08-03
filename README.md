@@ -72,7 +72,7 @@ head-to-head with alacritty that the table above is too close to settle.
 One line, which opens a menu and installs the package your distribution wants:
 
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/unisic/tuni/main/scripts/install.sh)
+curl -fsSL https://raw.githubusercontent.com/unisic/tuni/main/scripts/install.sh | bash
 ```
 
 The menu says which version is installed, installs or updates to the newest
