@@ -515,6 +515,14 @@ mod imp {
             self.parent_constructed();
             crate::debug::born("TuniTerminal");
             let obj = self.obj();
+            // GTK clips nothing to a widget's allocation by default, and a
+            // glyph's ink is not confined to the cell it is drawn in: a
+            // powerline arrow, a box-drawing sprite or a font with an ascent
+            // taller than the line height reaches past the grid and lands on
+            // the tab bar above it. Cheaper than measuring every run against
+            // the viewport, and the clip is a plain rectangle, so it costs a
+            // scissor rather than a layer.
+            obj.set_overflow(gtk::Overflow::Hidden);
             obj.set_focusable(true);
             obj.set_can_focus(true);
             obj.set_focus_on_click(true);
