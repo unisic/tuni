@@ -88,6 +88,15 @@ pub struct Settings {
     pub terminal: TerminalConfig,
     pub appearance: Appearance,
     pub new_tab: NewTab,
+    /// Whether a new tab or split starts in the directory the visible shell is
+    /// in, rather than where the process itself was started.
+    ///
+    /// On, because carrying the directory across is what a terminal that knows
+    /// about projects is for. Off is for people who want every tab to open the
+    /// same way a fresh terminal does; a single project can be taken out of it
+    /// without turning it off everywhere — see
+    /// [`crate::workspace::Project::inherit_directory`].
+    pub new_tab_inherits_directory: bool,
     /// Whether a restored tab replays what its shell had printed before.
     ///
     /// Off by default, and deliberately so: it writes terminal output to disk,
@@ -158,6 +167,7 @@ impl Default for Settings {
             terminal: TerminalConfig::default(),
             appearance: Appearance::default(),
             new_tab: NewTab::default(),
+            new_tab_inherits_directory: true,
             restore_history: false,
             wrap_lines: false,
             auto_hide_tab_bar: false,
@@ -318,6 +328,9 @@ impl Settings {
         if let Some(opens) = table.string("new-tab").and_then(NewTab::parse) {
             settings.new_tab = opens;
         }
+        if let Some(on) = table.boolean("new-tab-inherit-directory") {
+            settings.new_tab_inherits_directory = on;
+        }
         if let Some(term) = table
             .string("ssh-term")
             .filter(|term| !term.trim().is_empty())
@@ -471,6 +484,13 @@ impl Settings {
         }
         if self.new_tab != default.new_tab {
             let _ = writeln!(out, "new-tab = {}", toml::quote(self.new_tab.name()));
+        }
+        if self.new_tab_inherits_directory != default.new_tab_inherits_directory {
+            let _ = writeln!(
+                out,
+                "new-tab-inherit-directory = {}",
+                self.new_tab_inherits_directory
+            );
         }
         if self.ssh_term != default.ssh_term {
             let _ = writeln!(out, "ssh-term = {}", toml::quote(&self.ssh_term));
@@ -847,6 +867,7 @@ mod tests {
             },
             appearance: Appearance::Dark,
             new_tab: NewTab::Hosts,
+            new_tab_inherits_directory: false,
             restore_history: true,
             wrap_lines: true,
             auto_hide_tab_bar: true,
@@ -887,10 +908,12 @@ mod tests {
         assert!(read.wrap_lines);
         assert!(read.auto_hide_tab_bar);
         assert_eq!(read.new_tab, NewTab::Hosts);
+        assert!(!read.new_tab_inherits_directory);
         assert_eq!(read.ssh_term, "xterm-ghostty");
         assert!(!read.ssh_share_connections);
         assert_eq!(read.ssh_control_persist, 30);
         assert!(read.ssh_reconnect_on_restore);
+        assert!(!read.check_updates);
         assert_eq!(read.info_editor, "zed");
     }
 

@@ -609,6 +609,23 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
     ));
     session.add(&new_tab);
 
+    let inherit = adw::SwitchRow::builder()
+        .title("Follow the Shell's Directory")
+        .subtitle("A new tab or split starts where the visible shell is, not where tuni did")
+        .active(settings.new_tab_inherits_directory)
+        .build();
+    inherit.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| {
+                settings.new_tab_inherits_directory = on;
+            });
+        }
+    ));
+    session.add(&inherit);
+
     let restore = adw::SwitchRow::builder()
         .title("Restore Terminal Output")
         .subtitle("Writes what each terminal printed to disk, and replays it above the new prompt")

@@ -910,6 +910,16 @@ impl TuniWindow {
                     project.custom_directory = None;
                 }
             }),
+            // The per-project half of `new-tab-inherit-directory`: one project
+            // opens its tabs where a fresh terminal would while the rest go on
+            // following the shell.
+            entry("project-follow-directory", uint64, |window, target| {
+                if let Some(id) = project_target(target)
+                    && let Some(project) = window.imp().workspace.borrow_mut().project_mut(id)
+                {
+                    project.inherit_directory = !project.inherit_directory;
+                }
+            }),
             // The editor has `Ctrl+S` of its own, which a terminal may not:
             // `Ctrl+S` to a shell is flow control, and stopping the output of
             // the pane beside the file being saved is not what was asked for.
@@ -2478,14 +2488,33 @@ impl TuniWindow {
     }
 
     /// Where the next shell in `project` should start.
+    ///
+    /// A project with nothing to inherit — no shell has said where it is and
+    /// no directory is pinned — falls back twice over. While the window holds
+    /// a single project, the shell lands in the process's own directory,
+    /// because `tuni` run from a checkout is expected to open there the way
+    /// any terminal does. As soon as a second project exists the fallback is
+    /// the home directory for all of them: a fresh project is a fresh start
+    /// rather than a continuation of whatever launched the window, and by
+    /// then a shell that reports its directory has had every chance to — the
+    /// window does not remember which project was first just to keep the
+    /// checkout fallback alive for it.
     fn directory_for_new_shell(&self, project: Id) -> Option<PathBuf> {
-        self.imp()
-            .workspace
-            .borrow()
+        let imp = self.imp();
+        let inherit = imp.settings.borrow().new_tab_inherits_directory;
+        let workspace = imp.workspace.borrow();
+        let first = workspace.projects().len() <= 1;
+        workspace
             .project(project)
-            .and_then(|project| project.directory_for_new_tab().map(PathBuf::from))
+            .and_then(|project| project.directory_for_new_tab(inherit).map(PathBuf::from))
             .filter(|path| path.is_dir())
-            .or_else(|| std::env::current_dir().ok())
+            .or_else(|| {
+                if first {
+                    std::env::current_dir().ok()
+                } else {
+                    Some(glib::home_dir())
+                }
+            })
     }
 
     /// The widget one tab's panes live in, listening for what only the pointer
@@ -3832,12 +3861,20 @@ impl TuniWindow {
             .map(|project| (project.id(), project.name().to_owned()))
             .collect();
 
+        let empty = projects.is_empty();
         for (id, name) in projects {
             let (row, label) = self.build_row(id, &name);
             list.append(&row);
             imp.labels.borrow_mut().push(label);
         }
         imp.selecting.set(false);
+
+        // An empty scroller is not free: its minimum height is the scrollbar's,
+        // which with no projects left is 48px of nothing between the header and
+        // the New Project button. Hide it while there is nothing to scroll.
+        if let Some(scroller) = list.ancestor(gtk::ScrolledWindow::static_type()) {
+            scroller.set_visible(!empty);
+        }
     }
 
     fn build_row(&self, id: Id, name: &str) -> (gtk::ListBoxRow, gtk::Label) {
@@ -3973,20 +4010,23 @@ impl TuniWindow {
     fn popup_row_menu(&self, row: &gtk::ListBoxRow, x: f64, y: f64) {
         let imp = self.imp();
         let index = row.index().max(0) as usize;
-        let Some((id, named, pinned)) = imp.workspace.borrow().projects().get(index).map(|p| {
-            (
-                p.id(),
-                p.custom_name.is_some(),
-                p.custom_directory.is_some(),
-            )
-        }) else {
+        let Some((id, named, pinned, follows)) =
+            imp.workspace.borrow().projects().get(index).map(|p| {
+                (
+                    p.id(),
+                    p.custom_name.is_some(),
+                    p.custom_directory.is_some(),
+                    p.inherit_directory,
+                )
+            })
+        else {
             return;
         };
         let Some(menu) = imp.row_menu.borrow().clone() else {
             return;
         };
 
-        menu.set_menu_model(Some(&project_menu(id, named, pinned)));
+        menu.set_menu_model(Some(&project_menu(id, named, pinned, follows)));
         // The gesture reports the click in the row's coordinates; the popover
         // is parented to the list, which is where it has to point.
         let point = row
@@ -4144,8 +4184,10 @@ fn project_target(target: Option<&glib::Variant>) -> Option<Id> {
 }
 
 /// The context menu on a sidebar row. Built per row because "Use Automatic
-/// Title" only belongs there when there is a custom one to drop.
-fn project_menu(id: Id, named: bool, pinned: bool) -> gio::Menu {
+/// Title" only belongs there when there is a custom one to drop, and because
+/// the directory rule reads as one label per state rather than a checkbox that
+/// says what is off.
+fn project_menu(id: Id, named: bool, pinned: bool, follows: bool) -> gio::Menu {
     let target = id.raw().to_variant();
 
     let naming = gio::Menu::new();
@@ -4171,6 +4213,15 @@ fn project_menu(id: Id, named: bool, pinned: bool) -> gio::Menu {
             &target,
         ));
     }
+    directory.append_item(&item(
+        if follows {
+            "Do Not Follow the Shell's Directory"
+        } else {
+            "Follow the Shell's Directory"
+        },
+        "win.project-follow-directory",
+        &target,
+    ));
 
     let closing = gio::Menu::new();
     closing.append_item(&item("Close Project", "win.close-project", &target));

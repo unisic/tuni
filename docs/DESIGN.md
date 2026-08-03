@@ -30,14 +30,23 @@ tab a niri-style layout of panes. A project is named by whatever its visible
 shell calls itself until you rename it, which opens a prompt with the keyboard
 already in it and the old name selected, so the new one is typed and entered
 without touching the mouse again. A project directory can be pinned for the
-file tree and the git panel to stay on. A new tab starts where the
-visible one is, opens next to it, and closes when its last shell exits; a
-project whose tabs are all closed stays in the sidebar until it is closed on
-purpose: by its own button, by its menu, or by a middle click anywhere on the
-row, which is how a tab closes everywhere else. The sidebar and the panel are
-both dragged to a width by their inner edge, and one dragged to a width keeps
-it. Until then each is a fraction of the window, which is what a split view
-sizes by and what an undragged one should go on doing.
+file tree and the git panel to stay on. A new tab starts where the visible one
+is, opens next to it, and closes when its last shell exits. Where it starts is
+a setting: `new-tab-inherit-directory` off opens every new tab and split where
+a shell started outside the window would, and "Do Not Follow the Shell's
+Directory" in a project's own menu takes one project out of it while the rest
+go on following, since the exception is usually one project rather than the
+habit. A project with nothing to follow yet has two answers rather than one:
+the project the window opens with starts in the directory tuni itself was
+started in, since running it from a checkout should open there, and every
+project opened after that starts at home, because a second project is a fresh
+start and not a continuation of whatever launched the window. A project whose
+tabs are all closed stays in the sidebar until it is
+closed on purpose: by its own button, by its menu, or by a middle click
+anywhere on the row, which is how a tab closes everywhere else. The sidebar and
+the panel are both dragged to a width by their inner edge, and one dragged to a
+width keeps it. Until then each is a fraction of the window, which is what a
+split view sizes by and what an undragged one should go on doing.
 
 On the other side, a panel under `Ctrl+Shift+B` shows the directory the focused
 shell is working in, or the project's own if one is pinned, and follows it as
@@ -960,10 +969,12 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `editor.wrap-lines` | `false` | Whether a file pane folds a long line rather than scrolling sideways |
 | `window.auto-hide-tab-bar` | `false` | Whether the tab bar goes away while a window has one tab |
 | `new-tab` | `"shell"` | `shell` or `hosts`: what Ctrl+Shift+T opens. Ctrl+Shift+O opens the host list either way |
+| `new-tab-inherit-directory` | `true` | Whether a new tab or split starts where the visible shell is. Off opens every one where a shell started outside the window would; one project is taken out of it from its own menu instead |
 | `ssh-term` | `"xterm-256color"` | What an ssh pane calls itself at the far end. Tuni's own `TERM` describes terminfo that is on this machine and not necessarily on the other one |
 | `ssh-share-connections` | `true` | Whether every pane on a host goes through one authenticated connection. Ignored for a host whose own configuration already sets `ControlPath`, which tuni adopts rather than overrides |
 | `ssh-control-persist` | `600` | Seconds a shared connection outlives the last pane using it, up to a day. Zero closes it with the pane |
 | `ssh-reconnect-on-restore` | `false` | Whether a restored ssh pane dials with nothing to attach to. Off, so a window putting eight panes back cannot start eight logins |
+| `check-updates` | `true` | Whether the window asks the GitHub release page for a newer version, once per run. Off leaves the menu's "Check for Updates" to do it by hand |
 | `panel.files`, `panel.git`, `panel.info`, `panel.debug` | `true` | Which pages the panel's switcher offers. The Remote page manages itself: it exists while a pane is on a host |
 | `key.<action>` | | A window shortcut changed from its default, in GTK accelerator spelling: `key.win.palette = "<Ctrl><Shift>p"`. An empty string turns the shortcut off |
 
@@ -1002,9 +1013,11 @@ and `TUNI_FONT` a font the way Pango writes one (`"JetBrains Mono 13"`), with
 saved session nor overwrites it; `TUNI_DEBUG_FRAME_TIME` prints draw-time
 percentiles; `TUNI_DEBUG_STARTUP` prints how many milliseconds each phase
 before the first frame took;
-`TUNI_DEBUG_PTY_WRITE` logs what the terminal answers back to the shell; and
-`TUNI_CAPTURE_PNG` renders the widget to a file and exits — useful on
-compositors with no screenshot protocol.
+`TUNI_DEBUG_PTY_WRITE` logs what the terminal answers back to the shell;
+`TUNI_PARTIAL_REDRAW=1` puts GTK's damage tracking back on a translucent
+window, where it is turned off because transparent chrome never covers a pixel
+the tracking missed; and `TUNI_CAPTURE_PNG` renders the widget to a file and
+exits — useful on compositors with no screenshot protocol.
 
 ## License
 

@@ -349,13 +349,19 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                     window,
                     move || {
                         let (name, target) = match action.split_once('(') {
-                            Some((name, rest)) => (
-                                name.to_owned(),
-                                rest.trim_end_matches(')').parse::<i32>().ok(),
-                            ),
+                            // A bare number is the i32 most actions take; the
+                            // project actions take a u64 id, which a `u` suffix
+                            // asks for: `close-project(3u)`.
+                            Some((name, rest)) => {
+                                let rest = rest.trim_end_matches(')');
+                                let target = match rest.strip_suffix('u') {
+                                    Some(id) => id.parse::<u64>().ok().map(|id| id.to_variant()),
+                                    None => rest.parse::<i32>().ok().map(|n| n.to_variant()),
+                                };
+                                (name.to_owned(), target)
+                            }
                             None => (action.clone(), None),
                         };
-                        let target = target.map(|value| value.to_variant());
                         let (widget, name) = match (
                             name.strip_prefix("editor."),
                             name.strip_prefix("diff."),

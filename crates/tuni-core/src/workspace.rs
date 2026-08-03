@@ -139,6 +139,15 @@ pub struct Project {
     /// Directory". While it is unset the root is derived from the shell's own
     /// working directory on every read — see [`Project::panel_root`].
     pub custom_directory: Option<String>,
+    /// Whether a new tab in this project starts where the visible shell is.
+    ///
+    /// True unless this project was taken out of it, which is the exclusion the
+    /// global setting has no way to express: somebody who wants the directory
+    /// carried across everywhere except one project says so on that project
+    /// rather than by turning the setting off. It only ever narrows, so a
+    /// project cannot opt back in once the setting is off — an exception in the
+    /// other direction is the setting itself.
+    pub inherit_directory: bool,
     tabs: Vec<Tab>,
     selected: Option<Id>,
 }
@@ -151,6 +160,7 @@ impl Project {
             fallback_name: fallback_name.into(),
             custom_name: None,
             custom_directory: None,
+            inherit_directory: true,
             tabs: Vec::new(),
             selected: None,
         }
@@ -251,11 +261,19 @@ impl Project {
     /// Where a new tab's shell should start: where the selected one is, else
     /// the pinned project directory. `None` leaves it to the caller — the
     /// process's own working directory.
+    ///
+    /// `inherit` is the `new-tab-inherit-directory` setting. With it off, or
+    /// with this project taken out of it, the selected tab is not asked and a
+    /// new shell opens where a shell started outside the window would: the
+    /// pinned directory if there is one, otherwise the caller's fallback.
     #[must_use]
-    pub fn directory_for_new_tab(&self) -> Option<&str> {
-        self.selected_tab()
-            .and_then(Tab::directory)
-            .or_else(|| non_empty(self.custom_directory.as_deref()))
+    pub fn directory_for_new_tab(&self, inherit: bool) -> Option<&str> {
+        if inherit && self.inherit_directory {
+            if let Some(directory) = self.selected_tab().and_then(Tab::directory) {
+                return Some(directory);
+            }
+        }
+        non_empty(self.custom_directory.as_deref())
     }
 
     /// One pane, addressed the way the window addresses it: which tab, which
@@ -576,13 +594,33 @@ mod tests {
     fn a_new_tab_starts_where_the_selected_one_is() {
         let (mut project, ids) = project_with_tabs(2);
         project.custom_directory = Some("/srv/pinned".to_owned());
-        assert_eq!(project.directory_for_new_tab(), Some("/srv/pinned"));
+        assert_eq!(project.directory_for_new_tab(true), Some("/srv/pinned"));
 
         shell_says(project.tab_mut(ids[1]).unwrap(), "zsh", "/home/me/src");
-        assert_eq!(project.directory_for_new_tab(), Some("/home/me/src"));
+        assert_eq!(project.directory_for_new_tab(true), Some("/home/me/src"));
 
         project.select(Some(ids[0]));
-        assert_eq!(project.directory_for_new_tab(), Some("/srv/pinned"));
+        assert_eq!(project.directory_for_new_tab(true), Some("/srv/pinned"));
+    }
+
+    #[test]
+    fn a_project_taken_out_of_it_ignores_where_the_shell_is() {
+        let (mut project, ids) = project_with_tabs(2);
+        shell_says(project.tab_mut(ids[1]).unwrap(), "zsh", "/home/me/src");
+        project.select(Some(ids[1]));
+
+        // The setting off and the project excluded each suppress it on their
+        // own, and with neither a directory to fall back to there is nothing to
+        // say — the caller uses the process's own.
+        assert_eq!(project.directory_for_new_tab(false), None);
+        project.inherit_directory = false;
+        assert_eq!(project.directory_for_new_tab(true), None);
+
+        project.custom_directory = Some("/srv/pinned".to_owned());
+        assert_eq!(project.directory_for_new_tab(true), Some("/srv/pinned"));
+
+        project.inherit_directory = true;
+        assert_eq!(project.directory_for_new_tab(true), Some("/home/me/src"));
     }
 
     #[test]
