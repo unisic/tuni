@@ -8,6 +8,11 @@
 //! Each handler reads the settings back out of the window rather than sharing a
 //! copy with the other rows, so two rows changed in quick succession cannot
 //! overwrite each other with a stale snapshot.
+//!
+//! A row says what it does and stops: title in headline capitals, subtitle one
+//! short line with no full stop, and the reasoning that used to be crammed into
+//! it moved to the group description or dropped. A setting nobody can read at a
+//! glance is a setting nobody changes.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -54,6 +59,7 @@ pub fn present(window: &crate::window::TuniWindow, settings: &Settings) {
     dialog.set_title("Preferences");
     dialog.add(&appearance_page(window, settings));
     dialog.add(&terminal_page(window, settings));
+    dialog.add(&session_page(window, settings));
     dialog.add(&shortcuts_page(window, settings));
     dialog.connect_closed(|_| PREVIEW.with_borrow_mut(|slot| *slot = None));
     dialog.present(Some(window));
@@ -71,7 +77,7 @@ fn appearance_page(
     let window_group = adw::PreferencesGroup::builder().title("Window").build();
     let appearance = adw::ComboRow::builder()
         .title("Appearance")
-        .subtitle("Which of the two terminal themes is in use")
+        .subtitle("Light or dark, and which terminal theme goes with it")
         .model(&list(APPEARANCES.iter().map(|(_, label)| *label)))
         .selected(
             APPEARANCES
@@ -94,7 +100,7 @@ fn appearance_page(
 
     let tab_bar = adw::SwitchRow::builder()
         .title("Hide the Tab Bar for a Single Tab")
-        .subtitle("The bar comes back with the second tab, and takes a row of terminal with it")
+        .subtitle("The bar comes back with the second tab")
         .active(settings.auto_hide_tab_bar)
         .build();
     tab_bar.connect_active_notify(glib::clone!(
@@ -109,26 +115,26 @@ fn appearance_page(
 
     let panel_group = adw::PreferencesGroup::builder()
         .title("Panel Pages")
-        .description(
-            "A page turned off leaves the switcher; its shortcut stays for whoever kept it",
-        )
+        // Verified rather than implied: a hidden page is one GtkStack refuses to
+        // switch to, so the shortcut for it stops working as well.
+        .description("A page turned off leaves the switcher, and its shortcut stops opening it.")
         .build();
     for (title, subtitle, active, write) in [
         (
             "Files",
-            "The tree beside the terminals",
+            "The file tree",
             settings.panel_files,
             (|settings: &mut Settings, on| settings.panel_files = on) as fn(&mut Settings, bool),
         ),
         (
             "Git",
-            "The repository that directory belongs to",
+            "Branch, changes and hunk staging",
             settings.panel_git,
             |settings, on| settings.panel_git = on,
         ),
         (
             "Info",
-            "The shell, its processes and its ports",
+            "Processes, ports and connections",
             settings.panel_info,
             |settings, on| settings.panel_info = on,
         ),
@@ -156,8 +162,8 @@ fn appearance_page(
     }
 
     let padding_x = adw::SpinRow::builder()
-        .title("Side padding")
-        .subtitle("Pixels of nothing between the window and the grid")
+        .title("Side Padding")
+        .subtitle("Pixels between the window edge and the grid")
         .adjustment(&gtk::Adjustment::new(
             settings.terminal.padding_x,
             0.0,
@@ -178,7 +184,8 @@ fn appearance_page(
     window_group.add(&padding_x);
 
     let padding_y = adw::SpinRow::builder()
-        .title("Top and bottom padding")
+        .title("Top and Bottom Padding")
+        .subtitle("Pixels above the first row and below the last")
         .adjustment(&gtk::Adjustment::new(
             settings.terminal.padding_y,
             0.0,
@@ -202,12 +209,12 @@ fn appearance_page(
 
     let background_group = adw::PreferencesGroup::builder()
         .title("Background")
-        .description("What the desktop does with the window is the compositor's call: one that does not composite leaves a transparent window black")
+        .description("A desktop that does not composite leaves a transparent window black.")
         .build();
 
     let opacity = adw::SpinRow::builder()
         .title("Opacity")
-        .subtitle("Percent. The page color only, so colored text keeps its own background")
+        .subtitle("Percent, on the background only, not on colored text")
         .adjustment(&gtk::Adjustment::new(
             settings.terminal.background_opacity * 100.0,
             OPACITY_MIN * 100.0,
@@ -231,7 +238,7 @@ fn appearance_page(
 
     let blur = adw::SwitchRow::builder()
         .title("Blur")
-        .subtitle("Blurs what shows through, on a desktop that offers it. KDE does")
+        .subtitle("Blurs what shows through, on a desktop that offers it")
         .active(settings.background_blur)
         .build();
     blur.connect_active_notify(glib::clone!(
@@ -250,7 +257,7 @@ fn appearance_page(
     // through that ends up unreadable in the other.
     let theme_group = adw::PreferencesGroup::builder()
         .title("Terminal Theme")
-        .description("One for each appearance, as Ghostty and kero both do")
+        .description("One theme for the light appearance, one for the dark.")
         .build();
     theme_group.add(&theme_row(
         window,
@@ -365,7 +372,7 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
 
     let size = adw::SpinRow::builder()
         .title("Size")
-        .subtitle("Points, the same scale Ctrl+= and Ctrl+- move")
+        .subtitle("Points, the scale Ctrl+= and Ctrl+- move")
         .digits(1)
         .adjustment(&gtk::Adjustment::new(
             settings.terminal.font_size,
@@ -388,7 +395,7 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
 
     let ligatures = adw::SwitchRow::builder()
         .title("Ligatures")
-        .subtitle("Off by default: one glyph over several cells is still several cells")
+        .subtitle("Draws pairs like != as one glyph, where the font has one")
         .active(settings.terminal.font_ligatures)
         .build();
     ligatures.connect_active_notify(glib::clone!(
@@ -433,7 +440,7 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
 
     let blink = adw::SwitchRow::builder()
         .title("Blinking Cursor")
-        .subtitle("Only when the application running in the terminal has no opinion")
+        .subtitle("Unless the running program asks otherwise")
         .active(settings.terminal.cursor_blink)
         .build();
     blink.connect_active_notify(glib::clone!(
@@ -448,7 +455,7 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
 
     let cursor = adw::ComboRow::builder()
         .title("Cursor")
-        .subtitle("The shape it takes until a program asks for another")
+        .subtitle("Its shape, until a program asks for another")
         .model(&list(CURSOR_STYLES.iter().map(|(_, label)| *label)))
         .selected(
             CURSOR_STYLES
@@ -471,7 +478,7 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
 
     let copy_on_select = adw::SwitchRow::builder()
         .title("Copy on Select")
-        .subtitle("Highlighting also takes the clipboard, not only the middle-click selection")
+        .subtitle("Selecting text puts it on the clipboard")
         .active(settings.terminal.copy_on_select)
         .build();
     copy_on_select.connect_active_notify(glib::clone!(
@@ -486,7 +493,7 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
 
     let mouse_reporting = adw::SwitchRow::builder()
         .title("Mouse Reporting")
-        .subtitle("Programs that ask for the mouse get it. Off keeps the drag for selecting")
+        .subtitle("Off keeps every drag for selecting text")
         .active(settings.terminal.mouse_reporting)
         .build();
     mouse_reporting.connect_active_notify(glib::clone!(
@@ -501,7 +508,7 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
 
     let bell = adw::SwitchRow::builder()
         .title("Bell")
-        .subtitle("A program ringing the bell makes a sound and marks its tab")
+        .subtitle("A program ringing it makes a sound and marks the tab")
         .active(settings.terminal.bell)
         .build();
     bell.connect_active_notify(glib::clone!(
@@ -540,7 +547,7 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
 
     let wrap = adw::SwitchRow::builder()
         .title("Wrap Lines in Files")
-        .subtitle("A line longer than the pane folds onto the next one instead of scrolling")
+        .subtitle("A long line folds instead of scrolling sideways")
         .active(settings.wrap_lines)
         .build();
     wrap.connect_active_notify(glib::clone!(
@@ -553,6 +560,19 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
     ));
     behavior.add(&wrap);
     page.add(&behavior);
+
+    page
+}
+
+/// What a tab starts and what comes back after a restart. Its own page rather
+/// than three more groups under Terminal: that page is about what a terminal
+/// looks like and does while it is open, and a list long enough to scroll
+/// through twice is where a setting goes to be missed.
+fn session_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("Session")
+        .icon_name("document-open-recent-symbolic")
+        .build();
 
     // --- the shell
 
@@ -579,16 +599,13 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
     shell_group.add(&command);
     page.add(&shell_group);
 
-    // --- the session
+    // --- new tabs
 
-    let session = adw::PreferencesGroup::builder()
-        .title("Session")
-        .description("What a new tab opens, and how much of an old one comes back.")
-        .build();
+    let tabs = adw::PreferencesGroup::builder().title("New Tabs").build();
 
     let new_tab = adw::ComboRow::builder()
-        .title("New Tab")
-        .subtitle("Ctrl+Shift+O opens the host list either way")
+        .title("Opens")
+        .subtitle("A shell, or the list of hosts to connect to")
         .model(&list(NEW_TABS.iter().map(|(_, label)| *label)))
         .selected(
             NEW_TABS
@@ -607,11 +624,11 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
             edit(&window, |settings| settings.new_tab = *chosen);
         }
     ));
-    session.add(&new_tab);
+    tabs.add(&new_tab);
 
     let inherit = adw::SwitchRow::builder()
         .title("Follow the Shell's Directory")
-        .subtitle("A new tab or split starts where the visible shell is, not where tuni did")
+        .subtitle("A new tab or split starts where the current shell is")
         .active(settings.new_tab_inherits_directory)
         .build();
     inherit.connect_active_notify(glib::clone!(
@@ -624,11 +641,51 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
             });
         }
     ));
-    session.add(&inherit);
+    tabs.add(&inherit);
+    page.add(&tabs);
+
+    // --- what comes back
+
+    let session = adw::PreferencesGroup::builder()
+        .title("Restore")
+        .description(
+            "Off, Tuni starts on one empty project and one shell, the way a terminal does.",
+        )
+        .build();
+
+    let restore_session = adw::SwitchRow::builder()
+        .title("Restore the Last Session")
+        .subtitle("The projects, tabs and panes from last time")
+        .active(settings.restore_session)
+        .build();
+    restore_session.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.restore_session = on);
+        }
+    ));
+    session.add(&restore_session);
+
+    let directory = adw::SwitchRow::builder()
+        .title("Restore Working Directories")
+        .subtitle("Each shell comes back in the directory it was in")
+        .active(settings.restore_directory)
+        .build();
+    directory.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.restore_directory = on);
+        }
+    ));
+    session.add(&directory);
 
     let restore = adw::SwitchRow::builder()
         .title("Restore Terminal Output")
-        .subtitle("Writes what each terminal printed to disk, and replays it above the new prompt")
+        .subtitle("What each terminal printed, replayed above the new prompt")
         .active(settings.restore_history)
         .build();
     restore.connect_active_notify(glib::clone!(
@@ -640,20 +697,29 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
         }
     ));
     session.add(&restore);
+    // Both of these say what a restored window brings back with it, and neither
+    // has anything to decide while nothing is being restored.
+    for row in [&directory, &restore] {
+        restore_session
+            .bind_property("active", row, "sensitive")
+            .sync_create()
+            .build();
+    }
     page.add(&session);
 
-    // Not a page of its own for one switch, and not on Appearance, which is
-    // about what the window looks like. This is what tuni does on its own
-    // behalf, next to the rest of what a session does without being asked.
+    // Not a group on Appearance, which is about what the window looks like.
+    // This is one more thing tuni does on its own behalf when it starts, so it
+    // sits with the rest of them.
     let updates = adw::PreferencesGroup::builder()
         .title("Updates")
         .description(
-            "No distribution ships Tuni yet, so a system update will never bring a new one.",
+            "No distribution ships Tuni yet, so a system update will never bring a new one. \
+             Check for Updates in the menu works either way.",
         )
         .build();
     let check = adw::SwitchRow::builder()
         .title("Check for Updates at Startup")
-        .subtitle("One request to the GitHub release page per run; \"Check for Updates\" still works when this is off")
+        .subtitle("One request to the GitHub release page per run")
         .active(settings.check_updates)
         .build();
     check.connect_active_notify(glib::clone!(
@@ -682,7 +748,7 @@ fn shortcuts_page(window: &crate::window::TuniWindow, settings: &Settings) -> ad
         .build();
     let group = adw::PreferencesGroup::builder()
         .title("Window Shortcuts")
-        .description("A row is clicked, the new key is pressed; Backspace turns one off")
+        .description("Click a row, then press the new key. Backspace turns a shortcut off.")
         .build();
     for (action, defaults) in crate::ACCELS {
         group.add(&shortcut_row(window, settings, action, defaults));
@@ -904,7 +970,7 @@ fn font_subtitle(widget: &impl IsA<gtk::Widget>, family: &str) -> String {
 }
 
 /// What the font row says when there is nothing else to say about the family.
-const ORDERING: &str = "The families installed on this machine, monospaced first";
+const ORDERING: &str = "Installed families, monospaced first";
 
 fn installed(widget: &impl IsA<gtk::Widget>, family: &str) -> bool {
     let Some(map) = widget.as_ref().pango_context().font_map() else {
