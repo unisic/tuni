@@ -740,6 +740,16 @@ impl TuniTerminal {
         }
     }
 
+    /// Whether a full-screen application is drawing over the shell.
+    #[must_use]
+    pub fn is_alternate_screen(&self) -> bool {
+        self.imp()
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| session.term.is_alternate_screen())
+    }
+
     #[must_use]
     pub fn title(&self) -> Option<String> {
         self.imp().title.borrow().clone()
@@ -3183,6 +3193,33 @@ impl TuniTerminal {
                 }
                 _ => {}
             }
+        }
+
+        // Ctrl+Shift+Backspace wipes the line being typed. A shell has no one
+        // code for it, so this is the pair every shell does have: kill to the
+        // start of the line, then kill to the end of it, so the line goes whole
+        // wherever the cursor was standing. bash and fish read them as
+        // backward-kill-line and kill-line; zsh's Ctrl+U is kill-whole-line
+        // already, and the Ctrl+K after it finds nothing left to take.
+        //
+        // On Ctrl+Shift rather than on Ctrl, where every other thing this window
+        // takes from the shell lives: Ctrl+Backspace is already a word to a
+        // reader — bash sends it to backward-kill-word — and a key that used to
+        // delete one word deleting the whole line instead is the kind of
+        // surprise that costs a command.
+        //
+        // Not on the alternate screen: there is no command line there, and vim
+        // would read the two codes as scroll-up and start-a-digraph.
+        if mods == (Mods::CTRL | Mods::SHIFT)
+            && key == Key::Backspace
+            && !self.is_alternate_screen()
+        {
+            // Through the broadcasting path, not the quiet one: with typing
+            // broadcast to every pane of the tab, a line wiped in one and left
+            // standing in the other three is worse than not wiping at all.
+            self.send_bytes(b"\x15\x0b");
+            self.echo_broadcast(b"\x15\x0b");
+            return glib::Propagation::Stop;
         }
 
         // Application shortcuts live on Ctrl+Shift, because Ctrl+C and Ctrl+V

@@ -258,6 +258,18 @@ typing into four shells at once is a surprise nobody asked for. A pane opened
 while it is on joins in; the write each neighbor gets is the bytes the key
 encoded to, not a replay of the signal, so nothing goes round the tab twice.
 
+`Ctrl+Shift+Backspace` wipes the command being typed, from wherever the cursor
+happens to be, and in every pane at once while typing is broadcast. It is
+`Ctrl+U` and `Ctrl+K` in one keystroke, which is what the line actually costs:
+readline's `Ctrl+U` kills backwards from the cursor and zsh binds it to the
+whole line, so the pair is the only spelling that is correct in bash, zsh and
+fish alike. On `Ctrl+Shift` rather than on `Ctrl`, where everything else this window
+takes from the shell lives: `Ctrl+Backspace` already means a word to a reader,
+and a key that deleted one word deleting the whole line instead is the kind of
+surprise that costs a command. On the alternate screen it is left alone and the
+key goes to the application, since those two bytes are a scroll and a digraph to
+`vim` rather than a line to erase.
+
 Closing the window writes that arrangement down, and opening it again puts it
 back: the projects, their tabs, the columns and panes inside each one with the
 room they had, the names that were typed, and a fresh shell in each pane's last
@@ -317,6 +329,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `F3` / `Shift+F3` | Next match, previous match |
 | `Ctrl+Shift+H` | Find and replace in the file pane that has the keyboard |
 | `Ctrl+Shift+K` | Clear the terminal: the screen, the scrollback behind it, and a fresh prompt |
+| `Ctrl+Shift+Backspace` | Wipe the command being typed, whatever the shell, cursor wherever it is |
 | `Ctrl+F` / `Ctrl+H` | Find, find and replace — in a file pane only |
 | `Ctrl+G` / `Ctrl+Shift+G` | Next match, previous match — in a file pane only |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection, paste |

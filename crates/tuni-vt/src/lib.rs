@@ -651,6 +651,17 @@ impl Terminal {
         self.inner.is_mouse_tracking().unwrap_or(false)
     }
 
+    /// Whether a full-screen application is on top: an editor, a pager, a
+    /// terminal user interface. Three modes reach that state, and any of them
+    /// means what is on screen is a program's own drawing rather than a shell
+    /// with a prompt on it.
+    #[must_use]
+    pub fn is_alternate_screen(&self) -> bool {
+        self.inner.mode(Mode::ALT_SCREEN_LEGACY).unwrap_or(false)
+            || self.inner.mode(Mode::ALT_SCREEN).unwrap_or(false)
+            || self.inner.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false)
+    }
+
     /// Whether the application hears about the pointer moving, rather than only
     /// about the buttons.
     ///
@@ -738,11 +749,8 @@ impl Terminal {
     /// by default. The arrows honor DECCKM the way real arrow keys do.
     pub fn encode_alternate_scroll(&mut self, rows_down: isize) -> Result<&[u8]> {
         self.encoded.clear();
-        let alternate = self.inner.mode(Mode::ALT_SCREEN_LEGACY).unwrap_or(false)
-            || self.inner.mode(Mode::ALT_SCREEN).unwrap_or(false)
-            || self.inner.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false);
         if rows_down == 0
-            || !alternate
+            || !self.is_alternate_screen()
             || self.inner.is_mouse_tracking().unwrap_or(false)
             || !self.inner.mode(Mode::ALT_SCROLL).unwrap_or(false)
         {
