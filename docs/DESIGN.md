@@ -248,6 +248,16 @@ desktop is a gesture a tiling compositor can swallow before it reaches the
 window. The last project in a window may go too; what stays behind is the same
 New Project screen that closing it would have left.
 
+`Ctrl+Alt+I` sends what is typed to every pane of the tab rather than to the one
+with the keyboard, and a banner across the top says so until it is pressed
+again, because a mode this loud has to be visible from the pane being typed
+into. Per tab rather than per window: the panes of one tab are usually the
+machines being worked on together and the tab behind it is usually something
+else. It is not written to the session either, since a window that comes back
+typing into four shells at once is a surprise nobody asked for. A pane opened
+while it is on joins in; the write each neighbor gets is the bytes the key
+encoded to, not a replay of the signal, so nothing goes round the tab twice.
+
 Closing the window writes that arrangement down, and opening it again puts it
 back: the projects, their tabs, the columns and panes inside each one with the
 room they had, the names that were typed, and a fresh shell in each pane's last
@@ -282,6 +292,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+Shift+Enter` | Show the focused pane alone, and back |
 | `Ctrl+Alt+Shift`+arrows | Grow or shrink the focused pane |
 | `Ctrl+Alt+=` | Give every pane the same room |
+| `Ctrl+Alt+I` | Type into every pane of the tab at once, and stop |
 | Drag a pane's grip onto another | Move it to that pane's left, right, top, or bottom |
 | Drag the gap between panes | Move the divider |
 | `Ctrl+Shift+T` | New tab: a shell, or the host list when `new-tab` says so |

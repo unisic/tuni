@@ -56,6 +56,14 @@ pub struct Tab {
     id: Id,
     /// Set by "Rename…", cleared by "Use Automatic Title".
     pub custom_name: Option<String>,
+    /// Whether a key typed into one pane of this tab goes to all of them.
+    ///
+    /// Per tab rather than per window: the panes of one tab are usually the
+    /// machines being worked on together, and the tab behind it is usually
+    /// something else entirely. Not saved with the session either, because a
+    /// window that comes back typing into four shells at once is a surprise
+    /// nobody asked for.
+    pub broadcast: bool,
     layout: Layout,
 }
 
@@ -65,6 +73,7 @@ impl Tab {
         Self {
             id: Id::next(),
             custom_name: None,
+            broadcast: false,
             layout: Layout::new(Pane::new()),
         }
     }
@@ -76,6 +85,7 @@ impl Tab {
         Self {
             id: Id::next(),
             custom_name: None,
+            broadcast: false,
             layout: Layout::new(pane),
         }
     }

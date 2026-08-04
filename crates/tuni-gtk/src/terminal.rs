@@ -303,6 +303,11 @@ mod imp {
         pub(super) im: RefCell<Option<gtk::IMMulticontext>>,
         /// Text the input method committed during the current key press.
         pub(super) pending_commit: RefCell<Option<String>>,
+        /// Whether what is typed here is also meant for the other panes in the
+        /// tab. Set by the window, which is the only thing that knows what the
+        /// other panes are; all it does here is decide whether the `broadcast`
+        /// signal is worth raising.
+        pub(super) broadcast: Cell<bool>,
         pub(super) title: RefCell<Option<String>>,
         /// Whether the last title said a coding agent in this pane is working
         /// on a turn. See `tuni_core::usage::thinking`.
@@ -429,6 +434,7 @@ mod imp {
                 resize_timer: RefCell::new(None),
                 im: RefCell::new(None),
                 pending_commit: RefCell::new(None),
+                broadcast: Cell::new(false),
                 title: RefCell::new(None),
                 working: Cell::new(false),
                 cwd: RefCell::new(None),
@@ -532,6 +538,15 @@ mod imp {
                     // because only the window knows whether anyone was looking.
                     glib::subclass::Signal::builder("command-finished")
                         .param_types([String::static_type(), u64::static_type()])
+                        .build(),
+                    // What a key press encoded to, raised only while this
+                    // terminal is broadcasting. The window is what knows which
+                    // panes are in the same tab, so it does the copying; the
+                    // bytes are the ones the shell here was given, so every
+                    // pane gets what this one got rather than each encoding the
+                    // key against its own state.
+                    glib::subclass::Signal::builder("broadcast")
+                        .param_types([glib::Bytes::static_type()])
                         .build(),
                     // Output changed what the live search finds. The find bar
                     // reads the tally back rather than being handed it, because
@@ -695,10 +710,33 @@ impl TuniTerminal {
     /// Write text straight to the shell, bypassing key encoding. Paste and
     /// scripted smoke tests both need this.
     pub fn send_text(&self, text: &str) {
+        self.send_bytes(text.as_bytes());
+        self.echo_broadcast(text.as_bytes());
+    }
+
+    /// The same, for bytes a key encoded to rather than text somebody typed.
+    ///
+    /// Raises no `broadcast` signal: this is the end of the line, the write a
+    /// broadcasting pane's neighbors are given, and a pane that repeated what it
+    /// was handed would hand it round the tab forever.
+    pub fn send_bytes(&self, bytes: &[u8]) {
         let mut guard = self.imp().session.borrow_mut();
         if let Some(session) = guard.as_mut() {
-            send(&mut session.pty, text.as_bytes());
+            send(&mut session.pty, bytes);
             session.term.scroll_to_bottom();
+        }
+    }
+
+    /// Whether keys typed here are also meant for the rest of the tab.
+    pub fn set_broadcast(&self, on: bool) {
+        self.imp().broadcast.set(on);
+    }
+
+    /// Offers what was just written to whoever repeats it into the other panes,
+    /// and costs a signal emission only while this pane is broadcasting.
+    fn echo_broadcast(&self, bytes: &[u8]) {
+        if self.imp().broadcast.get() {
+            self.emit_by_name::<()>("broadcast", &[&glib::Bytes::from(bytes)]);
         }
     }
 
@@ -3260,6 +3298,10 @@ impl TuniTerminal {
                     );
                 }
                 send(&mut session.pty, bytes);
+                // Copied only while broadcasting, because the signal cannot be
+                // raised under the borrow the encoder answered from: a handler
+                // that reaches back into this terminal would find it locked.
+                let echo = imp.broadcast.get().then(|| bytes.to_vec());
                 // Typing pulls the viewport back down: the answer is about to
                 // arrive at the bottom. It also takes the selection with it,
                 // as Ghostty's `selection-clear-on-typing` does by default:
@@ -3271,6 +3313,9 @@ impl TuniTerminal {
                 session.term.scroll_to_bottom();
                 imp.scroll.set(session.term.scroll_position());
                 drop(guard);
+                if let Some(bytes) = echo {
+                    self.echo_broadcast(&bytes);
+                }
                 self.note_input();
                 self.queue_draw();
                 true

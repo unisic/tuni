@@ -604,6 +604,8 @@ mod tests {
             project.inherit_directory = false;
             let tab = project.tab_mut(tab_id).expect("just built");
             tab.custom_name = Some("logs".to_owned());
+            // Broadcast is deliberately not saved: see `Tab::broadcast`.
+            tab.broadcast = true;
             let panes: Vec<Id> = tab.layout().panes().map(Pane::id).collect();
             let top = tab.layout_mut().pane_mut(panes[0]).expect("just built");
             top.directory = Some("/var/log".to_owned());
@@ -621,6 +623,7 @@ mod tests {
 
         let tab = &project.tabs()[0];
         assert_eq!(tab.custom_name.as_deref(), Some("logs"));
+        assert!(!tab.broadcast);
         let top = &tab.layout().columns()[0].panes()[0];
         assert_eq!(top.directory.as_deref(), Some("/var/log"));
         assert!((top.weight - 0.25).abs() < f64::EPSILON);

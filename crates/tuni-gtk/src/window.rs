@@ -144,6 +144,12 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "win.new-connection",
     ),
     (
+        "Broadcast Typing to Every Pane",
+        "send-to-symbolic",
+        Some("Ctrl+Alt+I"),
+        "win.broadcast",
+    ),
+    (
         "New Project",
         "folder-new-symbolic",
         Some("Ctrl+Shift+N"),
@@ -411,6 +417,9 @@ mod imp {
         /// both. Only one of the two is ever visible, and a project that never
         /// picked an emoji leaves this one empty and hidden for good.
         pub emoji: RefCell<HashMap<Id, gtk::Label>>,
+        /// The banner that says typing goes to every pane in the tab. One per
+        /// window, showing whatever the tab in front is doing.
+        pub banner: RefCell<Option<adw::Banner>>,
 
         /// The tab whose context menu is open, if any.
         pub menu_page: RefCell<Option<adw::TabPage>>,
@@ -732,8 +741,23 @@ impl TuniWindow {
         // The tab strip belongs to the terminals, so it stops where they do:
         // stretched over the panel it would name tabs for a column that shows
         // the same three pages whichever tab is in front.
+        // Typing into four shells at once is not a thing to discover by the
+        // output, so it is said in the one place nothing else writes, under the
+        // strip and above the panes, with the way out on it.
+        let banner = adw::Banner::builder()
+            .title("Typing goes to every pane in this tab")
+            .button_label("Stop")
+            .revealed(false)
+            .build();
+        banner.connect_button_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.toggle_broadcast()
+        ));
+
         let terminal_view = adw::ToolbarView::new();
         terminal_view.add_top_bar(&tab_bar);
+        terminal_view.add_top_bar(&banner);
         terminal_view.set_content(Some(&content_overlay));
 
         let panel = adw::OverlaySplitView::builder()
@@ -856,6 +880,7 @@ impl TuniWindow {
         imp.status.replace(Some(status));
         imp.status_button.replace(Some(status_button));
         imp.tab_bar.replace(Some(tab_bar));
+        imp.banner.replace(Some(banner));
         imp.title.replace(Some(title));
     }
 
@@ -886,6 +911,7 @@ impl TuniWindow {
                 }
             }),
             entry("reopen-tab", None, |window, _| window.reopen_tab()),
+            entry("broadcast", None, |window, _| window.toggle_broadcast()),
             entry("close-pane", None, |window, _| window.close_focused_pane()),
             entry("split-right", None, |window, _| window.split(Edge::Right)),
             entry("split-down", None, |window, _| window.split(Edge::Down)),
@@ -1927,6 +1953,7 @@ impl TuniWindow {
 
         self.refresh();
         self.sync_files();
+        self.sync_banner();
         self.focus_pane();
     }
 
@@ -2086,9 +2113,116 @@ impl TuniWindow {
         terminal.set_vexpand(true);
         terminal.set_config(&imp.settings.borrow().terminal);
         terminal.set_theme(&self.theme());
+        // A pane split off a broadcasting tab is part of it: the split is what
+        // was asked for, and a pane that quietly stayed out would be one shell
+        // in four not running what the other three ran.
+        terminal.set_broadcast(self.broadcasting(tab));
         imp.terminals.borrow_mut().insert(pane, terminal.clone());
         self.watch_terminal(&terminal, tab, pane);
         terminal
+    }
+
+    /// Whether this tab sends what is typed in one pane to all of them.
+    fn broadcasting(&self, tab: Id) -> bool {
+        self.imp()
+            .workspace
+            .borrow()
+            .projects()
+            .iter()
+            .find_map(|project| project.tab(tab))
+            .is_some_and(|tab| tab.broadcast)
+    }
+
+    /// Turns broadcasting on or off for the tab in front.
+    ///
+    /// Per tab, and off again the moment the tab is closed with it: there is no
+    /// setting for this and nothing remembers it, because a mode that types
+    /// into several machines at once is one to leave on for a minute and not to
+    /// find still on tomorrow.
+    fn toggle_broadcast(&self) {
+        let imp = self.imp();
+        let Some((project, tab)) = self.selected_tab() else {
+            return;
+        };
+        let on = {
+            let mut workspace = imp.workspace.borrow_mut();
+            let Some(entry) = workspace
+                .project_mut(project)
+                .and_then(|project| project.tab_mut(tab))
+            else {
+                return;
+            };
+            entry.broadcast = !entry.broadcast;
+            entry.broadcast
+        };
+
+        self.apply_broadcast(tab, on);
+        self.sync_banner();
+        if on {
+            // The panes are the ones in this tab, and the count is what makes
+            // the difference between a mode and a mistake.
+            let panes = self.terminal_panes(tab).len();
+            self.toast(&format!("Typing goes to {panes} panes"));
+        }
+    }
+
+    /// Tells every terminal in a tab whether it is broadcasting.
+    fn apply_broadcast(&self, tab: Id, on: bool) {
+        let terminals = self.imp().terminals.borrow();
+        for pane in self.terminal_panes(tab) {
+            if let Some(terminal) = terminals.get(&pane) {
+                terminal.set_broadcast(on);
+            }
+        }
+    }
+
+    /// The panes of a tab that hold a terminal, in layout order.
+    ///
+    /// An editor, a diff or the host list is not one of them: broadcasting is
+    /// about shells, and a keystroke meant for four prompts has no business
+    /// landing in a file somebody is editing.
+    fn terminal_panes(&self, tab: Id) -> Vec<Id> {
+        let imp = self.imp();
+        let terminals = imp.terminals.borrow();
+        let workspace = imp.workspace.borrow();
+        workspace
+            .projects()
+            .iter()
+            .find_map(|project| project.tab(tab))
+            .map(|tab| {
+                tab.layout()
+                    .panes()
+                    .map(Pane::id)
+                    .filter(|pane| terminals.contains_key(pane))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Repeats what one pane was sent into the others in its tab.
+    fn broadcast_input(&self, tab: Id, from: Id, bytes: &[u8]) {
+        let Some((this, _)) = self.owner(tab) else {
+            return;
+        };
+        let terminals = this.imp().terminals.borrow().clone();
+        for pane in this.terminal_panes(tab) {
+            if pane == from {
+                continue;
+            }
+            if let Some(terminal) = terminals.get(&pane) {
+                terminal.send_bytes(bytes);
+            }
+        }
+    }
+
+    /// Shows the banner while the tab in front is broadcasting.
+    fn sync_banner(&self) {
+        let on = self
+            .selected_tab()
+            .is_some_and(|(_, tab)| self.broadcasting(tab));
+        if let Some(banner) = self.imp().banner.borrow().as_ref() {
+            banner.set_revealed(on);
+        }
     }
 
     /// The bar an ssh pane wears above its terminal, wired to the one thing it
@@ -2952,6 +3086,18 @@ impl TuniWindow {
         );
 
         terminal.connect_closure(
+            "broadcast",
+            false,
+            glib::closure_local!(
+                #[weak(rename_to = this)]
+                self,
+                move |_: TuniTerminal, bytes: glib::Bytes| {
+                    this.broadcast_input(tab, pane, &bytes);
+                }
+            ),
+        );
+
+        terminal.connect_closure(
             "desktop-notify",
             false,
             glib::closure_local!(
@@ -3749,6 +3895,7 @@ impl TuniWindow {
         }
         self.refresh();
         self.sync_files();
+        self.sync_banner();
         self.focus_pane();
     }
 
@@ -4980,6 +5127,12 @@ fn tab_menu() -> gio::Menu {
     naming.append(Some("Rename…"), Some("win.tab-rename"));
     naming.append(Some("Use Automatic Title"), Some("win.tab-automatic-title"));
 
+    let typing = gio::Menu::new();
+    typing.append(
+        Some("Broadcast Typing to Every Pane"),
+        Some("win.broadcast"),
+    );
+
     let closing = gio::Menu::new();
     closing.append(Some("Close"), Some("win.tab-close"));
     closing.append(Some("Close Others"), Some("win.tab-close-others"));
@@ -4987,6 +5140,7 @@ fn tab_menu() -> gio::Menu {
 
     let menu = gio::Menu::new();
     menu.append_section(None, &naming);
+    menu.append_section(None, &typing);
     menu.append_section(None, &closing);
     menu
 }

@@ -65,6 +65,11 @@ pub(crate) const ACCELS: &[(&str, &[&str])] = &[
     // had an undo for closing one. `R` for reopen is free on both sides - a
     // shell reads `Ctrl+R` as reverse search and never sees the shifted key.
     ("win.reopen-tab", &["<Ctrl><Shift>r"]),
+    // One command typed into every pane of the tab. iTerm2 spends ⇧⌘I on this,
+    // which is taken here by the session inspector, so it goes one modifier
+    // over. `Ctrl+Alt+I` costs a shell nothing it would miss: `Ctrl+I` is a
+    // tab character and the Alt of it is a readline binding nothing sets.
+    ("win.broadcast", &["<Ctrl><Alt>i"]),
     // The host list, in a tab of its own. `Ctrl+Shift` had no `o` on it, and
     // "open a connection" is what the key says everywhere else.
     ("win.new-connection", &["<Ctrl><Shift>o"]),
