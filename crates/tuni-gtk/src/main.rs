@@ -59,6 +59,11 @@ const APP_ID: &str = "dev.unisic.Tuni";
 /// shortcut goes to the shorter reach.
 pub(crate) const ACCELS: &[(&str, &[&str])] = &[
     ("win.new-tab", &["<Ctrl><Shift>t"]),
+    // Not `Ctrl+Shift+T`, which every browser puts this on and which opens a tab
+    // here: a terminal has had that key for a new tab since long before anything
+    // had an undo for closing one. `R` for reopen is free on both sides - a
+    // shell reads `Ctrl+R` as reverse search and never sees the shifted key.
+    ("win.reopen-tab", &["<Ctrl><Shift>r"]),
     // The host list, in a tab of its own. `Ctrl+Shift` had no `o` on it, and
     // "open a connection" is what the key says everywhere else.
     ("win.new-connection", &["<Ctrl><Shift>o"]),

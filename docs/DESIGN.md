@@ -212,6 +212,15 @@ silently does nothing. kitty, Ghostty and WezTerm all put this on `Ctrl+Shift`
 and an arrow, which is project switching here, so it went one key over onto the
 pair that already scrolls.
 
+`Ctrl+Shift+R` reopens the tab just closed, and the four closed before it. It
+comes back with its columns, its panes, the room they had, the name that was
+typed, and what its shells had printed, because the scrollback is taken at the
+moment of closing rather than looked for afterwards; the shells themselves are
+gone, because they were hung up when the tab closed. It is the session snapshot's
+own shape, one tab of it, which is why a reopened tab restores exactly what a
+restored session does. Not `Ctrl+Shift+T`: a terminal has had that key for a new
+tab since long before a browser had an undo for closing one.
+
 A tab dragged off the strip and dropped on the desktop becomes a window of its
 own, and the shells inside it keep running through the move: nothing is
 restarted, nothing is re-attached. Every widget in a pane looks its window up
@@ -259,6 +268,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | Drag the gap between panes | Move the divider |
 | `Ctrl+Shift+T` | New tab: a shell, or the host list when `new-tab` says so |
 | `Ctrl+Shift+O` | The host list, in a tab of its own, whichever that setting says |
+| `Ctrl+Shift+R` | Reopen the tab just closed, with its layout, its name and what its shells had printed |
 | `Ctrl+Page Down` / `Ctrl+Page Up` | Next tab, previous tab |
 | Drag a tab off the strip | A window of its own, with the shells still running in it |
 | Hold `Ctrl`, press `Tab` | The tab switcher: cards for every tab, most recently used first. `Shift+Tab` walks back, `Escape` cancels, letting `Ctrl` go switches |

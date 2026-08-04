@@ -95,6 +95,32 @@ pub struct TabSnapshot {
     pub custom_name: Option<String>,
 }
 
+/// A restored tab and what its panes are still waiting for: the scrollback key
+/// each one was written under, and where the cursor sat in the file it held.
+pub type RestoredTab = (Tab, HashMap<Id, String>, HashMap<Id, usize>);
+
+impl TabSnapshot {
+    /// One tab written down on its own, the same way the whole session writes
+    /// one. What "reopen the tab I just closed" keeps: a closed tab has to
+    /// survive without its widgets, and this is already the shape that does.
+    #[must_use]
+    pub fn of(tab: &Tab, state: impl Fn(Id) -> PaneState) -> Self {
+        snap_tab(tab, &state)
+    }
+
+    /// The tab this describes, with fresh pane ids.
+    ///
+    /// `None` when there is no pane left to build a layout out of, which is
+    /// what an empty or unreadable snapshot means.
+    #[must_use]
+    pub fn restore(&self) -> Option<RestoredTab> {
+        let mut histories = HashMap::new();
+        let mut cursors = HashMap::new();
+        let tab = restore_tab(self, &mut histories, &mut cursors)?;
+        Some((tab, histories, cursors))
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ProjectSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -496,6 +522,35 @@ mod tests {
             .iter()
             .map(|column| column.panes().len())
             .collect()
+    }
+
+    #[test]
+    fn a_closed_tab_comes_back_with_its_name_and_its_scrollback() {
+        let saved = workspace(&[2, 1]);
+        let tab = &saved.projects()[0].tabs()[0];
+        let first = tab.layout().panes().next().expect("a pane").id();
+        let snapshot = TabSnapshot::of(tab, |pane| PaneState {
+            history: (pane == first).then(|| "pane-1".to_owned()),
+            cursor: None,
+        });
+
+        let (reopened, histories, _) = snapshot.restore().expect("a tab with panes in it");
+        assert_eq!(
+            reopened.layout().columns().len(),
+            2,
+            "the split it was closed with"
+        );
+        // The pane that had scrollback is a new pane now, and the key it is
+        // waiting for is the one the closed pane wrote.
+        assert_eq!(histories.len(), 1);
+        assert_eq!(
+            histories.values().next().map(String::as_str),
+            Some("pane-1")
+        );
+        assert!(
+            !histories.contains_key(&first),
+            "the reopened panes are new panes"
+        );
     }
 
     #[test]

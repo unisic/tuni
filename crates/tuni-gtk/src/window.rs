@@ -14,7 +14,7 @@
 //! the model decides, and [`TuniGrid`] renders whatever it says.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -92,6 +92,26 @@ const CONNECT_TRIES: u32 = 240;
 /// learned.
 const DONE_ICON: &str = "emblem-important-symbolic";
 
+/// How many closed tabs a window can put back. Five is what a browser keeps and
+/// as far as anybody reaches for from memory; the cost is the reason there is a
+/// number at all, since each one holds up to `HISTORY_LINE_LIMIT` lines of
+/// scrollback per pane it had.
+const CLOSED_TABS: usize = 5;
+
+/// A tab that has been closed, kept whole enough to open again: the same
+/// snapshot the session file is made of, the scrollback its terminals were
+/// holding, and the project it belonged to.
+///
+/// The shells are gone by the time this exists - closing a tab hangs them up -
+/// so reopening starts new ones in the same layout, in the same directories,
+/// with the output the old ones had replayed above the prompt. That is exactly
+/// what restoring a session does, which is why it is the same machinery.
+pub struct ClosedTab {
+    project: Id,
+    snapshot: tuni_core::session::TabSnapshot,
+    history: History,
+}
+
 /// What a Find command found to act on. The bar over a terminal belongs to the
 /// window and is handed the terminal it is pointing at; a file pane carries its
 /// own search inside GtkSourceView.
@@ -110,6 +130,12 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "tab-new-symbolic",
         Some("Ctrl+Shift+T"),
         "win.new-tab",
+    ),
+    (
+        "Reopen Closed Tab",
+        "edit-undo-symbolic",
+        Some("Ctrl+Shift+R"),
+        "win.reopen-tab",
     ),
     (
         "New Connection",
@@ -272,8 +298,8 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
 
 mod imp {
     use super::{
-        Cell, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniFind, TuniGrid, TuniHosts,
-        TuniPanel, TuniRemote, TuniSwitcher, TuniTerminal, Workspace, glib,
+        Cell, ClosedTab, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniFind, TuniGrid,
+        TuniHosts, TuniPanel, TuniRemote, TuniSwitcher, TuniTerminal, VecDeque, Workspace, glib,
     };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
@@ -312,6 +338,11 @@ mod imp {
         /// while `AdwTabView` is between asking for a window and handing the
         /// page over, and taken by the detach that follows.
         pub handover: RefCell<Option<(super::TuniWindow, Id)>>,
+        /// The tabs this window has closed, oldest first, capped at
+        /// [`CLOSED_TABS`](super::CLOSED_TABS). Per window rather than per
+        /// application: the tab goes back where it was, and where it was is a
+        /// project in this window.
+        pub closed: RefCell<VecDeque<ClosedTab>>,
         /// Set once the window has been allowed to close, so the unsaved-work
         /// question is asked once rather than every time the answer is acted
         /// on.
@@ -849,6 +880,7 @@ impl TuniWindow {
                     view.close_page(&page);
                 }
             }),
+            entry("reopen-tab", None, |window, _| window.reopen_tab()),
             entry("close-pane", None, |window, _| window.close_focused_pane()),
             entry("split-right", None, |window, _| window.split(Edge::Right)),
             entry("split-down", None, |window, _| window.split(Edge::Down)),
@@ -3282,6 +3314,7 @@ impl TuniWindow {
             return;
         }
 
+        self.remember_closed(project, &tab);
         for pane in tab.layout().panes() {
             self.forget_pane(pane.id());
         }
@@ -3385,6 +3418,76 @@ impl TuniWindow {
             .iter()
             .find(|project| project.tab(tab).is_some())
             .map(tuni_core::workspace::Project::id)
+    }
+
+    /// Writes down a tab on its way out, so it can be opened again.
+    ///
+    /// Read here rather than at the reopen, because by then the shells have been
+    /// hung up and their scrollback is gone with them. The cost is one pass over
+    /// the tab's terminals, up to `HISTORY_LINE_LIMIT` lines each, held until
+    /// [`CLOSED_TABS`] newer closes push it out.
+    ///
+    /// The scrollback is kept whether or not the session setting asks for one on
+    /// disk: that setting is about what a *file* should hold after the window is
+    /// gone, and this never reaches a file.
+    fn remember_closed(&self, project: Id, tab: &Tab) {
+        let imp = self.imp();
+        let terminals = imp.terminals.borrow();
+        let editors = imp.editors.borrow();
+        let history = RefCell::new(History::default());
+        let snapshot = tuni_core::session::TabSnapshot::of(tab, |pane| PaneState {
+            history: terminals
+                .get(&pane)
+                .and_then(|terminal| terminal.history(HISTORY_LINE_LIMIT))
+                .map(|text| {
+                    // Unique within one closed tab, which is all it has to be:
+                    // the map goes out of scope with the tab that filled it.
+                    let key = format!("pane-{}", pane.raw());
+                    history.borrow_mut().insert(key.clone(), text);
+                    key
+                }),
+            cursor: editors.get(&pane).and_then(TuniEditor::cursor),
+        });
+
+        let mut closed = imp.closed.borrow_mut();
+        closed.push_back(ClosedTab {
+            project,
+            snapshot,
+            history: history.into_inner(),
+        });
+        while closed.len() > CLOSED_TABS {
+            closed.pop_front();
+        }
+    }
+
+    /// Opens the last tab this window closed, in the project it was closed from,
+    /// with its panes in the same shape and their output replayed.
+    ///
+    /// A tab whose project has since been closed has nowhere to go back to, and
+    /// says so rather than opening somewhere it never was.
+    fn reopen_tab(&self) {
+        let imp = self.imp();
+        let Some(closed) = imp.closed.borrow_mut().pop_back() else {
+            self.toast("No closed tab to reopen.");
+            return;
+        };
+        if imp.workspace.borrow().project(closed.project).is_none() {
+            self.toast("That tab's project is closed.");
+            return;
+        }
+        let Some((tab, histories, cursors)) = closed.snapshot.restore() else {
+            return;
+        };
+
+        for (pane, key) in &histories {
+            if let Some(text) = closed.history.get(key) {
+                imp.pending_history
+                    .borrow_mut()
+                    .insert(*pane, text.to_owned());
+            }
+        }
+        imp.pending_cursors.borrow_mut().extend(cursors);
+        self.add_tab(closed.project, tab);
     }
 
     // --- panes -------------------------------------------------------------
