@@ -254,6 +254,25 @@ impl Snapshot {
         }
     }
 
+    /// Drops every directory the snapshot remembers, so its shells start where
+    /// one started outside the window would. What `terminal.restore-directory`
+    /// off means, applied to the snapshot rather than to the restoring: a pane
+    /// with no directory is already the case this file handles everywhere.
+    ///
+    /// A file pane is untouched by it: its directory is the one its file is in,
+    /// derived again from the path when it comes back.
+    pub fn forget_directories(&mut self) {
+        for project in &mut self.projects {
+            for tab in &mut project.tabs {
+                for column in &mut tab.columns {
+                    for pane in &mut column.panes {
+                        pane.directory = None;
+                    }
+                }
+            }
+        }
+    }
+
     /// `$XDG_DATA_HOME/tuni/session.json`.
     #[must_use]
     pub fn path() -> PathBuf {
@@ -541,6 +560,31 @@ mod tests {
         let top = &tab.layout().columns()[0].panes()[0];
         assert_eq!(top.directory.as_deref(), Some("/var/log"));
         assert!((top.weight - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn forgetting_directories_leaves_a_shell_nowhere_and_a_file_where_it_is() {
+        let mut saved = workspace(&[1]);
+        let project = saved.projects()[0].id();
+        let tab = saved.projects()[0].tabs()[0].id();
+        {
+            let layout = saved
+                .project_mut(project)
+                .and_then(|project| project.tab_mut(tab))
+                .expect("just built")
+                .layout_mut();
+            layout.split(Pane::file(PathBuf::from("/src/main.rs")), Edge::Right);
+            let shell = layout.columns()[0].panes()[0].id();
+            layout.pane_mut(shell).expect("just built").directory = Some("/var/log".to_owned());
+        }
+
+        let mut snapshot = Snapshot::of(&saved, |_| PaneState::default());
+        snapshot.forget_directories();
+        let restored = snapshot.restore().workspace;
+
+        let columns = restored.projects()[0].tabs()[0].layout().columns();
+        assert_eq!(columns[0].panes()[0].directory, None);
+        assert_eq!(columns[1].panes()[0].directory.as_deref(), Some("/src"));
     }
 
     #[test]

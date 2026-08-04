@@ -211,7 +211,11 @@ screen; it starts empty and never writes the session, so the arrangement that
 comes back is the one the first window was left in. A settings window under
 `Ctrl+,` edits the font, the two themes, the cursor, the scrollback, the shell
 to run, whether a file pane wraps its long lines, and that last decision,
-writing each change to `~/.config/tuni/config.toml` as it is made. There is no
+writing each change to `~/.config/tuni/config.toml` as it is made. It is four
+pages, Appearance, Terminal, Session and Shortcuts, and each row is a title and
+one short line saying what it does: a page long enough to scroll through twice
+is where a setting goes to be missed, and a subtitle that argues its own design
+is a setting nobody reads. There is no
 OK button; a line of terminal beside the font rows is drawn in whatever has
 just been chosen, since that is the only way a font or a palette is actually
 picked. The family is chosen from what this machine has, asked of the font map
@@ -381,6 +385,28 @@ costs the previous session rather than both. Every field the snapshot reads is
 optional and every unreadable tab is skipped, which is what lets a file written
 by an older build still open — and `TUNI_SESSION=0` turns the whole mechanism
 off, restore and save alike.
+
+Restoring it is off by default. A terminal that opens on one empty shell is
+what everyone else's opens on, and a window that comes back with eight panes
+and four projects nobody asked for on this run is a surprise rather than a
+convenience; `session.restore` on is for people who want the workspace back and
+have said so. The window is written down either way, so turning the setting on
+restores the last one rather than starting to collect from that moment. What a
+restored pane starts in is its own switch: `terminal.restore-directory` off
+sends every one of them where a shell started outside the window would go, for
+people who want the arrangement back without the state that came with it.
+
+Where a shell is comes from OSC 7 while a shell sends it, and from `/proc`
+while one does not. Fish reports for itself; bash and zsh report only through a
+distribution's prompt hook, and every one of those hooks checks for VTE first,
+so under them the sequence never arrives and every pane would have inherited
+and restored nothing. The kernel knows regardless. A pane whose shell has never
+sent OSC 7 reads `/proc/<pid>/cwd` instead, on a timer of the same couple of
+seconds the panel polls at, and a shell that does report is believed: the first
+OSC 7 stops the timer for good, as does the session ending. A timer rather than
+a read on each drain, because after a `cd` the prompt is the last thing printed
+and a poll riding on output would have nothing left to ride on at the moment
+the answer changed.
 
 The file tree is a flat list rather than a tree of nodes. What a list view
 wants is rows, and what an expandable tree costs is a second structure that has
@@ -969,6 +995,8 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `bell` | `true` | Whether `\a` rings the desktop's own bell |
 | `command` | `""` | The shell to run; empty means the login shell |
 | `terminal.scrollback-lines` | `10000` | Lines kept above the screen |
+| `session.restore` | `false` | Whether the window opens on the workspace the last one closed with. Off opens one empty project and one shell; the session is written down either way, so turning it on restores the last window rather than the next one |
+| `terminal.restore-directory` | `true` | Whether a restored pane starts in the directory its shell was in. Only read when the session is restored at all |
 | `terminal.restore-history` | `false` | Whether a restored pane replays what it had printed |
 | `editor.wrap-lines` | `false` | Whether a file pane folds a long line rather than scrolling sideways |
 | `window.auto-hide-tab-bar` | `false` | Whether the tab bar goes away while a window has one tab |

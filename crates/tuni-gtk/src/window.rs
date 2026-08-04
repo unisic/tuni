@@ -1565,11 +1565,27 @@ impl TuniWindow {
     }
 
     /// Rebuilds the last session's window. `false` when there is nothing saved
-    /// to rebuild, which is the caller's cue to open a first project instead.
+    /// to rebuild or the setting says not to, which is the caller's cue to open
+    /// a first project instead.
+    ///
+    /// The window is still written down when it closes with the setting off:
+    /// the file is what turning it on has to restore, and a session that only
+    /// began accumulating once somebody found the switch would restore nothing
+    /// the first time.
     pub fn restore_session(&self) -> bool {
-        let Some(restored) = Snapshot::load().map(|snapshot| snapshot.restore()) else {
+        if !self.imp().settings.borrow().restore_session {
+            return false;
+        }
+        let Some(mut snapshot) = Snapshot::load() else {
             return false;
         };
+        // Cleared on the snapshot rather than at each pane, so nothing below
+        // has to know the setting: a pane with no directory is what a session
+        // whose shell never said where it was already looks like.
+        if !self.imp().settings.borrow().restore_directory {
+            snapshot.forget_directories();
+        }
+        let restored = snapshot.restore();
         if restored.workspace.is_empty() {
             return false;
         }

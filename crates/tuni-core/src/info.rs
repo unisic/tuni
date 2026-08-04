@@ -161,6 +161,27 @@ pub fn terminate(pid: u32, force: bool) {
     }
 }
 
+/// Where the process `pid` is working, as the kernel has it.
+///
+/// OSC 7 is a shell's own account of its directory, and a shell nobody
+/// configured to send it never gives one: bash and zsh emit the sequence only
+/// when a distribution's prompt hook does it, and that hook usually checks for
+/// VTE first. `/proc` answers for every shell there is, so this is what a tab
+/// falls back to rather than losing the directory entirely.
+///
+/// Only ever asked about a local process. A directory that is gone reads back
+/// as `"/path (deleted)"`, which is why the answer has to still be one.
+#[must_use]
+pub fn directory(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    path.is_dir()
+        .then(|| path.into_os_string().into_string().ok())
+        .flatten()
+}
+
 /// How long the process `pid` has been running, in seconds.
 ///
 /// Nothing for a process that is not there, which is the answer that matters
@@ -534,6 +555,17 @@ mod tests {
         format!(
             "{pid} ({comm}) {state} {ppid} 0 0 0 -1 0 0 0 0 0 100 50 0 0 20 0 1 0 900 0 512 {tail}"
         )
+    }
+
+    /// The one caller is a shell that never sent OSC 7, and the reader is this
+    /// process, which is a process like any other.
+    #[test]
+    fn a_running_process_says_where_it_is_working() {
+        let mine = std::env::current_dir().expect("a test runs somewhere");
+        assert_eq!(directory(std::process::id()).map(PathBuf::from), Some(mine));
+        // Not a process, so not a directory: pid 0 is what a pane with no shell
+        // in it reports.
+        assert_eq!(directory(0), None);
     }
 
     #[test]

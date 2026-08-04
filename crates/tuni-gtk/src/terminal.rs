@@ -51,6 +51,12 @@ const PROGRESS_STALE: Duration = Duration::from_secs(15);
 /// it costs throughput rather than the window's ability to answer.
 const FEED_BUDGET: Duration = Duration::from_millis(8);
 
+/// How often a shell that has never sent OSC 7 is looked up in `/proc`. The
+/// same couple of seconds the panel polls its own reads at, for the same
+/// reason: the answer is wanted by the time somebody looks, and one `readlink`
+/// is not worth a tighter loop than that.
+const CWD_POLL: Duration = Duration::from_secs(2);
+
 /// What a pane's session runs. `Launch::default()` is the configured shell in
 /// no particular directory, which is what every pane was before a pane could
 /// run anything else.
@@ -295,6 +301,11 @@ mod imp {
         /// Working directory as last reported by OSC 7. Etap 2 infers a
         /// project's directory from this; for now it names the window.
         pub(super) cwd: RefCell<Option<String>>,
+        /// Whether OSC 7 has ever arrived. A shell that reports for itself is
+        /// believed and never asked again through `/proc`; one that has not
+        /// reported by now is a shell without the prompt hook, and asking the
+        /// kernel is the only way its tab learns where it is.
+        pub(super) cwd_reported: Cell<bool>,
         pub(super) pointer: Cell<Pointer>,
         /// How many mouse buttons are down, which mouse reporting needs in
         /// order to decide whether motion is worth sending.
@@ -407,6 +418,7 @@ mod imp {
                 pending_commit: RefCell::new(None),
                 title: RefCell::new(None),
                 cwd: RefCell::new(None),
+                cwd_reported: Cell::new(false),
                 pointer: Cell::new(Pointer::default()),
                 buttons_down: Cell::new(0),
                 buttons_held: Cell::new(0),
@@ -668,11 +680,54 @@ impl TuniTerminal {
         self.imp().title.borrow().clone()
     }
 
-    /// The shell's working directory, as last reported by OSC 7. `None` until
-    /// a shell that sends it does.
+    /// The shell's working directory, as last reported by OSC 7 or, for a shell
+    /// that does not report, as `/proc` last had it. `None` until one of the
+    /// two has an answer.
     #[must_use]
     pub fn cwd(&self) -> Option<String> {
         self.imp().cwd.borrow().clone()
+    }
+
+    /// Keeps `cwd` true for a shell that never sends OSC 7.
+    ///
+    /// Fish announces its directory itself. Bash and zsh do it only through a
+    /// prompt hook the distribution installs, and those hooks check for VTE
+    /// before they fire, so under tuni the sequence never arrives: the tab
+    /// would inherit nothing, the session would restore into the home
+    /// directory, and the file tree would stay wherever the window was opened.
+    /// The kernel knows where the process is, so it is asked instead — from the
+    /// moment the session starts until the shell reports for itself, which
+    /// stops the timer, as does the session ending or the widget going.
+    ///
+    /// Deliberately a timer rather than a read at each drain: after a `cd` the
+    /// prompt is the last thing printed, and a poll that rides on output would
+    /// have nothing left to ride on at the moment the answer changed.
+    fn follow_directory(&self) {
+        glib::timeout_add_local(
+            CWD_POLL,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    let imp = this.imp();
+                    if imp.cwd_reported.get() {
+                        return glib::ControlFlow::Break;
+                    }
+                    let Some(pid) = this.shell_pid() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    if let Some(cwd) = tuni_core::info::directory(pid)
+                        && imp.cwd.borrow().as_deref() != Some(cwd.as_str())
+                    {
+                        imp.cwd.replace(Some(cwd));
+                        this.notify("cwd");
+                    }
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
     }
 
     /// The shell's process id. `None` before it starts and after it exits,
@@ -1254,6 +1309,7 @@ impl TuniTerminal {
             term,
             pty: Some(pty),
         }));
+        self.follow_directory();
         let cell = (m.cell_width.round() as u16, m.cell_height.round() as u16);
         imp.grid_size.set((cols, rows));
         imp.cell_size.set(cell);
@@ -1423,6 +1479,10 @@ impl TuniTerminal {
             .then(|| session.term.title().map(str::to_owned))
             .flatten();
         let cwd = effects.pwd_changed.then(|| session.term.pwd()).flatten();
+        if cwd.is_some() {
+            // The shell speaks for itself, so the poll below stops asking.
+            imp.cwd_reported.set(true);
+        }
         let scroll = session.term.scroll_position();
         drop(guard);
 
