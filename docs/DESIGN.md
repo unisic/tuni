@@ -53,7 +53,10 @@ is drawn in the row's own foreground color like every other symbolic icon in the
 window; an emoji is text the font colors. A project whose tabs are all closed
 stays in the sidebar until it is closed on purpose: by its own button, by its
 menu, or by a middle click anywhere on the row, which is how a tab closes
-everywhere else. The sidebar and
+everywhere else. Dragged off the sidebar entirely it becomes a window of its own
+instead, tabs, panes, shells and all: the tab strip does this for one tab and
+hears it from `AdwTabView`, and a list row, which has no such signal, reads a
+drag that ended on nothing as the same request. The sidebar and
 the panel are both dragged to a width by their inner edge, and one dragged to a
 width keeps it. Until then each is a fraction of the window, which is what a
 split view sizes by and what an undragged one should go on doing.
@@ -238,7 +241,12 @@ by the tab it belongs to at the moment a signal fires, rather than holding the
 window it was built in, so handing a tab over is moving one entry per pane
 between two maps and moving the model's `Tab`. Dropping a tab onto another tuni
 window is not that path and closes it instead: libadwaita only asks for a new
-window when the drop had no window under it.
+window when the drop had no window under it. A project row dragged off the
+sidebar does the same for everything in it, one transfer per tab, and its menu
+says "Move to a New Window" for the same thing by name, because a drag onto the
+desktop is a gesture a tiling compositor can swallow before it reaches the
+window. The last project in a window may go too; what stays behind is the same
+New Project screen that closing it would have left.
 
 Closing the window writes that arrangement down, and opening it again puts it
 back: the projects, their tabs, the columns and panes inside each one with the
@@ -286,6 +294,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+Shift+N` | New project |
 | `Ctrl+Alt+Page Down` / `Ctrl+Alt+Page Up`, `Ctrl+Shift+Down` / `Ctrl+Shift+Up` | Next project, previous project |
 | `Ctrl+Shift+1` … `Ctrl+Shift+9` | Jump to a project |
+| Drag a project off the sidebar | A window of its own, every tab in it, with the shells still running |
 | `F9` | Show or hide the sidebar |
 | `Ctrl+Shift+B` | Show or hide the panel |
 | `Ctrl+Shift+G` | Open the panel on the repository, or close it when it is already there |

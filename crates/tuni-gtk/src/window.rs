@@ -980,6 +980,11 @@ impl TuniWindow {
                     window.refresh();
                 }
             }),
+            entry("tear-out-project", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.tear_out_project(id);
+                }
+            }),
             entry("project-icon", uint64, |window, target| {
                 if let Some(id) = project_target(target) {
                     window.choose_project_icon(id);
@@ -3413,6 +3418,79 @@ impl TuniWindow {
         Some(view)
     }
 
+    /// Moves a whole project into a window of its own, shells and all.
+    ///
+    /// The tab strip has this for a single tab and gets it from `AdwTabView`,
+    /// which knows when a page was dropped on nothing. A `GtkListBox` row knows
+    /// no such thing, so the sidebar reads a drag that ended with no target as
+    /// the same request, and the move itself is the strip's: every page is
+    /// transferred to the new window's view, which carries the widgets, and so
+    /// the shells, across without closing anything. The row's menu asks for the
+    /// same thing by name, since a drag onto the desktop is a gesture a tiling
+    /// compositor can swallow before it ever reaches this window.
+    ///
+    /// The last project in a window may go too, and what stays behind is a
+    /// window with a New Project button in it — which is exactly what closing
+    /// that project by its own button already leaves.
+    fn tear_out_project(&self, id: Id) {
+        let imp = self.imp();
+        let Some(app) = self.application().and_downcast::<adw::Application>() else {
+            return;
+        };
+        let Some(view) = imp.views.borrow().get(&id).cloned() else {
+            return;
+        };
+        let Some((name, icon, directory, follows, selected)) =
+            imp.workspace.borrow().project(id).map(|project| {
+                (
+                    project.custom_name.clone(),
+                    project.icon.clone(),
+                    project.custom_directory.clone(),
+                    project.inherit_directory,
+                    project.selected_id(),
+                )
+            })
+        else {
+            return;
+        };
+
+        let window = Self::new(&app, imp.settings.borrow().clone());
+        let target = window.imp().workspace.borrow_mut().open_project();
+        window.attach_project(target);
+        if let Some(project) = window.imp().workspace.borrow_mut().project_mut(target) {
+            project.custom_name = name;
+            project.icon = icon;
+            project.custom_directory = directory;
+            project.inherit_directory = follows;
+        }
+        let Some(other) = window.imp().views.borrow().get(&target).cloned() else {
+            return;
+        };
+        window.present();
+
+        // Backwards, because `hand_over` puts every tab it is given at the head
+        // of the strip: walking the pages from the end is what leaves them in
+        // the order they were dragged out in. The handover is set again before
+        // each one, since it is taken by the transfer it belongs to.
+        for position in (0..view.n_pages()).rev() {
+            let page = view.nth_page(position);
+            imp.handover.replace(Some((window.clone(), target)));
+            view.transfer_page(&page, &other, 0);
+        }
+        imp.handover.take();
+        self.close_project(id);
+
+        // The tab that was in front stays in front. Every page landed selected
+        // as it arrived, so without this the window opens on whichever one was
+        // transferred last.
+        let page = selected.and_then(|tab| window.imp().pages.borrow().get(&tab).cloned());
+        if let Some(page) = page {
+            other.set_selected_page(&page);
+        }
+        window.rebuild_sidebar();
+        window.show_selected_project();
+    }
+
     /// Gives a tab to another window: the model's tab, and every map entry this
     /// window keeps for the panes in it.
     ///
@@ -4510,6 +4588,24 @@ impl TuniWindow {
                 );
             }
         ));
+        // A row let go of anywhere that does not take it — the desktop, another
+        // application, the terminals beside the sidebar — asks for the project
+        // in a window of its own, which is what dragging a tab off the strip
+        // above already means. Deferred, because the answer closes this project
+        // and so destroys the row whose controller is running.
+        source.connect_drag_cancel(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            false,
+            move |_, _, reason| {
+                if reason != gdk::DragCancelReason::NoTarget {
+                    return false;
+                }
+                glib::idle_add_local_once(move || this.tear_out_project(id));
+                true
+            }
+        ));
         row.add_controller(source);
 
         let target = gtk::DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);
@@ -4806,12 +4902,20 @@ fn project_menu(id: Id, named: bool, pinned: bool, follows: bool, iconed: bool) 
         &target,
     ));
 
+    let moving = gio::Menu::new();
+    moving.append_item(&item(
+        "Move to a New Window",
+        "win.tear-out-project",
+        &target,
+    ));
+
     let closing = gio::Menu::new();
     closing.append_item(&item("Close Project", "win.close-project", &target));
 
     let menu = gio::Menu::new();
     menu.append_section(None, &naming);
     menu.append_section(None, &directory);
+    menu.append_section(None, &moving);
     menu.append_section(None, &closing);
     menu
 }
