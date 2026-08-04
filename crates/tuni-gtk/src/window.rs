@@ -2900,6 +2900,37 @@ impl TuniWindow {
             ),
         );
 
+        // A build or a test run that ended while its tab was somewhere else.
+        // Judged the way the bell is judged, and for the same reason: a command
+        // whose last line is already on screen has told the person watching it,
+        // and a second telling is noise. Walking away is what this is for.
+        terminal.connect_closure(
+            "command-finished",
+            false,
+            glib::closure_local!(
+                #[weak(rename_to = this)]
+                self,
+                move |terminal: TuniTerminal, command: String, seconds: u64| {
+                    let Some((this, _)) = this.owner(tab) else {
+                        return;
+                    };
+                    if terminal.has_focus() && this.is_active() {
+                        return;
+                    }
+                    if let Some(page) = this.imp().pages.borrow().get(&tab)
+                        && !page.is_selected()
+                    {
+                        page.set_needs_attention(true);
+                    }
+                    this.notify_desktop(
+                        pane,
+                        &format!("{command} finished"),
+                        &format!("After {}", duration(seconds)),
+                    );
+                }
+            ),
+        );
+
         terminal.connect_closure(
             "desktop-notify",
             false,
@@ -5191,6 +5222,16 @@ fn unsaved_message(dirty: &[TuniEditor]) -> String {
 fn move_entry<T: Clone>(from: &RefCell<HashMap<Id, T>>, to: &RefCell<HashMap<Id, T>>, key: Id) {
     if let Some(value) = from.borrow_mut().remove(&key) {
         to.borrow_mut().insert(key, value);
+    }
+}
+
+/// How long something took, in the units somebody would say it in. Seconds
+/// under a minute, because a command is the one thing here measured in them.
+fn duration(seconds: u64) -> String {
+    match seconds {
+        ..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {}m", seconds / 3600, seconds % 3600 / 60),
     }
 }
 

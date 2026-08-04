@@ -57,6 +57,12 @@ const FEED_BUDGET: Duration = Duration::from_millis(8);
 /// is not worth a tighter loop than that.
 const CWD_POLL: Duration = Duration::from_secs(2);
 
+/// How long a command has to run before its ending is worth a notification.
+/// Long enough that nothing typed and answered at the prompt qualifies, short
+/// enough to cover the builds and test runs somebody walks away from - and
+/// anything shorter than the poll above cannot be measured anyway.
+const LONG_COMMAND_SECONDS: u64 = 10;
+
 /// What a pane's session runs. `Launch::default()` is the configured shell in
 /// no particular directory, which is what every pane was before a pane could
 /// run anything else.
@@ -309,6 +315,10 @@ mod imp {
         /// reported by now is a shell without the prompt hook, and asking the
         /// kernel is the only way its tab learns where it is.
         pub(super) cwd_reported: Cell<bool>,
+        /// What the shell handed the keyboard to and when, so that the moment
+        /// it takes the keyboard back is a command that finished and something
+        /// that ran for long enough to be worth saying so about.
+        pub(super) command: RefCell<Option<(String, Instant)>>,
         pub(super) pointer: Cell<Pointer>,
         /// How many mouse buttons are down, which mouse reporting needs in
         /// order to decide whether motion is worth sending.
@@ -423,6 +433,7 @@ mod imp {
                 working: Cell::new(false),
                 cwd: RefCell::new(None),
                 cwd_reported: Cell::new(false),
+                command: RefCell::new(None),
                 pointer: Cell::new(Pointer::default()),
                 buttons_down: Cell::new(0),
                 buttons_held: Cell::new(0),
@@ -513,6 +524,14 @@ mod imp {
                     // GObject's own.
                     glib::subclass::Signal::builder("desktop-notify")
                         .param_types([String::static_type(), String::static_type()])
+                        .build(),
+                    // A command that ran for a while has ended and the shell has
+                    // its prompt back. The parameters are what it was called and
+                    // how many seconds it took. Whoever placed this widget
+                    // decides whether that is worth telling the desktop about,
+                    // because only the window knows whether anyone was looking.
+                    glib::subclass::Signal::builder("command-finished")
+                        .param_types([String::static_type(), u64::static_type()])
                         .build(),
                     // Output changed what the live search finds. The find bar
                     // reads the tally back rather than being handed it, because
@@ -731,6 +750,60 @@ impl TuniTerminal {
                     {
                         imp.cwd.replace(Some(cwd));
                         this.notify("cwd");
+                    }
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
+    }
+
+    /// Watches what the shell is running, so that a long command ending is an
+    /// event the window can act on.
+    ///
+    /// The kernel's foreground process group is the signal, not OSC 133: the
+    /// escape says exactly this and says it with an exit code too, but a shell
+    /// nobody configured never sends it, and that is fish, bash and zsh as they
+    /// come. `/proc` answers for all three with no configuration at all - the
+    /// price is that a command's success is not knowable here, so what is
+    /// reported is that it ended and how long it took.
+    ///
+    /// The same cadence and the same shape as [`Self::follow_directory`]: one
+    /// small read out of the page cache every couple of seconds while a shell
+    /// is alive, two while something is running under it. It ends with the
+    /// session or with the widget.
+    fn watch_commands(&self) {
+        glib::timeout_add_local(
+            CWD_POLL,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    let Some(pid) = this.shell_pid() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let running = tuni_core::info::foreground(pid);
+                    let imp = this.imp();
+                    let previous = imp.command.borrow().clone();
+                    match (previous, running) {
+                        // Still the same thing, or still nothing.
+                        (Some((was, _)), Some(now)) if was == now => {}
+                        (None, None) => {}
+                        // A command started, or one replaced another without
+                        // the prompt coming back in between, which is what a
+                        // poll sees when two commands run inside one line.
+                        (_, Some(now)) => {
+                            imp.command.replace(Some((now, Instant::now())));
+                        }
+                        // The prompt is back.
+                        (Some((was, since)), None) => {
+                            imp.command.replace(None);
+                            let seconds = since.elapsed().as_secs();
+                            if seconds >= LONG_COMMAND_SECONDS {
+                                this.emit_by_name::<()>("command-finished", &[&was, &seconds]);
+                            }
+                        }
                     }
                     glib::ControlFlow::Continue
                 }
@@ -1318,6 +1391,7 @@ impl TuniTerminal {
             pty: Some(pty),
         }));
         self.follow_directory();
+        self.watch_commands();
         let cell = (m.cell_width.round() as u16, m.cell_height.round() as u16);
         imp.grid_size.set((cols, rows));
         imp.cell_size.set(cell);

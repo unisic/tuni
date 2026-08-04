@@ -337,6 +337,18 @@ after fifteen seconds of nothing further. Each pane's notification replaces its
 own rather than stacking one banner per line of output, and focusing the pane
 withdraws it.
 
+A command that ran long says so when it ends. Every two seconds a pane asks
+`/proc/<shell>/stat` which process group has its keyboard, which is how a shell
+answers "is something running" without being configured to; when that group goes
+away after ten seconds or more, the tab takes the attention mark and a desktop
+notification names the command and how long it took. It is the bell's rule about
+when to speak: the pane has to be unfocused, or the window inactive, since a
+banner about a build somebody just watched finish is a banner that teaches people
+to turn banners off. What it cannot say is whether the command succeeded: the
+foreground process group is gone by the time anyone can ask it, and the exit code
+went to the shell. A shell that marks its prompts with OSC 133 knows the code and
+could say so; nothing here requires that shell, so nothing here reads it.
+
 A coding agent thinking in a pane says so in two places: a spinner on its tab,
 and a spinner in place of the folder on its project's row in the sidebar. Two
 depths of the same fact, so that finding the pane which is working takes no
