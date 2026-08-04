@@ -21,6 +21,8 @@ A native terminal workspace for Linux.
 - The hosts `~/.ssh/config` already declares, one shared connection per machine,
   and an SFTP page for the machine a pane is on
 - Kitty graphics, OSC 8 hyperlinks, desktop notifications, progress bars
+- A coding agent thinking in a pane spins on its tab and on its project, and
+  leaves an exclamation there when it finishes into a tab you are not watching
 - Ghostty's 574 themes, which paint the window chrome as well as the terminal
 - The window comes back as it was left, once "Restore the Last Session" is on;
   a fresh shell every time is the default

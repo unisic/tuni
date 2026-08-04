@@ -316,6 +316,43 @@ after fifteen seconds of nothing further. Each pane's notification replaces its
 own rather than stacking one banner per line of output, and focusing the pane
 withdraws it.
 
+A coding agent thinking in a pane says so in two places: a spinner on its tab,
+and a spinner in place of the folder on its project's row in the sidebar. Two
+depths of the same fact, so that finding the pane which is working takes no
+clicking, and nothing louder than that. A bar sweeping the top of the window was
+built first and thrown away: a whole animation across the chrome to say a shell
+three tabs back is busy is too much of the window given to one pane's state.
+Both spinners are the one libadwaita draws on a loading tab, in the slot an icon
+would occupy, so the row and the tab say it in the same hand and neither changes
+width when a turn starts.
+
+When the turn ends into a tab nobody is looking at, both spinners become an
+exclamation and the tab takes the same attention mark the bell raises, because
+an answer waiting behind a tab is the half of this worth interrupting for.
+Selecting the tab clears it, on the click that reads the answer. A turn that
+ends in the tab already on screen is marked nowhere: it was watched as it
+happened, and a mark to dismiss for something already seen is a mark that
+teaches people to dismiss marks.
+
+What it reads is the title, and nothing else. Claude Code writes its own state
+there — `✳ Claude Code` between turns, a braille spinner frame in place of the
+star while it works — so a pane reports for itself over an escape sequence the
+terminal parses anyway. No process is polled for it and no screen is scraped;
+the CPU an agent burns was measured first and cannot tell thinking from waiting,
+which is the reason this is read rather than sampled. Braille is the whole test:
+a spinner is drawn out of that block and no prompt, path or command line starts
+with one. An agent that says nothing in its title simply never reports, the same
+as every pane that is not running one.
+
+The glyph then comes off the name. Having turned it into a spinner on the tab,
+leaving it in the label would say the same thing twice and animate a frame under
+the tab's own text four times a second, which is what makes a tab strip restless
+to sit beside. The idle star comes off with it, so the tab reads `Claude Code`
+either way rather than renaming itself as each turn starts and ends. It is also
+what the pane compares against: an agent redrawing its spinner changes the state
+and not the name, so the window's title-and-labels refresh runs when the name
+moves rather than on every frame.
+
 An image printed to a pane is drawn as an image. Tuni speaks the kitty graphics
 protocol, so `timg`, `chafa -f kitty`, matplotlib's kitty backend and anything
 else that transmits one lands in the pane at the size, position and stacking

@@ -14,7 +14,7 @@
 //! the model decides, and [`TuniGrid`] renders whatever it says.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -85,6 +85,12 @@ const PANEL_POLL_SECONDS: u32 = 2;
 /// question.
 const CONNECT_INTERVAL: Duration = Duration::from_millis(250);
 const CONNECT_TRIES: u32 = 240;
+
+/// What an agent that has finished leaves on its tab and on its project's row.
+/// The desktop's own exclamation, which every application here already uses for
+/// "this wants you", rather than a mark of tuni's own that would have to be
+/// learned.
+const DONE_ICON: &str = "emblem-important-symbolic";
 
 /// What a Find command found to act on. The bar over a terminal belongs to the
 /// window and is handed the terminal it is pointing at; a file pane carries its
@@ -335,6 +341,28 @@ mod imp {
         pub status_button: RefCell<Option<gtk::Button>>,
         pub tab_bar: RefCell<Option<adw::TabBar>>,
         pub title: RefCell<Option<adw::WindowTitle>>,
+
+        /// Panes whose coding agent is working, each with the tab and project
+        /// it sits in. Keyed by pane rather than counted per tab because two
+        /// agents in one tab finish at their own times, and the pane that just
+        /// finished has to be the only thing removed.
+        pub working: RefCell<HashMap<Id, (Id, Id)>>,
+        /// Panes whose agent has finished a turn nobody has looked at yet, the
+        /// same way round as `working`. An answer waiting in a tab that is not
+        /// on screen is the other half of the question the spinner asks, and
+        /// the mark clears the moment the tab is selected.
+        pub finished: RefCell<HashMap<Id, (Id, Id)>>,
+        /// The spinner on each sidebar row, by project id. Built with the row
+        /// and hidden, since a project with nothing thinking is the usual case.
+        /// AdwSpinner rather than GtkSpinner: the tab strip draws the first for
+        /// a loading page, and the second is a ring of separate spokes, so the
+        /// two sat side by side saying the same thing in two different hands.
+        pub spinners: RefCell<HashMap<Id, adw::Spinner>>,
+        /// The folder image on each sidebar row, which the spinner stands in
+        /// for while the project is busy and which becomes an exclamation once
+        /// an agent in it has finished. One widget in one slot, so the row is
+        /// the same width in all three states and the name never shifts.
+        pub icons: RefCell<HashMap<Id, gtk::Image>>,
 
         /// The tab whose context menu is open, if any.
         pub menu_page: RefCell<Option<adw::TabPage>>,
@@ -2738,6 +2766,39 @@ impl TuniWindow {
             ),
         );
 
+        terminal.connect_notify_local(
+            Some("working"),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |terminal: &TuniTerminal, _| {
+                    let Some((this, project)) = this.owner(tab) else {
+                        return;
+                    };
+                    let imp = this.imp();
+                    if terminal.property::<bool>("working") {
+                        imp.working.borrow_mut().insert(pane, (project, tab));
+                        imp.finished.borrow_mut().remove(&pane);
+                    } else if imp.working.borrow_mut().remove(&pane).is_some() {
+                        // Only a pane that was working can finish, and only
+                        // into a tab nobody is looking at: an answer that
+                        // arrived on screen has already been seen, so marking
+                        // it would be a mark to dismiss for nothing. The bell
+                        // decides the same way.
+                        let watched = imp
+                            .pages
+                            .borrow()
+                            .get(&tab)
+                            .is_some_and(adw::TabPage::is_selected);
+                        if !watched {
+                            imp.finished.borrow_mut().insert(pane, (project, tab));
+                        }
+                    }
+                    this.refresh_agents();
+                }
+            ),
+        );
+
         // The keyboard is GTK's to give; the model is told where it went rather
         // than asked to move it, which is what keeps a click and a shortcut
         // ending in the same place.
@@ -2904,6 +2965,55 @@ impl TuniWindow {
         }
     }
 
+    /// Draws what the agents in this window are doing: a spinner on the tab and
+    /// on the project's row while one thinks, an exclamation in both places
+    /// once one has finished into a tab nobody is looking at.
+    ///
+    /// Two depths of the same fact, so that the answer to "where is it" takes no
+    /// clicking: the sidebar says which project, the tab strip says which tab.
+    /// Both come from the same two maps, so they cannot disagree about what is
+    /// running, and neither invents an animation the agent is not already
+    /// running — the glyph it spins in its own title is taken off the tab as
+    /// this spinner goes on.
+    fn refresh_agents(&self) {
+        let imp = self.imp();
+        let (busy_projects, busy_tabs) = split_ids(&imp.working.borrow());
+        let (done_projects, done_tabs) = split_ids(&imp.finished.borrow());
+
+        for (tab, page) in imp.pages.borrow().iter() {
+            let busy = busy_tabs.contains(tab);
+            if page.is_loading() != busy {
+                page.set_loading(busy);
+            }
+            // The loading spinner takes the icon's place, so the two states
+            // cannot show at once and the finished mark waits its turn.
+            let done = !busy && done_tabs.contains(tab);
+            page.set_icon(done.then(|| gio::ThemedIcon::new(DONE_ICON)).as_ref());
+            // Set, never cleared: the bell raises the same mark, and clearing
+            // it here would take down a ring nobody has seen yet. Selecting the
+            // tab is what clears both.
+            if done {
+                page.set_needs_attention(true);
+            }
+        }
+
+        let icons = imp.icons.borrow();
+        for (project, spinner) in imp.spinners.borrow().iter() {
+            let busy = busy_projects.contains(project);
+            // An AdwSpinner animates whenever it is on screen and stops when it
+            // is not, so showing it is the whole of starting it.
+            spinner.set_visible(busy);
+            if let Some(icon) = icons.get(project) {
+                icon.set_visible(!busy);
+                icon.set_icon_name(Some(if !busy && done_projects.contains(project) {
+                    DONE_ICON
+                } else {
+                    "folder-symbolic"
+                }));
+            }
+        }
+    }
+
     /// Forgets one pane's widgets and hangs up its shell.
     ///
     /// Every close path goes through here rather than repeating the three
@@ -2925,6 +3035,13 @@ impl TuniWindow {
         imp.editors.borrow_mut().remove(&pane);
         imp.remotes.borrow_mut().remove(&pane);
         imp.hosts.borrow_mut().remove(&pane);
+        // A pane closed mid-turn never sends the notify that would have said it
+        // stopped, so both marks are cleared here instead.
+        let forgotten = imp.working.borrow_mut().remove(&pane).is_some()
+            | imp.finished.borrow_mut().remove(&pane).is_some();
+        if forgotten {
+            self.refresh_agents();
+        }
     }
 
     /// Closes one pane, and the tab with it when it was the last one.
@@ -3178,6 +3295,16 @@ impl TuniWindow {
             move_entry(&imp.diffs, &other.diffs, id);
             move_entry(&imp.remotes, &other.remotes, id);
             move_entry(&imp.hosts, &other.hosts, id);
+            // An agent still thinking, or one that finished into a tab nobody
+            // was watching, is now thinking or finished in the other window.
+            for (from, to) in [
+                (&imp.working, &other.working),
+                (&imp.finished, &other.finished),
+            ] {
+                if let Some((_, tab)) = from.borrow_mut().remove(&id) {
+                    to.borrow_mut().insert(id, (project, tab));
+                }
+            }
         }
         move_entry(&imp.grids, &other.grids, tab.id());
         move_entry(&imp.pages, &other.pages, tab.id());
@@ -3188,7 +3315,9 @@ impl TuniWindow {
             entry.insert_tab(0, tab);
             entry.select(Some(id));
         }
+        window.refresh_agents();
         window.refresh();
+        self.refresh_agents();
         self.refresh();
     }
 
@@ -3322,6 +3451,16 @@ impl TuniWindow {
         }
         if let Some(tab) = selected {
             self.mark_recent(tab);
+            // Looking at the tab is what reads the answer, so the mark goes
+            // with the same click that clears the bell above.
+            let mut finished = imp.finished.borrow_mut();
+            let before = finished.len();
+            finished.retain(|_, &mut (_, marked)| marked != tab);
+            let cleared = finished.len() != before;
+            drop(finished);
+            if cleared {
+                self.refresh_agents();
+            }
         }
         self.refresh();
         self.sync_files();
@@ -4015,6 +4154,8 @@ impl TuniWindow {
             list.remove(&row);
         }
         imp.labels.borrow_mut().clear();
+        imp.spinners.borrow_mut().clear();
+        imp.icons.borrow_mut().clear();
 
         let projects: Vec<(Id, String)> = imp
             .workspace
@@ -4031,6 +4172,9 @@ impl TuniWindow {
             imp.labels.borrow_mut().push(label);
         }
         imp.selecting.set(false);
+        // The rows are new, so whatever was spinning on the old ones has to be
+        // said again: a rename must not stop a spinner mid-turn.
+        self.refresh_agents();
 
         // An empty scroller is not free: its minimum height is the scrollbar's,
         // which with no projects left is 48px of nothing between the header and
@@ -4059,8 +4203,24 @@ impl TuniWindow {
         close.set_action_name(Some("win.close-project"));
         close.set_action_target_value(Some(&id.raw().to_variant()));
 
+        // In the folder's place rather than beside the close button: that is
+        // where the tab strip puts the same spinner, and a row says one thing
+        // about itself at a time. Only one of the two is ever visible.
+        let spinner = adw::Spinner::builder()
+            .visible(false)
+            .valign(gtk::Align::Center)
+            // The folder it stands in for is icon-sized, and an AdwSpinner with
+            // no size of its own would take whatever the row could give it.
+            .width_request(16)
+            .height_request(16)
+            .build();
+        spinner.set_tooltip_text(Some("An agent is working in this project"));
+        self.imp().spinners.borrow_mut().insert(id, spinner.clone());
+        self.imp().icons.borrow_mut().insert(id, icon.clone());
+
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         content.append(&icon);
+        content.append(&spinner);
         content.append(&label);
         content.append(&close);
 
@@ -4637,6 +4797,14 @@ fn pin_sidebar(split: &adw::OverlaySplitView, pixels: f64, minimum: f64, maximum
         .from_px(f64::from(split.width()) / 2.0, Some(&settings))
         .max(minimum);
     set_pinned_width(split, width.clamp(minimum, maximum.min(room)));
+}
+
+/// The projects and the tabs one of the agent maps names, in that order.
+fn split_ids(entries: &HashMap<Id, (Id, Id)>) -> (HashSet<Id>, HashSet<Id>) {
+    (
+        entries.values().map(|&(project, _)| project).collect(),
+        entries.values().map(|&(_, tab)| tab).collect(),
+    )
 }
 
 /// Shuts a split view's clamp on one width, in the split's own unit.

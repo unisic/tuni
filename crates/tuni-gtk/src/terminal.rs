@@ -298,6 +298,9 @@ mod imp {
         /// Text the input method committed during the current key press.
         pub(super) pending_commit: RefCell<Option<String>>,
         pub(super) title: RefCell<Option<String>>,
+        /// Whether the last title said a coding agent in this pane is working
+        /// on a turn. See `tuni_core::usage::thinking`.
+        pub(super) working: Cell<bool>,
         /// Working directory as last reported by OSC 7. Etap 2 infers a
         /// project's directory from this; for now it names the window.
         pub(super) cwd: RefCell<Option<String>>,
@@ -417,6 +420,7 @@ mod imp {
                 im: RefCell::new(None),
                 pending_commit: RefCell::new(None),
                 title: RefCell::new(None),
+                working: Cell::new(false),
                 cwd: RefCell::new(None),
                 cwd_reported: Cell::new(false),
                 pointer: Cell::new(Pointer::default()),
@@ -475,6 +479,9 @@ mod imp {
             PROPERTIES.get_or_init(|| {
                 vec![
                     glib::ParamSpecString::builder("title").read_only().build(),
+                    glib::ParamSpecBoolean::builder("working")
+                        .read_only()
+                        .build(),
                     glib::ParamSpecString::builder("cwd").read_only().build(),
                 ]
             })
@@ -483,6 +490,7 @@ mod imp {
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
             match pspec.name() {
                 "title" => self.title.borrow().to_value(),
+                "working" => self.working.get().to_value(),
                 "cwd" => self.cwd.borrow().to_value(),
                 other => unimplemented!("unknown property {other}"),
             }
@@ -1366,6 +1374,13 @@ impl TuniTerminal {
                             if let Some(session) = this.imp().session.borrow_mut().as_mut() {
                                 session.pty = None;
                             }
+                            // A shell killed mid-spin leaves the agent's last
+                            // title on screen, and nothing will ever arrive to
+                            // contradict it, so the pane stops reporting work
+                            // here rather than pulsing the bar forever.
+                            if this.imp().working.replace(false) {
+                                this.notify("working");
+                            }
                             this.queue_draw();
                             this.emit_by_name::<()>("exited", &[]);
                             break;
@@ -1497,11 +1512,23 @@ impl TuniTerminal {
         // The VT's flag says an OSC arrived, not that the value moved: a shell
         // re-announcing the same title before every prompt would otherwise run
         // the window's whole title-and-labels refresh each time.
-        if let Some(title) = title
-            && imp.title.borrow().as_deref() != Some(title.as_str())
-        {
-            imp.title.replace(Some(title));
-            self.notify("title");
+        //
+        // A coding agent spins its own state into the title, so whether one is
+        // thinking is decided here rather than by polling anything. The glyph
+        // carrying it is then taken off the name, and the comparison is made
+        // against what is left: an agent redrawing its spinner four times a
+        // second is four frames that change the state and not the name, and
+        // comparing raw titles would run that refresh for every one of them.
+        if let Some(title) = title {
+            let working = tuni_core::usage::thinking(&title);
+            if imp.working.replace(working) != working {
+                self.notify("working");
+            }
+            let name = tuni_core::usage::strip_spinner(&title);
+            if imp.title.borrow().as_deref() != Some(name) {
+                imp.title.replace(Some(name.to_owned()));
+                self.notify("title");
+            }
         }
         if let Some(cwd) = cwd
             && imp.cwd.borrow().as_deref() != Some(cwd.as_str())
