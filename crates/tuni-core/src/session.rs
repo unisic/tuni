@@ -125,6 +125,11 @@ impl TabSnapshot {
 pub struct ProjectSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_name: Option<String>,
+    /// The icon name or emoji the row was given, if it was given one. A folder
+    /// is what a project with no answer here draws, which is what every
+    /// snapshot written before this field existed restores as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     /// Only a pinned directory is saved. An automatic one is derived from
     /// wherever the shell is, and saving a derived value means restoring a
     /// decision the user never made.
@@ -198,6 +203,7 @@ impl Snapshot {
             .iter()
             .map(|project| ProjectSnapshot {
                 custom_name: project.custom_name.clone(),
+                icon: project.icon.clone(),
                 custom_directory: project.custom_directory.clone(),
                 inherit_directory: (!project.inherit_directory).then_some(false),
                 selected_tab: project.selected_id().and_then(|id| project.index_of(id)),
@@ -247,6 +253,7 @@ impl Snapshot {
                 continue;
             };
             project.custom_name.clone_from(&saved.custom_name);
+            project.icon.clone_from(&saved.icon);
             project.custom_directory.clone_from(&saved.custom_directory);
             project.inherit_directory = saved.inherit_directory.unwrap_or(true);
             for (index, tab) in tabs.into_iter().enumerate() {
@@ -592,6 +599,7 @@ mod tests {
         {
             let project = saved.project_mut(project_id).expect("just built");
             project.custom_name = Some("Backend".to_owned());
+            project.icon = Some("🐙".to_owned());
             project.custom_directory = Some("/srv/app".to_owned());
             project.inherit_directory = false;
             let tab = project.tab_mut(tab_id).expect("just built");
@@ -607,6 +615,7 @@ mod tests {
             .workspace;
         let project = &restored.projects()[0];
         assert_eq!(project.custom_name.as_deref(), Some("Backend"));
+        assert_eq!(project.icon.as_deref(), Some("🐙"));
         assert_eq!(project.custom_directory.as_deref(), Some("/srv/app"));
         assert!(!project.inherit_directory);
 

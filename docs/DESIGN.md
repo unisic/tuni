@@ -40,10 +40,20 @@ habit. A project with nothing to follow yet has two answers rather than one:
 the project the window opens with starts in the directory tuni itself was
 started in, since running it from a checkout should open there, and every
 project opened after that starts at home, because a second project is a fresh
-start and not a continuation of whatever launched the window. A project whose
-tabs are all closed stays in the sidebar until it is
-closed on purpose: by its own button, by its menu, or by a middle click
-anywhere on the row, which is how a tab closes everywhere else. The sidebar and
+start and not a continuation of whatever launched the window. A project's row
+draws a folder until its menu is asked for another one, which opens forty emoji
+first and the icons from the desktop's theme under them, since half of what
+makes one row findable is a color the other rows do not have and the colored
+half should not be the half behind a button. Every other emoji this desktop has
+is the last tile of that grid, which opens the system chooser with its search
+field. One field holds both and which of the two it is is read off the string
+rather than stored beside it: an icon name is ASCII, an emoji is not, so there
+is no pair of settings that can disagree about what a row shows. A themed icon
+is drawn in the row's own foreground color like every other symbolic icon in the
+window; an emoji is text the font colors. A project whose tabs are all closed
+stays in the sidebar until it is closed on purpose: by its own button, by its
+menu, or by a middle click anywhere on the row, which is how a tab closes
+everywhere else. The sidebar and
 the panel are both dragged to a width by their inner edge, and one dragged to a
 width keeps it. Until then each is a fraction of the window, which is what a
 split view sizes by and what an undragged one should go on doing.

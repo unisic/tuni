@@ -23,6 +23,7 @@ mod notify;
 mod palette;
 mod panel;
 mod preferences;
+mod project_icon;
 mod remote;
 mod sftp;
 mod shortcuts;

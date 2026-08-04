@@ -406,6 +406,11 @@ mod imp {
         /// an agent in it has finished. One widget in one slot, so the row is
         /// the same width in all three states and the name never shifts.
         pub icons: RefCell<HashMap<Id, gtk::Image>>,
+        /// The same slot, for a project whose icon is an emoji: a themed icon
+        /// is drawn by GtkImage and an emoji is text, and no one widget draws
+        /// both. Only one of the two is ever visible, and a project that never
+        /// picked an emoji leaves this one empty and hidden for good.
+        pub emoji: RefCell<HashMap<Id, gtk::Label>>,
 
         /// The tab whose context menu is open, if any.
         pub menu_page: RefCell<Option<adw::TabPage>>,
@@ -973,6 +978,16 @@ impl TuniWindow {
                         project.custom_name = None;
                     }
                     window.refresh();
+                }
+            }),
+            entry("project-icon", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.choose_project_icon(id);
+                }
+            }),
+            entry("automatic-project-icon", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.set_project_icon(id, None);
                 }
             }),
             entry("set-project-directory", uint64, |window, target| {
@@ -3098,17 +3113,38 @@ impl TuniWindow {
         }
 
         let icons = imp.icons.borrow();
+        let emoji = imp.emoji.borrow();
+        let workspace = imp.workspace.borrow();
         for (project, spinner) in imp.spinners.borrow().iter() {
             let busy = busy_projects.contains(project);
             // An AdwSpinner animates whenever it is on screen and stops when it
             // is not, so showing it is the whole of starting it.
             spinner.set_visible(busy);
-            if let Some(icon) = icons.get(project) {
-                icon.set_visible(!busy);
-                icon.set_icon_name(Some(if !busy && done_projects.contains(project) {
-                    DONE_ICON
+            // What the row would draw with nothing happening in it: the project's
+            // own icon if it picked one, the folder otherwise. An emoji is text
+            // and goes to the label, a name goes to the image, and the finished
+            // mark overrides both because it is the one that has to be seen.
+            let chosen = workspace
+                .project(*project)
+                .and_then(|project| project.icon.clone())
+                .filter(|_| !done_projects.contains(project));
+            let is_emoji = chosen
+                .as_deref()
+                .is_some_and(tuni_core::workspace::is_emoji);
+            if let Some(label) = emoji.get(project) {
+                label.set_visible(!busy && is_emoji);
+                label.set_label(if is_emoji {
+                    chosen.as_deref().unwrap_or_default()
                 } else {
-                    "folder-symbolic"
+                    ""
+                });
+            }
+            if let Some(icon) = icons.get(project) {
+                icon.set_visible(!busy && !is_emoji);
+                icon.set_icon_name(Some(match chosen.as_deref() {
+                    _ if done_projects.contains(project) => DONE_ICON,
+                    Some(name) if !is_emoji => name,
+                    _ => "folder-symbolic",
                 }));
             }
         }
@@ -4327,6 +4363,7 @@ impl TuniWindow {
         imp.labels.borrow_mut().clear();
         imp.spinners.borrow_mut().clear();
         imp.icons.borrow_mut().clear();
+        imp.emoji.borrow_mut().clear();
 
         let projects: Vec<(Id, String)> = imp
             .workspace
@@ -4386,11 +4423,22 @@ impl TuniWindow {
             .height_request(16)
             .build();
         spinner.set_tooltip_text(Some("An agent is working in this project"));
+
+        // The third thing that can stand in that slot, and the only one that is
+        // text: a GtkImage draws a themed icon and cannot draw an emoji, and a
+        // label given an icon name would print the name. Sized to the icon it
+        // replaces so a row with one is the same height as a row without.
+        let emoji = gtk::Label::builder()
+            .visible(false)
+            .width_request(16)
+            .build();
         self.imp().spinners.borrow_mut().insert(id, spinner.clone());
         self.imp().icons.borrow_mut().insert(id, icon.clone());
+        self.imp().emoji.borrow_mut().insert(id, emoji.clone());
 
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         content.append(&icon);
+        content.append(&emoji);
         content.append(&spinner);
         content.append(&label);
         content.append(&close);
@@ -4504,13 +4552,14 @@ impl TuniWindow {
     fn popup_row_menu(&self, row: &gtk::ListBoxRow, x: f64, y: f64) {
         let imp = self.imp();
         let index = row.index().max(0) as usize;
-        let Some((id, named, pinned, follows)) =
+        let Some((id, named, pinned, follows, iconed)) =
             imp.workspace.borrow().projects().get(index).map(|p| {
                 (
                     p.id(),
                     p.custom_name.is_some(),
                     p.custom_directory.is_some(),
                     p.inherit_directory,
+                    p.icon.is_some(),
                 )
             })
         else {
@@ -4520,7 +4569,7 @@ impl TuniWindow {
             return;
         };
 
-        menu.set_menu_model(Some(&project_menu(id, named, pinned, follows)));
+        menu.set_menu_model(Some(&project_menu(id, named, pinned, follows, iconed)));
         // The gesture reports the click in the row's coordinates; the popover
         // is parented to the list, which is where it has to point.
         let point = row
@@ -4549,6 +4598,38 @@ impl TuniWindow {
             }
             window.refresh();
         });
+    }
+
+    fn choose_project_icon(&self, id: Id) {
+        let current = self
+            .imp()
+            .workspace
+            .borrow()
+            .project(id)
+            .and_then(|project| project.icon.clone());
+
+        crate::project_icon::present(
+            self,
+            current,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |icon| this.set_project_icon(id, icon)
+            ),
+        );
+    }
+
+    /// Writes one project's icon down and redraws its row.
+    ///
+    /// Through `refresh_agents` rather than by setting the image here, because
+    /// that is the one place that knows a spinner may be standing in the icon's
+    /// slot right now. Picking an icon while an agent works leaves the spinner
+    /// where it is and shows the new icon when it stops.
+    fn set_project_icon(&self, id: Id, icon: Option<String>) {
+        if let Some(project) = self.imp().workspace.borrow_mut().project_mut(id) {
+            project.icon = icon;
+        }
+        self.refresh_agents();
     }
 
     fn rename_tab(&self) {
@@ -4681,7 +4762,7 @@ fn project_target(target: Option<&glib::Variant>) -> Option<Id> {
 /// Title" only belongs there when there is a custom one to drop, and because
 /// the directory rule reads as one label per state rather than a checkbox that
 /// says what is off.
-fn project_menu(id: Id, named: bool, pinned: bool, follows: bool) -> gio::Menu {
+fn project_menu(id: Id, named: bool, pinned: bool, follows: bool, iconed: bool) -> gio::Menu {
     let target = id.raw().to_variant();
 
     let naming = gio::Menu::new();
@@ -4690,6 +4771,14 @@ fn project_menu(id: Id, named: bool, pinned: bool, follows: bool) -> gio::Menu {
         naming.append_item(&item(
             "Use Automatic Title",
             "win.automatic-project-title",
+            &target,
+        ));
+    }
+    naming.append_item(&item("Change Icon…", "win.project-icon", &target));
+    if iconed {
+        naming.append_item(&item(
+            "Use the Folder Icon",
+            "win.automatic-project-icon",
             &target,
         ));
     }
@@ -5024,6 +5113,9 @@ fn load_css() {
                 drawn over it would only say the same thing twice. */\n\
              .tuni-sidebar-grip:hover { background-color: alpha(@accent_color, 0.5); }\n\
              .tuni-drop { background-color: alpha(@accent_color, 0.28); border-radius: 6px; }\n\
+             /* An emoji drawn at the size a symbolic icon is drawn at is a\n\
+                smudge, and a picker is for looking at what you are picking. */\n\
+             .tuni-icon-tile label { font-size: 20px; }\n\
              .tuni-switcher { border-radius: 26px; padding: 8px; }\n\
              .tuni-switch-card { padding: 9px 9px 14px 9px; border-radius: 16px; }\n\
              .tuni-switch-card.selected { background-color: alpha(currentColor, 0.20); }\n\

@@ -26,6 +26,7 @@ A native terminal workspace for Linux.
 - Scroll a command at a time in a shell that marks its prompts, reopen the last
   five closed tabs, drag a tab out into a window of its own without restarting
   the shells in it
+- A project's row takes an icon from the desktop's theme, or an emoji
 - A coding agent thinking in a pane spins on its tab and on its project, and
   leaves an exclamation there when it finishes into a tab you are not watching
 - Ghostty's 574 themes, which paint the window chrome as well as the terminal
