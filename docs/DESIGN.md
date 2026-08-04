@@ -202,6 +202,16 @@ pressing `Tab` brings up the tab switcher: a card per tab with a picture of what
 is in it, in the order they were last worked in, so one press and release goes
 back to where you just were.
 
+`Ctrl+Shift+Page Up` and `Ctrl+Shift+Page Down` walk the scrollback a command at
+a time rather than a screenful at a time, putting the prompt the search lands on
+at the top of the viewport. What a prompt is comes from the shell: OSC 133 is the
+only thing that says where one output ends and the next command begins, and a
+guess based on how a line looks would be wrong on every prompt somebody styled.
+So a shell that does not send it gets a toast saying that, rather than a key that
+silently does nothing. kitty, Ghostty and WezTerm all put this on `Ctrl+Shift`
+and an arrow, which is project switching here, so it went one key over onto the
+pair that already scrolls.
+
 A tab dragged off the strip and dropped on the desktop becomes a window of its
 own, and the shells inside it keep running through the move: nothing is
 restarted, nothing is re-attached. Every widget in a pane looks its window up
@@ -280,6 +290,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl`+click | Open the hyperlink under the pointer |
 | Drop a file on a pane | Its path, quoted, onto the prompt as an argument, followed by a space |
 | `Shift+Page Up` / `Shift+Page Down` | Scroll the viewport by a page |
+| `Ctrl+Shift+Page Up` / `Ctrl+Shift+Page Down` | Scroll a command at a time, where the shell marks its prompts |
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | Wheel | Three rows a notch, pixel for pixel on a touchpad. On the alternate screen it becomes arrow keys, which is how `less` scrolls without taking the mouse |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |

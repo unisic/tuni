@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use libghostty_vt::fmt::Format;
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
+use libghostty_vt::screen::RowSemanticPrompt;
 use libghostty_vt::selection::gesture::{
     Autoscroll, AutoscrollTickEvent, Behavior, Behaviors, DragEvent, Geometry as GestureGeometry,
     Gesture, PressEvent, ReleaseEvent,
@@ -1108,6 +1109,71 @@ impl Terminal {
                 Err(err) => return Err(err),
             }
         }
+    }
+
+    // --- prompts -------------------------------------------------------------
+
+    /// The row a shell prompt starts on, the nearest one to `from` in the
+    /// direction asked for, counted from the top of the scrollback the way
+    /// [`ScrollPosition::offset`] counts.
+    ///
+    /// Rows know this because OSC 133 told them, so a shell that does not mark
+    /// its prompts has no prompt rows at all and this always answers `None`.
+    /// That is the same bargain the triple click selecting a command's output
+    /// strikes, and there is no guessing it from the text: a `$` in a build log
+    /// is one character like any other.
+    ///
+    /// A prompt spanning several rows answers on its first, so walking up twice
+    /// does not land inside the prompt it just left.
+    ///
+    /// One FFI lookup per row walked over, bounded by the scrollback, which the
+    /// `terminal.scrollback-lines` setting caps. The walk stops at the first
+    /// prompt, so the length that costs the full scan is the one where there is
+    /// no prompt to find.
+    #[must_use]
+    pub fn prompt_row(&self, from: usize, up: bool) -> Option<usize> {
+        if up {
+            if from == 0 {
+                return None;
+            }
+            // A prompt row whose predecessor is not one is where the prompt
+            // begins, which is the whole test — carried down the walk rather
+            // than looked up twice per row.
+            let mut here = self.is_prompt_row(from - 1);
+            for row in (0..from).rev() {
+                let previous = row > 0 && self.is_prompt_row(row - 1);
+                if here && !previous {
+                    return Some(row);
+                }
+                here = previous;
+            }
+            return None;
+        }
+
+        let total = self.scroll_position().total;
+        let mut previous = self.is_prompt_row(from);
+        for row in from.saturating_add(1)..total {
+            let here = self.is_prompt_row(row);
+            if here && !previous {
+                return Some(row);
+            }
+            previous = here;
+        }
+        None
+    }
+
+    /// Whether one row carries a shell prompt, in screen coordinates — the row
+    /// space [`ScrollPosition`] counts in, scrollback included.
+    fn is_prompt_row(&self, row: usize) -> bool {
+        let point = Point::Screen(PointCoordinate {
+            x: 0,
+            y: u32::try_from(row).unwrap_or(u32::MAX),
+        });
+        self.inner
+            .grid_ref(point)
+            .and_then(|grid_ref| grid_ref.row())
+            .and_then(libghostty_vt::screen::Row::semantic_prompt)
+            .is_ok_and(|state| state != RowSemanticPrompt::None)
     }
 
     // --- search --------------------------------------------------------------

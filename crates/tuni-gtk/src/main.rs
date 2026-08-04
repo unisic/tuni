@@ -110,6 +110,11 @@ pub(crate) const ACCELS: &[(&str, &[&str])] = &[
     // kero's palette is ⌘K; `Ctrl+K` is kill-line in a shell, so the palette
     // takes the key every editor on this desktop puts it on.
     ("win.palette", &["<Ctrl><Shift>p"]),
+    // Walking the scrollback a command at a time. kitty, Ghostty and WezTerm all
+    // put this on `Ctrl+Shift`+arrow, which is taken here by project switching,
+    // so it goes one key over onto the pair that already scrolls by page.
+    ("win.previous-prompt", &["<Ctrl><Shift>Page_Up"]),
+    ("win.next-prompt", &["<Ctrl><Shift>Page_Down"]),
     ("win.split-right", &["<Ctrl><Shift>d"]),
     ("win.split-down", &["<Ctrl><Shift>e"]),
     ("win.focus-pane-left", &["<Ctrl><Alt>Left"]),

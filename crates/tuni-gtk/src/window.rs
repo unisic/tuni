@@ -205,6 +205,18 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "win.clear-terminal",
     ),
     (
+        "Previous Prompt",
+        "go-up-symbolic",
+        Some("Ctrl+Shift+Page Up"),
+        "win.previous-prompt",
+    ),
+    (
+        "Next Prompt",
+        "go-down-symbolic",
+        Some("Ctrl+Shift+Page Down"),
+        "win.next-prompt",
+    ),
+    (
         "Save File",
         "media-floppy-symbolic",
         Some("Ctrl+S"),
@@ -998,6 +1010,16 @@ impl TuniWindow {
                 if let Some(terminal) = window.active_terminal() {
                     terminal.clear();
                 }
+            }),
+            // Walking the scrollback by command instead of by screenful. Only a
+            // shell that marks its prompts with OSC 133 has anything to walk, so
+            // the answer when nothing moved is a toast rather than silence: the
+            // key is not broken, the shell is not saying where the prompts are.
+            entry("previous-prompt", None, |window, _| {
+                window.jump_to_prompt(true);
+            }),
+            entry("next-prompt", None, |window, _| {
+                window.jump_to_prompt(false);
             }),
             // The setting, not a per-window mood: a program takes the mouse in
             // every pane it runs in, so the way out of it is the same knob the
@@ -2953,6 +2975,21 @@ impl TuniWindow {
             return;
         };
         notify::post(app.upcast_ref(), pane, title, body);
+    }
+
+    /// Puts the focused terminal's viewport on the prompt above or below the one
+    /// it shows now, and says so when there is none to land on.
+    ///
+    /// A shell that does not mark its prompts is the common case rather than the
+    /// error case - bash, zsh and fish all need a line of configuration for it -
+    /// so the toast names the reason instead of reporting a failure.
+    fn jump_to_prompt(&self, up: bool) {
+        let Some(terminal) = self.active_terminal() else {
+            return;
+        };
+        if !terminal.scroll_to_prompt(up) {
+            self.toast("No prompt marked that way. The shell has to send OSC 133.");
+        }
     }
 
     /// Raises a short-lived confirmation over the window's content: three

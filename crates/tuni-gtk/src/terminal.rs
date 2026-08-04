@@ -1946,6 +1946,33 @@ impl TuniTerminal {
         self.scroll_by(lines);
     }
 
+    /// Puts the viewport on the prompt above or below where it sits now, so a
+    /// screenful of build output is one key rather than a hunt for where the
+    /// command started.
+    ///
+    /// `false` when there is no prompt that way — which is what a shell that
+    /// does not mark its prompts with OSC 133 always answers, and the caller's
+    /// cue to say so rather than to move nothing and look broken.
+    pub(crate) fn scroll_to_prompt(&self, up: bool) -> bool {
+        let imp = self.imp();
+        let mut guard = imp.session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return false;
+        };
+        let from = session.term.scroll_position().offset;
+        let Some(row) = session.term.prompt_row(from, up) else {
+            return false;
+        };
+        session.term.scroll_to_row(row);
+        imp.scroll.set(session.term.scroll_position());
+        drop(guard);
+
+        self.invalidate_links();
+        self.reveal_scrollbar();
+        self.queue_draw();
+        true
+    }
+
     fn scroll_by(&self, lines: isize) {
         let imp = self.imp();
         let mut guard = imp.session.borrow_mut();
