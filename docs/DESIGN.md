@@ -202,6 +202,15 @@ pressing `Tab` brings up the tab switcher: a card per tab with a picture of what
 is in it, in the order they were last worked in, so one press and release goes
 back to where you just were.
 
+A tab dragged off the strip and dropped on the desktop becomes a window of its
+own, and the shells inside it keep running through the move: nothing is
+restarted, nothing is re-attached. Every widget in a pane looks its window up
+by the tab it belongs to at the moment a signal fires, rather than holding the
+window it was built in, so handing a tab over is moving one entry per pane
+between two maps and moving the model's `Tab`. Dropping a tab onto another tuni
+window is not that path and closes it instead: libadwaita only asks for a new
+window when the drop had no window under it.
+
 Closing the window writes that arrangement down, and opening it again puts it
 back: the projects, their tabs, the columns and panes inside each one with the
 room they had, the names that were typed, and a fresh shell in each pane's last
@@ -241,6 +250,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+Shift+T` | New tab: a shell, or the host list when `new-tab` says so |
 | `Ctrl+Shift+O` | The host list, in a tab of its own, whichever that setting says |
 | `Ctrl+Page Down` / `Ctrl+Page Up` | Next tab, previous tab |
+| Drag a tab off the strip | A window of its own, with the shells still running in it |
 | Hold `Ctrl`, press `Tab` | The tab switcher: cards for every tab, most recently used first. `Shift+Tab` walks back, `Escape` cancels, letting `Ctrl` go switches |
 | `Alt+1` … `Alt+9` | Jump to a tab; `Alt+9` is the last one |
 | `Ctrl+Shift+N` | New project |

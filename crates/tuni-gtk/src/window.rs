@@ -289,6 +289,11 @@ mod imp {
         /// Where the cursor was in each restored file pane, by pane id, until
         /// its editor exists to be told.
         pub pending_cursors: RefCell<HashMap<Id, usize>>,
+        /// Where the tab now being dragged out of the strip is going: the window
+        /// built to receive it and the project in it that will hold it. Set
+        /// while `AdwTabView` is between asking for a window and handing the
+        /// page over, and taken by the detach that follows.
+        pub handover: RefCell<Option<(super::TuniWindow, Id)>>,
         /// Set once the window has been allowed to close, so the unsaved-work
         /// question is asked once rather than every time the answer is acted
         /// on.
@@ -1713,6 +1718,16 @@ impl TuniWindow {
             self,
             move |_, _, position| this.tab_detached(id, position)
         ));
+        // A tab dropped on the desktop asks for a window to land in. Answering
+        // with one hands the page over live: the widgets, and so the shells
+        // inside them, are moved rather than rebuilt.
+        view.connect_create_window(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            None,
+            move |_| this.window_for_torn_out_tab()
+        ));
         view.connect_page_reordered(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -1888,7 +1903,7 @@ impl TuniWindow {
             (entry.name().to_owned(), panes)
         };
 
-        let grid = self.new_grid(project, tab);
+        let grid = self.new_grid(tab);
         let page = view.insert(&grid, position);
         page.set_title(&name);
         page.set_live_thumbnail(true);
@@ -1900,16 +1915,16 @@ impl TuniWindow {
             .into_iter()
             .filter_map(|(pane, directory, content)| {
                 if !matches!(content, Content::Terminal | Content::Ssh { .. }) {
-                    self.new_content(project, tab, pane, &content);
+                    self.new_content(tab, pane, &content);
                     return None;
                 }
                 let cwd = directory
                     .map(PathBuf::from)
                     .filter(|path| path.is_dir())
                     .or_else(|| fallback.clone());
-                let terminal = self.new_terminal(project, tab, pane);
+                let terminal = self.new_terminal(tab, pane);
                 if is_remote(&content) {
-                    self.new_remote(project, tab, pane, &terminal);
+                    self.new_remote(tab, pane, &terminal);
                 }
                 Some((terminal, pane, content, cwd))
             })
@@ -1933,7 +1948,7 @@ impl TuniWindow {
             return;
         }
 
-        let terminal = self.new_terminal(project, tab, pane_id);
+        let terminal = self.new_terminal(tab, pane_id);
         self.rebuild_grid(project, tab);
         self.refresh();
         self.start_terminal(
@@ -1962,7 +1977,7 @@ impl TuniWindow {
     }
 
     /// A terminal for one pane, themed and remembered.
-    fn new_terminal(&self, project: Id, tab: Id, pane: Id) -> TuniTerminal {
+    fn new_terminal(&self, tab: Id, pane: Id) -> TuniTerminal {
         let imp = self.imp();
         let terminal = TuniTerminal::new();
         terminal.set_hexpand(true);
@@ -1970,13 +1985,13 @@ impl TuniWindow {
         terminal.set_config(&imp.settings.borrow().terminal);
         terminal.set_theme(&self.theme());
         imp.terminals.borrow_mut().insert(pane, terminal.clone());
-        self.watch_terminal(&terminal, project, tab, pane);
+        self.watch_terminal(&terminal, tab, pane);
         terminal
     }
 
     /// The bar an ssh pane wears above its terminal, wired to the one thing it
     /// offers.
-    fn new_remote(&self, project: Id, tab: Id, pane: Id, terminal: &TuniTerminal) -> TuniRemote {
+    fn new_remote(&self, tab: Id, pane: Id, terminal: &TuniTerminal) -> TuniRemote {
         let remote = TuniRemote::new(terminal);
         remote.connect_open(glib::clone!(
             #[weak(rename_to = this)]
@@ -1984,6 +1999,9 @@ impl TuniWindow {
             #[weak]
             terminal,
             move || {
+                let Some((this, project)) = this.owner(tab) else {
+                    return;
+                };
                 let content = this.pane_content(project, tab, pane);
                 if let Some(content) = content {
                     this.start_session(&terminal, pane, &content, None, true);
@@ -2010,7 +2028,7 @@ impl TuniWindow {
     /// The host list for one pane, wired to the three places a connection it is
     /// asked for can go, and to the one thing it cannot do itself, which is
     /// open the file it only reads.
-    fn new_hosts(&self, project: Id, tab: Id, pane: Id) -> TuniHosts {
+    fn new_hosts(&self, tab: Id, pane: Id) -> TuniHosts {
         use crate::hosts::Message;
 
         let hosts = TuniHosts::new();
@@ -2019,15 +2037,20 @@ impl TuniWindow {
         hosts.connect_message(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |message| match message {
-                Message::Connect(alias) => {
-                    this.replace_pane(project, tab, pane, Pane::ssh(alias));
+            move |message| {
+                let Some((this, project)) = this.owner(tab) else {
+                    return;
+                };
+                match message {
+                    Message::Connect(alias) => {
+                        this.replace_pane(project, tab, pane, Pane::ssh(alias));
+                    }
+                    Message::LocalShell => this.replace_pane(project, tab, pane, Pane::new()),
+                    Message::ConnectToSide(alias) => this.open_pane_to_side(Pane::ssh(alias)),
+                    Message::ConnectInTab(alias) => this.open_pane(Pane::ssh(alias)),
+                    Message::OpenFile(path, line) => this.open_file_at(&path, line),
+                    Message::RunLocally(argv) => this.run_locally(&argv),
                 }
-                Message::LocalShell => this.replace_pane(project, tab, pane, Pane::new()),
-                Message::ConnectToSide(alias) => this.open_pane_to_side(Pane::ssh(alias)),
-                Message::ConnectInTab(alias) => this.open_pane(Pane::ssh(alias)),
-                Message::OpenFile(path, line) => this.open_file_at(&path, line),
-                Message::RunLocally(argv) => this.run_locally(&argv),
             }
         ));
         self.imp().hosts.borrow_mut().insert(pane, hosts.clone());
@@ -2063,14 +2086,14 @@ impl TuniWindow {
     fn fill_pane(&self, project: Id, tab: Id, pane: Id, content: &Content, cwd: Option<PathBuf>) {
         let terminal = match content {
             Content::Terminal | Content::Ssh { .. } => {
-                let terminal = self.new_terminal(project, tab, pane);
+                let terminal = self.new_terminal(tab, pane);
                 if is_remote(content) {
-                    self.new_remote(project, tab, pane, &terminal);
+                    self.new_remote(tab, pane, &terminal);
                 }
                 Some(terminal)
             }
             _ => {
-                self.new_content(project, tab, pane, content);
+                self.new_content(tab, pane, content);
                 None
             }
         };
@@ -2083,7 +2106,7 @@ impl TuniWindow {
     }
 
     /// An editor for one pane, opened on a file and remembered.
-    fn new_editor(&self, project: Id, tab: Id, pane: Id, path: &Path) -> TuniEditor {
+    fn new_editor(&self, tab: Id, pane: Id, path: &Path) -> TuniEditor {
         let imp = self.imp();
         let editor = TuniEditor::new();
         editor.set_hexpand(true);
@@ -2104,14 +2127,18 @@ impl TuniWindow {
         editor.connect_focused(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move || this.pane_focused(project, tab, pane)
+            move || {
+                if let Some((this, project)) = this.owner(tab) {
+                    this.pane_focused(project, tab, pane);
+                }
+            }
         ));
         imp.editors.borrow_mut().insert(pane, editor.clone());
         editor
     }
 
     /// A diff for one pane, opened on a file and remembered.
-    fn new_diff(&self, project: Id, tab: Id, pane: Id, path: &Path, staged: bool) -> TuniDiff {
+    fn new_diff(&self, tab: Id, pane: Id, path: &Path, staged: bool) -> TuniDiff {
         let imp = self.imp();
         let diff = TuniDiff::new();
         diff.set_hexpand(true);
@@ -2121,7 +2148,11 @@ impl TuniWindow {
         diff.connect_focused(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move || this.pane_focused(project, tab, pane)
+            move || {
+                if let Some((this, project)) = this.owner(tab) {
+                    this.pane_focused(project, tab, pane);
+                }
+            }
         ));
         // Staging from the diff changes what the panel is showing, and the
         // panel would otherwise not know until its next poll.
@@ -2234,17 +2265,17 @@ impl TuniWindow {
     /// Builds whatever a pane holds, for a pane already in the layout. Not a
     /// terminal or a connection: those need a directory to start in and
     /// something to start, which only the caller knows.
-    fn new_content(&self, project: Id, tab: Id, pane: Id, content: &Content) {
+    fn new_content(&self, tab: Id, pane: Id, content: &Content) {
         match content {
             Content::Terminal | Content::Ssh { .. } => (),
             Content::File(path) => {
-                self.new_editor(project, tab, pane, path);
+                self.new_editor(tab, pane, path);
             }
             Content::Diff { path, staged } => {
-                self.new_diff(project, tab, pane, path, *staged);
+                self.new_diff(tab, pane, path, *staged);
             }
             Content::Hosts => {
-                self.new_hosts(project, tab, pane);
+                self.new_hosts(tab, pane);
             }
         }
     }
@@ -2535,12 +2566,16 @@ impl TuniWindow {
 
     /// The widget one tab's panes live in, listening for what only the pointer
     /// can decide.
-    fn new_grid(&self, project: Id, tab: Id) -> TuniGrid {
+    fn new_grid(&self, tab: Id) -> TuniGrid {
         let grid = TuniGrid::new();
         grid.connect_message(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |message| this.grid_message(project, tab, message)
+            move |message| {
+                if let Some((this, project)) = this.owner(tab) {
+                    this.grid_message(project, tab, message);
+                }
+            }
         ));
         self.imp().grids.borrow_mut().insert(tab, grid.clone());
         grid
@@ -2643,13 +2678,19 @@ impl TuniWindow {
     /// working directory is where the next shell starts, its bell marks the tab
     /// when it is not the one on screen, clicking into it moves the focus ring,
     /// and its shell's death closes the pane.
-    fn watch_terminal(&self, terminal: &TuniTerminal, project: Id, tab: Id, pane: Id) {
+    fn watch_terminal(&self, terminal: &TuniTerminal, tab: Id, pane: Id) {
         terminal.connect_notify_local(
             Some("title"),
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
                 move |terminal: &TuniTerminal, _| {
+                    // The window and the project as they are now, which is not
+                    // where this handler was wired if the tab has since been
+                    // dragged out into a window of its own.
+                    let Some((this, project)) = this.owner(tab) else {
+                        return;
+                    };
                     let title = terminal.title();
                     if let Some(entry) = this
                         .imp()
@@ -2671,6 +2712,9 @@ impl TuniWindow {
                 #[weak(rename_to = this)]
                 self,
                 move |terminal: &TuniTerminal, _| {
+                    let Some((this, project)) = this.owner(tab) else {
+                        return;
+                    };
                     let cwd = terminal.cwd();
                     if let Some(entry) = this
                         .imp()
@@ -2703,6 +2747,9 @@ impl TuniWindow {
                 #[weak(rename_to = this)]
                 self,
                 move |terminal: &TuniTerminal, _| {
+                    let Some((this, project)) = this.owner(tab) else {
+                        return;
+                    };
                     if terminal.has_focus() {
                         this.pane_focused(project, tab, pane);
                     }
@@ -2717,6 +2764,9 @@ impl TuniWindow {
                 #[weak(rename_to = this)]
                 self,
                 move |terminal: TuniTerminal| {
+                    let Some((this, _)) = this.owner(tab) else {
+                        return;
+                    };
                     if let Some(page) = this.imp().pages.borrow().get(&tab)
                         && !page.is_selected()
                     {
@@ -2742,7 +2792,9 @@ impl TuniWindow {
                 #[weak(rename_to = this)]
                 self,
                 move |_: TuniTerminal, title: String, body: String| {
-                    this.notify_desktop(pane, &title, &body);
+                    if let Some((this, _)) = this.owner(tab) {
+                        this.notify_desktop(pane, &title, &body);
+                    }
                 }
             ),
         );
@@ -2754,6 +2806,9 @@ impl TuniWindow {
                 #[weak(rename_to = this)]
                 self,
                 move |_: TuniTerminal, cleared: bool| {
+                    let Some((this, _)) = this.owner(tab) else {
+                        return;
+                    };
                     this.toast(if cleared {
                         "Cleared clipboard"
                     } else {
@@ -2769,7 +2824,11 @@ impl TuniWindow {
             glib::closure_local!(
                 #[weak(rename_to = this)]
                 self,
-                move |_: TuniTerminal| this.session_ended(project, tab, pane)
+                move |_: TuniTerminal| {
+                    if let Some((this, project)) = this.owner(tab) {
+                        this.session_ended(project, tab, pane);
+                    }
+                }
             ),
         );
     }
@@ -3062,6 +3121,13 @@ impl TuniWindow {
             return;
         };
 
+        // Dragged out rather than closed: the shells go on running in another
+        // window instead of being hung up here.
+        if let Some((window, project)) = imp.handover.take() {
+            self.hand_over(&window, project, tab);
+            return;
+        }
+
         for pane in tab.layout().panes() {
             self.forget_pane(pane.id());
         }
@@ -3072,6 +3138,87 @@ impl TuniWindow {
         // every walk.
         imp.recent.borrow_mut().retain(|id| *id != tab.id());
         self.refresh();
+    }
+
+    /// A window for a tab that has just been dragged out of a strip, and the
+    /// empty project in it that will hold the tab.
+    ///
+    /// Empty on purpose: [`Self::open_window`] opens a project with a shell in
+    /// it, which is what asking for a new window means, while this one is about
+    /// to be given a tab and a second shell nobody asked for would be in it.
+    fn window_for_torn_out_tab(&self) -> Option<adw::TabView> {
+        let app = self.application().and_downcast::<adw::Application>()?;
+        let window = Self::new(&app, self.imp().settings.borrow().clone());
+        let project = window.imp().workspace.borrow_mut().open_project();
+        window.attach_project(project);
+        window.rebuild_sidebar();
+        window.show_selected_project();
+        let view = window.imp().views.borrow().get(&project).cloned()?;
+        window.present();
+        self.imp().handover.replace(Some((window, project)));
+        Some(view)
+    }
+
+    /// Gives a tab to another window: the model's tab, and every map entry this
+    /// window keeps for the panes in it.
+    ///
+    /// The page and the widgets under it have already moved - `AdwTabView`
+    /// moved them, which is what makes this a move rather than a restore, since
+    /// no PTY is closed and no scrollback is replayed. What is left is the
+    /// bookkeeping, and the handlers on those widgets, which find their window
+    /// through [`Self::owner`] rather than remembering the one they were wired
+    /// in.
+    fn hand_over(&self, window: &Self, project: Id, tab: Tab) {
+        let imp = self.imp();
+        let other = window.imp();
+        for pane in tab.layout().panes() {
+            let id = pane.id();
+            move_entry(&imp.terminals, &other.terminals, id);
+            move_entry(&imp.editors, &other.editors, id);
+            move_entry(&imp.diffs, &other.diffs, id);
+            move_entry(&imp.remotes, &other.remotes, id);
+            move_entry(&imp.hosts, &other.hosts, id);
+        }
+        move_entry(&imp.grids, &other.grids, tab.id());
+        move_entry(&imp.pages, &other.pages, tab.id());
+        imp.recent.borrow_mut().retain(|id| *id != tab.id());
+
+        let id = tab.id();
+        if let Some(entry) = other.workspace.borrow_mut().project_mut(project) {
+            entry.insert_tab(0, tab);
+            entry.select(Some(id));
+        }
+        window.refresh();
+        self.refresh();
+    }
+
+    /// The window holding `tab` now, and the project in it that holds it.
+    ///
+    /// Almost always this window, and the first branch is the one that runs. A
+    /// tab dragged into a window of its own leaves every handler on its widgets
+    /// wired to the window they were built in, so they ask this rather than
+    /// assume, and the answer is the window the tab is in at the moment the
+    /// handler runs.
+    fn owner(&self, tab: Id) -> Option<(Self, Id)> {
+        if let Some(project) = self.project_of(tab) {
+            return Some((self.clone(), project));
+        }
+        self.application()?
+            .windows()
+            .into_iter()
+            .filter_map(|window| window.downcast::<Self>().ok())
+            .find_map(|window| window.project_of(tab).map(|project| (window, project)))
+    }
+
+    /// Which of this window's projects holds `tab`.
+    fn project_of(&self, tab: Id) -> Option<Id> {
+        self.imp()
+            .workspace
+            .borrow()
+            .projects()
+            .iter()
+            .find(|project| project.tab(tab).is_some())
+            .map(tuni_core::workspace::Project::id)
     }
 
     // --- panes -------------------------------------------------------------
@@ -4728,6 +4875,14 @@ fn unsaved_message(dirty: &[TuniEditor]) -> String {
             "{} files have changes that have not been written to disk.",
             editors.len()
         ),
+    }
+}
+
+/// Moves one entry between two windows' maps of the same kind, if it is there
+/// to move. What handing a tab over does to every widget in it.
+fn move_entry<T: Clone>(from: &RefCell<HashMap<Id, T>>, to: &RefCell<HashMap<Id, T>>, key: Id) {
+    if let Some(value) = from.borrow_mut().remove(&key) {
+        to.borrow_mut().insert(key, value);
     }
 }
 
