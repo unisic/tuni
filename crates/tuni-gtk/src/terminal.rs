@@ -51,6 +51,18 @@ const PROGRESS_STALE: Duration = Duration::from_secs(15);
 /// it costs throughput rather than the window's ability to answer.
 const FEED_BUDGET: Duration = Duration::from_millis(8);
 
+/// How often a shell that has never sent OSC 7 is looked up in `/proc`. The
+/// same couple of seconds the panel polls its own reads at, for the same
+/// reason: the answer is wanted by the time somebody looks, and one `readlink`
+/// is not worth a tighter loop than that.
+const CWD_POLL: Duration = Duration::from_secs(2);
+
+/// How long a command has to run before its ending is worth a notification.
+/// Long enough that nothing typed and answered at the prompt qualifies, short
+/// enough to cover the builds and test runs somebody walks away from - and
+/// anything shorter than the poll above cannot be measured anyway.
+const LONG_COMMAND_SECONDS: u64 = 10;
+
 /// What a pane's session runs. `Launch::default()` is the configured shell in
 /// no particular directory, which is what every pane was before a pane could
 /// run anything else.
@@ -291,10 +303,27 @@ mod imp {
         pub(super) im: RefCell<Option<gtk::IMMulticontext>>,
         /// Text the input method committed during the current key press.
         pub(super) pending_commit: RefCell<Option<String>>,
+        /// Whether what is typed here is also meant for the other panes in the
+        /// tab. Set by the window, which is the only thing that knows what the
+        /// other panes are; all it does here is decide whether the `broadcast`
+        /// signal is worth raising.
+        pub(super) broadcast: Cell<bool>,
         pub(super) title: RefCell<Option<String>>,
+        /// Whether the last title said a coding agent in this pane is working
+        /// on a turn. See `tuni_core::usage::thinking`.
+        pub(super) working: Cell<bool>,
         /// Working directory as last reported by OSC 7. Etap 2 infers a
         /// project's directory from this; for now it names the window.
         pub(super) cwd: RefCell<Option<String>>,
+        /// Whether OSC 7 has ever arrived. A shell that reports for itself is
+        /// believed and never asked again through `/proc`; one that has not
+        /// reported by now is a shell without the prompt hook, and asking the
+        /// kernel is the only way its tab learns where it is.
+        pub(super) cwd_reported: Cell<bool>,
+        /// What the shell handed the keyboard to and when, so that the moment
+        /// it takes the keyboard back is a command that finished and something
+        /// that ran for long enough to be worth saying so about.
+        pub(super) command: RefCell<Option<(String, Instant)>>,
         pub(super) pointer: Cell<Pointer>,
         /// How many mouse buttons are down, which mouse reporting needs in
         /// order to decide whether motion is worth sending.
@@ -405,8 +434,12 @@ mod imp {
                 resize_timer: RefCell::new(None),
                 im: RefCell::new(None),
                 pending_commit: RefCell::new(None),
+                broadcast: Cell::new(false),
                 title: RefCell::new(None),
+                working: Cell::new(false),
                 cwd: RefCell::new(None),
+                cwd_reported: Cell::new(false),
+                command: RefCell::new(None),
                 pointer: Cell::new(Pointer::default()),
                 buttons_down: Cell::new(0),
                 buttons_held: Cell::new(0),
@@ -463,6 +496,9 @@ mod imp {
             PROPERTIES.get_or_init(|| {
                 vec![
                     glib::ParamSpecString::builder("title").read_only().build(),
+                    glib::ParamSpecBoolean::builder("working")
+                        .read_only()
+                        .build(),
                     glib::ParamSpecString::builder("cwd").read_only().build(),
                 ]
             })
@@ -471,6 +507,7 @@ mod imp {
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
             match pspec.name() {
                 "title" => self.title.borrow().to_value(),
+                "working" => self.working.get().to_value(),
                 "cwd" => self.cwd.borrow().to_value(),
                 other => unimplemented!("unknown property {other}"),
             }
@@ -493,6 +530,23 @@ mod imp {
                     // GObject's own.
                     glib::subclass::Signal::builder("desktop-notify")
                         .param_types([String::static_type(), String::static_type()])
+                        .build(),
+                    // A command that ran for a while has ended and the shell has
+                    // its prompt back. The parameters are what it was called and
+                    // how many seconds it took. Whoever placed this widget
+                    // decides whether that is worth telling the desktop about,
+                    // because only the window knows whether anyone was looking.
+                    glib::subclass::Signal::builder("command-finished")
+                        .param_types([String::static_type(), u64::static_type()])
+                        .build(),
+                    // What a key press encoded to, raised only while this
+                    // terminal is broadcasting. The window is what knows which
+                    // panes are in the same tab, so it does the copying; the
+                    // bytes are the ones the shell here was given, so every
+                    // pane gets what this one got rather than each encoding the
+                    // key against its own state.
+                    glib::subclass::Signal::builder("broadcast")
+                        .param_types([glib::Bytes::static_type()])
                         .build(),
                     // Output changed what the live search finds. The find bar
                     // reads the tally back rather than being handed it, because
@@ -656,11 +710,44 @@ impl TuniTerminal {
     /// Write text straight to the shell, bypassing key encoding. Paste and
     /// scripted smoke tests both need this.
     pub fn send_text(&self, text: &str) {
+        self.send_bytes(text.as_bytes());
+        self.echo_broadcast(text.as_bytes());
+    }
+
+    /// The same, for bytes a key encoded to rather than text somebody typed.
+    ///
+    /// Raises no `broadcast` signal: this is the end of the line, the write a
+    /// broadcasting pane's neighbors are given, and a pane that repeated what it
+    /// was handed would hand it round the tab forever.
+    pub fn send_bytes(&self, bytes: &[u8]) {
         let mut guard = self.imp().session.borrow_mut();
         if let Some(session) = guard.as_mut() {
-            send(&mut session.pty, text.as_bytes());
+            send(&mut session.pty, bytes);
             session.term.scroll_to_bottom();
         }
+    }
+
+    /// Whether keys typed here are also meant for the rest of the tab.
+    pub fn set_broadcast(&self, on: bool) {
+        self.imp().broadcast.set(on);
+    }
+
+    /// Offers what was just written to whoever repeats it into the other panes,
+    /// and costs a signal emission only while this pane is broadcasting.
+    fn echo_broadcast(&self, bytes: &[u8]) {
+        if self.imp().broadcast.get() {
+            self.emit_by_name::<()>("broadcast", &[&glib::Bytes::from(bytes)]);
+        }
+    }
+
+    /// Whether a full-screen application is drawing over the shell.
+    #[must_use]
+    pub fn is_alternate_screen(&self) -> bool {
+        self.imp()
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| session.term.is_alternate_screen())
     }
 
     #[must_use]
@@ -668,11 +755,108 @@ impl TuniTerminal {
         self.imp().title.borrow().clone()
     }
 
-    /// The shell's working directory, as last reported by OSC 7. `None` until
-    /// a shell that sends it does.
+    /// The shell's working directory, as last reported by OSC 7 or, for a shell
+    /// that does not report, as `/proc` last had it. `None` until one of the
+    /// two has an answer.
     #[must_use]
     pub fn cwd(&self) -> Option<String> {
         self.imp().cwd.borrow().clone()
+    }
+
+    /// Keeps `cwd` true for a shell that never sends OSC 7.
+    ///
+    /// Fish announces its directory itself. Bash and zsh do it only through a
+    /// prompt hook the distribution installs, and those hooks check for VTE
+    /// before they fire, so under tuni the sequence never arrives: the tab
+    /// would inherit nothing, the session would restore into the home
+    /// directory, and the file tree would stay wherever the window was opened.
+    /// The kernel knows where the process is, so it is asked instead — from the
+    /// moment the session starts until the shell reports for itself, which
+    /// stops the timer, as does the session ending or the widget going.
+    ///
+    /// Deliberately a timer rather than a read at each drain: after a `cd` the
+    /// prompt is the last thing printed, and a poll that rides on output would
+    /// have nothing left to ride on at the moment the answer changed.
+    fn follow_directory(&self) {
+        glib::timeout_add_local(
+            CWD_POLL,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    let imp = this.imp();
+                    if imp.cwd_reported.get() {
+                        return glib::ControlFlow::Break;
+                    }
+                    let Some(pid) = this.shell_pid() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    if let Some(cwd) = tuni_core::info::directory(pid)
+                        && imp.cwd.borrow().as_deref() != Some(cwd.as_str())
+                    {
+                        imp.cwd.replace(Some(cwd));
+                        this.notify("cwd");
+                    }
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
+    }
+
+    /// Watches what the shell is running, so that a long command ending is an
+    /// event the window can act on.
+    ///
+    /// The kernel's foreground process group is the signal, not OSC 133: the
+    /// escape says exactly this and says it with an exit code too, but a shell
+    /// nobody configured never sends it, and that is fish, bash and zsh as they
+    /// come. `/proc` answers for all three with no configuration at all - the
+    /// price is that a command's success is not knowable here, so what is
+    /// reported is that it ended and how long it took.
+    ///
+    /// The same cadence and the same shape as [`Self::follow_directory`]: one
+    /// small read out of the page cache every couple of seconds while a shell
+    /// is alive, two while something is running under it. It ends with the
+    /// session or with the widget.
+    fn watch_commands(&self) {
+        glib::timeout_add_local(
+            CWD_POLL,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    let Some(pid) = this.shell_pid() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let running = tuni_core::info::foreground(pid);
+                    let imp = this.imp();
+                    let previous = imp.command.borrow().clone();
+                    match (previous, running) {
+                        // Still the same thing, or still nothing.
+                        (Some((was, _)), Some(now)) if was == now => {}
+                        (None, None) => {}
+                        // A command started, or one replaced another without
+                        // the prompt coming back in between, which is what a
+                        // poll sees when two commands run inside one line.
+                        (_, Some(now)) => {
+                            imp.command.replace(Some((now, Instant::now())));
+                        }
+                        // The prompt is back.
+                        (Some((was, since)), None) => {
+                            imp.command.replace(None);
+                            let seconds = since.elapsed().as_secs();
+                            if seconds >= LONG_COMMAND_SECONDS {
+                                this.emit_by_name::<()>("command-finished", &[&was, &seconds]);
+                            }
+                        }
+                    }
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
     }
 
     /// The shell's process id. `None` before it starts and after it exits,
@@ -1254,6 +1438,8 @@ impl TuniTerminal {
             term,
             pty: Some(pty),
         }));
+        self.follow_directory();
+        self.watch_commands();
         let cell = (m.cell_width.round() as u16, m.cell_height.round() as u16);
         imp.grid_size.set((cols, rows));
         imp.cell_size.set(cell);
@@ -1309,6 +1495,13 @@ impl TuniTerminal {
                             // read. Scoped, because emitting reaches back in.
                             if let Some(session) = this.imp().session.borrow_mut().as_mut() {
                                 session.pty = None;
+                            }
+                            // A shell killed mid-spin leaves the agent's last
+                            // title on screen, and nothing will ever arrive to
+                            // contradict it, so the pane stops reporting work
+                            // here rather than pulsing the bar forever.
+                            if this.imp().working.replace(false) {
+                                this.notify("working");
                             }
                             this.queue_draw();
                             this.emit_by_name::<()>("exited", &[]);
@@ -1423,6 +1616,10 @@ impl TuniTerminal {
             .then(|| session.term.title().map(str::to_owned))
             .flatten();
         let cwd = effects.pwd_changed.then(|| session.term.pwd()).flatten();
+        if cwd.is_some() {
+            // The shell speaks for itself, so the poll below stops asking.
+            imp.cwd_reported.set(true);
+        }
         let scroll = session.term.scroll_position();
         drop(guard);
 
@@ -1437,11 +1634,23 @@ impl TuniTerminal {
         // The VT's flag says an OSC arrived, not that the value moved: a shell
         // re-announcing the same title before every prompt would otherwise run
         // the window's whole title-and-labels refresh each time.
-        if let Some(title) = title
-            && imp.title.borrow().as_deref() != Some(title.as_str())
-        {
-            imp.title.replace(Some(title));
-            self.notify("title");
+        //
+        // A coding agent spins its own state into the title, so whether one is
+        // thinking is decided here rather than by polling anything. The glyph
+        // carrying it is then taken off the name, and the comparison is made
+        // against what is left: an agent redrawing its spinner four times a
+        // second is four frames that change the state and not the name, and
+        // comparing raw titles would run that refresh for every one of them.
+        if let Some(title) = title {
+            let working = tuni_core::usage::thinking(&title);
+            if imp.working.replace(working) != working {
+                self.notify("working");
+            }
+            let name = tuni_core::usage::strip_spinner(&title);
+            if imp.title.borrow().as_deref() != Some(name) {
+                imp.title.replace(Some(name.to_owned()));
+                self.notify("title");
+            }
         }
         if let Some(cwd) = cwd
             && imp.cwd.borrow().as_deref() != Some(cwd.as_str())
@@ -1857,6 +2066,33 @@ impl TuniTerminal {
     /// does.
     pub(crate) fn scroll_lines(&self, lines: isize) {
         self.scroll_by(lines);
+    }
+
+    /// Puts the viewport on the prompt above or below where it sits now, so a
+    /// screenful of build output is one key rather than a hunt for where the
+    /// command started.
+    ///
+    /// `false` when there is no prompt that way — which is what a shell that
+    /// does not mark its prompts with OSC 133 always answers, and the caller's
+    /// cue to say so rather than to move nothing and look broken.
+    pub(crate) fn scroll_to_prompt(&self, up: bool) -> bool {
+        let imp = self.imp();
+        let mut guard = imp.session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return false;
+        };
+        let from = session.term.scroll_position().offset;
+        let Some(row) = session.term.prompt_row(from, up) else {
+            return false;
+        };
+        session.term.scroll_to_row(row);
+        imp.scroll.set(session.term.scroll_position());
+        drop(guard);
+
+        self.invalidate_links();
+        self.reveal_scrollbar();
+        self.queue_draw();
+        true
     }
 
     fn scroll_by(&self, lines: isize) {
@@ -2959,6 +3195,33 @@ impl TuniTerminal {
             }
         }
 
+        // Ctrl+Shift+Backspace wipes the line being typed. A shell has no one
+        // code for it, so this is the pair every shell does have: kill to the
+        // start of the line, then kill to the end of it, so the line goes whole
+        // wherever the cursor was standing. bash and fish read them as
+        // backward-kill-line and kill-line; zsh's Ctrl+U is kill-whole-line
+        // already, and the Ctrl+K after it finds nothing left to take.
+        //
+        // On Ctrl+Shift rather than on Ctrl, where every other thing this window
+        // takes from the shell lives: Ctrl+Backspace is already a word to a
+        // reader — bash sends it to backward-kill-word — and a key that used to
+        // delete one word deleting the whole line instead is the kind of
+        // surprise that costs a command.
+        //
+        // Not on the alternate screen: there is no command line there, and vim
+        // would read the two codes as scroll-up and start-a-digraph.
+        if mods == (Mods::CTRL | Mods::SHIFT)
+            && key == Key::Backspace
+            && !self.is_alternate_screen()
+        {
+            // Through the broadcasting path, not the quiet one: with typing
+            // broadcast to every pane of the tab, a line wiped in one and left
+            // standing in the other three is worse than not wiping at all.
+            self.send_bytes(b"\x15\x0b");
+            self.echo_broadcast(b"\x15\x0b");
+            return glib::Propagation::Stop;
+        }
+
         // Application shortcuts live on Ctrl+Shift, because Ctrl+C and Ctrl+V
         // belong to the shell.
         if mods.contains(Mods::CTRL) && mods.contains(Mods::SHIFT) {
@@ -3072,6 +3335,10 @@ impl TuniTerminal {
                     );
                 }
                 send(&mut session.pty, bytes);
+                // Copied only while broadcasting, because the signal cannot be
+                // raised under the borrow the encoder answered from: a handler
+                // that reaches back into this terminal would find it locked.
+                let echo = imp.broadcast.get().then(|| bytes.to_vec());
                 // Typing pulls the viewport back down: the answer is about to
                 // arrive at the bottom. It also takes the selection with it,
                 // as Ghostty's `selection-clear-on-typing` does by default:
@@ -3083,6 +3350,9 @@ impl TuniTerminal {
                 session.term.scroll_to_bottom();
                 imp.scroll.set(session.term.scroll_position());
                 drop(guard);
+                if let Some(bytes) = echo {
+                    self.echo_broadcast(&bytes);
+                }
                 self.note_input();
                 self.queue_draw();
                 true

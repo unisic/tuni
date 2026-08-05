@@ -23,6 +23,7 @@ mod notify;
 mod palette;
 mod panel;
 mod preferences;
+mod project_icon;
 mod remote;
 mod sftp;
 mod shortcuts;
@@ -32,6 +33,8 @@ mod switcher;
 mod terminal;
 mod tiles;
 mod window;
+
+use std::path::{Path, PathBuf};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -59,6 +62,16 @@ const APP_ID: &str = "dev.unisic.Tuni";
 /// shortcut goes to the shorter reach.
 pub(crate) const ACCELS: &[(&str, &[&str])] = &[
     ("win.new-tab", &["<Ctrl><Shift>t"]),
+    // Not `Ctrl+Shift+T`, which every browser puts this on and which opens a tab
+    // here: a terminal has had that key for a new tab since long before anything
+    // had an undo for closing one. `R` for reopen is free on both sides - a
+    // shell reads `Ctrl+R` as reverse search and never sees the shifted key.
+    ("win.reopen-tab", &["<Ctrl><Shift>r"]),
+    // One command typed into every pane of the tab. iTerm2 spends ⇧⌘I on this,
+    // which is taken here by the session inspector, so it goes one modifier
+    // over. `Ctrl+Alt+I` costs a shell nothing it would miss: `Ctrl+I` is a
+    // tab character and the Alt of it is a readline binding nothing sets.
+    ("win.broadcast", &["<Ctrl><Alt>i"]),
     // The host list, in a tab of its own. `Ctrl+Shift` had no `o` on it, and
     // "open a connection" is what the key says everywhere else.
     ("win.new-connection", &["<Ctrl><Shift>o"]),
@@ -110,6 +123,11 @@ pub(crate) const ACCELS: &[(&str, &[&str])] = &[
     // kero's palette is ⌘K; `Ctrl+K` is kill-line in a shell, so the palette
     // takes the key every editor on this desktop puts it on.
     ("win.palette", &["<Ctrl><Shift>p"]),
+    // Walking the scrollback a command at a time. kitty, Ghostty and WezTerm all
+    // put this on `Ctrl+Shift`+arrow, which is taken here by project switching,
+    // so it goes one key over onto the pair that already scrolls by page.
+    ("win.previous-prompt", &["<Ctrl><Shift>Page_Up"]),
+    ("win.next-prompt", &["<Ctrl><Shift>Page_Down"]),
     ("win.split-right", &["<Ctrl><Shift>d"]),
     ("win.split-down", &["<Ctrl><Shift>e"]),
     ("win.focus-pane-left", &["<Ctrl><Alt>Left"]),
@@ -131,11 +149,21 @@ fn main() -> glib::ExitCode {
     quieten();
     debug::mark("gtk::init");
 
-    // Not unique: a terminal launched from a shell must inherit *that* shell's
-    // working directory, which a single primary instance could not see.
+    // One instance, and every later launch is forwarded to it as a command
+    // line: "Open Terminal Here" in a file manager, or `tuni` typed in a shell,
+    // opens a project in the window that is already there rather than a second
+    // window with a second saved session behind it. The working directory the
+    // launch carried is the whole point of such a launch and is what the
+    // primary instance could not otherwise see, so the flags ask for the
+    // environment as well - `cwd()` is in the message either way, and
+    // `XDG_ACTIVATION_TOKEN` is what lets the window come to the front.
     let app = adw::Application::builder()
         .application_id(APP_ID)
-        .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+        .flags(
+            gtk::gio::ApplicationFlags::HANDLES_COMMAND_LINE
+                | gtk::gio::ApplicationFlags::SEND_ENVIRONMENT
+                | separate_process(),
+        )
         .build();
 
     app.connect_startup(|app| {
@@ -178,8 +206,86 @@ fn main() -> glib::ExitCode {
         }
         debug::mark("startup end");
     });
-    app.connect_activate(build_window);
+    // `activate` is not emitted for an application that handles its own command
+    // line, so both jobs are here: the first launch builds the window, and
+    // every launch after it is a project in the window that exists.
+    app.connect_command_line(|app, cmdline| {
+        let directory = launch_directory(cmdline);
+        // The focused window, else any of them: a window that has never been
+        // focused is still a window to open the project in, and building a
+        // second one would be the thing this is here to avoid.
+        let existing = app
+            .active_window()
+            .or_else(|| app.windows().into_iter().next())
+            .and_downcast::<TuniWindow>();
+        match existing {
+            Some(window) => {
+                if let Some(directory) = &directory {
+                    window.open_project_in(Some(directory));
+                }
+                // Without the token the compositor has no reason to believe the
+                // launch and the window stays where it is, behind whatever the
+                // person was looking at when they asked for a terminal.
+                if let Some(token) = cmdline
+                    .getenv("XDG_ACTIVATION_TOKEN")
+                    .or_else(|| cmdline.getenv("DESKTOP_STARTUP_ID"))
+                {
+                    window.set_startup_id(&token);
+                }
+                window.present();
+            }
+            None => build_window(app, directory.as_deref()),
+        }
+        glib::ExitCode::SUCCESS
+    });
     app.run()
+}
+
+/// `NON_UNIQUE` when this run must not join the one already going.
+///
+/// A capture renders a window and quits, and forwarded to a running instance it
+/// would render nothing and quit anyway. A build being worked on is the same
+/// problem the other way around: `cargo run` while an installed Tuni is up
+/// would open a window in the installed one and test nothing.
+fn separate_process() -> gtk::gio::ApplicationFlags {
+    let separate = std::env::var_os("TUNI_CAPTURE_PNG").is_some()
+        || std::env::var("TUNI_SINGLE_INSTANCE").is_ok_and(|value| value == "0");
+    if separate {
+        gtk::gio::ApplicationFlags::NON_UNIQUE
+    } else {
+        gtk::gio::ApplicationFlags::empty()
+    }
+}
+
+/// The directory a launch was about, if it was about one.
+///
+/// An argument names it outright, which is what a shell alias or a `.desktop`
+/// file with a path in it would use. Otherwise it is the working directory the
+/// launch was made from, which is how a file manager says it: KDE's launcher
+/// sets the child process's directory rather than passing a flag, since only
+/// konsole takes one. A launch from the home directory is not read as naming
+/// it, because that is where an application menu launches everything from and a
+/// session restored with a project per checkout does not want a tenth project
+/// for the home directory on top.
+fn launch_directory(cmdline: &gtk::gio::ApplicationCommandLine) -> Option<PathBuf> {
+    let cwd = cmdline.cwd();
+    let named = cmdline
+        .arguments()
+        .into_iter()
+        .skip(1)
+        .find(|argument| !argument.to_string_lossy().starts_with('-'));
+    if let Some(named) = named {
+        let path = PathBuf::from(named);
+        let path = match path.is_absolute() {
+            true => path,
+            false => cwd?.join(path),
+        };
+        return path.is_dir().then_some(path);
+    }
+
+    let cwd = cwd?;
+    let home = cmdline.getenv("HOME").map(PathBuf::from);
+    (Some(&cwd) != home.as_ref() && cwd.is_dir()).then_some(cwd)
 }
 
 /// The two lines a terminal on this desktop prints before it has drawn
@@ -237,7 +343,7 @@ fn quieten() {
     }
 }
 
-fn build_window(app: &adw::Application) {
+fn build_window(app: &adw::Application, directory: Option<&Path>) {
     debug::mark("activate");
     let settings = settings();
     window::apply_appearance(settings.appearance);
@@ -258,13 +364,20 @@ fn build_window(app: &adw::Application) {
 
     // The first project's shell learns its size from the first allocation, so
     // it opens after the window is on screen rather than before.
+    let directory = directory.map(Path::to_path_buf);
     glib::idle_add_local_once(glib::clone!(
         #[weak]
         window,
         move || {
             // A saved session opens as it was left; anything else opens as a
             // first run does.
-            if !window::session_enabled() || !window.restore_session() {
+            let restored = window::session_enabled() && window.restore_session();
+            // A launch that named a directory gets a project for it either way:
+            // the session is what was there before, and the directory is what
+            // was asked for now.
+            if let Some(directory) = directory {
+                window.open_project_in(Some(&directory));
+            } else if !restored {
                 window.open_project();
             }
             debug::mark("project open");

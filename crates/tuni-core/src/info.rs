@@ -70,6 +70,10 @@ pub struct Stat {
     /// kernel, and only a fallback for a process whose `exe` link cannot be
     /// read.
     pub comm: String,
+    /// The process group the terminal is giving the keyboard to: the `tpgid`
+    /// field. `-1` for a process with no controlling terminal, which is why it
+    /// is signed.
+    pub tpgid: i32,
     /// User plus system time, in clock ticks.
     pub ticks: u64,
     /// When it started, in clock ticks since boot.
@@ -159,6 +163,56 @@ pub fn terminate(pid: u32, force: bool) {
     unsafe {
         libc::kill(pid, signal);
     }
+}
+
+/// Where the process `pid` is working, as the kernel has it.
+///
+/// OSC 7 is a shell's own account of its directory, and a shell nobody
+/// configured to send it never gives one: bash and zsh emit the sequence only
+/// when a distribution's prompt hook does it, and that hook usually checks for
+/// VTE first. `/proc` answers for every shell there is, so this is what a tab
+/// falls back to rather than losing the directory entirely.
+///
+/// Only ever asked about a local process. A directory that is gone reads back
+/// as `"/path (deleted)"`, which is why the answer has to still be one.
+#[must_use]
+pub fn directory(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    path.is_dir()
+        .then(|| path.into_os_string().into_string().ok())
+        .flatten()
+}
+
+/// What the shell `shell_pid` has handed the keyboard to, by name, or `None`
+/// when the shell has it back and is sitting at its prompt.
+///
+/// This is the kernel's own answer rather than the shell's: a foreground
+/// process group is what a terminal gives its input to, so `make`, `vim` and a
+/// pipeline all show up here with no configuration at all. OSC 133 would say
+/// the same thing and say it exactly, but a shell nobody has configured to send
+/// it says nothing, and that is most shells - fish, bash and zsh all need a
+/// line in a startup file first.
+///
+/// Two small reads of `/proc` when something is running, one when nothing is,
+/// both out of the page cache. The name is the `comm` field, so it is the
+/// executable's, truncated to 15 bytes by the kernel, and not the command line:
+/// a command line can hold a password, and this ends up in a desktop
+/// notification.
+#[must_use]
+pub fn foreground(shell_pid: u32) -> Option<String> {
+    if shell_pid == 0 {
+        return None;
+    }
+    let text = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
+    let group = parse_stat(&text)?.tpgid;
+    if group <= 0 || u32::try_from(group).ok()? == shell_pid {
+        return None;
+    }
+    let text = std::fs::read_to_string(format!("/proc/{group}/stat")).ok()?;
+    Some(parse_stat(&text)?.comm)
 }
 
 /// How long the process `pid` has been running, in seconds.
@@ -312,6 +366,7 @@ pub fn parse_stat(text: &str) -> Option<Stat> {
         pid,
         state: field(3)?.chars().next()?,
         ppid: field(4)?.parse().ok()?,
+        tpgid: field(8)?.parse().ok()?,
         comm,
         ticks: field(14)?.parse::<u64>().ok()? + field(15)?.parse::<u64>().ok()?,
         start_ticks: field(22)?.parse().ok()?,
@@ -536,6 +591,17 @@ mod tests {
         )
     }
 
+    /// The one caller is a shell that never sent OSC 7, and the reader is this
+    /// process, which is a process like any other.
+    #[test]
+    fn a_running_process_says_where_it_is_working() {
+        let mine = std::env::current_dir().expect("a test runs somewhere");
+        assert_eq!(directory(std::process::id()).map(PathBuf::from), Some(mine));
+        // Not a process, so not a directory: pid 0 is what a pane with no shell
+        // in it reports.
+        assert_eq!(directory(0), None);
+    }
+
     #[test]
     fn a_stat_line_parses_into_the_fields_the_panel_needs() {
         let stat = parse_stat(&stat_line(42, 7, 'S', "zsh")).expect("stat");
@@ -546,6 +612,25 @@ mod tests {
         assert_eq!(stat.ticks, 150, "user and system time added together");
         assert_eq!(stat.start_ticks, 900);
         assert_eq!(stat.rss_pages, 512);
+        assert_eq!(stat.tpgid, -1, "no controlling terminal in the fixture");
+    }
+
+    /// The reader is this process, which is running in the foreground of
+    /// whatever started it, so the two ends of the question are both real: a
+    /// shell with something running answers with a name, and a pid that is not
+    /// a process answers with nothing.
+    #[test]
+    fn a_shell_says_what_it_handed_the_keyboard_to() {
+        let mine = std::process::id();
+        let text = std::fs::read_to_string(format!("/proc/{mine}/stat")).expect("my own stat");
+        let stat = parse_stat(&text).expect("stat");
+        if stat.tpgid > 0 && u32::try_from(stat.tpgid) != Ok(mine) {
+            assert!(
+                foreground(mine).is_some(),
+                "a process whose terminal is somebody else's has a foreground to name"
+            );
+        }
+        assert_eq!(foreground(0), None);
     }
 
     #[test]

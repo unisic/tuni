@@ -40,13 +40,39 @@ habit. A project with nothing to follow yet has two answers rather than one:
 the project the window opens with starts in the directory tuni itself was
 started in, since running it from a checkout should open there, and every
 project opened after that starts at home, because a second project is a fresh
-start and not a continuation of whatever launched the window. A project whose
-tabs are all closed stays in the sidebar until it is
-closed on purpose: by its own button, by its menu, or by a middle click
-anywhere on the row, which is how a tab closes everywhere else. The sidebar and
+start and not a continuation of whatever launched the window. A project's row
+draws a folder until its menu is asked for another one, which opens forty emoji
+first and the icons from the desktop's theme under them, since half of what
+makes one row findable is a color the other rows do not have and the colored
+half should not be the half behind a button. Every other emoji this desktop has
+is the last tile of that grid, which opens the system chooser with its search
+field. One field holds both and which of the two it is is read off the string
+rather than stored beside it: an icon name is ASCII, an emoji is not, so there
+is no pair of settings that can disagree about what a row shows. A themed icon
+is drawn in the row's own foreground color like every other symbolic icon in the
+window; an emoji is text the font colors. A project whose tabs are all closed
+stays in the sidebar until it is closed on purpose: by its own button, by its
+menu, or by a middle click anywhere on the row, which is how a tab closes
+everywhere else. Dragged off the sidebar entirely it becomes a window of its own
+instead, tabs, panes, shells and all: the tab strip does this for one tab and
+hears it from `AdwTabView`, and a list row, which has no such signal, reads a
+drag that ended on nothing as the same request. The sidebar and
 the panel are both dragged to a width by their inner edge, and one dragged to a
 width keeps it. Until then each is a fraction of the window, which is what a
 split view sizes by and what an undragged one should go on doing.
+
+One tuni runs at a time, and a launch made while it is running is a project
+rather than a second window. "Open Terminal Here" in a file manager says where
+by starting the process in that directory and nothing else, since only konsole
+takes a flag for it, so the directory a launch carries is the whole of what it
+asked for: it opens a project pinned there, named after the folder, in the
+window already on screen, and the activation token the launch came with is what
+brings that window to the front. A launch from the home directory is not read as
+naming one, because that is where an application menu starts everything from; a
+path given as an argument is, so `tuni ~/src/thing` typed in a shell says it
+outright. The alternative is two windows with two saved sessions writing over
+each other, which is the other half of why there is one process.
+`TUNI_SINGLE_INSTANCE=0` puts a separate one back for a build being worked on.
 
 On the other side, a panel under `Ctrl+Shift+B` shows the directory the focused
 shell is working in, or the project's own if one is pinned, and follows it as
@@ -202,6 +228,82 @@ pressing `Tab` brings up the tab switcher: a card per tab with a picture of what
 is in it, in the order they were last worked in, so one press and release goes
 back to where you just were.
 
+`Ctrl+Shift+Page Up` and `Ctrl+Shift+Page Down` walk the scrollback a command at
+a time rather than a screenful at a time, putting the prompt the search lands on
+at the top of the viewport. What a prompt is comes from the shell: OSC 133 is the
+only thing that says where one output ends and the next command begins, and a
+guess based on how a line looks would be wrong on every prompt somebody styled.
+So a shell that does not send it gets a toast saying that, rather than a key that
+silently does nothing. kitty, Ghostty and WezTerm all put this on `Ctrl+Shift`
+and an arrow, which is project switching here, so it went one key over onto the
+pair that already scrolls.
+
+`Ctrl+Shift+R` reopens the tab just closed, and the four closed before it. It
+comes back with its columns, its panes, the room they had, the name that was
+typed, and what its shells had printed, because the scrollback is taken at the
+moment of closing rather than looked for afterwards; the shells themselves are
+gone, because they were hung up when the tab closed. It is the session snapshot's
+own shape, one tab of it, which is why a reopened tab restores exactly what a
+restored session does. Not `Ctrl+Shift+T`: a terminal has had that key for a new
+tab since long before a browser had an undo for closing one.
+
+A tab dragged off the strip and dropped on the desktop becomes a window of its
+own, and the shells inside it keep running through the move: nothing is
+restarted, nothing is re-attached. Every widget in a pane looks its window up
+by the tab it belongs to at the moment a signal fires, rather than holding the
+window it was built in, so handing a tab over is moving one entry per pane
+between two maps and moving the model's `Tab`. Dropped on another tuni window's
+strip it is that same move with those same shells, because the strip a page
+lands in is the one that reports it: libadwaita detaches the page when the drag
+begins and attaches it where it was let go, and the tab waits between the two
+rather than being closed and built again. Dropped on a project row in the
+sidebar it moves into that project, which libadwaita has no signal for either: a
+drop anywhere in the window that is not a tab strip makes it ask for a window to
+put the page in, and the row that took the drop is what that question is
+answered with. That move is the one the window has to narrate, because the tab
+leaves the strip in front of a person and lands in a project they may not be
+looking at: the row lights up in the accent colour while the tab is held over
+it, so what will take it is lit before it is let go of, and keeps that colour
+for a moment afterwards as it fades, so what did take it is the same light going
+out rather than a second signal somewhere else. It also swells while the tab is
+over it and the icons either side of it lift, which is the dock's magnification
+in the one direction a list has. Only the row under the pointer changes height,
+and it grows downward from a top edge that does not move, because a neighbour
+that grew would slide that row out from under a pointer that had not moved, and
+the leave and enter that followed would hand the magnification back and forth
+between two rows for as long as it stayed still. A toast names the project as
+well, for the same move made from the menu, where the sidebar can be shut and
+the tab would simply vanish. The tab's own menu says "Move to Project" and lists
+the others by name, for the same reason the project menu says "Move to a New
+Window": a drag is a gesture a tiling compositor can swallow. A project row dragged off the
+sidebar does the same for everything in it, one transfer per tab, and its menu
+says "Move to a New Window" for the same thing by name, because a drag onto the
+desktop is a gesture a tiling compositor can swallow before it reaches the
+window. The last project in a window may go too; what stays behind is the same
+New Project screen that closing it would have left.
+
+`Ctrl+Alt+I` sends what is typed to every pane of the tab rather than to the one
+with the keyboard, and a banner across the top says so until it is pressed
+again, because a mode this loud has to be visible from the pane being typed
+into. Per tab rather than per window: the panes of one tab are usually the
+machines being worked on together and the tab behind it is usually something
+else. It is not written to the session either, since a window that comes back
+typing into four shells at once is a surprise nobody asked for. A pane opened
+while it is on joins in; the write each neighbor gets is the bytes the key
+encoded to, not a replay of the signal, so nothing goes round the tab twice.
+
+`Ctrl+Shift+Backspace` wipes the command being typed, from wherever the cursor
+happens to be, and in every pane at once while typing is broadcast. It is
+`Ctrl+U` and `Ctrl+K` in one keystroke, which is what the line actually costs:
+readline's `Ctrl+U` kills backwards from the cursor and zsh binds it to the
+whole line, so the pair is the only spelling that is correct in bash, zsh and
+fish alike. On `Ctrl+Shift` rather than on `Ctrl`, where everything else this window
+takes from the shell lives: `Ctrl+Backspace` already means a word to a reader,
+and a key that deleted one word deleting the whole line instead is the kind of
+surprise that costs a command. On the alternate screen it is left alone and the
+key goes to the application, since those two bytes are a scroll and a digraph to
+`vim` rather than a line to erase.
+
 Closing the window writes that arrangement down, and opening it again puts it
 back: the projects, their tabs, the columns and panes inside each one with the
 room they had, the names that were typed, and a fresh shell in each pane's last
@@ -211,7 +313,11 @@ screen; it starts empty and never writes the session, so the arrangement that
 comes back is the one the first window was left in. A settings window under
 `Ctrl+,` edits the font, the two themes, the cursor, the scrollback, the shell
 to run, whether a file pane wraps its long lines, and that last decision,
-writing each change to `~/.config/tuni/config.toml` as it is made. There is no
+writing each change to `~/.config/tuni/config.toml` as it is made. It is four
+pages, Appearance, Terminal, Session and Shortcuts, and each row is a title and
+one short line saying what it does: a page long enough to scroll through twice
+is where a setting goes to be missed, and a subtitle that argues its own design
+is a setting nobody reads. There is no
 OK button; a line of terminal beside the font rows is drawn in whatever has
 just been chosen, since that is the only way a font or a palette is actually
 picked. The family is chosen from what this machine has, asked of the font map
@@ -232,16 +338,21 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+Shift+Enter` | Show the focused pane alone, and back |
 | `Ctrl+Alt+Shift`+arrows | Grow or shrink the focused pane |
 | `Ctrl+Alt+=` | Give every pane the same room |
+| `Ctrl+Alt+I` | Type into every pane of the tab at once, and stop |
 | Drag a pane's grip onto another | Move it to that pane's left, right, top, or bottom |
 | Drag the gap between panes | Move the divider |
 | `Ctrl+Shift+T` | New tab: a shell, or the host list when `new-tab` says so |
 | `Ctrl+Shift+O` | The host list, in a tab of its own, whichever that setting says |
+| `Ctrl+Shift+R` | Reopen the tab just closed, with its layout, its name and what its shells had printed |
 | `Ctrl+Page Down` / `Ctrl+Page Up` | Next tab, previous tab |
+| Drag a tab off the strip | A window of its own, with the shells still running in it |
+| Drag a tab onto a project row | Move it into that project; its menu says "Move to Project" for the same thing |
 | Hold `Ctrl`, press `Tab` | The tab switcher: cards for every tab, most recently used first. `Shift+Tab` walks back, `Escape` cancels, letting `Ctrl` go switches |
 | `Alt+1` … `Alt+9` | Jump to a tab; `Alt+9` is the last one |
 | `Ctrl+Shift+N` | New project |
 | `Ctrl+Alt+Page Down` / `Ctrl+Alt+Page Up`, `Ctrl+Shift+Down` / `Ctrl+Shift+Up` | Next project, previous project |
 | `Ctrl+Shift+1` … `Ctrl+Shift+9` | Jump to a project |
+| Drag a project off the sidebar | A window of its own, every tab in it, with the shells still running |
 | `F9` | Show or hide the sidebar |
 | `Ctrl+Shift+B` | Show or hide the panel |
 | `Ctrl+Shift+G` | Open the panel on the repository, or close it when it is already there |
@@ -253,6 +364,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `F3` / `Shift+F3` | Next match, previous match |
 | `Ctrl+Shift+H` | Find and replace in the file pane that has the keyboard |
 | `Ctrl+Shift+K` | Clear the terminal: the screen, the scrollback behind it, and a fresh prompt |
+| `Ctrl+Shift+Backspace` | Wipe the command being typed, whatever the shell, cursor wherever it is |
 | `Ctrl+F` / `Ctrl+H` | Find, find and replace — in a file pane only |
 | `Ctrl+G` / `Ctrl+Shift+G` | Next match, previous match — in a file pane only |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection, paste |
@@ -266,6 +378,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl`+click | Open the hyperlink under the pointer |
 | Drop a file on a pane | Its path, quoted, onto the prompt as an argument, followed by a space |
 | `Shift+Page Up` / `Shift+Page Down` | Scroll the viewport by a page |
+| `Ctrl+Shift+Page Up` / `Ctrl+Shift+Page Down` | Scroll a command at a time, where the shell marks its prompts |
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
 | Wheel | Three rows a notch, pixel for pixel on a touchpad. On the alternate screen it becomes arrow keys, which is how `less` scrolls without taking the mouse |
 | `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Font a point larger, smaller, back to the configured size |
@@ -301,6 +414,55 @@ program only knows that it is busy. It clears when the program says so, or
 after fifteen seconds of nothing further. Each pane's notification replaces its
 own rather than stacking one banner per line of output, and focusing the pane
 withdraws it.
+
+A command that ran long says so when it ends. Every two seconds a pane asks
+`/proc/<shell>/stat` which process group has its keyboard, which is how a shell
+answers "is something running" without being configured to; when that group goes
+away after ten seconds or more, the tab takes the attention mark and a desktop
+notification names the command and how long it took. It is the bell's rule about
+when to speak: the pane has to be unfocused, or the window inactive, since a
+banner about a build somebody just watched finish is a banner that teaches people
+to turn banners off. What it cannot say is whether the command succeeded: the
+foreground process group is gone by the time anyone can ask it, and the exit code
+went to the shell. A shell that marks its prompts with OSC 133 knows the code and
+could say so; nothing here requires that shell, so nothing here reads it.
+
+A coding agent thinking in a pane says so in two places: a spinner on its tab,
+and a spinner in place of the folder on its project's row in the sidebar. Two
+depths of the same fact, so that finding the pane which is working takes no
+clicking, and nothing louder than that. A bar sweeping the top of the window was
+built first and thrown away: a whole animation across the chrome to say a shell
+three tabs back is busy is too much of the window given to one pane's state.
+Both spinners are the one libadwaita draws on a loading tab, in the slot an icon
+would occupy, so the row and the tab say it in the same hand and neither changes
+width when a turn starts.
+
+When the turn ends into a tab nobody is looking at, both spinners become an
+exclamation and the tab takes the same attention mark the bell raises, because
+an answer waiting behind a tab is the half of this worth interrupting for.
+Selecting the tab clears it, on the click that reads the answer. A turn that
+ends in the tab already on screen is marked nowhere: it was watched as it
+happened, and a mark to dismiss for something already seen is a mark that
+teaches people to dismiss marks.
+
+What it reads is the title, and nothing else. Claude Code writes its own state
+there — `✳ Claude Code` between turns, a braille spinner frame in place of the
+star while it works — so a pane reports for itself over an escape sequence the
+terminal parses anyway. No process is polled for it and no screen is scraped;
+the CPU an agent burns was measured first and cannot tell thinking from waiting,
+which is the reason this is read rather than sampled. Braille is the whole test:
+a spinner is drawn out of that block and no prompt, path or command line starts
+with one. An agent that says nothing in its title simply never reports, the same
+as every pane that is not running one.
+
+The glyph then comes off the name. Having turned it into a spinner on the tab,
+leaving it in the label would say the same thing twice and animate a frame under
+the tab's own text four times a second, which is what makes a tab strip restless
+to sit beside. The idle star comes off with it, so the tab reads `Claude Code`
+either way rather than renaming itself as each turn starts and ends. It is also
+what the pane compares against: an agent redrawing its spinner changes the state
+and not the name, so the window's title-and-labels refresh runs when the name
+moves rather than on every frame.
 
 An image printed to a pane is drawn as an image. Tuni speaks the kitty graphics
 protocol, so `timg`, `chafa -f kitty`, matplotlib's kitty backend and anything
@@ -381,6 +543,28 @@ costs the previous session rather than both. Every field the snapshot reads is
 optional and every unreadable tab is skipped, which is what lets a file written
 by an older build still open — and `TUNI_SESSION=0` turns the whole mechanism
 off, restore and save alike.
+
+Restoring it is off by default. A terminal that opens on one empty shell is
+what everyone else's opens on, and a window that comes back with eight panes
+and four projects nobody asked for on this run is a surprise rather than a
+convenience; `session.restore` on is for people who want the workspace back and
+have said so. The window is written down either way, so turning the setting on
+restores the last one rather than starting to collect from that moment. What a
+restored pane starts in is its own switch: `terminal.restore-directory` off
+sends every one of them where a shell started outside the window would go, for
+people who want the arrangement back without the state that came with it.
+
+Where a shell is comes from OSC 7 while a shell sends it, and from `/proc`
+while one does not. Fish reports for itself; bash and zsh report only through a
+distribution's prompt hook, and every one of those hooks checks for VTE first,
+so under them the sequence never arrives and every pane would have inherited
+and restored nothing. The kernel knows regardless. A pane whose shell has never
+sent OSC 7 reads `/proc/<pid>/cwd` instead, on a timer of the same couple of
+seconds the panel polls at, and a shell that does report is believed: the first
+OSC 7 stops the timer for good, as does the session ending. A timer rather than
+a read on each drain, because after a `cd` the prompt is the last thing printed
+and a poll riding on output would have nothing left to ride on at the moment
+the answer changed.
 
 The file tree is a flat list rather than a tree of nodes. What a list view
 wants is rows, and what an expandable tree costs is a second structure that has
@@ -969,6 +1153,8 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `bell` | `true` | Whether `\a` rings the desktop's own bell |
 | `command` | `""` | The shell to run; empty means the login shell |
 | `terminal.scrollback-lines` | `10000` | Lines kept above the screen |
+| `session.restore` | `false` | Whether the window opens on the workspace the last one closed with. Off opens one empty project and one shell; the session is written down either way, so turning it on restores the last window rather than the next one |
+| `terminal.restore-directory` | `true` | Whether a restored pane starts in the directory its shell was in. Only read when the session is restored at all |
 | `terminal.restore-history` | `false` | Whether a restored pane replays what it had printed |
 | `editor.wrap-lines` | `false` | Whether a file pane folds a long line rather than scrolling sideways |
 | `window.auto-hide-tab-bar` | `false` | Whether the tab bar goes away while a window has one tab |
@@ -1032,7 +1218,9 @@ Debugging aids, all off unless set, and none of them written back to the
 configuration file: `TUNI_THEME` names one of the bundled themes for the run
 and `TUNI_FONT` a font the way Pango writes one (`"JetBrains Mono 13"`), with
 `TUNI_LIGATURES=1` to let them fire; `TUNI_SESSION=0` neither restores the
-saved session nor overwrites it; `TUNI_DEBUG_FRAME_TIME` prints draw-time
+saved session nor overwrites it; `TUNI_SINGLE_INSTANCE=0` runs a window of its
+own rather than opening a project in the tuni already running, which is what a
+build being worked on wants; `TUNI_DEBUG_FRAME_TIME` prints draw-time
 percentiles; `TUNI_DEBUG_STARTUP` prints how many milliseconds each phase
 before the first frame took;
 `TUNI_DEBUG_PTY_WRITE` logs what the terminal answers back to the shell;

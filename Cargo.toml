@@ -7,7 +7,7 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/unisic/tuni"
 rust-version = "1.95"
-version = "1.4.1"
+version = "1.5.0"
 
 [workspace.dependencies]
 tuni-core = { path = "crates/tuni-core" }

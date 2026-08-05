@@ -6,7 +6,7 @@
 # GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
 # populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.4.1/ -o tuni-1.4.1.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.5.0/ -o tuni-1.5.0.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.15.2
 
 Name:           tuni
-Version:        1.4.1
+Version:        1.5.0
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -89,6 +89,30 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/*/*/*.svg
 
 %changelog
+* Wed Aug 05 2026 Unisic <contact@unisic.app> - 1.5.0-1
+- Tuni opens on a fresh shell; restoring the last session is a switch, and it
+  is off. A second switch restores each pane's working directory, which is read
+  from the kernel for the shells that never send OSC 7.
+- A tab dragged off the strip moves rather than closes: onto the desktop it
+  becomes a window of its own, onto another window's strip it joins that
+  window, onto a project row in the sidebar it moves into that project. The row
+  swells and lights up under the tab and holds that light for a moment after it
+  lands; the tab's menu says "Move to Project" for the same move without the
+  drag. A project row dragged off the sidebar takes every tab in it.
+- Ctrl+Shift+R reopens the tab just closed, and the four before it, with its
+  panes, its name and the output each terminal had printed.
+- A tab spins while a coding agent is thinking in it, and the project's row
+  spins beside it. A command that ran ten seconds or longer raises a
+  notification when it exits in a tab that is out of sight.
+- Ctrl+Shift+Page Up and Page Down walk the scrollback one prompt at a time,
+  Ctrl+Alt+I types into every pane of the tab at once, and
+  Ctrl+Shift+Backspace wipes a half-typed command whole.
+- A project's row can carry an icon or an emoji in place of its folder.
+- Opening a folder from a file manager reaches the Tuni already running and
+  opens it as a project of its own.
+- Every preferences row says what it does in one line, and the session
+  settings are a page of their own.
+
 * Mon Aug 03 2026 Unisic <contact@unisic.app> - 1.4.1-1
 - The install command in the README runs in fish, which has no process
   substitution: it is a pipe into bash rather than bash reading a substituted

@@ -75,6 +75,54 @@ impl Agent {
     }
 }
 
+/// Whether a terminal title says the agent in that pane is working on a turn.
+///
+/// An agent that is thinking spins something, and it spins it in the terminal
+/// title as well as on the screen. Claude Code writes `✳ Claude Code` while it
+/// waits for a turn and swaps the star for a braille frame while it works:
+/// `⠂ Claude Code`, `⠐ Claude Code`, and so on until the answer lands. Measured
+/// from its own output rather than assumed, on 2.1.221.
+///
+/// Reading the title is what makes this affordable. It arrives as an escape
+/// sequence the terminal parses anyway, so nothing polls `/proc` for it and
+/// nothing scrapes the screen; a pane whose agent says nothing simply never
+/// reports, which is also what every non-agent pane does.
+///
+/// Braille is the whole test on purpose. A spinner is drawn out of that block
+/// and nothing else is: no directory, no command line and no hostname a prompt
+/// puts in a title starts with one.
+#[must_use]
+pub fn thinking(title: &str) -> bool {
+    matches!(title.chars().next(), Some(first) if ('\u{2800}'..='\u{28ff}').contains(&first))
+}
+
+/// The same title with the agent's own status glyph taken off the front.
+///
+/// Having read the state out of the glyph, tuni draws it as a spinner on the
+/// tab, and leaving the glyph in place would say it twice: a tab reading
+/// `⠂ Claude Code` beside a spinner is one animation too many, and the frame
+/// changing four times a second under a name is what makes a tab strip restless
+/// to sit next to. The name stays; the flicker goes.
+///
+/// The idle star comes off with the spinner frames, not because it animates but
+/// because leaving it would make the tab jump between two names as a turn starts
+/// and ends. What is left is what the agent calls itself.
+#[must_use]
+pub fn strip_spinner(title: &str) -> &str {
+    let mut rest = title.chars();
+    let Some(first) = rest.next() else {
+        return title;
+    };
+    if !('\u{2800}'..='\u{28ff}').contains(&first) && first != '✳' {
+        return title;
+    }
+    let rest = rest.as_str().trim_start();
+    // A title that is nothing but the glyph is left alone: an empty one would
+    // send the tab back to whatever names an untitled pane, which is a bigger
+    // change than the flicker this is here to stop.
+    if rest.is_empty() { title } else { rest }
+}
+
 /// What a turn cost, in the four kinds every one of these agents counts.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Tokens {
@@ -834,6 +882,33 @@ mod tests {
             claude_slug(Path::new("/home/dean/.config/ghostty")),
             "-home-dean--config-ghostty"
         );
+    }
+
+    #[test]
+    fn a_spinner_in_the_title_says_the_agent_is_working() {
+        // Measured from Claude Code itself, both states.
+        assert!(thinking("⠂ Claude Code"));
+        assert!(thinking("⠐ Claude Code"));
+        assert!(!thinking("✳ Claude Code"));
+    }
+
+    #[test]
+    fn the_agents_own_spinner_comes_off_the_tab() {
+        assert_eq!(strip_spinner("⠂ Claude Code"), "Claude Code");
+        assert_eq!(strip_spinner("✳ Claude Code"), "Claude Code");
+        assert_eq!(strip_spinner("Claude Code"), "Claude Code");
+        assert_eq!(strip_spinner("~/Projects/tuni"), "~/Projects/tuni");
+        // Nothing left to name the tab with, so nothing is taken.
+        assert_eq!(strip_spinner("⠂"), "⠂");
+        assert_eq!(strip_spinner(""), "");
+    }
+
+    #[test]
+    fn an_ordinary_title_is_not_mistaken_for_a_spinner() {
+        assert!(!thinking(""));
+        assert!(!thinking("dean@fedora:~/Projects/tuni"));
+        assert!(!thinking("vim src/main.rs"));
+        assert!(!thinking("~/Projects/tuni"));
     }
 
     #[test]

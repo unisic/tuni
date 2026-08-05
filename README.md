@@ -21,8 +21,19 @@ A native terminal workspace for Linux.
 - The hosts `~/.ssh/config` already declares, one shared connection per machine,
   and an SFTP page for the machine a pane is on
 - Kitty graphics, OSC 8 hyperlinks, desktop notifications, progress bars
+- A long command finishing in a tab you are not watching says so, with what it
+  was and how long it took
+- Scroll a command at a time in a shell that marks its prompts, reopen the last
+  five closed tabs, drag a tab or a whole project out into a window of its own
+  without restarting the shells in it
+- Type one command into every pane of a tab at once, and wipe the one being
+  typed with `Ctrl+Shift+Backspace` whatever the shell
+- A project's row takes an icon from the desktop's theme, or an emoji
+- A coding agent thinking in a pane spins on its tab and on its project, and
+  leaves an exclamation there when it finishes into a tab you are not watching
 - Ghostty's 574 themes, which paint the window chrome as well as the terminal
-- The window comes back as it was left
+- The window comes back as it was left, once "Restore the Last Session" is on;
+  a fresh shell every time is the default
 
 Rust and GTK4/libadwaita, with Ghostty's `libghostty-vt` doing the emulation.
 
@@ -82,7 +93,7 @@ reports.
 
 Run it again to update, or let Tuni do it: it checks the release page once per
 run and offers an Update button that opens the installer in a tab, where sudo
-has somewhere to ask for your password. Preferences - Terminal - Updates turns
+has somewhere to ask for your password. Preferences - Session - Updates turns
 the check off.
 
 Every [release](https://github.com/unisic/tuni/releases) carries the same three

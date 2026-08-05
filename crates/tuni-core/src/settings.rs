@@ -97,6 +97,21 @@ pub struct Settings {
     /// without turning it off everywhere — see
     /// [`crate::workspace::Project::inherit_directory`].
     pub new_tab_inherits_directory: bool,
+    /// Whether the window opens on the workspace the last one closed with.
+    ///
+    /// Off, so tuni starts the way a terminal does: one empty project, one
+    /// shell, wherever a shell would have started. A window is still written
+    /// down when it closes, so turning this on restores the last one rather
+    /// than waiting for a session to accumulate.
+    pub restore_session: bool,
+    /// Whether a restored pane starts in the directory its shell was working
+    /// in, rather than where a shell started outside the window would.
+    ///
+    /// On, because a window that opens again should open on the work it was
+    /// closed on. Off is for people who want every run to start clean, and it
+    /// decides restoring only: what a new tab inherits from the visible shell
+    /// is [`Self::new_tab_inherits_directory`].
+    pub restore_directory: bool,
     /// Whether a restored tab replays what its shell had printed before.
     ///
     /// Off by default, and deliberately so: it writes terminal output to disk,
@@ -168,6 +183,8 @@ impl Default for Settings {
             appearance: Appearance::default(),
             new_tab: NewTab::default(),
             new_tab_inherits_directory: true,
+            restore_session: false,
+            restore_directory: true,
             restore_history: false,
             wrap_lines: false,
             auto_hide_tab_bar: false,
@@ -289,6 +306,12 @@ impl Settings {
             .filter(|lines| *lines >= 0.0)
         {
             settings.terminal.scrollback_lines = lines as usize;
+        }
+        if let Some(on) = table.boolean("session.restore") {
+            settings.restore_session = on;
+        }
+        if let Some(on) = table.boolean("terminal.restore-directory") {
+            settings.restore_directory = on;
         }
         if let Some(on) = table.boolean("terminal.restore-history") {
             settings.restore_history = on;
@@ -447,6 +470,16 @@ impl Settings {
                 out,
                 "terminal.scrollback-lines = {}",
                 self.terminal.scrollback_lines
+            );
+        }
+        if self.restore_session != default.restore_session {
+            let _ = writeln!(out, "session.restore = {}", self.restore_session);
+        }
+        if self.restore_directory != default.restore_directory {
+            let _ = writeln!(
+                out,
+                "terminal.restore-directory = {}",
+                self.restore_directory
             );
         }
         if self.restore_history != default.restore_history {
@@ -868,6 +901,8 @@ mod tests {
             appearance: Appearance::Dark,
             new_tab: NewTab::Hosts,
             new_tab_inherits_directory: false,
+            restore_session: true,
+            restore_directory: false,
             restore_history: true,
             wrap_lines: true,
             auto_hide_tab_bar: true,
@@ -905,6 +940,8 @@ mod tests {
         assert!(read.background_blur);
         assert_eq!(read.appearance, Appearance::Dark);
         assert!(read.restore_history);
+        assert!(read.restore_session);
+        assert!(!read.restore_directory);
         assert!(read.wrap_lines);
         assert!(read.auto_hide_tab_bar);
         assert_eq!(read.new_tab, NewTab::Hosts);

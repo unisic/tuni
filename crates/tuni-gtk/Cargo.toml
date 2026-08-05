@@ -16,7 +16,11 @@ tuni-core.workspace = true
 tuni-pty.workspace = true
 tuni-vt.workspace = true
 
-adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
+# `gtk_v4_10` is what turns AdwSpinner on in the bindings rather than a floor of
+# its own: libadwaita 1.6 is where that widget arrives and already asks for a
+# newer GTK than 4.10. It is the same spinner AdwTabPage draws on a loading tab,
+# which is the point of using it on the sidebar row beside it.
+adw = { package = "libadwaita", version = "0.9", features = ["v1_6", "gtk_v4_10"] }
 # The same bridge tuni-pty crosses: a language server's reader thread feeds the
 # main loop through one of these.
 async-channel = "2"

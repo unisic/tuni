@@ -14,7 +14,7 @@
 //! the model decides, and [`TuniGrid`] renders whatever it says.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -86,6 +86,64 @@ const PANEL_POLL_SECONDS: u32 = 2;
 const CONNECT_INTERVAL: Duration = Duration::from_millis(250);
 const CONNECT_TRIES: u32 = 240;
 
+/// What an agent that has finished leaves on its tab and on its project's row.
+/// The desktop's own exclamation, which every application here already uses for
+/// "this wants you", rather than a mark of tuni's own that would have to be
+/// learned.
+const DONE_ICON: &str = "emblem-important-symbolic";
+
+/// How many closed tabs a window can put back. Five is what a browser keeps and
+/// as far as anybody reaches for from memory; the cost is the reason there is a
+/// number at all, since each one holds up to `HISTORY_LINE_LIMIT` lines of
+/// scrollback per pane it had.
+const CLOSED_TABS: usize = 5;
+
+/// A tab that has been closed, kept whole enough to open again: the same
+/// snapshot the session file is made of, the scrollback its terminals were
+/// holding, and the project it belonged to.
+///
+/// The shells are gone by the time this exists - closing a tab hangs them up -
+/// so reopening starts new ones in the same layout, in the same directories,
+/// with the output the old ones had replayed above the prompt. That is exactly
+/// what restoring a session does, which is why it is the same machinery.
+pub struct ClosedTab {
+    project: Id,
+    snapshot: tuni_core::session::TabSnapshot,
+    history: History,
+}
+
+thread_local! {
+    /// The tab a drag is carrying between strips: the window and project it
+    /// left, and the model's record of it, which no project holds while it is
+    /// in the air.
+    ///
+    /// `AdwTabView` detaches the page the moment the drag starts and attaches
+    /// it again wherever it lands: the desktop, another window's strip, a
+    /// sidebar row, or back where it came from when the drag is called off.
+    /// The detach is the same signal a closed tab sends, so a tab in flight is
+    /// parked here instead of being torn down, and the attach at the other end
+    /// puts it back into a project. One slot rather than one per window: a
+    /// pointer drags one tab at a time, and the attach happens in whichever
+    /// window took it.
+    /// Where it came from is kept as well as what it is, so the arrival can
+    /// tell a move from a drag that was called off and put back.
+    static IN_FLIGHT: RefCell<Option<(TuniWindow, Id, Tab)>> = const { RefCell::new(None) };
+
+    /// The project a dragged tab was let go of over, and the window whose
+    /// sidebar drew that row. Read by the `create-window` that follows every
+    /// drop outside a strip, which answers with that project's strip instead
+    /// of a new window's.
+    static DROPPED_ON: RefCell<Option<(TuniWindow, Id)>> = const { RefCell::new(None) };
+
+    /// Whether the page about to be attached was let go of outside a strip.
+    ///
+    /// Such a drop names a project rather than a place in one, and libadwaita
+    /// attaches it at index 0 because a window it asked to have made would have
+    /// nothing else in it. A project that does gets the tab at the end, where a
+    /// new tab goes and where the menu's "Move to Project" puts it.
+    static DROPPED_OUTSIDE: Cell<bool> = const { Cell::new(false) };
+}
+
 /// What a Find command found to act on. The bar over a terminal belongs to the
 /// window and is handed the terminal it is pointing at; a file pane carries its
 /// own search inside GtkSourceView.
@@ -106,10 +164,22 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "win.new-tab",
     ),
     (
+        "Reopen Closed Tab",
+        "edit-undo-symbolic",
+        Some("Ctrl+Shift+R"),
+        "win.reopen-tab",
+    ),
+    (
         "New Connection",
         "network-server-symbolic",
         Some("Ctrl+Shift+O"),
         "win.new-connection",
+    ),
+    (
+        "Broadcast Typing to Every Pane",
+        "send-to-symbolic",
+        Some("Ctrl+Alt+I"),
+        "win.broadcast",
     ),
     (
         "New Project",
@@ -199,6 +269,18 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "win.clear-terminal",
     ),
     (
+        "Previous Prompt",
+        "go-up-symbolic",
+        Some("Ctrl+Shift+Page Up"),
+        "win.previous-prompt",
+    ),
+    (
+        "Next Prompt",
+        "go-down-symbolic",
+        Some("Ctrl+Shift+Page Down"),
+        "win.next-prompt",
+    ),
+    (
         "Save File",
         "media-floppy-symbolic",
         Some("Ctrl+S"),
@@ -254,8 +336,9 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
 
 mod imp {
     use super::{
-        Cell, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniFind, TuniGrid, TuniHosts,
-        TuniPanel, TuniRemote, TuniSwitcher, TuniTerminal, Workspace, glib,
+        Cell, ClosedTab, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniFind, TuniGrid,
+        TuniHosts, TuniPanel, TuniRemote, TuniSwitcher, TuniTerminal, VecDeque, Workspace, gio,
+        glib,
     };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
@@ -289,6 +372,17 @@ mod imp {
         /// Where the cursor was in each restored file pane, by pane id, until
         /// its editor exists to be told.
         pub pending_cursors: RefCell<HashMap<Id, usize>>,
+        /// The "Move to Project" part of every tab's context menu, filled in
+        /// as the menu opens. One `GMenu` shared by every strip in the window,
+        /// because `AdwTabBox` builds its popover from the model once and
+        /// keeps it: a list that changes with the projects has to change in
+        /// place rather than by handing over another model.
+        pub tab_move: RefCell<Option<gio::Menu>>,
+        /// The tabs this window has closed, oldest first, capped at
+        /// [`CLOSED_TABS`](super::CLOSED_TABS). Per window rather than per
+        /// application: the tab goes back where it was, and where it was is a
+        /// project in this window.
+        pub closed: RefCell<VecDeque<ClosedTab>>,
         /// Set once the window has been allowed to close, so the unsaved-work
         /// question is asked once rather than every time the answer is acted
         /// on.
@@ -330,6 +424,36 @@ mod imp {
         pub status_button: RefCell<Option<gtk::Button>>,
         pub tab_bar: RefCell<Option<adw::TabBar>>,
         pub title: RefCell<Option<adw::WindowTitle>>,
+
+        /// Panes whose coding agent is working, each with the tab and project
+        /// it sits in. Keyed by pane rather than counted per tab because two
+        /// agents in one tab finish at their own times, and the pane that just
+        /// finished has to be the only thing removed.
+        pub working: RefCell<HashMap<Id, (Id, Id)>>,
+        /// Panes whose agent has finished a turn nobody has looked at yet, the
+        /// same way round as `working`. An answer waiting in a tab that is not
+        /// on screen is the other half of the question the spinner asks, and
+        /// the mark clears the moment the tab is selected.
+        pub finished: RefCell<HashMap<Id, (Id, Id)>>,
+        /// The spinner on each sidebar row, by project id. Built with the row
+        /// and hidden, since a project with nothing thinking is the usual case.
+        /// AdwSpinner rather than GtkSpinner: the tab strip draws the first for
+        /// a loading page, and the second is a ring of separate spokes, so the
+        /// two sat side by side saying the same thing in two different hands.
+        pub spinners: RefCell<HashMap<Id, adw::Spinner>>,
+        /// The folder image on each sidebar row, which the spinner stands in
+        /// for while the project is busy and which becomes an exclamation once
+        /// an agent in it has finished. One widget in one slot, so the row is
+        /// the same width in all three states and the name never shifts.
+        pub icons: RefCell<HashMap<Id, gtk::Image>>,
+        /// The same slot, for a project whose icon is an emoji: a themed icon
+        /// is drawn by GtkImage and an emoji is text, and no one widget draws
+        /// both. Only one of the two is ever visible, and a project that never
+        /// picked an emoji leaves this one empty and hidden for good.
+        pub emoji: RefCell<HashMap<Id, gtk::Label>>,
+        /// The banner that says typing goes to every pane in the tab. One per
+        /// window, showing whatever the tab in front is doing.
+        pub banner: RefCell<Option<adw::Banner>>,
 
         /// The tab whose context menu is open, if any.
         pub menu_page: RefCell<Option<adw::TabPage>>,
@@ -651,8 +775,23 @@ impl TuniWindow {
         // The tab strip belongs to the terminals, so it stops where they do:
         // stretched over the panel it would name tabs for a column that shows
         // the same three pages whichever tab is in front.
+        // Typing into four shells at once is not a thing to discover by the
+        // output, so it is said in the one place nothing else writes, under the
+        // strip and above the panes, with the way out on it.
+        let banner = adw::Banner::builder()
+            .title("Typing goes to every pane in this tab")
+            .button_label("Stop")
+            .revealed(false)
+            .build();
+        banner.connect_button_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.toggle_broadcast()
+        ));
+
         let terminal_view = adw::ToolbarView::new();
         terminal_view.add_top_bar(&tab_bar);
+        terminal_view.add_top_bar(&banner);
         terminal_view.set_content(Some(&content_overlay));
 
         let panel = adw::OverlaySplitView::builder()
@@ -775,6 +914,7 @@ impl TuniWindow {
         imp.status.replace(Some(status));
         imp.status_button.replace(Some(status_button));
         imp.tab_bar.replace(Some(tab_bar));
+        imp.banner.replace(Some(banner));
         imp.title.replace(Some(title));
     }
 
@@ -804,6 +944,8 @@ impl TuniWindow {
                     view.close_page(&page);
                 }
             }),
+            entry("reopen-tab", None, |window, _| window.reopen_tab()),
+            entry("broadcast", None, |window, _| window.toggle_broadcast()),
             entry("close-pane", None, |window, _| window.close_focused_pane()),
             entry("split-right", None, |window, _| window.split(Edge::Right)),
             entry("split-down", None, |window, _| window.split(Edge::Down)),
@@ -898,6 +1040,29 @@ impl TuniWindow {
                     window.refresh();
                 }
             }),
+            entry("tear-out-project", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.tear_out_project(id);
+                }
+            }),
+            // The menu's half of dragging a tab onto a sidebar row: the same
+            // move, for a drag a tiling compositor swallowed or a hand that
+            // would rather read a list than aim at a row.
+            entry("tab-move-to-project", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.move_tab_to_project(id);
+                }
+            }),
+            entry("project-icon", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.choose_project_icon(id);
+                }
+            }),
+            entry("automatic-project-icon", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.set_project_icon(id, None);
+                }
+            }),
             entry("set-project-directory", uint64, |window, target| {
                 if let Some(id) = project_target(target) {
                     window.choose_project_directory(id);
@@ -965,6 +1130,16 @@ impl TuniWindow {
                 if let Some(terminal) = window.active_terminal() {
                     terminal.clear();
                 }
+            }),
+            // Walking the scrollback by command instead of by screenful. Only a
+            // shell that marks its prompts with OSC 133 has anything to walk, so
+            // the answer when nothing moved is a toast rather than silence: the
+            // key is not broken, the shell is not saying where the prompts are.
+            entry("previous-prompt", None, |window, _| {
+                window.jump_to_prompt(true);
+            }),
+            entry("next-prompt", None, |window, _| {
+                window.jump_to_prompt(false);
             }),
             // The setting, not a per-window mood: a program takes the mouse in
             // every pane it runs in, so the way out of it is the same knob the
@@ -1565,11 +1740,27 @@ impl TuniWindow {
     }
 
     /// Rebuilds the last session's window. `false` when there is nothing saved
-    /// to rebuild, which is the caller's cue to open a first project instead.
+    /// to rebuild or the setting says not to, which is the caller's cue to open
+    /// a first project instead.
+    ///
+    /// The window is still written down when it closes with the setting off:
+    /// the file is what turning it on has to restore, and a session that only
+    /// began accumulating once somebody found the switch would restore nothing
+    /// the first time.
     pub fn restore_session(&self) -> bool {
-        let Some(restored) = Snapshot::load().map(|snapshot| snapshot.restore()) else {
+        if !self.imp().settings.borrow().restore_session {
+            return false;
+        }
+        let Some(mut snapshot) = Snapshot::load() else {
             return false;
         };
+        // Cleared on the snapshot rather than at each pane, so nothing below
+        // has to know the setting: a pane with no directory is what a session
+        // whose shell never said where it was already looks like.
+        if !self.imp().settings.borrow().restore_directory {
+            snapshot.forget_directories();
+        }
+        let restored = snapshot.restore();
         if restored.workspace.is_empty() {
             return false;
         }
@@ -1662,7 +1853,28 @@ impl TuniWindow {
 
     /// Opens a project with one terminal in it, and shows it.
     pub fn open_project(&self) -> Id {
+        self.open_project_in(None)
+    }
+
+    /// The same, for a project that is about a directory: a launch from a file
+    /// manager or a shell that named one.
+    ///
+    /// The directory is pinned rather than typed into the shell, so every tab
+    /// opened in the project afterwards starts there too and the file tree and
+    /// the git panel anchor to it. The name comes from the folder for the same
+    /// reason the sidebar shows one at all: a row saying "Project 3" next to
+    /// three others says nothing, and "Use Automatic Title" gives it back to
+    /// the shell for anybody who would rather have that.
+    pub fn open_project_in(&self, directory: Option<&Path>) -> Id {
         let id = self.imp().workspace.borrow_mut().open_project();
+        if let Some(directory) = directory
+            && let Some(project) = self.imp().workspace.borrow_mut().project_mut(id)
+        {
+            project.custom_directory = Some(directory.to_string_lossy().into_owned());
+            project.custom_name = directory
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+        }
         self.attach_project(id);
         self.rebuild_sidebar();
         self.show_selected_project();
@@ -1675,12 +1887,18 @@ impl TuniWindow {
     fn attach_project(&self, id: Id) {
         let imp = self.imp();
         let view = adw::TabView::new();
-        view.set_menu_model(Some(&tab_menu()));
+        view.set_menu_model(Some(&tab_menu(&self.move_section())));
         view.connect_setup_menu(glib::clone!(
             #[weak(rename_to = this)]
             self,
             move |_, page| {
                 this.imp().menu_page.replace(page.cloned());
+                // As the menu opens rather than when the projects change: the
+                // strip's popover holds the model it was built from, so the
+                // list is written into the same one every time.
+                if page.is_some() {
+                    this.fill_move_section(id);
+                }
             }
         ));
         // A tab with unsaved work in it asks before it goes; the strip waits
@@ -1695,7 +1913,26 @@ impl TuniWindow {
         view.connect_page_detached(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |_, _, position| this.tab_detached(id, position)
+            move |view, _, position| this.tab_detached(view, id, position)
+        ));
+        // The other half of a detach that was a drag rather than a close: the
+        // page has landed, in this strip or another window's, and the tab it
+        // carries goes back into a project.
+        view.connect_page_attached(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |view, page, position| this.tab_attached(view, id, page, position)
+        ));
+        // A tab dropped outside every strip asks for a window to land in.
+        // Answering with one hands the page over live: the widgets, and so the
+        // shells inside them, are moved rather than rebuilt. A drop on a
+        // sidebar row is answered with that project's strip instead.
+        view.connect_create_window(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            None,
+            move |_| this.view_for_dropped_tab()
         ));
         view.connect_page_reordered(glib::clone!(
             #[weak(rename_to = this)]
@@ -1794,6 +2031,7 @@ impl TuniWindow {
 
         self.refresh();
         self.sync_files();
+        self.sync_banner();
         self.focus_pane();
     }
 
@@ -1872,7 +2110,7 @@ impl TuniWindow {
             (entry.name().to_owned(), panes)
         };
 
-        let grid = self.new_grid(project, tab);
+        let grid = self.new_grid(tab);
         let page = view.insert(&grid, position);
         page.set_title(&name);
         page.set_live_thumbnail(true);
@@ -1884,16 +2122,16 @@ impl TuniWindow {
             .into_iter()
             .filter_map(|(pane, directory, content)| {
                 if !matches!(content, Content::Terminal | Content::Ssh { .. }) {
-                    self.new_content(project, tab, pane, &content);
+                    self.new_content(tab, pane, &content);
                     return None;
                 }
                 let cwd = directory
                     .map(PathBuf::from)
                     .filter(|path| path.is_dir())
                     .or_else(|| fallback.clone());
-                let terminal = self.new_terminal(project, tab, pane);
+                let terminal = self.new_terminal(tab, pane);
                 if is_remote(&content) {
-                    self.new_remote(project, tab, pane, &terminal);
+                    self.new_remote(tab, pane, &terminal);
                 }
                 Some((terminal, pane, content, cwd))
             })
@@ -1917,7 +2155,7 @@ impl TuniWindow {
             return;
         }
 
-        let terminal = self.new_terminal(project, tab, pane_id);
+        let terminal = self.new_terminal(tab, pane_id);
         self.rebuild_grid(project, tab);
         self.refresh();
         self.start_terminal(
@@ -1946,21 +2184,128 @@ impl TuniWindow {
     }
 
     /// A terminal for one pane, themed and remembered.
-    fn new_terminal(&self, project: Id, tab: Id, pane: Id) -> TuniTerminal {
+    fn new_terminal(&self, tab: Id, pane: Id) -> TuniTerminal {
         let imp = self.imp();
         let terminal = TuniTerminal::new();
         terminal.set_hexpand(true);
         terminal.set_vexpand(true);
         terminal.set_config(&imp.settings.borrow().terminal);
         terminal.set_theme(&self.theme());
+        // A pane split off a broadcasting tab is part of it: the split is what
+        // was asked for, and a pane that quietly stayed out would be one shell
+        // in four not running what the other three ran.
+        terminal.set_broadcast(self.broadcasting(tab));
         imp.terminals.borrow_mut().insert(pane, terminal.clone());
-        self.watch_terminal(&terminal, project, tab, pane);
+        self.watch_terminal(&terminal, tab, pane);
         terminal
+    }
+
+    /// Whether this tab sends what is typed in one pane to all of them.
+    fn broadcasting(&self, tab: Id) -> bool {
+        self.imp()
+            .workspace
+            .borrow()
+            .projects()
+            .iter()
+            .find_map(|project| project.tab(tab))
+            .is_some_and(|tab| tab.broadcast)
+    }
+
+    /// Turns broadcasting on or off for the tab in front.
+    ///
+    /// Per tab, and off again the moment the tab is closed with it: there is no
+    /// setting for this and nothing remembers it, because a mode that types
+    /// into several machines at once is one to leave on for a minute and not to
+    /// find still on tomorrow.
+    fn toggle_broadcast(&self) {
+        let imp = self.imp();
+        let Some((project, tab)) = self.selected_tab() else {
+            return;
+        };
+        let on = {
+            let mut workspace = imp.workspace.borrow_mut();
+            let Some(entry) = workspace
+                .project_mut(project)
+                .and_then(|project| project.tab_mut(tab))
+            else {
+                return;
+            };
+            entry.broadcast = !entry.broadcast;
+            entry.broadcast
+        };
+
+        self.apply_broadcast(tab, on);
+        self.sync_banner();
+        if on {
+            // The panes are the ones in this tab, and the count is what makes
+            // the difference between a mode and a mistake.
+            let panes = self.terminal_panes(tab).len();
+            self.toast(&format!("Typing goes to {panes} panes"));
+        }
+    }
+
+    /// Tells every terminal in a tab whether it is broadcasting.
+    fn apply_broadcast(&self, tab: Id, on: bool) {
+        let terminals = self.imp().terminals.borrow();
+        for pane in self.terminal_panes(tab) {
+            if let Some(terminal) = terminals.get(&pane) {
+                terminal.set_broadcast(on);
+            }
+        }
+    }
+
+    /// The panes of a tab that hold a terminal, in layout order.
+    ///
+    /// An editor, a diff or the host list is not one of them: broadcasting is
+    /// about shells, and a keystroke meant for four prompts has no business
+    /// landing in a file somebody is editing.
+    fn terminal_panes(&self, tab: Id) -> Vec<Id> {
+        let imp = self.imp();
+        let terminals = imp.terminals.borrow();
+        let workspace = imp.workspace.borrow();
+        workspace
+            .projects()
+            .iter()
+            .find_map(|project| project.tab(tab))
+            .map(|tab| {
+                tab.layout()
+                    .panes()
+                    .map(Pane::id)
+                    .filter(|pane| terminals.contains_key(pane))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Repeats what one pane was sent into the others in its tab.
+    fn broadcast_input(&self, tab: Id, from: Id, bytes: &[u8]) {
+        let Some((this, _)) = self.owner(tab) else {
+            return;
+        };
+        let terminals = this.imp().terminals.borrow().clone();
+        for pane in this.terminal_panes(tab) {
+            if pane == from {
+                continue;
+            }
+            if let Some(terminal) = terminals.get(&pane) {
+                terminal.send_bytes(bytes);
+            }
+        }
+    }
+
+    /// Shows the banner while the tab in front is broadcasting.
+    fn sync_banner(&self) {
+        let on = self
+            .selected_tab()
+            .is_some_and(|(_, tab)| self.broadcasting(tab));
+        if let Some(banner) = self.imp().banner.borrow().as_ref() {
+            banner.set_revealed(on);
+        }
     }
 
     /// The bar an ssh pane wears above its terminal, wired to the one thing it
     /// offers.
-    fn new_remote(&self, project: Id, tab: Id, pane: Id, terminal: &TuniTerminal) -> TuniRemote {
+    fn new_remote(&self, tab: Id, pane: Id, terminal: &TuniTerminal) -> TuniRemote {
         let remote = TuniRemote::new(terminal);
         remote.connect_open(glib::clone!(
             #[weak(rename_to = this)]
@@ -1968,6 +2313,9 @@ impl TuniWindow {
             #[weak]
             terminal,
             move || {
+                let Some((this, project)) = this.owner(tab) else {
+                    return;
+                };
                 let content = this.pane_content(project, tab, pane);
                 if let Some(content) = content {
                     this.start_session(&terminal, pane, &content, None, true);
@@ -1994,7 +2342,7 @@ impl TuniWindow {
     /// The host list for one pane, wired to the three places a connection it is
     /// asked for can go, and to the one thing it cannot do itself, which is
     /// open the file it only reads.
-    fn new_hosts(&self, project: Id, tab: Id, pane: Id) -> TuniHosts {
+    fn new_hosts(&self, tab: Id, pane: Id) -> TuniHosts {
         use crate::hosts::Message;
 
         let hosts = TuniHosts::new();
@@ -2003,15 +2351,20 @@ impl TuniWindow {
         hosts.connect_message(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |message| match message {
-                Message::Connect(alias) => {
-                    this.replace_pane(project, tab, pane, Pane::ssh(alias));
+            move |message| {
+                let Some((this, project)) = this.owner(tab) else {
+                    return;
+                };
+                match message {
+                    Message::Connect(alias) => {
+                        this.replace_pane(project, tab, pane, Pane::ssh(alias));
+                    }
+                    Message::LocalShell => this.replace_pane(project, tab, pane, Pane::new()),
+                    Message::ConnectToSide(alias) => this.open_pane_to_side(Pane::ssh(alias)),
+                    Message::ConnectInTab(alias) => this.open_pane(Pane::ssh(alias)),
+                    Message::OpenFile(path, line) => this.open_file_at(&path, line),
+                    Message::RunLocally(argv) => this.run_locally(&argv),
                 }
-                Message::LocalShell => this.replace_pane(project, tab, pane, Pane::new()),
-                Message::ConnectToSide(alias) => this.open_pane_to_side(Pane::ssh(alias)),
-                Message::ConnectInTab(alias) => this.open_pane(Pane::ssh(alias)),
-                Message::OpenFile(path, line) => this.open_file_at(&path, line),
-                Message::RunLocally(argv) => this.run_locally(&argv),
             }
         ));
         self.imp().hosts.borrow_mut().insert(pane, hosts.clone());
@@ -2047,14 +2400,14 @@ impl TuniWindow {
     fn fill_pane(&self, project: Id, tab: Id, pane: Id, content: &Content, cwd: Option<PathBuf>) {
         let terminal = match content {
             Content::Terminal | Content::Ssh { .. } => {
-                let terminal = self.new_terminal(project, tab, pane);
+                let terminal = self.new_terminal(tab, pane);
                 if is_remote(content) {
-                    self.new_remote(project, tab, pane, &terminal);
+                    self.new_remote(tab, pane, &terminal);
                 }
                 Some(terminal)
             }
             _ => {
-                self.new_content(project, tab, pane, content);
+                self.new_content(tab, pane, content);
                 None
             }
         };
@@ -2067,7 +2420,7 @@ impl TuniWindow {
     }
 
     /// An editor for one pane, opened on a file and remembered.
-    fn new_editor(&self, project: Id, tab: Id, pane: Id, path: &Path) -> TuniEditor {
+    fn new_editor(&self, tab: Id, pane: Id, path: &Path) -> TuniEditor {
         let imp = self.imp();
         let editor = TuniEditor::new();
         editor.set_hexpand(true);
@@ -2088,14 +2441,18 @@ impl TuniWindow {
         editor.connect_focused(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move || this.pane_focused(project, tab, pane)
+            move || {
+                if let Some((this, project)) = this.owner(tab) {
+                    this.pane_focused(project, tab, pane);
+                }
+            }
         ));
         imp.editors.borrow_mut().insert(pane, editor.clone());
         editor
     }
 
     /// A diff for one pane, opened on a file and remembered.
-    fn new_diff(&self, project: Id, tab: Id, pane: Id, path: &Path, staged: bool) -> TuniDiff {
+    fn new_diff(&self, tab: Id, pane: Id, path: &Path, staged: bool) -> TuniDiff {
         let imp = self.imp();
         let diff = TuniDiff::new();
         diff.set_hexpand(true);
@@ -2105,7 +2462,11 @@ impl TuniWindow {
         diff.connect_focused(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move || this.pane_focused(project, tab, pane)
+            move || {
+                if let Some((this, project)) = this.owner(tab) {
+                    this.pane_focused(project, tab, pane);
+                }
+            }
         ));
         // Staging from the diff changes what the panel is showing, and the
         // panel would otherwise not know until its next poll.
@@ -2218,17 +2579,17 @@ impl TuniWindow {
     /// Builds whatever a pane holds, for a pane already in the layout. Not a
     /// terminal or a connection: those need a directory to start in and
     /// something to start, which only the caller knows.
-    fn new_content(&self, project: Id, tab: Id, pane: Id, content: &Content) {
+    fn new_content(&self, tab: Id, pane: Id, content: &Content) {
         match content {
             Content::Terminal | Content::Ssh { .. } => (),
             Content::File(path) => {
-                self.new_editor(project, tab, pane, path);
+                self.new_editor(tab, pane, path);
             }
             Content::Diff { path, staged } => {
-                self.new_diff(project, tab, pane, path, *staged);
+                self.new_diff(tab, pane, path, *staged);
             }
             Content::Hosts => {
-                self.new_hosts(project, tab, pane);
+                self.new_hosts(tab, pane);
             }
         }
     }
@@ -2519,12 +2880,16 @@ impl TuniWindow {
 
     /// The widget one tab's panes live in, listening for what only the pointer
     /// can decide.
-    fn new_grid(&self, project: Id, tab: Id) -> TuniGrid {
+    fn new_grid(&self, tab: Id) -> TuniGrid {
         let grid = TuniGrid::new();
         grid.connect_message(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |message| this.grid_message(project, tab, message)
+            move |message| {
+                if let Some((this, project)) = this.owner(tab) {
+                    this.grid_message(project, tab, message);
+                }
+            }
         ));
         self.imp().grids.borrow_mut().insert(tab, grid.clone());
         grid
@@ -2627,13 +2992,19 @@ impl TuniWindow {
     /// working directory is where the next shell starts, its bell marks the tab
     /// when it is not the one on screen, clicking into it moves the focus ring,
     /// and its shell's death closes the pane.
-    fn watch_terminal(&self, terminal: &TuniTerminal, project: Id, tab: Id, pane: Id) {
+    fn watch_terminal(&self, terminal: &TuniTerminal, tab: Id, pane: Id) {
         terminal.connect_notify_local(
             Some("title"),
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
                 move |terminal: &TuniTerminal, _| {
+                    // The window and the project as they are now, which is not
+                    // where this handler was wired if the tab has since been
+                    // dragged out into a window of its own.
+                    let Some((this, project)) = this.owner(tab) else {
+                        return;
+                    };
                     let title = terminal.title();
                     if let Some(entry) = this
                         .imp()
@@ -2655,6 +3026,9 @@ impl TuniWindow {
                 #[weak(rename_to = this)]
                 self,
                 move |terminal: &TuniTerminal, _| {
+                    let Some((this, project)) = this.owner(tab) else {
+                        return;
+                    };
                     let cwd = terminal.cwd();
                     if let Some(entry) = this
                         .imp()
@@ -2678,6 +3052,39 @@ impl TuniWindow {
             ),
         );
 
+        terminal.connect_notify_local(
+            Some("working"),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |terminal: &TuniTerminal, _| {
+                    let Some((this, project)) = this.owner(tab) else {
+                        return;
+                    };
+                    let imp = this.imp();
+                    if terminal.property::<bool>("working") {
+                        imp.working.borrow_mut().insert(pane, (project, tab));
+                        imp.finished.borrow_mut().remove(&pane);
+                    } else if imp.working.borrow_mut().remove(&pane).is_some() {
+                        // Only a pane that was working can finish, and only
+                        // into a tab nobody is looking at: an answer that
+                        // arrived on screen has already been seen, so marking
+                        // it would be a mark to dismiss for nothing. The bell
+                        // decides the same way.
+                        let watched = imp
+                            .pages
+                            .borrow()
+                            .get(&tab)
+                            .is_some_and(adw::TabPage::is_selected);
+                        if !watched {
+                            imp.finished.borrow_mut().insert(pane, (project, tab));
+                        }
+                    }
+                    this.refresh_agents();
+                }
+            ),
+        );
+
         // The keyboard is GTK's to give; the model is told where it went rather
         // than asked to move it, which is what keeps a click and a shortcut
         // ending in the same place.
@@ -2687,6 +3094,9 @@ impl TuniWindow {
                 #[weak(rename_to = this)]
                 self,
                 move |terminal: &TuniTerminal, _| {
+                    let Some((this, project)) = this.owner(tab) else {
+                        return;
+                    };
                     if terminal.has_focus() {
                         this.pane_focused(project, tab, pane);
                     }
@@ -2701,6 +3111,9 @@ impl TuniWindow {
                 #[weak(rename_to = this)]
                 self,
                 move |terminal: TuniTerminal| {
+                    let Some((this, _)) = this.owner(tab) else {
+                        return;
+                    };
                     if let Some(page) = this.imp().pages.borrow().get(&tab)
                         && !page.is_selected()
                     {
@@ -2719,6 +3132,49 @@ impl TuniWindow {
             ),
         );
 
+        // A build or a test run that ended while its tab was somewhere else.
+        // Judged the way the bell is judged, and for the same reason: a command
+        // whose last line is already on screen has told the person watching it,
+        // and a second telling is noise. Walking away is what this is for.
+        terminal.connect_closure(
+            "command-finished",
+            false,
+            glib::closure_local!(
+                #[weak(rename_to = this)]
+                self,
+                move |terminal: TuniTerminal, command: String, seconds: u64| {
+                    let Some((this, _)) = this.owner(tab) else {
+                        return;
+                    };
+                    if terminal.has_focus() && this.is_active() {
+                        return;
+                    }
+                    if let Some(page) = this.imp().pages.borrow().get(&tab)
+                        && !page.is_selected()
+                    {
+                        page.set_needs_attention(true);
+                    }
+                    this.notify_desktop(
+                        pane,
+                        &format!("{command} finished"),
+                        &format!("After {}", duration(seconds)),
+                    );
+                }
+            ),
+        );
+
+        terminal.connect_closure(
+            "broadcast",
+            false,
+            glib::closure_local!(
+                #[weak(rename_to = this)]
+                self,
+                move |_: TuniTerminal, bytes: glib::Bytes| {
+                    this.broadcast_input(tab, pane, &bytes);
+                }
+            ),
+        );
+
         terminal.connect_closure(
             "desktop-notify",
             false,
@@ -2726,7 +3182,9 @@ impl TuniWindow {
                 #[weak(rename_to = this)]
                 self,
                 move |_: TuniTerminal, title: String, body: String| {
-                    this.notify_desktop(pane, &title, &body);
+                    if let Some((this, _)) = this.owner(tab) {
+                        this.notify_desktop(pane, &title, &body);
+                    }
                 }
             ),
         );
@@ -2738,6 +3196,9 @@ impl TuniWindow {
                 #[weak(rename_to = this)]
                 self,
                 move |_: TuniTerminal, cleared: bool| {
+                    let Some((this, _)) = this.owner(tab) else {
+                        return;
+                    };
                     this.toast(if cleared {
                         "Cleared clipboard"
                     } else {
@@ -2753,7 +3214,11 @@ impl TuniWindow {
             glib::closure_local!(
                 #[weak(rename_to = this)]
                 self,
-                move |_: TuniTerminal| this.session_ended(project, tab, pane)
+                move |_: TuniTerminal| {
+                    if let Some((this, project)) = this.owner(tab) {
+                        this.session_ended(project, tab, pane);
+                    }
+                }
             ),
         );
     }
@@ -2819,6 +3284,21 @@ impl TuniWindow {
         notify::post(app.upcast_ref(), pane, title, body);
     }
 
+    /// Puts the focused terminal's viewport on the prompt above or below the one
+    /// it shows now, and says so when there is none to land on.
+    ///
+    /// A shell that does not mark its prompts is the common case rather than the
+    /// error case - bash, zsh and fish all need a line of configuration for it -
+    /// so the toast names the reason instead of reporting a failure.
+    fn jump_to_prompt(&self, up: bool) {
+        let Some(terminal) = self.active_terminal() else {
+            return;
+        };
+        if !terminal.scroll_to_prompt(up) {
+            self.toast("No prompt marked that way. The shell has to send OSC 133.");
+        }
+    }
+
     /// Raises a short-lived confirmation over the window's content: three
     /// seconds, the same toast Ghostty shows for the same copy.
     pub(crate) fn toast(&self, message: &str) {
@@ -2826,6 +3306,76 @@ impl TuniWindow {
             let toast = adw::Toast::new(message);
             toast.set_timeout(3);
             overlay.add_toast(toast);
+        }
+    }
+
+    /// Draws what the agents in this window are doing: a spinner on the tab and
+    /// on the project's row while one thinks, an exclamation in both places
+    /// once one has finished into a tab nobody is looking at.
+    ///
+    /// Two depths of the same fact, so that the answer to "where is it" takes no
+    /// clicking: the sidebar says which project, the tab strip says which tab.
+    /// Both come from the same two maps, so they cannot disagree about what is
+    /// running, and neither invents an animation the agent is not already
+    /// running — the glyph it spins in its own title is taken off the tab as
+    /// this spinner goes on.
+    fn refresh_agents(&self) {
+        let imp = self.imp();
+        let (busy_projects, busy_tabs) = split_ids(&imp.working.borrow());
+        let (done_projects, done_tabs) = split_ids(&imp.finished.borrow());
+
+        for (tab, page) in imp.pages.borrow().iter() {
+            let busy = busy_tabs.contains(tab);
+            if page.is_loading() != busy {
+                page.set_loading(busy);
+            }
+            // The loading spinner takes the icon's place, so the two states
+            // cannot show at once and the finished mark waits its turn.
+            let done = !busy && done_tabs.contains(tab);
+            page.set_icon(done.then(|| gio::ThemedIcon::new(DONE_ICON)).as_ref());
+            // Set, never cleared: the bell raises the same mark, and clearing
+            // it here would take down a ring nobody has seen yet. Selecting the
+            // tab is what clears both.
+            if done {
+                page.set_needs_attention(true);
+            }
+        }
+
+        let icons = imp.icons.borrow();
+        let emoji = imp.emoji.borrow();
+        let workspace = imp.workspace.borrow();
+        for (project, spinner) in imp.spinners.borrow().iter() {
+            let busy = busy_projects.contains(project);
+            // An AdwSpinner animates whenever it is on screen and stops when it
+            // is not, so showing it is the whole of starting it.
+            spinner.set_visible(busy);
+            // What the row would draw with nothing happening in it: the project's
+            // own icon if it picked one, the folder otherwise. An emoji is text
+            // and goes to the label, a name goes to the image, and the finished
+            // mark overrides both because it is the one that has to be seen.
+            let chosen = workspace
+                .project(*project)
+                .and_then(|project| project.icon.clone())
+                .filter(|_| !done_projects.contains(project));
+            let is_emoji = chosen
+                .as_deref()
+                .is_some_and(tuni_core::workspace::is_emoji);
+            if let Some(label) = emoji.get(project) {
+                label.set_visible(!busy && is_emoji);
+                label.set_label(if is_emoji {
+                    chosen.as_deref().unwrap_or_default()
+                } else {
+                    ""
+                });
+            }
+            if let Some(icon) = icons.get(project) {
+                icon.set_visible(!busy && !is_emoji);
+                icon.set_icon_name(Some(match chosen.as_deref() {
+                    _ if done_projects.contains(project) => DONE_ICON,
+                    Some(name) if !is_emoji => name,
+                    _ => "folder-symbolic",
+                }));
+            }
         }
     }
 
@@ -2850,6 +3400,13 @@ impl TuniWindow {
         imp.editors.borrow_mut().remove(&pane);
         imp.remotes.borrow_mut().remove(&pane);
         imp.hosts.borrow_mut().remove(&pane);
+        // A pane closed mid-turn never sends the notify that would have said it
+        // stopped, so both marks are cleared here instead.
+        let forgotten = imp.working.borrow_mut().remove(&pane).is_some()
+            | imp.finished.borrow_mut().remove(&pane).is_some();
+        if forgotten {
+            self.refresh_agents();
+        }
     }
 
     /// Closes one pane, and the tab with it when it was the last one.
@@ -3024,7 +3581,15 @@ impl TuniWindow {
 
     /// The strip has removed a tab: drop it from the model and hang up every
     /// shell that was in it.
-    fn tab_detached(&self, project: Id, position: i32) {
+    ///
+    /// Unless the page is only passing through. `AdwTabView` detaches a page
+    /// the instant a drag picks it up, seconds before anything decides where it
+    /// is going, and that detach is this same signal, so a tab torn down here
+    /// would be a tab whose shells died the moment somebody took hold of it.
+    /// `is-transferring-page` is what tells a drag from a close, and a tab in
+    /// flight is parked in [`IN_FLIGHT`] until the attach at the other end says
+    /// which project it landed in.
+    fn tab_detached(&self, view: &adw::TabView, project: Id, position: i32) {
         let imp = self.imp();
         let removed = {
             let mut workspace = imp.workspace.borrow_mut();
@@ -3046,6 +3611,15 @@ impl TuniWindow {
             return;
         };
 
+        // Dragged rather than closed: the shells go on running, and the tab
+        // waits for the strip that takes the page.
+        if view.is_transferring_page() {
+            IN_FLIGHT.set(Some((self.clone(), project, tab)));
+            self.refresh();
+            return;
+        }
+
+        self.remember_closed(project, &tab);
         for pane in tab.layout().panes() {
             self.forget_pane(pane.id());
         }
@@ -3056,6 +3630,439 @@ impl TuniWindow {
         // every walk.
         imp.recent.borrow_mut().retain(|id| *id != tab.id());
         self.refresh();
+    }
+
+    /// A page has arrived in a strip. A tab in flight is the only kind this
+    /// answers for: every other attach is a tab this window has just built,
+    /// which is already in the model.
+    fn tab_attached(&self, view: &adw::TabView, project: Id, page: &adw::TabPage, position: i32) {
+        let Some((source, from, tab)) = IN_FLIGHT.take() else {
+            return;
+        };
+        // A drag called off puts the page back where it was taken from, through
+        // the same pair of signals a move goes through. Nothing happened, so
+        // nothing is said about it.
+        let moved = source != *self || from != project;
+        source.hand_over(self, project, tab, position.max(0) as usize);
+        if moved {
+            self.announce_move(project);
+        }
+
+        // Not moved here: `adw_tab_view_attach_page` is in the middle of this
+        // signal and tells its own page list where the page went once the
+        // handlers are done, so a reorder now is one the list model never hears
+        // about. An idle later is still before anything is drawn or clicked.
+        // The reorder itself carries the model with it, through the same
+        // `page-reordered` a tab dragged along the strip goes through.
+        if DROPPED_OUTSIDE.replace(false) {
+            glib::idle_add_local_once(glib::clone!(
+                #[weak]
+                view,
+                #[weak]
+                page,
+                move || {
+                    view.reorder_last(&page);
+                }
+            ));
+        }
+    }
+
+    /// Swells the row a dragged tab is being held over, and lifts the icons of
+    /// the rows either side of it, the way the dock magnifies what a pointer is
+    /// nearest. `None` puts the sidebar back.
+    ///
+    /// Only the row under the pointer changes height, and it grows downward
+    /// from a top edge that does not move, because the rows above it are
+    /// untouched. A neighbour that grew taller would slide that row down out
+    /// from under the pointer, and the leave and enter that followed would move
+    /// the magnification to the next row and back again for as long as the
+    /// pointer stayed still.
+    fn magnify_rows(&self, target: Option<i32>) {
+        let Some(list) = self.imp().sidebar.borrow().clone() else {
+            return;
+        };
+        let mut index = 0;
+        while let Some(row) = list.row_at_index(index) {
+            row.remove_css_class("tuni-row-magnify");
+            row.remove_css_class("tuni-row-near");
+            match target.map(|target| (index - target).abs()) {
+                Some(0) => row.add_css_class("tuni-row-magnify"),
+                Some(1) => row.add_css_class("tuni-row-near"),
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+
+    /// Says where a tab just went, in the two places a person is looking.
+    ///
+    /// The row it landed in lights up and fades, which answers "which project
+    /// took it" without a word, and is the only answer a drag needs because the
+    /// row is the thing the pointer was over. The toast is for the same move
+    /// made from the tab menu, where the sidebar can be shut and the tab simply
+    /// vanishes from the strip.
+    fn announce_move(&self, project: Id) {
+        let name = self
+            .imp()
+            .workspace
+            .borrow()
+            .project(project)
+            .map(|entry| entry.name().to_owned());
+        let Some(name) = name else {
+            return;
+        };
+        self.toast(&format!("Tab moved to {name}"));
+
+        let Some(row) = self.row_for(project) else {
+            return;
+        };
+        row.add_css_class("tuni-row-landed");
+        // Taken off again so the next arrival can play it: a class already on
+        // the widget restarts nothing. Weak, so a window closed in the meantime
+        // is not held open by its own applause.
+        glib::timeout_add_local_once(
+            Duration::from_millis(700),
+            glib::clone!(
+                #[weak]
+                row,
+                move || row.remove_css_class("tuni-row-landed")
+            ),
+        );
+    }
+
+    /// The sidebar row drawn for a project. The rows are appended in the order
+    /// the projects are in, and nothing else is in that list.
+    fn row_for(&self, project: Id) -> Option<gtk::ListBoxRow> {
+        let index = self
+            .imp()
+            .workspace
+            .borrow()
+            .projects()
+            .iter()
+            .position(|entry| entry.id() == project)?;
+        self.imp()
+            .sidebar
+            .borrow()
+            .as_ref()?
+            .row_at_index(i32::try_from(index).ok()?)
+    }
+
+    /// Where a tab let go of outside every strip should land: the project whose
+    /// sidebar row took the drop, else a window of its own.
+    fn view_for_dropped_tab(&self) -> Option<adw::TabView> {
+        let dropped = DROPPED_ON
+            .take()
+            .and_then(|(window, project)| window.imp().views.borrow().get(&project).cloned());
+        let view = match dropped {
+            Some(view) => Some(view),
+            None => self.window_for_torn_out_tab(),
+        };
+        // The attach that follows put it at the head of a strip that may
+        // already have tabs in it. Only when there is one: an answer of nothing
+        // sends the page back where it came from, at the index it left.
+        DROPPED_OUTSIDE.set(view.is_some());
+        view
+    }
+
+    /// The section of the tab menu that lists the other projects, made once and
+    /// kept: the strip builds its popover from the model the first time it is
+    /// asked for and hands out the same one afterwards, so the list has to be
+    /// written into a section that is already in it.
+    fn move_section(&self) -> gio::Menu {
+        self.imp()
+            .tab_move
+            .borrow_mut()
+            .get_or_insert_with(gio::Menu::new)
+            .clone()
+    }
+
+    /// Writes the other projects into that section, as the menu opens.
+    ///
+    /// A window with one project in it leaves the section empty, and an empty
+    /// section draws nothing, so there is no menu item saying a tab has nowhere
+    /// to go.
+    fn fill_move_section(&self, project: Id) {
+        let section = self.move_section();
+        section.remove_all();
+        for entry in self.imp().workspace.borrow().projects() {
+            if entry.id() == project {
+                continue;
+            }
+            section.append_item(&item(
+                entry.name(),
+                "win.tab-move-to-project",
+                &entry.id().raw().to_variant(),
+            ));
+        }
+    }
+
+    /// Moves the tab the menu was opened on into another project, at the end of
+    /// its strip.
+    ///
+    /// The move itself is the strip's, the same call a drag makes: transferring
+    /// the page carries the widgets, and so the shells, without closing a PTY
+    /// or replaying a scrollback. The model follows through the detach and the
+    /// attach that a transfer is made of.
+    fn move_tab_to_project(&self, project: Id) {
+        // The menu's tab, and the tab in front when the action was reached some
+        // other way - the strip clears its page as the popover closes, and the
+        // action is worth having from a keyboard too.
+        let menu_page = self.imp().menu_page.borrow().clone();
+        let Some((view, page)) = self
+            .selected_view()
+            .zip(menu_page)
+            .or_else(|| self.selected_page())
+        else {
+            return;
+        };
+        let Some(other) = self.imp().views.borrow().get(&project).cloned() else {
+            return;
+        };
+        if view == other {
+            return;
+        }
+        view.transfer_page(&page, &other, other.n_pages());
+    }
+
+    /// A window for a tab that has just been dragged out of a strip, and the
+    /// empty project in it that will hold the tab.
+    ///
+    /// Empty on purpose: [`Self::open_window`] opens a project with a shell in
+    /// it, which is what asking for a new window means, while this one is about
+    /// to be given a tab and a second shell nobody asked for would be in it.
+    fn window_for_torn_out_tab(&self) -> Option<adw::TabView> {
+        let app = self.application().and_downcast::<adw::Application>()?;
+        let window = Self::new(&app, self.imp().settings.borrow().clone());
+        let project = window.imp().workspace.borrow_mut().open_project();
+        window.attach_project(project);
+        window.rebuild_sidebar();
+        window.show_selected_project();
+        let view = window.imp().views.borrow().get(&project).cloned()?;
+        window.present();
+        Some(view)
+    }
+
+    /// Moves a whole project into a window of its own, shells and all.
+    ///
+    /// The tab strip has this for a single tab and gets it from `AdwTabView`,
+    /// which knows when a page was dropped on nothing. A `GtkListBox` row knows
+    /// no such thing, so the sidebar reads a drag that ended with no target as
+    /// the same request, and the move itself is the strip's: every page is
+    /// transferred to the new window's view, which carries the widgets, and so
+    /// the shells, across without closing anything. The row's menu asks for the
+    /// same thing by name, since a drag onto the desktop is a gesture a tiling
+    /// compositor can swallow before it ever reaches this window.
+    ///
+    /// The last project in a window may go too, and what stays behind is a
+    /// window with a New Project button in it — which is exactly what closing
+    /// that project by its own button already leaves.
+    fn tear_out_project(&self, id: Id) {
+        let imp = self.imp();
+        let Some(app) = self.application().and_downcast::<adw::Application>() else {
+            return;
+        };
+        let Some(view) = imp.views.borrow().get(&id).cloned() else {
+            return;
+        };
+        let Some((name, icon, directory, follows, selected)) =
+            imp.workspace.borrow().project(id).map(|project| {
+                (
+                    project.custom_name.clone(),
+                    project.icon.clone(),
+                    project.custom_directory.clone(),
+                    project.inherit_directory,
+                    project.selected_id(),
+                )
+            })
+        else {
+            return;
+        };
+
+        let window = Self::new(&app, imp.settings.borrow().clone());
+        let target = window.imp().workspace.borrow_mut().open_project();
+        window.attach_project(target);
+        if let Some(project) = window.imp().workspace.borrow_mut().project_mut(target) {
+            project.custom_name = name;
+            project.icon = icon;
+            project.custom_directory = directory;
+            project.inherit_directory = follows;
+        }
+        let Some(other) = window.imp().views.borrow().get(&target).cloned() else {
+            return;
+        };
+        window.present();
+
+        // Backwards, because each page goes to the head of the other strip:
+        // walking from the end is what leaves them in the order they were in
+        // here. Every transfer detaches and attaches, so the same pair of
+        // handlers that carries one dragged tab carries these.
+        for position in (0..view.n_pages()).rev() {
+            let page = view.nth_page(position);
+            view.transfer_page(&page, &other, 0);
+        }
+        self.close_project(id);
+
+        // The tab that was in front stays in front. Every page landed selected
+        // as it arrived, so without this the window opens on whichever one was
+        // transferred last.
+        let page = selected.and_then(|tab| window.imp().pages.borrow().get(&tab).cloned());
+        if let Some(page) = page {
+            other.set_selected_page(&page);
+        }
+        window.rebuild_sidebar();
+        window.show_selected_project();
+    }
+
+    /// Gives a tab to another window: the model's tab, and every map entry this
+    /// window keeps for the panes in it.
+    ///
+    /// The page and the widgets under it have already moved - `AdwTabView`
+    /// moved them, which is what makes this a move rather than a restore, since
+    /// no PTY is closed and no scrollback is replayed. What is left is the
+    /// bookkeeping, and the handlers on those widgets, which find their window
+    /// through [`Self::owner`] rather than remembering the one they were wired
+    /// in.
+    ///
+    /// `window` is this window when a tab is moved between two projects of the
+    /// same one, and then every map here is the map there: the moves are no-ops
+    /// and only the workspace really changes hands.
+    fn hand_over(&self, window: &Self, project: Id, tab: Tab, position: usize) {
+        let imp = self.imp();
+        let other = window.imp();
+        for pane in tab.layout().panes() {
+            let id = pane.id();
+            move_entry(&imp.terminals, &other.terminals, id);
+            move_entry(&imp.editors, &other.editors, id);
+            move_entry(&imp.diffs, &other.diffs, id);
+            move_entry(&imp.remotes, &other.remotes, id);
+            move_entry(&imp.hosts, &other.hosts, id);
+            // An agent still thinking, or one that finished into a tab nobody
+            // was watching, is now thinking or finished in the other window.
+            for (from, to) in [
+                (&imp.working, &other.working),
+                (&imp.finished, &other.finished),
+            ] {
+                // Taken out before it is put back, rather than in the `if let`,
+                // because the two maps are one map when the move stays in this
+                // window and the borrow would still be held.
+                let entry = from.borrow_mut().remove(&id);
+                if let Some((_, tab)) = entry {
+                    to.borrow_mut().insert(id, (project, tab));
+                }
+            }
+        }
+        move_entry(&imp.grids, &other.grids, tab.id());
+        move_entry(&imp.pages, &other.pages, tab.id());
+        imp.recent.borrow_mut().retain(|id| *id != tab.id());
+
+        let id = tab.id();
+        if let Some(entry) = other.workspace.borrow_mut().project_mut(project) {
+            entry.insert_tab(position, tab);
+            entry.select(Some(id));
+        }
+        window.refresh_agents();
+        window.refresh();
+        self.refresh_agents();
+        self.refresh();
+    }
+
+    /// The window holding `tab` now, and the project in it that holds it.
+    ///
+    /// Almost always this window, and the first branch is the one that runs. A
+    /// tab dragged into a window of its own leaves every handler on its widgets
+    /// wired to the window they were built in, so they ask this rather than
+    /// assume, and the answer is the window the tab is in at the moment the
+    /// handler runs.
+    fn owner(&self, tab: Id) -> Option<(Self, Id)> {
+        if let Some(project) = self.project_of(tab) {
+            return Some((self.clone(), project));
+        }
+        self.application()?
+            .windows()
+            .into_iter()
+            .filter_map(|window| window.downcast::<Self>().ok())
+            .find_map(|window| window.project_of(tab).map(|project| (window, project)))
+    }
+
+    /// Which of this window's projects holds `tab`.
+    fn project_of(&self, tab: Id) -> Option<Id> {
+        self.imp()
+            .workspace
+            .borrow()
+            .projects()
+            .iter()
+            .find(|project| project.tab(tab).is_some())
+            .map(tuni_core::workspace::Project::id)
+    }
+
+    /// Writes down a tab on its way out, so it can be opened again.
+    ///
+    /// Read here rather than at the reopen, because by then the shells have been
+    /// hung up and their scrollback is gone with them. The cost is one pass over
+    /// the tab's terminals, up to `HISTORY_LINE_LIMIT` lines each, held until
+    /// [`CLOSED_TABS`] newer closes push it out.
+    ///
+    /// The scrollback is kept whether or not the session setting asks for one on
+    /// disk: that setting is about what a *file* should hold after the window is
+    /// gone, and this never reaches a file.
+    fn remember_closed(&self, project: Id, tab: &Tab) {
+        let imp = self.imp();
+        let terminals = imp.terminals.borrow();
+        let editors = imp.editors.borrow();
+        let history = RefCell::new(History::default());
+        let snapshot = tuni_core::session::TabSnapshot::of(tab, |pane| PaneState {
+            history: terminals
+                .get(&pane)
+                .and_then(|terminal| terminal.history(HISTORY_LINE_LIMIT))
+                .map(|text| {
+                    // Unique within one closed tab, which is all it has to be:
+                    // the map goes out of scope with the tab that filled it.
+                    let key = format!("pane-{}", pane.raw());
+                    history.borrow_mut().insert(key.clone(), text);
+                    key
+                }),
+            cursor: editors.get(&pane).and_then(TuniEditor::cursor),
+        });
+
+        let mut closed = imp.closed.borrow_mut();
+        closed.push_back(ClosedTab {
+            project,
+            snapshot,
+            history: history.into_inner(),
+        });
+        while closed.len() > CLOSED_TABS {
+            closed.pop_front();
+        }
+    }
+
+    /// Opens the last tab this window closed, in the project it was closed from,
+    /// with its panes in the same shape and their output replayed.
+    ///
+    /// A tab whose project has since been closed has nowhere to go back to, and
+    /// says so rather than opening somewhere it never was.
+    fn reopen_tab(&self) {
+        let imp = self.imp();
+        let Some(closed) = imp.closed.borrow_mut().pop_back() else {
+            self.toast("No closed tab to reopen.");
+            return;
+        };
+        if imp.workspace.borrow().project(closed.project).is_none() {
+            self.toast("That tab's project is closed.");
+            return;
+        }
+        let Some((tab, histories, cursors)) = closed.snapshot.restore() else {
+            return;
+        };
+
+        for (pane, key) in &histories {
+            if let Some(text) = closed.history.get(key) {
+                imp.pending_history
+                    .borrow_mut()
+                    .insert(*pane, text.to_owned());
+            }
+        }
+        imp.pending_cursors.borrow_mut().extend(cursors);
+        self.add_tab(closed.project, tab);
     }
 
     // --- panes -------------------------------------------------------------
@@ -3159,9 +4166,20 @@ impl TuniWindow {
         }
         if let Some(tab) = selected {
             self.mark_recent(tab);
+            // Looking at the tab is what reads the answer, so the mark goes
+            // with the same click that clears the bell above.
+            let mut finished = imp.finished.borrow_mut();
+            let before = finished.len();
+            finished.retain(|_, &mut (_, marked)| marked != tab);
+            let cleared = finished.len() != before;
+            drop(finished);
+            if cleared {
+                self.refresh_agents();
+            }
         }
         self.refresh();
         self.sync_files();
+        self.sync_banner();
         self.focus_pane();
     }
 
@@ -3852,6 +4870,9 @@ impl TuniWindow {
             list.remove(&row);
         }
         imp.labels.borrow_mut().clear();
+        imp.spinners.borrow_mut().clear();
+        imp.icons.borrow_mut().clear();
+        imp.emoji.borrow_mut().clear();
 
         let projects: Vec<(Id, String)> = imp
             .workspace
@@ -3868,6 +4889,9 @@ impl TuniWindow {
             imp.labels.borrow_mut().push(label);
         }
         imp.selecting.set(false);
+        // The rows are new, so whatever was spinning on the old ones has to be
+        // said again: a rename must not stop a spinner mid-turn.
+        self.refresh_agents();
 
         // An empty scroller is not free: its minimum height is the scrollbar's,
         // which with no projects left is 48px of nothing between the header and
@@ -3879,6 +4903,9 @@ impl TuniWindow {
 
     fn build_row(&self, id: Id, name: &str) -> (gtk::ListBoxRow, gtk::Label) {
         let icon = gtk::Image::from_icon_name("folder-symbolic");
+        // Named so the dock effect can lift this icon without lifting the close
+        // button's, which is the other image in the row.
+        icon.add_css_class("tuni-row-icon");
         let label = gtk::Label::builder()
             .label(name)
             .xalign(0.0)
@@ -3896,8 +4923,35 @@ impl TuniWindow {
         close.set_action_name(Some("win.close-project"));
         close.set_action_target_value(Some(&id.raw().to_variant()));
 
+        // In the folder's place rather than beside the close button: that is
+        // where the tab strip puts the same spinner, and a row says one thing
+        // about itself at a time. Only one of the two is ever visible.
+        let spinner = adw::Spinner::builder()
+            .visible(false)
+            .valign(gtk::Align::Center)
+            // The folder it stands in for is icon-sized, and an AdwSpinner with
+            // no size of its own would take whatever the row could give it.
+            .width_request(16)
+            .height_request(16)
+            .build();
+        spinner.set_tooltip_text(Some("An agent is working in this project"));
+
+        // The third thing that can stand in that slot, and the only one that is
+        // text: a GtkImage draws a themed icon and cannot draw an emoji, and a
+        // label given an icon name would print the name. Sized to the icon it
+        // replaces so a row with one is the same height as a row without.
+        let emoji = gtk::Label::builder()
+            .visible(false)
+            .width_request(16)
+            .build();
+        self.imp().spinners.borrow_mut().insert(id, spinner.clone());
+        self.imp().icons.borrow_mut().insert(id, icon.clone());
+        self.imp().emoji.borrow_mut().insert(id, emoji.clone());
+
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         content.append(&icon);
+        content.append(&emoji);
+        content.append(&spinner);
         content.append(&label);
         content.append(&close);
 
@@ -3968,6 +5022,24 @@ impl TuniWindow {
                 );
             }
         ));
+        // A row let go of anywhere that does not take it — the desktop, another
+        // application, the terminals beside the sidebar — asks for the project
+        // in a window of its own, which is what dragging a tab off the strip
+        // above already means. Deferred, because the answer closes this project
+        // and so destroys the row whose controller is running.
+        source.connect_drag_cancel(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            false,
+            move |_, _, reason| {
+                if reason != gdk::DragCancelReason::NoTarget {
+                    return false;
+                }
+                glib::idle_add_local_once(move || this.tear_out_project(id));
+                true
+            }
+        ));
         row.add_controller(source);
 
         let target = gtk::DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);
@@ -3987,6 +5059,57 @@ impl TuniWindow {
             }
         ));
         row.add_controller(target);
+
+        // A tab dragged out of the strip and let go of on a row moves into that
+        // project. The move is not made here: `AdwTabBox` detached the page when
+        // the drag began, and a drop anywhere inside the window that is not a
+        // tab strip makes it ask for a window to put the page in. So the row
+        // writes down what it was given and the ask is answered with this
+        // project's strip.
+        let tabs = gtk::DropTarget::new(adw::TabPage::static_type(), gdk::DragAction::MOVE);
+        // Lit while the tab is held over it, the way the tiles below light up
+        // the half a dropped pane would take: a drop that says nothing until it
+        // has happened is one a person has to undo to find out what it did.
+        tabs.connect_enter(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            row,
+            #[upgrade_or]
+            gdk::DragAction::empty(),
+            move |_, _, _| {
+                row.add_css_class("tuni-row-target");
+                this.magnify_rows(Some(row.index()));
+                gdk::DragAction::MOVE
+            }
+        ));
+        tabs.connect_leave(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            row,
+            move |_| {
+                row.remove_css_class("tuni-row-target");
+                this.magnify_rows(None);
+            }
+        ));
+        tabs.connect_drop(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            row,
+            #[upgrade_or]
+            false,
+            move |_, _, _, _| {
+                // The lit row is handed straight over to the landing pulse, so
+                // there is no dark frame between the two.
+                row.remove_css_class("tuni-row-target");
+                this.magnify_rows(None);
+                DROPPED_ON.set(Some((this, id)));
+                true
+            }
+        ));
+        row.add_controller(tabs);
 
         (row, label)
     }
@@ -4010,13 +5133,14 @@ impl TuniWindow {
     fn popup_row_menu(&self, row: &gtk::ListBoxRow, x: f64, y: f64) {
         let imp = self.imp();
         let index = row.index().max(0) as usize;
-        let Some((id, named, pinned, follows)) =
+        let Some((id, named, pinned, follows, iconed)) =
             imp.workspace.borrow().projects().get(index).map(|p| {
                 (
                     p.id(),
                     p.custom_name.is_some(),
                     p.custom_directory.is_some(),
                     p.inherit_directory,
+                    p.icon.is_some(),
                 )
             })
         else {
@@ -4026,7 +5150,7 @@ impl TuniWindow {
             return;
         };
 
-        menu.set_menu_model(Some(&project_menu(id, named, pinned, follows)));
+        menu.set_menu_model(Some(&project_menu(id, named, pinned, follows, iconed)));
         // The gesture reports the click in the row's coordinates; the popover
         // is parented to the list, which is where it has to point.
         let point = row
@@ -4055,6 +5179,38 @@ impl TuniWindow {
             }
             window.refresh();
         });
+    }
+
+    fn choose_project_icon(&self, id: Id) {
+        let current = self
+            .imp()
+            .workspace
+            .borrow()
+            .project(id)
+            .and_then(|project| project.icon.clone());
+
+        crate::project_icon::present(
+            self,
+            current,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |icon| this.set_project_icon(id, icon)
+            ),
+        );
+    }
+
+    /// Writes one project's icon down and redraws its row.
+    ///
+    /// Through `refresh_agents` rather than by setting the image here, because
+    /// that is the one place that knows a spinner may be standing in the icon's
+    /// slot right now. Picking an icon while an agent works leaves the spinner
+    /// where it is and shows the new icon when it stops.
+    fn set_project_icon(&self, id: Id, icon: Option<String>) {
+        if let Some(project) = self.imp().workspace.borrow_mut().project_mut(id) {
+            project.icon = icon;
+        }
+        self.refresh_agents();
     }
 
     fn rename_tab(&self) {
@@ -4187,7 +5343,7 @@ fn project_target(target: Option<&glib::Variant>) -> Option<Id> {
 /// Title" only belongs there when there is a custom one to drop, and because
 /// the directory rule reads as one label per state rather than a checkbox that
 /// says what is off.
-fn project_menu(id: Id, named: bool, pinned: bool, follows: bool) -> gio::Menu {
+fn project_menu(id: Id, named: bool, pinned: bool, follows: bool, iconed: bool) -> gio::Menu {
     let target = id.raw().to_variant();
 
     let naming = gio::Menu::new();
@@ -4196,6 +5352,14 @@ fn project_menu(id: Id, named: bool, pinned: bool, follows: bool) -> gio::Menu {
         naming.append_item(&item(
             "Use Automatic Title",
             "win.automatic-project-title",
+            &target,
+        ));
+    }
+    naming.append_item(&item("Change Icon…", "win.project-icon", &target));
+    if iconed {
+        naming.append_item(&item(
+            "Use the Folder Icon",
+            "win.automatic-project-icon",
             &target,
         ));
     }
@@ -4223,12 +5387,20 @@ fn project_menu(id: Id, named: bool, pinned: bool, follows: bool) -> gio::Menu {
         &target,
     ));
 
+    let moving = gio::Menu::new();
+    moving.append_item(&item(
+        "Move to a New Window",
+        "win.tear-out-project",
+        &target,
+    ));
+
     let closing = gio::Menu::new();
     closing.append_item(&item("Close Project", "win.close-project", &target));
 
     let menu = gio::Menu::new();
     menu.append_section(None, &naming);
     menu.append_section(None, &directory);
+    menu.append_section(None, &moving);
     menu.append_section(None, &closing);
     menu
 }
@@ -4288,10 +5460,22 @@ fn main_menu() -> gio::Menu {
 
 /// The context menu on a tab. The strip tells us which tab it belongs to
 /// through `setup-menu`, so none of these carry a target.
-fn tab_menu() -> gio::Menu {
+///
+/// `moving` is the one section that is not fixed: it lists the other projects
+/// and so is filled in as the menu opens. It is passed in rather than built
+/// here because `AdwTabBox` reads this model once and keeps the popover it
+/// built from it, which leaves changing the section in place as the only way
+/// to change what the menu says.
+fn tab_menu(moving: &gio::Menu) -> gio::Menu {
     let naming = gio::Menu::new();
     naming.append(Some("Rename…"), Some("win.tab-rename"));
     naming.append(Some("Use Automatic Title"), Some("win.tab-automatic-title"));
+
+    let typing = gio::Menu::new();
+    typing.append(
+        Some("Broadcast Typing to Every Pane"),
+        Some("win.broadcast"),
+    );
 
     let closing = gio::Menu::new();
     closing.append(Some("Close"), Some("win.tab-close"));
@@ -4300,6 +5484,8 @@ fn tab_menu() -> gio::Menu {
 
     let menu = gio::Menu::new();
     menu.append_section(None, &naming);
+    menu.append_section(None, &typing);
+    menu.append_section(Some("Move to Project"), moving);
     menu.append_section(None, &closing);
     menu
 }
@@ -4476,6 +5662,14 @@ fn pin_sidebar(split: &adw::OverlaySplitView, pixels: f64, minimum: f64, maximum
     set_pinned_width(split, width.clamp(minimum, maximum.min(room)));
 }
 
+/// The projects and the tabs one of the agent maps names, in that order.
+fn split_ids(entries: &HashMap<Id, (Id, Id)>) -> (HashSet<Id>, HashSet<Id>) {
+    (
+        entries.values().map(|&(project, _)| project).collect(),
+        entries.values().map(|&(_, tab)| tab).collect(),
+    )
+}
+
 /// Shuts a split view's clamp on one width, in the split's own unit.
 fn set_pinned_width(split: &adw::OverlaySplitView, width: f64) {
     split.set_min_sidebar_width(width);
@@ -4522,6 +5716,32 @@ fn load_css() {
                 drawn over it would only say the same thing twice. */\n\
              .tuni-sidebar-grip:hover { background-color: alpha(@accent_color, 0.5); }\n\
              .tuni-drop { background-color: alpha(@accent_color, 0.28); border-radius: 6px; }\n\
+             /* A tab held over a project row, and the same row for a moment\n\
+                after it has been let go of. The two are one colour on purpose:\n\
+                what lights up under the pointer is what keeps the tab, and the\n\
+                pulse is that light going out rather than a second signal. */\n\
+             row.tuni-row-target { \
+              background-color: alpha(@accent_color, 0.28); \
+              box-shadow: inset 0 0 0 1px alpha(@accent_color, 0.7); \
+              transition: background-color 120ms ease-out; }\n\
+             @keyframes tuni-row-landed { \
+              from { background-color: alpha(@accent_color, 0.45); } \
+              to { background-color: alpha(@accent_color, 0); } }\n\
+             row.tuni-row-landed { animation: tuni-row-landed 700ms ease-out; }\n\
+             /* The dock's magnification, in the one direction a list has: the\n\
+                row being dragged over swells and its neighbours' icons lift.\n\
+                Declared on the plain row as well so the way back is as smooth\n\
+                as the way out; a transition written only into the class would\n\
+                snap when the class came off. */\n\
+             .navigation-sidebar row { transition: min-height 160ms ease-out; }\n\
+             .navigation-sidebar row .tuni-row-icon { \
+              transition: -gtk-icon-size 160ms ease-out; }\n\
+             row.tuni-row-magnify { min-height: 52px; }\n\
+             row.tuni-row-magnify .tuni-row-icon { -gtk-icon-size: 24px; }\n\
+             row.tuni-row-near .tuni-row-icon { -gtk-icon-size: 20px; }\n\
+             /* An emoji drawn at the size a symbolic icon is drawn at is a\n\
+                smudge, and a picker is for looking at what you are picking. */\n\
+             .tuni-icon-tile label { font-size: 20px; }\n\
              .tuni-switcher { border-radius: 26px; padding: 8px; }\n\
              .tuni-switch-card { padding: 9px 9px 14px 9px; border-radius: 16px; }\n\
              .tuni-switch-card.selected { background-color: alpha(currentColor, 0.20); }\n\
@@ -4712,6 +5932,31 @@ fn unsaved_message(dirty: &[TuniEditor]) -> String {
             "{} files have changes that have not been written to disk.",
             editors.len()
         ),
+    }
+}
+
+/// Moves one entry between two windows' maps of the same kind, if it is there
+/// to move. What handing a tab over does to every widget in it.
+///
+/// One map both times is a tab moved between projects of the same window: the
+/// entry is already where it belongs, and taking it out would only be a borrow
+/// held while the same cell is asked for again.
+fn move_entry<T: Clone>(from: &RefCell<HashMap<Id, T>>, to: &RefCell<HashMap<Id, T>>, key: Id) {
+    if std::ptr::eq(from, to) {
+        return;
+    }
+    if let Some(value) = from.borrow_mut().remove(&key) {
+        to.borrow_mut().insert(key, value);
+    }
+}
+
+/// How long something took, in the units somebody would say it in. Seconds
+/// under a minute, because a command is the one thing here measured in them.
+fn duration(seconds: u64) -> String {
+    match seconds {
+        ..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {}m", seconds / 3600, seconds % 3600 / 60),
     }
 }
 

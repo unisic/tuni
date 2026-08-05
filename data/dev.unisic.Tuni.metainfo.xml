@@ -67,6 +67,53 @@
   </provides>
 
   <releases>
+    <release version="1.5.0" date="2026-08-05">
+      <description>
+        <p>Tuni opens on a fresh shell rather than on the window that was left.
+        Restoring a session is a switch now, and it is off; a second switch
+        decides whether a restored pane starts in the directory its shell was
+        working in. The directory is read from the kernel when a shell does not
+        send OSC 7, which is most of them, so a new tab, a restored session and
+        the file tree all open on the work rather than in the home
+        directory.</p>
+        <p>A tab dragged off the strip is a move rather than a loss. Let go of
+        on the desktop it becomes a window of its own, let go of on another Tuni
+        window's strip it joins that window, and let go of on a project row in
+        the sidebar it moves into that project. The shells go on running through
+        all three. The row swells and lights up while a tab is held over it and
+        keeps that light for a moment after the tab lands, so what will take it
+        and what did take it are the same signal; the tab's own menu says "Move
+        to Project" for the same move without the drag. A project's row dragged
+        off the sidebar does this for everything in the project at once, and its
+        menu says "Move to a New Window".</p>
+        <p><code>Ctrl+Shift+R</code> reopens the tab just closed, and the four
+        closed before it, with its panes, the room they had, the name that was
+        typed and what each terminal had printed replayed above a fresh
+        prompt.</p>
+        <p>A tab spins while a coding agent is thinking in it and the project's
+        row spins in place of its folder, so which project and which tab are
+        both answered without opening anything, and a turn that ends in a tab
+        nobody is watching leaves a mark until it is looked at. Separately, a
+        command that ran ten seconds or longer raises a notification when it
+        exits in a tab that is out of sight, naming what ran, how long it took
+        and where it was.</p>
+        <p>Three keys: <code>Ctrl+Shift+Page Up</code> and
+        <code>Ctrl+Shift+Page Down</code> walk the scrollback one prompt at a
+        time for a shell that sends OSC 133, <code>Ctrl+Alt+I</code> sends what
+        is typed to every pane of the tab at once with a banner saying so, and
+        <code>Ctrl+Shift+Backspace</code> wipes a half-typed command whole.</p>
+        <p>A project's row can carry an icon or an emoji in place of the folder,
+        picked from its own menu, because a sidebar of six identical folders is
+        read by name alone.</p>
+        <p>Opening a terminal from a file manager reaches the Tuni that is
+        already running and opens a project of its own rooted at the folder that
+        was chosen, rather than a second copy of Tuni that ignores the
+        directory.</p>
+        <p>Every preferences row says what it does in one line, and what a new
+        tab opens, which shell runs and how much of a session comes back are a
+        Session page of their own.</p>
+      </description>
+    </release>
     <release version="1.4.1" date="2026-08-03">
       <description>
         <p>The install command works in fish. It was written as

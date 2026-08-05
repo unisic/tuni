@@ -973,3 +973,38 @@ fn zero_scrollback_lines_means_none_not_unlimited() {
         "nothing above the viewport to scroll to"
     );
 }
+
+#[test]
+fn a_walk_up_lands_on_the_prompt_above() {
+    let mut terminal = Terminal::new(20, 6, 100).expect("terminal");
+    // Five commands, each marked the way a shell with OSC 133 marks them, and
+    // each leaving more output than the viewport is tall.
+    for command in ["one", "two", "three", "four", "five"] {
+        terminal.feed(b"\x1b]133;A\x07$ ");
+        terminal.feed(command.as_bytes());
+        terminal.feed(b"\r\n\x1b]133;C\x07one\r\ntwo\r\nthree\r\n\x1b]133;D;0\x07");
+    }
+    let bottom = terminal.scroll_position().offset;
+
+    let first = terminal.prompt_row(bottom, true).expect("a prompt above");
+    let second = terminal
+        .prompt_row(first, true)
+        .expect("the one above that");
+    assert!(second < first, "the walk goes up: {second} then {first}");
+    assert_eq!(
+        terminal.prompt_row(second, false),
+        Some(first),
+        "and comes back down the same way"
+    );
+}
+
+#[test]
+fn a_shell_that_marks_nothing_has_no_prompts_to_jump_to() {
+    let mut terminal = Terminal::new(20, 6, 100).expect("terminal");
+    for i in 0..20 {
+        terminal.feed(format!("$ line-{i}\r\n").as_bytes());
+    }
+    let bottom = terminal.scroll_position().offset;
+    assert_eq!(terminal.prompt_row(bottom, true), None);
+    assert_eq!(terminal.prompt_row(0, false), None);
+}

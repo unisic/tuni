@@ -95,10 +95,41 @@ pub struct TabSnapshot {
     pub custom_name: Option<String>,
 }
 
+/// A restored tab and what its panes are still waiting for: the scrollback key
+/// each one was written under, and where the cursor sat in the file it held.
+pub type RestoredTab = (Tab, HashMap<Id, String>, HashMap<Id, usize>);
+
+impl TabSnapshot {
+    /// One tab written down on its own, the same way the whole session writes
+    /// one. What "reopen the tab I just closed" keeps: a closed tab has to
+    /// survive without its widgets, and this is already the shape that does.
+    #[must_use]
+    pub fn of(tab: &Tab, state: impl Fn(Id) -> PaneState) -> Self {
+        snap_tab(tab, &state)
+    }
+
+    /// The tab this describes, with fresh pane ids.
+    ///
+    /// `None` when there is no pane left to build a layout out of, which is
+    /// what an empty or unreadable snapshot means.
+    #[must_use]
+    pub fn restore(&self) -> Option<RestoredTab> {
+        let mut histories = HashMap::new();
+        let mut cursors = HashMap::new();
+        let tab = restore_tab(self, &mut histories, &mut cursors)?;
+        Some((tab, histories, cursors))
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ProjectSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_name: Option<String>,
+    /// The icon name or emoji the row was given, if it was given one. A folder
+    /// is what a project with no answer here draws, which is what every
+    /// snapshot written before this field existed restores as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     /// Only a pinned directory is saved. An automatic one is derived from
     /// wherever the shell is, and saving a derived value means restoring a
     /// decision the user never made.
@@ -172,6 +203,7 @@ impl Snapshot {
             .iter()
             .map(|project| ProjectSnapshot {
                 custom_name: project.custom_name.clone(),
+                icon: project.icon.clone(),
                 custom_directory: project.custom_directory.clone(),
                 inherit_directory: (!project.inherit_directory).then_some(false),
                 selected_tab: project.selected_id().and_then(|id| project.index_of(id)),
@@ -221,6 +253,7 @@ impl Snapshot {
                 continue;
             };
             project.custom_name.clone_from(&saved.custom_name);
+            project.icon.clone_from(&saved.icon);
             project.custom_directory.clone_from(&saved.custom_directory);
             project.inherit_directory = saved.inherit_directory.unwrap_or(true);
             for (index, tab) in tabs.into_iter().enumerate() {
@@ -251,6 +284,25 @@ impl Snapshot {
             panel_page: self.panel_page.clone(),
             sidebar_width: self.sidebar_width,
             panel_width: self.panel_width,
+        }
+    }
+
+    /// Drops every directory the snapshot remembers, so its shells start where
+    /// one started outside the window would. What `terminal.restore-directory`
+    /// off means, applied to the snapshot rather than to the restoring: a pane
+    /// with no directory is already the case this file handles everywhere.
+    ///
+    /// A file pane is untouched by it: its directory is the one its file is in,
+    /// derived again from the path when it comes back.
+    pub fn forget_directories(&mut self) {
+        for project in &mut self.projects {
+            for tab in &mut project.tabs {
+                for column in &mut tab.columns {
+                    for pane in &mut column.panes {
+                        pane.directory = None;
+                    }
+                }
+            }
         }
     }
 
@@ -480,6 +532,35 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_tab_comes_back_with_its_name_and_its_scrollback() {
+        let saved = workspace(&[2, 1]);
+        let tab = &saved.projects()[0].tabs()[0];
+        let first = tab.layout().panes().next().expect("a pane").id();
+        let snapshot = TabSnapshot::of(tab, |pane| PaneState {
+            history: (pane == first).then(|| "pane-1".to_owned()),
+            cursor: None,
+        });
+
+        let (reopened, histories, _) = snapshot.restore().expect("a tab with panes in it");
+        assert_eq!(
+            reopened.layout().columns().len(),
+            2,
+            "the split it was closed with"
+        );
+        // The pane that had scrollback is a new pane now, and the key it is
+        // waiting for is the one the closed pane wrote.
+        assert_eq!(histories.len(), 1);
+        assert_eq!(
+            histories.values().next().map(String::as_str),
+            Some("pane-1")
+        );
+        assert!(
+            !histories.contains_key(&first),
+            "the reopened panes are new panes"
+        );
+    }
+
+    #[test]
     fn a_layout_comes_back_the_shape_it_was_saved_in() {
         let saved = workspace(&[2, 1, 3]);
         let restored = Snapshot::of(&saved, |_| PaneState::default())
@@ -518,10 +599,13 @@ mod tests {
         {
             let project = saved.project_mut(project_id).expect("just built");
             project.custom_name = Some("Backend".to_owned());
+            project.icon = Some("🐙".to_owned());
             project.custom_directory = Some("/srv/app".to_owned());
             project.inherit_directory = false;
             let tab = project.tab_mut(tab_id).expect("just built");
             tab.custom_name = Some("logs".to_owned());
+            // Broadcast is deliberately not saved: see `Tab::broadcast`.
+            tab.broadcast = true;
             let panes: Vec<Id> = tab.layout().panes().map(Pane::id).collect();
             let top = tab.layout_mut().pane_mut(panes[0]).expect("just built");
             top.directory = Some("/var/log".to_owned());
@@ -533,14 +617,41 @@ mod tests {
             .workspace;
         let project = &restored.projects()[0];
         assert_eq!(project.custom_name.as_deref(), Some("Backend"));
+        assert_eq!(project.icon.as_deref(), Some("🐙"));
         assert_eq!(project.custom_directory.as_deref(), Some("/srv/app"));
         assert!(!project.inherit_directory);
 
         let tab = &project.tabs()[0];
         assert_eq!(tab.custom_name.as_deref(), Some("logs"));
+        assert!(!tab.broadcast);
         let top = &tab.layout().columns()[0].panes()[0];
         assert_eq!(top.directory.as_deref(), Some("/var/log"));
         assert!((top.weight - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn forgetting_directories_leaves_a_shell_nowhere_and_a_file_where_it_is() {
+        let mut saved = workspace(&[1]);
+        let project = saved.projects()[0].id();
+        let tab = saved.projects()[0].tabs()[0].id();
+        {
+            let layout = saved
+                .project_mut(project)
+                .and_then(|project| project.tab_mut(tab))
+                .expect("just built")
+                .layout_mut();
+            layout.split(Pane::file(PathBuf::from("/src/main.rs")), Edge::Right);
+            let shell = layout.columns()[0].panes()[0].id();
+            layout.pane_mut(shell).expect("just built").directory = Some("/var/log".to_owned());
+        }
+
+        let mut snapshot = Snapshot::of(&saved, |_| PaneState::default());
+        snapshot.forget_directories();
+        let restored = snapshot.restore().workspace;
+
+        let columns = restored.projects()[0].tabs()[0].layout().columns();
+        assert_eq!(columns[0].panes()[0].directory, None);
+        assert_eq!(columns[1].panes()[0].directory.as_deref(), Some("/src"));
     }
 
     #[test]

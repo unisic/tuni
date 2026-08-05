@@ -56,6 +56,14 @@ pub struct Tab {
     id: Id,
     /// Set by "Rename…", cleared by "Use Automatic Title".
     pub custom_name: Option<String>,
+    /// Whether a key typed into one pane of this tab goes to all of them.
+    ///
+    /// Per tab rather than per window: the panes of one tab are usually the
+    /// machines being worked on together, and the tab behind it is usually
+    /// something else entirely. Not saved with the session either, because a
+    /// window that comes back typing into four shells at once is a surprise
+    /// nobody asked for.
+    pub broadcast: bool,
     layout: Layout,
 }
 
@@ -65,6 +73,7 @@ impl Tab {
         Self {
             id: Id::next(),
             custom_name: None,
+            broadcast: false,
             layout: Layout::new(Pane::new()),
         }
     }
@@ -76,6 +85,7 @@ impl Tab {
         Self {
             id: Id::next(),
             custom_name: None,
+            broadcast: false,
             layout: Layout::new(pane),
         }
     }
@@ -135,6 +145,11 @@ pub struct Project {
     fallback_name: String,
     /// Set by "Rename…", cleared by "Use Automatic Title".
     pub custom_name: Option<String>,
+    /// What the sidebar row draws instead of a folder: an icon name from the
+    /// desktop's theme, or an emoji. One field for both, told apart by
+    /// [`is_emoji`], because a row shows one thing and asking which of two
+    /// fields wins is a question with no good answer.
+    pub icon: Option<String>,
     /// Pinned by "Set Project Directory…", cleared by "Use Automatic
     /// Directory". While it is unset the root is derived from the shell's own
     /// working directory on every read — see [`Project::panel_root`].
@@ -159,6 +174,7 @@ impl Project {
             id: Id::next(),
             fallback_name: fallback_name.into(),
             custom_name: None,
+            icon: None,
             custom_directory: None,
             inherit_directory: true,
             tabs: Vec::new(),
@@ -462,6 +478,17 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.filter(|text| !text.trim().is_empty())
 }
 
+/// Whether a project's icon is an emoji to draw as text rather than a name to
+/// look up in the icon theme.
+///
+/// Every icon name is ASCII — the theme's own file names are — and no emoji is,
+/// so the test is the alphabet rather than a list of ranges that would need
+/// revisiting with every Unicode release.
+#[must_use]
+pub fn is_emoji(icon: &str) -> bool {
+    !icon.is_ascii()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +513,17 @@ mod tests {
         }
         project.select(ids.last().copied());
         (project, ids)
+    }
+
+    #[test]
+    fn an_emoji_is_told_from_an_icon_name_by_its_alphabet() {
+        assert!(!is_emoji("folder-symbolic"));
+        assert!(!is_emoji("utilities-terminal-symbolic"));
+        assert!(is_emoji("🐙"));
+        // Skin tone, zero-width joiner, variation selector: one grapheme the
+        // theme could never hold, and every one of them non-ASCII.
+        assert!(is_emoji("👩‍💻"));
+        assert!(is_emoji("❤️"));
     }
 
     #[test]
