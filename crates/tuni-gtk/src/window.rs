@@ -112,6 +112,38 @@ pub struct ClosedTab {
     history: History,
 }
 
+thread_local! {
+    /// The tab a drag is carrying between strips: the window and project it
+    /// left, and the model's record of it, which no project holds while it is
+    /// in the air.
+    ///
+    /// `AdwTabView` detaches the page the moment the drag starts and attaches
+    /// it again wherever it lands: the desktop, another window's strip, a
+    /// sidebar row, or back where it came from when the drag is called off.
+    /// The detach is the same signal a closed tab sends, so a tab in flight is
+    /// parked here instead of being torn down, and the attach at the other end
+    /// puts it back into a project. One slot rather than one per window: a
+    /// pointer drags one tab at a time, and the attach happens in whichever
+    /// window took it.
+    /// Where it came from is kept as well as what it is, so the arrival can
+    /// tell a move from a drag that was called off and put back.
+    static IN_FLIGHT: RefCell<Option<(TuniWindow, Id, Tab)>> = const { RefCell::new(None) };
+
+    /// The project a dragged tab was let go of over, and the window whose
+    /// sidebar drew that row. Read by the `create-window` that follows every
+    /// drop outside a strip, which answers with that project's strip instead
+    /// of a new window's.
+    static DROPPED_ON: RefCell<Option<(TuniWindow, Id)>> = const { RefCell::new(None) };
+
+    /// Whether the page about to be attached was let go of outside a strip.
+    ///
+    /// Such a drop names a project rather than a place in one, and libadwaita
+    /// attaches it at index 0 because a window it asked to have made would have
+    /// nothing else in it. A project that does gets the tab at the end, where a
+    /// new tab goes and where the menu's "Move to Project" puts it.
+    static DROPPED_OUTSIDE: Cell<bool> = const { Cell::new(false) };
+}
+
 /// What a Find command found to act on. The bar over a terminal belongs to the
 /// window and is handed the terminal it is pointing at; a file pane carries its
 /// own search inside GtkSourceView.
@@ -305,7 +337,8 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
 mod imp {
     use super::{
         Cell, ClosedTab, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniFind, TuniGrid,
-        TuniHosts, TuniPanel, TuniRemote, TuniSwitcher, TuniTerminal, VecDeque, Workspace, glib,
+        TuniHosts, TuniPanel, TuniRemote, TuniSwitcher, TuniTerminal, VecDeque, Workspace, gio,
+        glib,
     };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
@@ -339,11 +372,12 @@ mod imp {
         /// Where the cursor was in each restored file pane, by pane id, until
         /// its editor exists to be told.
         pub pending_cursors: RefCell<HashMap<Id, usize>>,
-        /// Where the tab now being dragged out of the strip is going: the window
-        /// built to receive it and the project in it that will hold it. Set
-        /// while `AdwTabView` is between asking for a window and handing the
-        /// page over, and taken by the detach that follows.
-        pub handover: RefCell<Option<(super::TuniWindow, Id)>>,
+        /// The "Move to Project" part of every tab's context menu, filled in
+        /// as the menu opens. One `GMenu` shared by every strip in the window,
+        /// because `AdwTabBox` builds its popover from the model once and
+        /// keeps it: a list that changes with the projects has to change in
+        /// place rather than by handing over another model.
+        pub tab_move: RefCell<Option<gio::Menu>>,
         /// The tabs this window has closed, oldest first, capped at
         /// [`CLOSED_TABS`](super::CLOSED_TABS). Per window rather than per
         /// application: the tab goes back where it was, and where it was is a
@@ -1009,6 +1043,14 @@ impl TuniWindow {
             entry("tear-out-project", uint64, |window, target| {
                 if let Some(id) = project_target(target) {
                     window.tear_out_project(id);
+                }
+            }),
+            // The menu's half of dragging a tab onto a sidebar row: the same
+            // move, for a drag a tiling compositor swallowed or a hand that
+            // would rather read a list than aim at a row.
+            entry("tab-move-to-project", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.move_tab_to_project(id);
                 }
             }),
             entry("project-icon", uint64, |window, target| {
@@ -1811,7 +1853,28 @@ impl TuniWindow {
 
     /// Opens a project with one terminal in it, and shows it.
     pub fn open_project(&self) -> Id {
+        self.open_project_in(None)
+    }
+
+    /// The same, for a project that is about a directory: a launch from a file
+    /// manager or a shell that named one.
+    ///
+    /// The directory is pinned rather than typed into the shell, so every tab
+    /// opened in the project afterwards starts there too and the file tree and
+    /// the git panel anchor to it. The name comes from the folder for the same
+    /// reason the sidebar shows one at all: a row saying "Project 3" next to
+    /// three others says nothing, and "Use Automatic Title" gives it back to
+    /// the shell for anybody who would rather have that.
+    pub fn open_project_in(&self, directory: Option<&Path>) -> Id {
         let id = self.imp().workspace.borrow_mut().open_project();
+        if let Some(directory) = directory
+            && let Some(project) = self.imp().workspace.borrow_mut().project_mut(id)
+        {
+            project.custom_directory = Some(directory.to_string_lossy().into_owned());
+            project.custom_name = directory
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+        }
         self.attach_project(id);
         self.rebuild_sidebar();
         self.show_selected_project();
@@ -1824,12 +1887,18 @@ impl TuniWindow {
     fn attach_project(&self, id: Id) {
         let imp = self.imp();
         let view = adw::TabView::new();
-        view.set_menu_model(Some(&tab_menu()));
+        view.set_menu_model(Some(&tab_menu(&self.move_section())));
         view.connect_setup_menu(glib::clone!(
             #[weak(rename_to = this)]
             self,
             move |_, page| {
                 this.imp().menu_page.replace(page.cloned());
+                // As the menu opens rather than when the projects change: the
+                // strip's popover holds the model it was built from, so the
+                // list is written into the same one every time.
+                if page.is_some() {
+                    this.fill_move_section(id);
+                }
             }
         ));
         // A tab with unsaved work in it asks before it goes; the strip waits
@@ -1844,17 +1913,26 @@ impl TuniWindow {
         view.connect_page_detached(glib::clone!(
             #[weak(rename_to = this)]
             self,
-            move |_, _, position| this.tab_detached(id, position)
+            move |view, _, position| this.tab_detached(view, id, position)
         ));
-        // A tab dropped on the desktop asks for a window to land in. Answering
-        // with one hands the page over live: the widgets, and so the shells
-        // inside them, are moved rather than rebuilt.
+        // The other half of a detach that was a drag rather than a close: the
+        // page has landed, in this strip or another window's, and the tab it
+        // carries goes back into a project.
+        view.connect_page_attached(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |view, page, position| this.tab_attached(view, id, page, position)
+        ));
+        // A tab dropped outside every strip asks for a window to land in.
+        // Answering with one hands the page over live: the widgets, and so the
+        // shells inside them, are moved rather than rebuilt. A drop on a
+        // sidebar row is answered with that project's strip instead.
         view.connect_create_window(glib::clone!(
             #[weak(rename_to = this)]
             self,
             #[upgrade_or]
             None,
-            move |_| this.window_for_torn_out_tab()
+            move |_| this.view_for_dropped_tab()
         ));
         view.connect_page_reordered(glib::clone!(
             #[weak(rename_to = this)]
@@ -3503,7 +3581,15 @@ impl TuniWindow {
 
     /// The strip has removed a tab: drop it from the model and hang up every
     /// shell that was in it.
-    fn tab_detached(&self, project: Id, position: i32) {
+    ///
+    /// Unless the page is only passing through. `AdwTabView` detaches a page
+    /// the instant a drag picks it up, seconds before anything decides where it
+    /// is going, and that detach is this same signal, so a tab torn down here
+    /// would be a tab whose shells died the moment somebody took hold of it.
+    /// `is-transferring-page` is what tells a drag from a close, and a tab in
+    /// flight is parked in [`IN_FLIGHT`] until the attach at the other end says
+    /// which project it landed in.
+    fn tab_detached(&self, view: &adw::TabView, project: Id, position: i32) {
         let imp = self.imp();
         let removed = {
             let mut workspace = imp.workspace.borrow_mut();
@@ -3525,10 +3611,11 @@ impl TuniWindow {
             return;
         };
 
-        // Dragged out rather than closed: the shells go on running in another
-        // window instead of being hung up here.
-        if let Some((window, project)) = imp.handover.take() {
-            self.hand_over(&window, project, tab);
+        // Dragged rather than closed: the shells go on running, and the tab
+        // waits for the strip that takes the page.
+        if view.is_transferring_page() {
+            IN_FLIGHT.set(Some((self.clone(), project, tab)));
+            self.refresh();
             return;
         }
 
@@ -3543,6 +3630,198 @@ impl TuniWindow {
         // every walk.
         imp.recent.borrow_mut().retain(|id| *id != tab.id());
         self.refresh();
+    }
+
+    /// A page has arrived in a strip. A tab in flight is the only kind this
+    /// answers for: every other attach is a tab this window has just built,
+    /// which is already in the model.
+    fn tab_attached(&self, view: &adw::TabView, project: Id, page: &adw::TabPage, position: i32) {
+        let Some((source, from, tab)) = IN_FLIGHT.take() else {
+            return;
+        };
+        // A drag called off puts the page back where it was taken from, through
+        // the same pair of signals a move goes through. Nothing happened, so
+        // nothing is said about it.
+        let moved = source != *self || from != project;
+        source.hand_over(self, project, tab, position.max(0) as usize);
+        if moved {
+            self.announce_move(project);
+        }
+
+        // Not moved here: `adw_tab_view_attach_page` is in the middle of this
+        // signal and tells its own page list where the page went once the
+        // handlers are done, so a reorder now is one the list model never hears
+        // about. An idle later is still before anything is drawn or clicked.
+        // The reorder itself carries the model with it, through the same
+        // `page-reordered` a tab dragged along the strip goes through.
+        if DROPPED_OUTSIDE.replace(false) {
+            glib::idle_add_local_once(glib::clone!(
+                #[weak]
+                view,
+                #[weak]
+                page,
+                move || {
+                    view.reorder_last(&page);
+                }
+            ));
+        }
+    }
+
+    /// Swells the row a dragged tab is being held over, and lifts the icons of
+    /// the rows either side of it, the way the dock magnifies what a pointer is
+    /// nearest. `None` puts the sidebar back.
+    ///
+    /// Only the row under the pointer changes height, and it grows downward
+    /// from a top edge that does not move, because the rows above it are
+    /// untouched. A neighbour that grew taller would slide that row down out
+    /// from under the pointer, and the leave and enter that followed would move
+    /// the magnification to the next row and back again for as long as the
+    /// pointer stayed still.
+    fn magnify_rows(&self, target: Option<i32>) {
+        let Some(list) = self.imp().sidebar.borrow().clone() else {
+            return;
+        };
+        let mut index = 0;
+        while let Some(row) = list.row_at_index(index) {
+            row.remove_css_class("tuni-row-magnify");
+            row.remove_css_class("tuni-row-near");
+            match target.map(|target| (index - target).abs()) {
+                Some(0) => row.add_css_class("tuni-row-magnify"),
+                Some(1) => row.add_css_class("tuni-row-near"),
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+
+    /// Says where a tab just went, in the two places a person is looking.
+    ///
+    /// The row it landed in lights up and fades, which answers "which project
+    /// took it" without a word, and is the only answer a drag needs because the
+    /// row is the thing the pointer was over. The toast is for the same move
+    /// made from the tab menu, where the sidebar can be shut and the tab simply
+    /// vanishes from the strip.
+    fn announce_move(&self, project: Id) {
+        let name = self
+            .imp()
+            .workspace
+            .borrow()
+            .project(project)
+            .map(|entry| entry.name().to_owned());
+        let Some(name) = name else {
+            return;
+        };
+        self.toast(&format!("Tab moved to {name}"));
+
+        let Some(row) = self.row_for(project) else {
+            return;
+        };
+        row.add_css_class("tuni-row-landed");
+        // Taken off again so the next arrival can play it: a class already on
+        // the widget restarts nothing. Weak, so a window closed in the meantime
+        // is not held open by its own applause.
+        glib::timeout_add_local_once(
+            Duration::from_millis(700),
+            glib::clone!(
+                #[weak]
+                row,
+                move || row.remove_css_class("tuni-row-landed")
+            ),
+        );
+    }
+
+    /// The sidebar row drawn for a project. The rows are appended in the order
+    /// the projects are in, and nothing else is in that list.
+    fn row_for(&self, project: Id) -> Option<gtk::ListBoxRow> {
+        let index = self
+            .imp()
+            .workspace
+            .borrow()
+            .projects()
+            .iter()
+            .position(|entry| entry.id() == project)?;
+        self.imp()
+            .sidebar
+            .borrow()
+            .as_ref()?
+            .row_at_index(i32::try_from(index).ok()?)
+    }
+
+    /// Where a tab let go of outside every strip should land: the project whose
+    /// sidebar row took the drop, else a window of its own.
+    fn view_for_dropped_tab(&self) -> Option<adw::TabView> {
+        let dropped = DROPPED_ON
+            .take()
+            .and_then(|(window, project)| window.imp().views.borrow().get(&project).cloned());
+        let view = match dropped {
+            Some(view) => Some(view),
+            None => self.window_for_torn_out_tab(),
+        };
+        // The attach that follows put it at the head of a strip that may
+        // already have tabs in it. Only when there is one: an answer of nothing
+        // sends the page back where it came from, at the index it left.
+        DROPPED_OUTSIDE.set(view.is_some());
+        view
+    }
+
+    /// The section of the tab menu that lists the other projects, made once and
+    /// kept: the strip builds its popover from the model the first time it is
+    /// asked for and hands out the same one afterwards, so the list has to be
+    /// written into a section that is already in it.
+    fn move_section(&self) -> gio::Menu {
+        self.imp()
+            .tab_move
+            .borrow_mut()
+            .get_or_insert_with(gio::Menu::new)
+            .clone()
+    }
+
+    /// Writes the other projects into that section, as the menu opens.
+    ///
+    /// A window with one project in it leaves the section empty, and an empty
+    /// section draws nothing, so there is no menu item saying a tab has nowhere
+    /// to go.
+    fn fill_move_section(&self, project: Id) {
+        let section = self.move_section();
+        section.remove_all();
+        for entry in self.imp().workspace.borrow().projects() {
+            if entry.id() == project {
+                continue;
+            }
+            section.append_item(&item(
+                entry.name(),
+                "win.tab-move-to-project",
+                &entry.id().raw().to_variant(),
+            ));
+        }
+    }
+
+    /// Moves the tab the menu was opened on into another project, at the end of
+    /// its strip.
+    ///
+    /// The move itself is the strip's, the same call a drag makes: transferring
+    /// the page carries the widgets, and so the shells, without closing a PTY
+    /// or replaying a scrollback. The model follows through the detach and the
+    /// attach that a transfer is made of.
+    fn move_tab_to_project(&self, project: Id) {
+        // The menu's tab, and the tab in front when the action was reached some
+        // other way - the strip clears its page as the popover closes, and the
+        // action is worth having from a keyboard too.
+        let menu_page = self.imp().menu_page.borrow().clone();
+        let Some((view, page)) = self
+            .selected_view()
+            .zip(menu_page)
+            .or_else(|| self.selected_page())
+        else {
+            return;
+        };
+        let Some(other) = self.imp().views.borrow().get(&project).cloned() else {
+            return;
+        };
+        if view == other {
+            return;
+        }
+        view.transfer_page(&page, &other, other.n_pages());
     }
 
     /// A window for a tab that has just been dragged out of a strip, and the
@@ -3560,7 +3839,6 @@ impl TuniWindow {
         window.show_selected_project();
         let view = window.imp().views.borrow().get(&project).cloned()?;
         window.present();
-        self.imp().handover.replace(Some((window, project)));
         Some(view)
     }
 
@@ -3614,16 +3892,14 @@ impl TuniWindow {
         };
         window.present();
 
-        // Backwards, because `hand_over` puts every tab it is given at the head
-        // of the strip: walking the pages from the end is what leaves them in
-        // the order they were dragged out in. The handover is set again before
-        // each one, since it is taken by the transfer it belongs to.
+        // Backwards, because each page goes to the head of the other strip:
+        // walking from the end is what leaves them in the order they were in
+        // here. Every transfer detaches and attaches, so the same pair of
+        // handlers that carries one dragged tab carries these.
         for position in (0..view.n_pages()).rev() {
             let page = view.nth_page(position);
-            imp.handover.replace(Some((window.clone(), target)));
             view.transfer_page(&page, &other, 0);
         }
-        imp.handover.take();
         self.close_project(id);
 
         // The tab that was in front stays in front. Every page landed selected
@@ -3646,7 +3922,11 @@ impl TuniWindow {
     /// bookkeeping, and the handlers on those widgets, which find their window
     /// through [`Self::owner`] rather than remembering the one they were wired
     /// in.
-    fn hand_over(&self, window: &Self, project: Id, tab: Tab) {
+    ///
+    /// `window` is this window when a tab is moved between two projects of the
+    /// same one, and then every map here is the map there: the moves are no-ops
+    /// and only the workspace really changes hands.
+    fn hand_over(&self, window: &Self, project: Id, tab: Tab, position: usize) {
         let imp = self.imp();
         let other = window.imp();
         for pane in tab.layout().panes() {
@@ -3662,7 +3942,11 @@ impl TuniWindow {
                 (&imp.working, &other.working),
                 (&imp.finished, &other.finished),
             ] {
-                if let Some((_, tab)) = from.borrow_mut().remove(&id) {
+                // Taken out before it is put back, rather than in the `if let`,
+                // because the two maps are one map when the move stays in this
+                // window and the borrow would still be held.
+                let entry = from.borrow_mut().remove(&id);
+                if let Some((_, tab)) = entry {
                     to.borrow_mut().insert(id, (project, tab));
                 }
             }
@@ -3673,7 +3957,7 @@ impl TuniWindow {
 
         let id = tab.id();
         if let Some(entry) = other.workspace.borrow_mut().project_mut(project) {
-            entry.insert_tab(0, tab);
+            entry.insert_tab(position, tab);
             entry.select(Some(id));
         }
         window.refresh_agents();
@@ -4619,6 +4903,9 @@ impl TuniWindow {
 
     fn build_row(&self, id: Id, name: &str) -> (gtk::ListBoxRow, gtk::Label) {
         let icon = gtk::Image::from_icon_name("folder-symbolic");
+        // Named so the dock effect can lift this icon without lifting the close
+        // button's, which is the other image in the row.
+        icon.add_css_class("tuni-row-icon");
         let label = gtk::Label::builder()
             .label(name)
             .xalign(0.0)
@@ -4772,6 +5059,57 @@ impl TuniWindow {
             }
         ));
         row.add_controller(target);
+
+        // A tab dragged out of the strip and let go of on a row moves into that
+        // project. The move is not made here: `AdwTabBox` detached the page when
+        // the drag began, and a drop anywhere inside the window that is not a
+        // tab strip makes it ask for a window to put the page in. So the row
+        // writes down what it was given and the ask is answered with this
+        // project's strip.
+        let tabs = gtk::DropTarget::new(adw::TabPage::static_type(), gdk::DragAction::MOVE);
+        // Lit while the tab is held over it, the way the tiles below light up
+        // the half a dropped pane would take: a drop that says nothing until it
+        // has happened is one a person has to undo to find out what it did.
+        tabs.connect_enter(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            row,
+            #[upgrade_or]
+            gdk::DragAction::empty(),
+            move |_, _, _| {
+                row.add_css_class("tuni-row-target");
+                this.magnify_rows(Some(row.index()));
+                gdk::DragAction::MOVE
+            }
+        ));
+        tabs.connect_leave(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            row,
+            move |_| {
+                row.remove_css_class("tuni-row-target");
+                this.magnify_rows(None);
+            }
+        ));
+        tabs.connect_drop(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            row,
+            #[upgrade_or]
+            false,
+            move |_, _, _, _| {
+                // The lit row is handed straight over to the landing pulse, so
+                // there is no dark frame between the two.
+                row.remove_css_class("tuni-row-target");
+                this.magnify_rows(None);
+                DROPPED_ON.set(Some((this, id)));
+                true
+            }
+        ));
+        row.add_controller(tabs);
 
         (row, label)
     }
@@ -5122,7 +5460,13 @@ fn main_menu() -> gio::Menu {
 
 /// The context menu on a tab. The strip tells us which tab it belongs to
 /// through `setup-menu`, so none of these carry a target.
-fn tab_menu() -> gio::Menu {
+///
+/// `moving` is the one section that is not fixed: it lists the other projects
+/// and so is filled in as the menu opens. It is passed in rather than built
+/// here because `AdwTabBox` reads this model once and keeps the popover it
+/// built from it, which leaves changing the section in place as the only way
+/// to change what the menu says.
+fn tab_menu(moving: &gio::Menu) -> gio::Menu {
     let naming = gio::Menu::new();
     naming.append(Some("Rename…"), Some("win.tab-rename"));
     naming.append(Some("Use Automatic Title"), Some("win.tab-automatic-title"));
@@ -5141,6 +5485,7 @@ fn tab_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append_section(None, &naming);
     menu.append_section(None, &typing);
+    menu.append_section(Some("Move to Project"), moving);
     menu.append_section(None, &closing);
     menu
 }
@@ -5371,6 +5716,29 @@ fn load_css() {
                 drawn over it would only say the same thing twice. */\n\
              .tuni-sidebar-grip:hover { background-color: alpha(@accent_color, 0.5); }\n\
              .tuni-drop { background-color: alpha(@accent_color, 0.28); border-radius: 6px; }\n\
+             /* A tab held over a project row, and the same row for a moment\n\
+                after it has been let go of. The two are one colour on purpose:\n\
+                what lights up under the pointer is what keeps the tab, and the\n\
+                pulse is that light going out rather than a second signal. */\n\
+             row.tuni-row-target { \
+              background-color: alpha(@accent_color, 0.28); \
+              box-shadow: inset 0 0 0 1px alpha(@accent_color, 0.7); \
+              transition: background-color 120ms ease-out; }\n\
+             @keyframes tuni-row-landed { \
+              from { background-color: alpha(@accent_color, 0.45); } \
+              to { background-color: alpha(@accent_color, 0); } }\n\
+             row.tuni-row-landed { animation: tuni-row-landed 700ms ease-out; }\n\
+             /* The dock's magnification, in the one direction a list has: the\n\
+                row being dragged over swells and its neighbours' icons lift.\n\
+                Declared on the plain row as well so the way back is as smooth\n\
+                as the way out; a transition written only into the class would\n\
+                snap when the class came off. */\n\
+             .navigation-sidebar row { transition: min-height 160ms ease-out; }\n\
+             .navigation-sidebar row .tuni-row-icon { \
+              transition: -gtk-icon-size 160ms ease-out; }\n\
+             row.tuni-row-magnify { min-height: 52px; }\n\
+             row.tuni-row-magnify .tuni-row-icon { -gtk-icon-size: 24px; }\n\
+             row.tuni-row-near .tuni-row-icon { -gtk-icon-size: 20px; }\n\
              /* An emoji drawn at the size a symbolic icon is drawn at is a\n\
                 smudge, and a picker is for looking at what you are picking. */\n\
              .tuni-icon-tile label { font-size: 20px; }\n\
@@ -5569,7 +5937,14 @@ fn unsaved_message(dirty: &[TuniEditor]) -> String {
 
 /// Moves one entry between two windows' maps of the same kind, if it is there
 /// to move. What handing a tab over does to every widget in it.
+///
+/// One map both times is a tab moved between projects of the same window: the
+/// entry is already where it belongs, and taking it out would only be a borrow
+/// held while the same cell is asked for again.
 fn move_entry<T: Clone>(from: &RefCell<HashMap<Id, T>>, to: &RefCell<HashMap<Id, T>>, key: Id) {
+    if std::ptr::eq(from, to) {
+        return;
+    }
     if let Some(value) = from.borrow_mut().remove(&key) {
         to.borrow_mut().insert(key, value);
     }

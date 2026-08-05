@@ -61,6 +61,19 @@ the panel are both dragged to a width by their inner edge, and one dragged to a
 width keeps it. Until then each is a fraction of the window, which is what a
 split view sizes by and what an undragged one should go on doing.
 
+One tuni runs at a time, and a launch made while it is running is a project
+rather than a second window. "Open Terminal Here" in a file manager says where
+by starting the process in that directory and nothing else, since only konsole
+takes a flag for it, so the directory a launch carries is the whole of what it
+asked for: it opens a project pinned there, named after the folder, in the
+window already on screen, and the activation token the launch came with is what
+brings that window to the front. A launch from the home directory is not read as
+naming one, because that is where an application menu starts everything from; a
+path given as an argument is, so `tuni ~/src/thing` typed in a shell says it
+outright. The alternative is two windows with two saved sessions writing over
+each other, which is the other half of why there is one process.
+`TUNI_SINGLE_INSTANCE=0` puts a separate one back for a build being worked on.
+
 On the other side, a panel under `Ctrl+Shift+B` shows the directory the focused
 shell is working in, or the project's own if one is pinned, and follows it as
 the focus moves. It stands beside the tab strip rather than under it, since the
@@ -239,9 +252,30 @@ own, and the shells inside it keep running through the move: nothing is
 restarted, nothing is re-attached. Every widget in a pane looks its window up
 by the tab it belongs to at the moment a signal fires, rather than holding the
 window it was built in, so handing a tab over is moving one entry per pane
-between two maps and moving the model's `Tab`. Dropping a tab onto another tuni
-window is not that path and closes it instead: libadwaita only asks for a new
-window when the drop had no window under it. A project row dragged off the
+between two maps and moving the model's `Tab`. Dropped on another tuni window's
+strip it is that same move with those same shells, because the strip a page
+lands in is the one that reports it: libadwaita detaches the page when the drag
+begins and attaches it where it was let go, and the tab waits between the two
+rather than being closed and built again. Dropped on a project row in the
+sidebar it moves into that project, which libadwaita has no signal for either: a
+drop anywhere in the window that is not a tab strip makes it ask for a window to
+put the page in, and the row that took the drop is what that question is
+answered with. That move is the one the window has to narrate, because the tab
+leaves the strip in front of a person and lands in a project they may not be
+looking at: the row lights up in the accent colour while the tab is held over
+it, so what will take it is lit before it is let go of, and keeps that colour
+for a moment afterwards as it fades, so what did take it is the same light going
+out rather than a second signal somewhere else. It also swells while the tab is
+over it and the icons either side of it lift, which is the dock's magnification
+in the one direction a list has. Only the row under the pointer changes height,
+and it grows downward from a top edge that does not move, because a neighbour
+that grew would slide that row out from under a pointer that had not moved, and
+the leave and enter that followed would hand the magnification back and forth
+between two rows for as long as it stayed still. A toast names the project as
+well, for the same move made from the menu, where the sidebar can be shut and
+the tab would simply vanish. The tab's own menu says "Move to Project" and lists
+the others by name, for the same reason the project menu says "Move to a New
+Window": a drag is a gesture a tiling compositor can swallow. A project row dragged off the
 sidebar does the same for everything in it, one transfer per tab, and its menu
 says "Move to a New Window" for the same thing by name, because a drag onto the
 desktop is a gesture a tiling compositor can swallow before it reaches the
@@ -312,6 +346,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+Shift+R` | Reopen the tab just closed, with its layout, its name and what its shells had printed |
 | `Ctrl+Page Down` / `Ctrl+Page Up` | Next tab, previous tab |
 | Drag a tab off the strip | A window of its own, with the shells still running in it |
+| Drag a tab onto a project row | Move it into that project; its menu says "Move to Project" for the same thing |
 | Hold `Ctrl`, press `Tab` | The tab switcher: cards for every tab, most recently used first. `Shift+Tab` walks back, `Escape` cancels, letting `Ctrl` go switches |
 | `Alt+1` … `Alt+9` | Jump to a tab; `Alt+9` is the last one |
 | `Ctrl+Shift+N` | New project |
@@ -1183,7 +1218,9 @@ Debugging aids, all off unless set, and none of them written back to the
 configuration file: `TUNI_THEME` names one of the bundled themes for the run
 and `TUNI_FONT` a font the way Pango writes one (`"JetBrains Mono 13"`), with
 `TUNI_LIGATURES=1` to let them fire; `TUNI_SESSION=0` neither restores the
-saved session nor overwrites it; `TUNI_DEBUG_FRAME_TIME` prints draw-time
+saved session nor overwrites it; `TUNI_SINGLE_INSTANCE=0` runs a window of its
+own rather than opening a project in the tuni already running, which is what a
+build being worked on wants; `TUNI_DEBUG_FRAME_TIME` prints draw-time
 percentiles; `TUNI_DEBUG_STARTUP` prints how many milliseconds each phase
 before the first frame took;
 `TUNI_DEBUG_PTY_WRITE` logs what the terminal answers back to the shell;
