@@ -10,6 +10,14 @@
 //! touching the user's file, and the banner at the top says so. That file has
 //! `Include`, `Match`, first-value-wins and comments people rely on; a terminal
 //! that reformats it loses trust once and for good.
+//!
+//! The order of the cards is the order somebody fills them in: the address,
+//! then what to call the machine, then how to get onto it. Everything a host
+//! usually does not have — a snippet on connect, forwards, options written in
+//! ssh's own words — is behind Show more, because four cards of empty advanced
+//! fields is what makes an editor feel like a form rather than a question.
+//! What is behind it opens with the dialog when the host already uses any of
+//! it, so nothing a host carries is hidden from the person editing it.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -19,7 +27,10 @@ use gtk::glib;
 
 use tuni_core::ssh::{Forward, Host, Meta, Source};
 
-use crate::forward_editor;
+use crate::{forward_editor, icon_picker};
+
+/// What a host's row and its icon tile draw when it has not been given an icon.
+pub(crate) const ICON: &str = "network-server-symbolic";
 
 /// What the dialog hands back: the host as a file will hold it, and the part of
 /// it ssh syntax cannot say.
@@ -51,21 +62,94 @@ pub fn present<F>(
     });
     let original = editing.then(|| host.alias.clone());
 
-    let page = adw::PreferencesPage::new();
-
-    let connection = adw::PreferencesGroup::builder().title("Connection").build();
-    let name = adw::EntryRow::builder()
-        .title("Name")
-        .text(&host.alias)
+    // The page a preferences page would have been. Built by hand because the
+    // advanced half sits in a revealer, and a `PreferencesPage` takes groups
+    // rather than a widget that can hold three of them.
+    let page = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
+        .margin_top(12)
+        .margin_bottom(24)
+        .margin_start(12)
+        .margin_end(12)
         .build();
+
+    // The icon is metadata rather than ssh syntax, and the tile beside the
+    // address is where it is picked: a list of servers is a list of rows that
+    // say the same thing, and the icon is what tells one from another.
+    let icon = Rc::new(RefCell::new(meta.icon.clone()));
+
+    let where_group = adw::PreferencesGroup::builder().title("Address").build();
     let address = adw::EntryRow::builder()
         .title("Address")
         .text(&host.hostname)
         .build();
+    // Raised rather than flat, and square: it is the one control in the dialog
+    // that is not a field, and a dim icon at the head of a row reads as
+    // decoration rather than as something to press.
+    let tile = gtk::Button::builder()
+        .tooltip_text("Choose an icon")
+        .valign(gtk::Align::Center)
+        .width_request(34)
+        .height_request(34)
+        .build();
+    tile.add_css_class("tuni-icon-tile");
+    tile.set_child(Some(&icon_picker::image(
+        icon.borrow().as_deref(),
+        ICON,
+        false,
+    )));
+    tile.connect_clicked(glib::clone!(
+        #[strong]
+        icon,
+        move |tile| {
+            let current = icon.borrow().clone();
+            icon_picker::present(
+                tile,
+                "Host Icon",
+                "Use the Server Icon",
+                current,
+                glib::clone!(
+                    #[strong]
+                    icon,
+                    #[weak]
+                    tile,
+                    move |chosen: Option<String>| {
+                        tile.set_child(Some(&icon_picker::image(chosen.as_deref(), ICON, false)));
+                        icon.replace(chosen);
+                    }
+                ),
+            );
+        }
+    ));
+    address.add_prefix(&tile);
+    where_group.add(&address);
+    page.append(&where_group);
+
+    let general = adw::PreferencesGroup::builder().title("General").build();
+    let name = adw::EntryRow::builder()
+        .title("Name")
+        .text(&host.alias)
+        .build();
+    let label = adw::EntryRow::builder()
+        .title("Label")
+        .text(&meta.label)
+        .build();
+    let tags = adw::EntryRow::builder()
+        .title("Tags")
+        .text(meta.tags.join(", "))
+        .build();
+    general.add(&name);
+    general.add(&label);
+    general.add(&tags);
+    page.append(&general);
+
+    let connection = adw::PreferencesGroup::builder().title("Connection").build();
     let user = adw::EntryRow::builder()
         .title("User")
         .text(&host.user)
         .build();
+    user.add_prefix(&prefix("avatar-default-symbolic"));
     let port = adw::SpinRow::builder()
         .title("Port")
         .subtitle("Zero leaves the port to ssh, which means 22")
@@ -82,6 +166,7 @@ pub fn present<F>(
         .title("Identity file")
         .text(host.identities.first().map_or("", String::as_str))
         .build();
+    identity.add_prefix(&prefix("dialog-password-symbolic"));
     let choose = gtk::Button::builder()
         .icon_name("document-open-symbolic")
         .tooltip_text("Choose a key")
@@ -101,22 +186,6 @@ pub fn present<F>(
     identity.add_suffix(&known);
     identity.add_suffix(&choose);
     offer_keys(&known, &identity);
-    connection.add(&name);
-    connection.add(&address);
-    connection.add(&user);
-    connection.add(&port);
-    connection.add(&identity);
-    page.add(&connection);
-
-    let options = adw::PreferencesGroup::builder().title("Options").build();
-    let label = adw::EntryRow::builder()
-        .title("Label")
-        .text(&meta.label)
-        .build();
-    let tags = adw::EntryRow::builder()
-        .title("Tags")
-        .text(meta.tags.join(", "))
-        .build();
     // Nothing is a real answer here, and it is the first one, so the index of a
     // chosen alias is one past where it sits in the list.
     let mut names = vec!["None".to_owned()];
@@ -132,6 +201,36 @@ pub fn present<F>(
                 .unwrap_or(0) as u32,
         )
         .build();
+    connection.add(&port);
+    connection.add(&user);
+    connection.add(&identity);
+    connection.add(&jump);
+    page.append(&connection);
+
+    // Everything below is what most hosts leave alone, so it is folded away
+    // unless this one already uses it.
+    let advanced = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
+        .build();
+    let revealer = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideDown)
+        .reveal_child(crowded(&host, &meta))
+        .child(&advanced)
+        .build();
+    let more = disclosure(revealer.reveals_child());
+    more.connect_clicked(glib::clone!(
+        #[weak]
+        revealer,
+        move |button| {
+            let opening = !revealer.reveals_child();
+            revealer.set_reveal_child(opening);
+            button.set_child(Some(&disclosure_face(opening)));
+        }
+    ));
+    page.append(&more);
+    page.append(&revealer);
+
     // Same shape as the jump host: nothing is the first answer and a real one.
     let mut snippets = vec!["None".to_owned()];
     snippets.extend(
@@ -151,11 +250,9 @@ pub fn present<F>(
                 .unwrap_or(0) as u32,
         )
         .build();
-    options.add(&label);
-    options.add(&tags);
-    options.add(&jump);
-    options.add(&on_connect);
-    page.add(&options);
+    let session = adw::PreferencesGroup::builder().title("Session").build();
+    session.add(&on_connect);
+    advanced.append(&session);
 
     // Held apart from the rows, because a forward is added and removed rather
     // than typed, and Save is what puts the list in the file.
@@ -176,7 +273,7 @@ pub fn present<F>(
     add_forward.add_css_class("flat");
     forwards_group.set_header_suffix(Some(&add_forward));
     forwards_group.add(&forward_rows);
-    page.add(&forwards_group);
+    advanced.append(&forwards_group);
     draw(&forward_rows, &forwards);
     add_forward.connect_clicked(glib::clone!(
         #[strong]
@@ -219,15 +316,29 @@ pub fn present<F>(
         .child(&extra)
         .build();
     extra_frame.add_css_class("card");
+    // A text view paints its own background, which is a shade darker than the
+    // card around it and reads as a hole in the page rather than as a field.
+    extra.add_css_class("tuni-plain-view");
     extra_group.add(&extra_frame);
-    page.add(&extra_group);
+    advanced.append(&extra_group);
+
+    let column = adw::Clamp::builder()
+        .maximum_size(480)
+        .tightening_threshold(480)
+        .child(&page)
+        .build();
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&column)
+        .build();
 
     // A size rather than the content's own: rows this narrow wrap their
     // subtitles into paragraphs, and the dropdown loses the name it is showing.
     let dialog = adw::Dialog::builder()
         .title(if editing { "Edit Host" } else { "Add Host" })
         .content_width(480)
-        .content_height(620)
+        .content_height(700)
         .build();
 
     let cancel = gtk::Button::with_label("Cancel");
@@ -249,7 +360,7 @@ pub fn present<F>(
             .build();
         view.add_top_bar(&banner);
     }
-    view.set_content(Some(&page));
+    view.set_content(Some(&scroller));
     dialog.set_child(Some(&view));
 
     cancel.connect_clicked(glib::clone!(
@@ -321,6 +432,7 @@ pub fn present<F>(
             let written_meta = Meta {
                 label: label.text().trim().to_owned(),
                 tags: split_tags(&tags.text()),
+                icon: icon.borrow().clone(),
                 on_connect: snippets
                     .get(on_connect.selected() as usize)
                     .filter(|_| on_connect.selected() != 0)
@@ -339,6 +451,45 @@ pub fn present<F>(
 
     dialog.present(Some(parent));
     name.grab_focus();
+}
+
+/// Whether a host already uses anything the advanced half holds, which is what
+/// decides whether that half opens with the dialog. Folding away a forward
+/// somebody wrote would be hiding the host from the person editing it.
+fn crowded(host: &Host, meta: &Meta) -> bool {
+    !host.forwards.is_empty() || !host.extra.is_empty() || !meta.on_connect.is_empty()
+}
+
+/// The mark in front of a row, saying what the field is for at the width a
+/// title has already been read at.
+fn prefix(icon: &str) -> gtk::Image {
+    let image = gtk::Image::from_icon_name(icon);
+    image.add_css_class("dim-label");
+    image
+}
+
+/// The Show more control: a flat button rather than a row, because what it
+/// opens is three cards and not one field.
+fn disclosure(open: bool) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .child(&disclosure_face(open))
+        .halign(gtk::Align::Start)
+        .build();
+    button.add_css_class("flat");
+    button
+}
+
+fn disclosure_face(open: bool) -> gtk::Box {
+    let face = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let label = gtk::Label::new(Some(if open { "Show less" } else { "Show more" }));
+    label.add_css_class("dim-label");
+    face.append(&label);
+    face.append(&gtk::Image::from_icon_name(if open {
+        "pan-up-symbolic"
+    } else {
+        "pan-down-symbolic"
+    }));
+    face
 }
 
 /// Draws the forwards a host declares, whole. A handful of rows, each carrying
@@ -534,6 +685,26 @@ mod tests {
     fn tags_are_read_the_way_somebody_would_type_them() {
         assert_eq!(split_tags(" prod, db ,, "), ["prod", "db"]);
         assert!(split_tags("   ").is_empty());
+    }
+
+    #[test]
+    fn the_advanced_half_opens_on_a_host_that_uses_any_of_it() {
+        let plain = Host::default();
+        assert!(!crowded(&plain, &Meta::default()));
+        assert!(crowded(
+            &Host {
+                extra: vec!["Compression yes".to_owned()],
+                ..plain.clone()
+            },
+            &Meta::default()
+        ));
+        assert!(crowded(
+            &plain,
+            &Meta {
+                on_connect: "tmux".to_owned(),
+                ..Meta::default()
+            }
+        ));
     }
 
     #[test]

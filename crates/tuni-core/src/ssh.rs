@@ -834,6 +834,11 @@ pub struct Meta {
     pub label: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// A themed icon name or an emoji, written the way a project's row writes
+    /// one. Nothing means the server icon every unmarked host shares, which is
+    /// exactly what a launcher of identical rows is not worth marking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     /// Seconds since the epoch, which is what the Recent section sorts on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used: Option<u64>,

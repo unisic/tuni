@@ -65,6 +65,10 @@ pub(crate) fn connected() -> Vec<String> {
 /// list underneath it.
 const RECENT: usize = 5;
 
+/// How many tags a row draws before the rest become a count. Bounded because
+/// the row is as wide as the pane and tags are the part of it nobody limits.
+const TAGS: usize = 3;
+
 /// How wide the column gets before the space around it grows instead. A
 /// launcher on a wide monitor is a column, not a field of whitespace with three
 /// words in the middle of it.
@@ -581,6 +585,7 @@ impl TuniHosts {
             meta = Meta {
                 label: meta.label,
                 tags: meta.tags,
+                icon: meta.icon,
                 ..Meta::default()
             };
         }
@@ -980,7 +985,14 @@ fn header(title: &str) -> gtk::ListBoxRow {
 }
 
 fn local_row() -> gtk::ListBoxRow {
-    row("utilities-terminal-symbolic", "Local shell", "", "", false)
+    row(
+        &crate::icon_picker::image(None, "utilities-terminal-symbolic", false),
+        "Local shell",
+        "",
+        &[],
+        "",
+        false,
+    )
 }
 
 fn host_row(host: &Host, meta: &Meta, live: bool) -> gtk::ListBoxRow {
@@ -993,16 +1005,17 @@ fn host_row(host: &Host, meta: &Meta, live: bool) -> gtk::ListBoxRow {
     // first is doing anything. A list that shows both without saying so is a
     // list that lies about which one an edit would change, and that is worth
     // the space the tags would have had.
-    let note = if host.shadowed {
-        "declared twice".to_owned()
+    let (tags, note): (&[String], &str) = if host.shadowed {
+        (&[], "declared twice")
     } else {
-        meta.tags.join(", ")
+        (&meta.tags, "")
     };
     let row = row(
-        "network-server-symbolic",
+        &crate::icon_picker::image(meta.icon.as_deref(), crate::host_editor::ICON, false),
         name,
         &host.address(),
-        &note,
+        tags,
+        note,
         live,
     );
     if let Some(origin) = &host.origin {
@@ -1017,28 +1030,57 @@ fn host_row(host: &Host, meta: &Meta, live: bool) -> gtk::ListBoxRow {
 
 fn adhoc_row(host: &Host) -> gtk::ListBoxRow {
     row(
-        "network-server-symbolic",
+        &crate::icon_picker::image(None, crate::host_editor::ICON, false),
         &format!("Connect to {}", host.target()),
         &host.address(),
+        &[],
         "not saved",
         false,
     )
 }
 
-fn row(icon: &str, name: &str, address: &str, note: &str, live: bool) -> gtk::ListBoxRow {
-    // Emptied rather than hidden, so the icons below it stay in one column
-    // whether or not anything is connected.
-    let dot = gtk::Image::from_icon_name("media-record-symbolic");
-    dot.set_pixel_size(8);
-    if live {
-        dot.add_css_class("success");
-        dot.set_tooltip_text(Some("Connected"));
-    } else {
-        dot.set_icon_name(None);
-    }
+/// One entry: the icon in a tile, the name over the address it resolves to,
+/// and what is worth knowing about it on the right.
+///
+/// Two lines rather than one because the name and the address answer different
+/// questions — which machine, and which machine *is* that — and side by side
+/// the longer of the two decides how much of the other survives ellipsizing.
+/// The connected mark sits on the tile instead of in a column of its own: a
+/// column that is empty on every row but one is a column of indentation.
+fn row(
+    icon: &gtk::Widget,
+    name: &str,
+    address: &str,
+    tags: &[String],
+    note: &str,
+    live: bool,
+) -> gtk::ListBoxRow {
+    let tile = gtk::Box::builder()
+        .valign(gtk::Align::Center)
+        .width_request(32)
+        .height_request(32)
+        .build();
+    tile.add_css_class("tuni-host-tile");
+    // Set on purpose, not left to the child: the icon inside expands to centre
+    // itself in the tile, and without this that expansion travels outwards and
+    // the tile eats the row.
+    tile.set_hexpand(false);
+    icon.set_halign(gtk::Align::Center);
+    icon.set_valign(gtk::Align::Center);
+    icon.set_hexpand(true);
+    tile.append(icon);
 
-    let image = gtk::Image::from_icon_name(icon);
-    image.add_css_class("dim-label");
+    let mark = gtk::Overlay::builder().child(&tile).build();
+    if live {
+        let dot = gtk::Image::from_icon_name("media-record-symbolic");
+        dot.set_pixel_size(10);
+        dot.set_halign(gtk::Align::End);
+        dot.set_valign(gtk::Align::End);
+        dot.add_css_class("success");
+        dot.add_css_class("tuni-host-live");
+        dot.set_tooltip_text(Some("Connected"));
+        mark.add_overlay(&dot);
+    }
 
     let title = gtk::Label::builder()
         .label(name)
@@ -1046,27 +1088,49 @@ fn row(icon: &str, name: &str, address: &str, note: &str, live: bool) -> gtk::Li
         .xalign(0.0)
         .build();
 
-    let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    text.set_valign(gtk::Align::Center);
+    text.set_hexpand(true);
+    text.append(&title);
+
+    if !address.is_empty() {
+        let label = gtk::Label::builder()
+            .label(address)
+            // The end of an address says more than its beginning, and the
+            // middle is what a reader can do without.
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .xalign(0.0)
+            .build();
+        label.add_css_class("monospace");
+        label.add_css_class("caption");
+        label.add_css_class("dim-label");
+        text.append(&label);
+    }
+
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     line.set_margin_start(12);
     line.set_margin_end(6);
-    line.set_margin_top(4);
-    line.set_margin_bottom(4);
-    line.append(&dot);
-    line.append(&image);
-    line.append(&title);
+    line.set_margin_top(5);
+    line.set_margin_bottom(5);
+    line.append(&mark);
+    line.append(&text);
 
-    let label = gtk::Label::builder()
-        .label(address)
-        // The end of an address says more than its beginning, and the middle is
-        // what a reader can do without.
-        .ellipsize(gtk::pango::EllipsizeMode::Middle)
-        .xalign(0.0)
-        .hexpand(true)
-        .build();
-    label.add_css_class("monospace");
-    label.add_css_class("caption");
-    label.add_css_class("dim-label");
-    line.append(&label);
+    // Three, because a row is as wide as the pane and a host somebody tagged
+    // seven ways would push its own address out of the row. The rest are one
+    // more count rather than one more chip, and the tooltip has all of them.
+    for tag in tags.iter().take(TAGS) {
+        let chip = gtk::Label::new(Some(tag));
+        chip.add_css_class("caption");
+        chip.add_css_class("tuni-tag");
+        line.append(&chip);
+    }
+    if tags.len() > TAGS {
+        let rest = gtk::Label::new(Some(&format!("+{}", tags.len() - TAGS)));
+        rest.add_css_class("caption");
+        rest.add_css_class("dim-label");
+        rest.set_tooltip_text(Some(&tags.join(", ")));
+        line.append(&rest);
+    }
 
     if !note.is_empty() {
         let label = gtk::Label::new(Some(note));
@@ -1075,7 +1139,9 @@ fn row(icon: &str, name: &str, address: &str, note: &str, live: bool) -> gtk::Li
         line.append(&label);
     }
 
-    gtk::ListBoxRow::builder().child(&line).build()
+    let row = gtk::ListBoxRow::builder().child(&line).build();
+    row.add_css_class("tuni-host-row");
+    row
 }
 
 /// Puts a host in the file tuni owns, and makes sure `ssh` reads that file.

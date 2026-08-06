@@ -1,4 +1,4 @@
-//! The picker a project's sidebar icon is chosen in.
+//! The picker a sidebar icon is chosen in: a project's row, and a host's.
 //!
 //! Two alphabets, one field. A themed icon follows the desktop's icon theme and
 //! is drawn in the row's foreground colour like every other symbolic icon in the
@@ -12,6 +12,10 @@
 //! forty here are the ones a directory of work tends to be about; the system
 //! chooser, with every emoji this desktop has and a search field over them, is
 //! the last tile of that grid rather than a second control in the header.
+//!
+//! The distribution logos come second, above the desktop's own icons, because a
+//! host list is where this picker is opened from most and "which system is this"
+//! is the question a row of identical addresses cannot answer.
 //!
 //! The icon grid is a fixed list rather than everything the theme has. A desktop
 //! icon theme holds thousands of names, most of them a device, a mimetype or one
@@ -67,6 +71,7 @@ const EMOJI: &[&str] = &[
     "🧠",
     "👀",
     "🍎",
+    "🐧",
 ];
 
 /// The icons offered, in the order they are drawn. Grouped loosely by what a
@@ -118,19 +123,104 @@ const ICONS: &[&str] = &[
     "dialog-information-symbolic",
 ];
 
+/// The system a host runs, and the name to say so in the tooltip, since
+/// `tuni-pop-os-symbolic` is not what anybody is looking for. Ordered the way
+/// the families are related rather than alphabetically: Debian and its
+/// children, Red Hat and its rebuilds, SUSE, Arch, the source and small ones,
+/// the appliances, the BSDs, the desktops, then where a machine is rented.
+///
+/// Shipped in `data/icons` rather than looked up in the theme: a desktop has
+/// the logo of the distribution it is running on, at best, and a host list is
+/// about other machines. The marks belong to those projects; they are here to
+/// say which system a row is, and nothing else.
+const DISTROS: &[(&str, &str)] = &[
+    ("tuni-debian-symbolic", "Debian"),
+    ("tuni-ubuntu-symbolic", "Ubuntu"),
+    ("tuni-mint-symbolic", "Linux Mint"),
+    ("tuni-pop-os-symbolic", "Pop!_OS"),
+    ("tuni-elementary-symbolic", "elementary OS"),
+    ("tuni-zorin-symbolic", "Zorin OS"),
+    ("tuni-fedora-symbolic", "Fedora"),
+    ("tuni-redhat-symbolic", "Red Hat"),
+    ("tuni-centos-symbolic", "CentOS"),
+    ("tuni-alma-symbolic", "AlmaLinux"),
+    ("tuni-rocky-symbolic", "Rocky Linux"),
+    ("tuni-opensuse-symbolic", "openSUSE"),
+    ("tuni-arch-symbolic", "Arch Linux"),
+    ("tuni-manjaro-symbolic", "Manjaro"),
+    ("tuni-gentoo-symbolic", "Gentoo"),
+    ("tuni-alpine-symbolic", "Alpine Linux"),
+    ("tuni-nixos-symbolic", "NixOS"),
+    ("tuni-void-symbolic", "Void Linux"),
+    ("tuni-kali-symbolic", "Kali Linux"),
+    ("tuni-linux-symbolic", "Linux"),
+    ("tuni-raspberry-pi-symbolic", "Raspberry Pi"),
+    ("tuni-openwrt-symbolic", "OpenWrt"),
+    ("tuni-proxmox-symbolic", "Proxmox"),
+    ("tuni-truenas-symbolic", "TrueNAS"),
+    ("tuni-unraid-symbolic", "Unraid"),
+    ("tuni-synology-symbolic", "Synology"),
+    ("tuni-docker-symbolic", "Docker"),
+    ("tuni-kubernetes-symbolic", "Kubernetes"),
+    ("tuni-freebsd-symbolic", "FreeBSD"),
+    ("tuni-openbsd-symbolic", "OpenBSD"),
+    ("tuni-netbsd-symbolic", "NetBSD"),
+    ("tuni-windows-symbolic", "Windows"),
+    ("tuni-macos-symbolic", "macOS"),
+    ("tuni-aws-symbolic", "AWS"),
+    ("tuni-google-cloud-symbolic", "Google Cloud"),
+    ("tuni-oracle-symbolic", "Oracle Cloud"),
+    ("tuni-digitalocean-symbolic", "DigitalOcean"),
+    ("tuni-hetzner-symbolic", "Hetzner"),
+    ("tuni-ovh-symbolic", "OVH"),
+    ("tuni-linode-symbolic", "Linode"),
+    ("tuni-vultr-symbolic", "Vultr"),
+    ("tuni-cloudflare-symbolic", "Cloudflare"),
+];
+
+/// Draws an icon the way this picker writes them down: an emoji is text the
+/// font colours, a name is a symbolic icon in the foreground colour, and
+/// nothing at all is `fallback`, which is whatever the row draws when it has
+/// not been given one.
+///
+/// `dim` is for a list, where the icon is beside the name rather than the thing
+/// being pointed at. An emoji is never dimmed whatever the caller asks: its
+/// colour is the reason somebody picked it.
+pub fn image(icon: Option<&str>, fallback: &str, dim: bool) -> gtk::Widget {
+    match icon {
+        Some(glyph) if tuni_core::workspace::is_emoji(glyph) => {
+            gtk::Label::builder().label(glyph).build().upcast()
+        }
+        chosen => {
+            let image = gtk::Image::from_icon_name(chosen.unwrap_or(fallback));
+            if dim {
+                image.add_css_class("dim-label");
+            }
+            image.upcast()
+        }
+    }
+}
+
 /// Opens the picker over `parent`.
 ///
-/// `current` is what the project draws now, so the picker can mark it, and
-/// `apply` is handed the new value: a name, an emoji, or `None` for the folder
-/// every project starts with. It is called once and the dialog closes, because
-/// picking an icon is one complete change and a Save button over it would only
-/// be a second click to say the same thing.
-pub fn present<F>(parent: &impl IsA<gtk::Widget>, current: Option<String>, apply: F)
-where
+/// `title` names what is being given an icon and `reset` says what dropping it
+/// goes back to, because a project falls back to a folder and a host to a
+/// server. `current` is what the row draws now, so the picker can mark it, and
+/// `apply` is handed the new value: a name, an emoji, or `None` for the
+/// fallback. It is called once and the dialog closes, because picking an icon
+/// is one complete change and a Save button over it would only be a second
+/// click to say the same thing.
+pub fn present<F>(
+    parent: &impl IsA<gtk::Widget>,
+    title: &str,
+    reset: &str,
+    current: Option<String>,
+    apply: F,
+) where
     F: Fn(Option<String>) + 'static,
 {
     let dialog = adw::Dialog::builder()
-        .title("Project Icon")
+        .title(title)
         .content_width(400)
         .content_height(560)
         .build();
@@ -171,22 +261,32 @@ where
     more.add_css_class("circular");
     emoji.append(&more);
 
-    let icons = group();
     // Asked of the display the dialog is opening on rather than the default: a
     // window dragged to another screen draws with that screen's theme, and an
     // icon missing there would be a hole in the grid.
     let theme = gtk::IconTheme::for_display(&parent.as_ref().display());
-    for name in ICONS.iter().filter(|name| theme.has_icon(name)) {
+    let chosen = |name: &str, label: &str| {
         let button = tile(&gtk::Image::from_icon_name(name));
-        button.set_tooltip_text(Some(name));
-        if current.as_deref() == Some(*name) {
+        button.set_tooltip_text(Some(label));
+        if current.as_deref() == Some(name) {
             button.add_css_class("suggested-action");
         }
-        button.connect_clicked(chooses(&apply, &dialog, Some((*name).to_owned())));
-        icons.append(&button);
+        button.connect_clicked(chooses(&apply, &dialog, Some(name.to_owned())));
+        button
+    };
+
+    let systems = group();
+    for (name, label) in DISTROS.iter().filter(|(name, _)| theme.has_icon(name)) {
+        systems.append(&chosen(name, label));
+    }
+
+    let icons = group();
+    for name in ICONS.iter().filter(|name| theme.has_icon(name)) {
+        icons.append(&chosen(name, name));
     }
 
     page.add(&wrap("Emoji", &emoji));
+    page.add(&wrap("Systems", &systems));
     page.add(&wrap("Icons", &icons));
 
     // Only when there is something to undo. A reset that is always there and
@@ -194,7 +294,7 @@ where
     // grid.
     if current.is_some() {
         let reset = gtk::Button::builder()
-            .label("Use the Folder Icon")
+            .label(reset)
             .halign(gtk::Align::Center)
             .margin_top(6)
             .build();
@@ -263,4 +363,33 @@ where
             dialog.close();
         }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DISTROS;
+
+    /// A name in the list with no file behind it is not an error anywhere: the
+    /// grid drops what the theme is missing, so a typo is a tile that silently
+    /// never appears.
+    #[test]
+    fn every_system_logo_is_a_file_this_repository_ships() {
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/icons/hicolor/scalable/actions"
+        );
+        for (name, label) in DISTROS {
+            let path = std::path::Path::new(dir).join(format!("{name}.svg"));
+            assert!(path.exists(), "{label} has no {name}.svg");
+        }
+    }
+
+    #[test]
+    fn no_system_is_offered_twice() {
+        let mut seen: Vec<_> = DISTROS.iter().map(|(name, _)| *name).collect();
+        let count = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), count);
+    }
 }

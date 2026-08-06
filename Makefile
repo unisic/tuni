@@ -148,8 +148,12 @@ install-data:
 		$(icondir)/scalable/apps/$(APP_ID).svg
 	install -Dm644 data/icons/hicolor/symbolic/apps/$(APP_ID)-symbolic.svg \
 		$(icondir)/symbolic/apps/$(APP_ID)-symbolic.svg
-	install -Dm644 data/icons/hicolor/scalable/actions/tuni-git-symbolic.svg \
-		$(icondir)/scalable/actions/tuni-git-symbolic.svg
+	# The whole directory rather than a file per line: the icons Adwaita does
+	# not have are added a few at a time, and a list here that has to be
+	# remembered is a list that goes stale silently.
+	for icon in data/icons/hicolor/scalable/actions/*.svg; do \
+		install -Dm644 $$icon $(icondir)/scalable/actions/$$(basename $$icon); \
+	done
 
 uninstall:
 	rm -f $(bindir)/tuni
@@ -157,7 +161,9 @@ uninstall:
 	rm -f $(datadir)/metainfo/$(APP_ID).metainfo.xml
 	rm -f $(icondir)/scalable/apps/$(APP_ID).svg
 	rm -f $(icondir)/symbolic/apps/$(APP_ID)-symbolic.svg
-	rm -f $(icondir)/scalable/actions/tuni-git-symbolic.svg
+	for icon in data/icons/hicolor/scalable/actions/*.svg; do \
+		rm -f $(icondir)/scalable/actions/$$(basename $$icon); \
+	done
 
 check:
 	$(CARGO) fmt --check

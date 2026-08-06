@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The Windows mark, so a host row says which machine it is at a
+     glance. From simple-icons (CC0 1.0); the trademark stays its
+     owner's, and this names that system and nothing else. No fill,
+     because GTK recolors a -symbolic icon by its shape. -->
+<svg width="16" height="16" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+<path d="M0,0H11.377V11.372H0ZM12.623,0H24V11.372H12.623ZM0,12.623H11.377V24H0Zm12.623,0H24V24H12.623"/>
+</svg>

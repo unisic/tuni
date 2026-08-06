@@ -5223,8 +5223,10 @@ impl TuniWindow {
             .project(id)
             .and_then(|project| project.icon.clone());
 
-        crate::project_icon::present(
+        crate::icon_picker::present(
             self,
+            "Project Icon",
+            "Use the Folder Icon",
             current,
             glib::clone!(
                 #[weak(rename_to = this)]
@@ -5776,6 +5778,24 @@ fn load_css() {
              /* An emoji drawn at the size a symbolic icon is drawn at is a\n\
                 smudge, and a picker is for looking at what you are picking. */\n\
              .tuni-icon-tile label { font-size: 20px; }\n\
+             /* A host's icon sits on a tile rather than loose beside the name:\n\
+                a column of logos on the list background reads as decoration,\n\
+                and the same logos on a tile read as what the row is. */\n\
+             .tuni-host-tile { \
+              background-color: alpha(currentColor, 0.10); border-radius: 8px; }\n\
+             .tuni-host-tile label { font-size: 17px; }\n\
+             /* Punched out of the tile, so a green dot on a green logo is\n\
+                still a dot and not a smudge on it. */\n\
+             .tuni-host-live { \
+              background-color: @window_bg_color; border-radius: 7px; \
+              margin: -2px -2px 0 0; }\n\
+             .tuni-host-row { min-height: 46px; }\n\
+             .tuni-tag { \
+              background-color: alpha(currentColor, 0.12); border-radius: 6px; \
+              padding: 1px 7px; }\n\
+             /* A text view inside a card: the card is the background, and the\n\
+                view's own is a second one a shade darker inside it. */\n\
+             .tuni-plain-view, .tuni-plain-view > text { background: none; }\n\
              .tuni-switcher { border-radius: 26px; padding: 8px; }\n\
              .tuni-switch-card { padding: 9px 9px 14px 9px; border-radius: 16px; }\n\
              .tuni-switch-card.selected { background-color: alpha(currentColor, 0.20); }\n\
