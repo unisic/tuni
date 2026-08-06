@@ -1,10 +1,16 @@
 //! The dialog keys are looked at in.
 //!
-//! Reading only. Every command that can ask a question, which is making a key,
-//! putting one on a host, and handing one to the agent, is typed into a
-//! terminal pane instead of run from here: each of them wants a passphrase or a
-//! password sooner or later and this window has nowhere to put the answer.
-//! `ssh-agent` and the desktop's keyring hold the secrets. Tuni holds the list.
+//! Every command that can ask a question, which is making a key, putting one on
+//! a host, and handing one to the agent, is typed into a terminal pane instead
+//! of run from here: each of them wants a passphrase or a password sooner or
+//! later and this window has nowhere to put the answer. `ssh-agent` and the
+//! desktop's keyring hold the secrets. Tuni holds the list.
+//!
+//! The one thing written from here is a key pasted in from somewhere else,
+//! because there is no command to type for that: the key is already in a
+//! clipboard rather than on a disk. It goes into `~/.ssh` and nowhere tuni
+//! owns, so it ends up in the same place a key made in a pane would, and every
+//! ssh tool on the machine finds it there.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -44,10 +50,13 @@ pub fn present(parent: &impl IsA<gtk::Widget>, run: impl Fn(Vec<String>) + 'stat
         .content_height(460)
         .build();
 
-    let add = gtk::Button::builder()
+    let menu = gio::Menu::new();
+    menu.append(Some("Make a Key"), Some("keys.generate"));
+    menu.append(Some("Paste a Key"), Some("keys.import"));
+    let add = gtk::MenuButton::builder()
         .icon_name("list-add-symbolic")
-        .tooltip_text("Make a key")
-        .action_name("keys.generate")
+        .tooltip_text("Add a key")
+        .menu_model(&menu)
         .build();
     add.add_css_class("flat");
     let bar = adw::HeaderBar::new();
@@ -71,11 +80,37 @@ pub fn present(parent: &impl IsA<gtk::Widget>, run: impl Fn(Vec<String>) + 'stat
             dialog.close();
         }
     ));
-    dialog.insert_action_group("keys", Some(&actions(&dialog, &keys, &aliases, &fire)));
+    // Reading the list again is what an import ends with, so the action group
+    // is handed the same closure that fills it the first time.
+    let reload: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        group,
+        #[weak]
+        rows,
+        #[strong]
+        keys,
+        #[strong]
+        aliases,
+        move || load(&group, &rows, &keys, &aliases)
+    ));
+    dialog.insert_action_group(
+        "keys",
+        Some(&actions(&dialog, &keys, &aliases, &fire, &reload)),
+    );
     dialog.present(Some(parent));
+    reload();
+}
 
-    // One subprocess per key and one for the agent, so the list arrives rather
-    // than being there.
+/// Reads `~/.ssh` and the agent, and draws what they say.
+///
+/// One subprocess per key and one for the agent, so the list arrives rather
+/// than being there.
+fn load(
+    group: &adw::PreferencesGroup,
+    rows: &gtk::ListBox,
+    keys: &Held,
+    aliases: &Rc<RefCell<Vec<String>>>,
+) {
     glib::spawn_future_local(glib::clone!(
         #[weak]
         group,
@@ -199,6 +234,7 @@ fn actions(
     keys: &Held,
     aliases: &Rc<RefCell<Vec<String>>>,
     run: &Run,
+    reload: &Rc<dyn Fn()>,
 ) -> gio::SimpleActionGroup {
     let group = gio::SimpleActionGroup::new();
     let string = Some(glib::VariantTy::STRING);
@@ -291,7 +327,16 @@ fn actions(
         move |_, _| generate_key(&dialog, &run)
     ));
 
-    for action in [copy, add, copy_to_host, show, generate] {
+    let import = gio::SimpleAction::new("import", None);
+    import.connect_activate(glib::clone!(
+        #[weak]
+        dialog,
+        #[strong]
+        reload,
+        move |_, _| import_key(&dialog, &reload)
+    ));
+
+    for action in [copy, add, copy_to_host, show, generate, import] {
         group.add_action(&action);
     }
     group
@@ -366,6 +411,173 @@ fn pick_host(parent: &adw::Dialog, aliases: &[String], chosen: impl Fn(String) +
         }
     ));
     dialog.present(Some(parent));
+}
+
+/// A key that already exists somewhere else, on its way into `~/.ssh`.
+///
+/// The private half is typed or pasted here and nowhere else: it goes straight
+/// to [`ssh::import`], which writes it 0600 and hands back the file. Tuni keeps
+/// no copy, and the buffer it came through is emptied on the way out, so a
+/// dialog left open behind another one is not a private key sitting in a widget.
+///
+/// The public half is asked for rather than required. A key without a
+/// passphrase gives its own up to `ssh-keygen -y`; a key with one cannot, and
+/// this window has nowhere to ask for a passphrase.
+fn import_key(parent: &adw::Dialog, reload: &Rc<dyn Fn()>) {
+    let name = adw::EntryRow::builder().title("File name").build();
+    let named = adw::PreferencesGroup::builder()
+        .description("Written into ~/.ssh, where every ssh tool looks for a key")
+        .build();
+    named.add(&name);
+
+    let private = gtk::TextBuffer::new(None);
+    let public = gtk::TextBuffer::new(None);
+    let page = adw::PreferencesPage::new();
+    page.add(&named);
+    page.add(&area(
+        "Private key",
+        "The whole file, BEGIN and END lines and all",
+        &private,
+    ));
+    page.add(&area(
+        "Public key",
+        "Worked out from the private half when it has no passphrase",
+        &public,
+    ));
+
+    let dialog = adw::Dialog::builder()
+        .title("Paste a Key")
+        .content_width(560)
+        .content_height(560)
+        .build();
+    let cancel = gtk::Button::with_label("Cancel");
+    let confirm = gtk::Button::with_label("Import");
+    confirm.add_css_class("suggested-action");
+    let bar = adw::HeaderBar::new();
+    bar.set_show_end_title_buttons(false);
+    bar.pack_start(&cancel);
+    bar.pack_end(&confirm);
+    let banner = adw::Banner::new("");
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&bar);
+    view.add_top_bar(&banner);
+    view.set_content(Some(&page));
+    dialog.set_child(Some(&view));
+
+    cancel.connect_clicked(glib::clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            dialog.close();
+        }
+    ));
+
+    let ready = glib::clone!(
+        #[weak]
+        name,
+        #[weak]
+        confirm,
+        #[strong]
+        private,
+        move || {
+            let written = name.text().trim().to_owned();
+            confirm.set_sensitive(!written.is_empty() && !text(&private).trim().is_empty());
+        }
+    );
+    name.connect_changed(glib::clone!(
+        #[strong]
+        ready,
+        move |_| ready()
+    ));
+    private.connect_changed(glib::clone!(
+        #[strong]
+        ready,
+        move |_| ready()
+    ));
+    ready();
+
+    confirm.connect_clicked(glib::clone!(
+        #[weak]
+        dialog,
+        #[weak]
+        banner,
+        #[weak]
+        name,
+        #[strong]
+        private,
+        #[strong]
+        public,
+        #[strong]
+        reload,
+        move |confirm| {
+            let written = name.text().trim().to_owned();
+            let secret = text(&private);
+            let published = text(&public);
+            let (private, public) = (private.clone(), public.clone());
+            let reload = reload.clone();
+            let confirm = confirm.clone();
+            // Two files and a couple of `ssh-keygen` runs, and a paste of a
+            // thousand lines is still a paste, so it goes off the main thread.
+            confirm.set_sensitive(false);
+            glib::spawn_future_local(async move {
+                let done =
+                    gio::spawn_blocking(move || ssh::import(&written, &secret, &published)).await;
+                let complaint = match done {
+                    Ok(Ok(_)) => {
+                        // Emptied rather than left to the dialog being dropped:
+                        // what a widget holds is what a screen reader, a
+                        // clipboard manager or the next paste can reach.
+                        private.set_text("");
+                        public.set_text("");
+                        reload();
+                        dialog.close();
+                        return;
+                    }
+                    Ok(Err(reason)) => reason,
+                    Err(_) => "The write did not finish".to_owned(),
+                };
+                banner.set_title(&complaint);
+                banner.set_revealed(true);
+                confirm.set_sensitive(true);
+            });
+        }
+    ));
+
+    dialog.present(Some(parent));
+    name.grab_focus();
+}
+
+fn text(buffer: &gtk::TextBuffer) -> String {
+    buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+        .to_string()
+}
+
+/// One titled box a key is pasted into.
+fn area(title: &str, description: &str, buffer: &gtk::TextBuffer) -> adw::PreferencesGroup {
+    let view = gtk::TextView::builder()
+        .buffer(buffer)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::Char)
+        .top_margin(8)
+        .bottom_margin(8)
+        .left_margin(8)
+        .right_margin(8)
+        .build();
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&view)
+        .height_request(120)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    // The border rather than the card background: a card of the same colour as
+    // the page is a text area nobody can see the edges of.
+    scroller.add_css_class("frame");
+    let group = adw::PreferencesGroup::builder()
+        .title(title)
+        .description(description)
+        .build();
+    group.add(&scroller);
+    group
 }
 
 /// The one key tuni offers to make. Ed25519 because there is no reason to

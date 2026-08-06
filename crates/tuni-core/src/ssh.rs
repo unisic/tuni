@@ -853,6 +853,14 @@ pub struct Meta {
     /// A snippet, by name, typed into the pane once the connection is up.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub on_connect: String,
+    /// Whether the desktop keyring holds a password for this host. A note, not
+    /// a password: it is here so the editor can say which hosts have one
+    /// without asking the keyring — and asking it is what unlocks it, which is
+    /// a dialog nobody asked for on the way to changing a port. What connects
+    /// asks [`crate::secrets`] itself, because a note in a file is not what
+    /// decides whether there is a password.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub password: bool,
 }
 
 fn never_used(count: &u32) -> bool {
@@ -1474,6 +1482,146 @@ pub fn agent() -> Agent {
         1 => Agent::Empty,
         _ => Agent::Missing,
     }
+}
+
+/// Puts a key somebody already has into `~/.ssh`, where every ssh tool looks
+/// for one, and says which file it landed in.
+///
+/// The private half passes through this process, which is the one thing tuni
+/// otherwise never does with a secret, because pasting a key is what this is
+/// for. It is not kept anywhere else: it goes into a file that is 0600 from the
+/// moment it exists, and the string it came in dies with the call. There is no
+/// second copy in tuni's own configuration, because `~/.ssh` is already the
+/// place a key lives and a terminal that keeps its own key store is a key store
+/// nobody audits.
+///
+/// What makes it safe to offer is what it refuses. It never overwrites, since
+/// overwriting a private key is losing one. A paste `ssh-keygen` will not read
+/// is taken back out rather than left in `~/.ssh` looking like a key. And a key
+/// with a passphrase has to arrive with its public half, because the public
+/// half cannot be derived without the passphrase and this window has nowhere to
+/// ask for one.
+pub fn import(name: &str, private: &str, public: &str) -> Result<PathBuf, String> {
+    import_into(&crate::settings::home().join(".ssh"), name, private, public)
+}
+
+fn import_into(
+    directory: &Path,
+    name: &str,
+    private: &str,
+    public: &str,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("The key needs a file name".to_owned());
+    }
+    if name.contains('/') || name.starts_with('.') || name.ends_with(".pub") {
+        return Err(format!("{name} is not a name a key file can have"));
+    }
+
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .or_else(|error| {
+            if directory.is_dir() {
+                Ok(())
+            } else {
+                Err(describe_io(directory, &error))
+            }
+        })?;
+
+    let path = directory.join(name);
+    let published = directory.join(format!("{name}.pub"));
+    for taken in [&path, &published] {
+        if taken.exists() {
+            return Err(format!("{} is already there", taken.display()));
+        }
+    }
+
+    // `create_new` is the check and the write in one, so two imports of the
+    // same name cannot both decide the file is free.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| describe_io(&path, &error))?;
+    let text = if private.ends_with('\n') {
+        private.to_owned()
+    } else {
+        format!("{private}\n")
+    };
+    let written = std::io::Write::write_all(&mut file, text.as_bytes())
+        .and_then(|()| std::io::Write::flush(&mut file));
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&path);
+        return Err(describe_io(&path, &error));
+    }
+
+    // The empty passphrase rather than no answer at all: with `-P` given,
+    // `ssh-keygen` fails on an encrypted key instead of asking, and asking is
+    // what nothing here can answer.
+    let derived = tool(
+        "ssh-keygen",
+        &[
+            OsStr::new("-y"),
+            OsStr::new("-P"),
+            OsStr::new(""),
+            OsStr::new("-f"),
+            path.as_os_str(),
+        ],
+    );
+    let public = public.trim();
+    let public = if derived.is_ok() {
+        // What was pasted wins over what was derived only in that a comment
+        // somebody wrote is worth keeping; the key material is the same one.
+        if public.is_empty() {
+            derived.stdout.trim().to_owned()
+        } else {
+            public.to_owned()
+        }
+    } else if public.is_empty() {
+        let _ = fs::remove_file(&path);
+        return Err(if derived.stderr.contains("passphrase") {
+            "This key has a passphrase, so its public half cannot be worked out here. Paste that too.".to_owned()
+        } else {
+            format!(
+                "ssh-keygen will not read this as a private key: {}",
+                derived
+                    .stderr
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("no reason given")
+            )
+        });
+    } else {
+        public.to_owned()
+    };
+
+    let removing = |reason: String| {
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&published);
+        Err(reason)
+    };
+    if let Err(error) = fs::write(&published, format!("{public}\n")) {
+        return removing(describe_io(&published, &error));
+    }
+    // The list is drawn from what `ssh-keygen -l` says about the public half,
+    // so a public half it cannot read is a key that would be written and then
+    // never appear.
+    if !tool(
+        "ssh-keygen",
+        &[OsStr::new("-l"), OsStr::new("-f"), published.as_os_str()],
+    )
+    .is_ok()
+    {
+        return removing("ssh-keygen will not read this as a public key".to_owned());
+    }
+    Ok(path)
 }
 
 /// Every key in `~/.ssh`, sorted by file name, with the agent asked once about
@@ -2508,5 +2656,53 @@ mod tests {
             shell_line(&["ssh-keygen".to_owned(), "dean's key".to_owned()]),
             r"ssh-keygen 'dean'\''s key'"
         );
+    }
+
+    /// A pasted key is the one place a private key is written, so the two
+    /// things that must not happen are checked here: a mode anybody else can
+    /// read, and a paste that is not a key being left behind in `~/.ssh`
+    /// looking like one.
+    #[test]
+    fn a_pasted_key_lands_at_0600_and_a_pasted_anything_else_does_not_land() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir();
+        let made = tool(
+            "ssh-keygen",
+            &[
+                OsStr::new("-q"),
+                OsStr::new("-t"),
+                OsStr::new("ed25519"),
+                OsStr::new("-N"),
+                OsStr::new(""),
+                OsStr::new("-C"),
+                OsStr::new("pasted"),
+                OsStr::new("-f"),
+                directory.join("source").as_os_str(),
+            ],
+        );
+        assert!(made.is_ok(), "ssh-keygen: {}", made.stderr);
+        let private = fs::read_to_string(directory.join("source")).expect("the key just made");
+
+        let path = import_into(&directory, "imported", &private, "").expect("import the key");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("the imported key")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        // Worked out from the private half rather than pasted, and the comment
+        // ssh-keygen puts on a derived public key is the file it came from.
+        let public = fs::read_to_string(directory.join("imported.pub")).expect("the public half");
+        assert!(public.starts_with("ssh-ed25519 "), "{public}");
+
+        assert!(import_into(&directory, "imported", &private, "").is_err());
+        assert!(import_into(&directory, "../escape", &private, "").is_err());
+        assert!(import_into(&directory, "junk", "not a key at all\n", "").is_err());
+        assert!(!directory.join("junk").exists());
+
+        fs::remove_dir_all(&directory).expect("clean up");
     }
 }

@@ -2739,10 +2739,16 @@ impl TuniWindow {
                     // files. Nothing is typed unless the host names one.
                     let waited = greeting(&alias)
                         .and_then(|body| Some((body, control.socket(&destination)?.0)));
+                    // Subprocesses of its own — the keyring and `ssh-keygen -F`
+                    // — so it belongs on this thread with the rest of them.
+                    // Empty unless the host has a saved password, which is the
+                    // pane asking in the terminal the way it always has.
+                    let askpass = tuni_core::secrets::askpass(&destination);
                     Some((
                         tuni_core::ssh::command(&host, &control),
                         destination,
                         waited,
+                        askpass,
                     ))
                 })
                 .await
@@ -2750,7 +2756,7 @@ impl TuniWindow {
                     return;
                 };
                 let remote = this.imp().remotes.borrow().get(&pane).cloned();
-                let Some((argv, destination, waited)) = dialled else {
+                let Some((argv, destination, waited, askpass)) = dialled else {
                     if let Some(remote) = remote {
                         remote.set_idle(&format!("Not connected to {name}"), "Connect");
                     }
@@ -2770,7 +2776,9 @@ impl TuniWindow {
                     pane,
                     Launch {
                         argv,
-                        env: vec![("TERM".to_owned(), term)],
+                        env: std::iter::once(("TERM".to_owned(), term))
+                            .chain(askpass)
+                            .collect(),
                         ..Launch::default()
                     },
                 );

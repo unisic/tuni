@@ -201,9 +201,14 @@ pub fn present<F>(
                 .unwrap_or(0) as u32,
         )
         .build();
+    // Keyed by the alias rather than by the address, because the alias is what
+    // `ssh` is handed and what a changed hostname leaves alone.
+    let saved = Rc::new(RefCell::new(meta.password));
+    let password = password_row(&name, &saved);
     connection.add(&port);
     connection.add(&user);
     connection.add(&identity);
+    connection.add(&password);
     connection.add(&jump);
     page.append(&connection);
 
@@ -438,6 +443,7 @@ pub fn present<F>(
                     .filter(|_| on_connect.selected() != 0)
                     .cloned()
                     .unwrap_or_default(),
+                password: *saved.borrow(),
                 ..meta.clone()
             };
             save(Edited {
@@ -451,6 +457,186 @@ pub fn present<F>(
 
     dialog.present(Some(parent));
     name.grab_focus();
+}
+
+/// The row a password is saved from, and the only part of tuni that ever holds
+/// one.
+///
+/// Held for as long as the entry is on screen and handed to the desktop keyring
+/// the moment Save is pressed. Nothing keeps it after that: `secret-tool` has
+/// it, `ssh` asks the keyring for it through the askpass helper, and the row
+/// itself only ever learns whether there is one. A host with no password saved
+/// behaves the way it always has, which is `ssh` asking in the pane.
+fn password_row(name: &adw::EntryRow, saved: &Rc<RefCell<bool>>) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title("Password").build();
+    row.add_prefix(&prefix("channel-secure-symbolic"));
+
+    let set = gtk::Button::builder()
+        .label("Set…")
+        .valign(gtk::Align::Center)
+        .build();
+    set.add_css_class("flat");
+    let clear = gtk::Button::builder()
+        .icon_name("edit-clear-symbolic")
+        .tooltip_text("Forget the password")
+        .valign(gtk::Align::Center)
+        .visible(*saved.borrow())
+        .build();
+    clear.add_css_class("flat");
+    row.add_suffix(&clear);
+    row.add_suffix(&set);
+
+    let keyring = tuni_core::secrets::available();
+    let told = {
+        let row = row.downgrade();
+        let clear = clear.downgrade();
+        move |saved: bool| {
+            if let Some(row) = row.upgrade() {
+                row.set_subtitle(match (keyring, saved) {
+                    (false, _) => "No keyring on this desktop, so ssh asks in the pane",
+                    (_, true) => "Saved in the desktop keyring",
+                    (_, false) => "Asked in the pane, the way ssh asks",
+                });
+            }
+            if let Some(clear) = clear.upgrade() {
+                clear.set_visible(saved);
+            }
+        }
+    };
+    told(*saved.borrow());
+    row.set_sensitive(keyring);
+
+    // A password belongs to an alias, and an alias that is still being typed is
+    // not one to hang a secret off.
+    let named = {
+        let name = name.downgrade();
+        move || {
+            name.upgrade()
+                .is_some_and(|name| !name.text().trim().is_empty())
+        }
+    };
+    set.set_sensitive(named());
+    name.connect_changed(glib::clone!(
+        #[weak]
+        set,
+        #[strong]
+        named,
+        move |_| set.set_sensitive(named())
+    ));
+
+    set.connect_clicked(glib::clone!(
+        #[weak]
+        name,
+        #[strong]
+        saved,
+        #[strong]
+        told,
+        move |set| ask_password(
+            set,
+            name.text().trim().to_owned(),
+            saved.clone(),
+            told.clone()
+        )
+    ));
+    clear.connect_clicked(glib::clone!(
+        #[weak]
+        row,
+        #[weak]
+        name,
+        #[strong]
+        saved,
+        #[strong]
+        told,
+        move |_| {
+            let alias = name.text().trim().to_owned();
+            let saved = saved.clone();
+            let told = told.clone();
+            glib::spawn_future_local(async move {
+                let done =
+                    gtk::gio::spawn_blocking(move || tuni_core::secrets::clear(&alias)).await;
+                match done {
+                    Ok(Ok(())) => {
+                        saved.replace(false);
+                        told(false);
+                    }
+                    // The subtitle rather than a dialog: what it says is what
+                    // the row was saying anyway, which is where the password
+                    // stands. A keyring that refused still has it.
+                    Ok(Err(reason)) => row.set_subtitle(&reason),
+                    Err(_) => row.set_subtitle("The keyring did not answer"),
+                }
+            });
+        }
+    ));
+
+    row
+}
+
+/// Asks for the password and hands it straight to the keyring.
+fn ask_password<F>(parent: &impl IsA<gtk::Widget>, alias: String, saved: Rc<RefCell<bool>>, told: F)
+where
+    F: Fn(bool) + Clone + 'static,
+{
+    let entry = gtk::PasswordEntry::builder()
+        .show_peek_icon(true)
+        .activates_default(true)
+        .build();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Password")
+        .body(format!(
+            "Kept in the desktop keyring for {alias}, and read by ssh itself \
+             when it asks. Tuni does not store it and cannot read it back."
+        ))
+        .extra_child(&entry)
+        .default_response("save")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("save", "Save");
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.connect_response(
+        None,
+        glib::clone!(
+            #[weak]
+            entry,
+            move |dialog, response| {
+                if response != "save" {
+                    return;
+                }
+                let password = entry.text().to_string();
+                if password.is_empty() {
+                    return;
+                }
+                let alias = alias.clone();
+                let saved = saved.clone();
+                let told = told.clone();
+                let dialog = dialog.clone();
+                glib::spawn_future_local(async move {
+                    let done = gtk::gio::spawn_blocking(move || {
+                        tuni_core::secrets::store(&alias, &password)
+                    })
+                    .await;
+                    let complaint = match done {
+                        Ok(Ok(())) => {
+                            saved.replace(true);
+                            told(true);
+                            return;
+                        }
+                        Ok(Err(reason)) => reason,
+                        Err(_) => "The keyring did not answer".to_owned(),
+                    };
+                    let failed = adw::AlertDialog::builder()
+                        .heading("The Keyring Refused It")
+                        .body(complaint)
+                        .build();
+                    failed.add_response("close", "Close");
+                    failed.present(Some(&dialog));
+                });
+            }
+        ),
+    );
+    dialog.present(Some(parent.as_ref()));
+    entry.grab_focus();
 }
 
 /// Whether a host already uses anything the advanced half holds, which is what

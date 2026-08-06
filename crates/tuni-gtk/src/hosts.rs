@@ -1164,10 +1164,19 @@ fn write(edited: crate::host_editor::Edited) -> Result<(), String> {
     ssh::ensure_include()?;
 
     let mut notes = Notes::load();
+    let mut meta = meta;
     // A rename leaves the tags filed under a name nothing answers to.
     if let Some(original) = &original
         && *original != host.alias
     {
+        if forget(original, &notes) {
+            // The password went with the old name, since a keyring entry is
+            // filed under the alias `ssh` is handed. Whether the new name has
+            // one of its own is a question only the keyring can answer, and
+            // this is the one moment worth asking it: a note left saying yes
+            // here would be a note about a password nothing holds.
+            meta.password = tuni_core::secrets::has(&host.alias);
+        }
         notes.set(original, Meta::default());
     }
     notes.set(&host.alias, meta);
@@ -1180,8 +1189,26 @@ fn remove(alias: &str) -> Result<(), String> {
     ssh::save(&hosts)?;
 
     let mut notes = Notes::load();
+    forget(alias, &notes);
     notes.set(alias, Meta::default());
     notes.save().map_err(|error| error.to_string())
+}
+
+/// Takes the keyring entry of a host that is going away with it, and says
+/// whether there was one to take.
+///
+/// A password left behind under a name nothing answers to is worse than an
+/// orphan: the next host given that name would be handed the old machine's
+/// password. Best effort, and on the same thread as the writes above, since it
+/// is a subprocess: a keyring that refuses is a password still in the keyring,
+/// which the editor will say the next time that name is opened, and not a
+/// reason to fail a save that already happened.
+fn forget(alias: &str, notes: &Notes) -> bool {
+    let saved = notes.get(alias).password;
+    if saved {
+        let _ = tuni_core::secrets::clear(alias);
+    }
+    saved
 }
 
 /// Which of `destinations` a shared connection is open and answering on.
