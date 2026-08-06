@@ -67,6 +67,31 @@
   </provides>
 
   <releases>
+    <release version="1.5.1" date="2026-08-06">
+      <description>
+        <p>A keyboard shortcut that runs <code>tuni</code> opens a window
+        again. Since 1.5.0 a launch that reached the copy already running only
+        brought its window to the front, so a desktop shortcut bound to
+        <code>Ctrl+Alt+T</code> did nothing anyone could see once Tuni was
+        open. A launch that names a folder still opens that folder in the
+        window already running, which is what "Open Terminal Here" asks for; a
+        launch that names none opens a window, which is what asking for a
+        terminal means.</p>
+        <p>Everything Tuni does with a coding agent is a switch now, on an AI
+        Agents page of its own: whether the agents' session logs are read at
+        all, which agents count as one, whether Claude Code's plan bars are
+        asked for over the network, whether a tab spins while a turn runs, and
+        whether a turn that ends out of sight leaves a mark, raises a
+        notification or rings the bell. Every default is what 1.5.0 already
+        did, apart from the notification, which is new.</p>
+        <p>Pi is read like the other three: the model and what the session
+        working in the pane's directory has spent, off Pi's own log. Pi says
+        nothing in the terminal title about a turn running, so it gets no
+        spinner, no mark and no notification on its own. The extension in
+        <code>data/pi</code> makes it say so; installing that with
+        <code>pi install</code> is what makes a Pi tab spin.</p>
+      </description>
+    </release>
     <release version="1.5.0" date="2026-08-05">
       <description>
         <p>Tuni opens on a fresh shell rather than on the window that was left.

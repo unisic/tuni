@@ -6,7 +6,7 @@
 # GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
 # populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.5.0/ -o tuni-1.5.0.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.5.1/ -o tuni-1.5.1.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.15.2
 
 Name:           tuni
-Version:        1.5.0
+Version:        1.5.1
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -89,6 +89,19 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/*/*/*.svg
 
 %changelog
+* Thu Aug 06 2026 Unisic <contact@unisic.app> - 1.5.1-1
+- A launch that names no directory opens a window again. Since 1.5.0 it only
+  raised the window already open, so a desktop shortcut bound to Ctrl+Alt+T did
+  nothing once Tuni was running. A launch that names a folder still opens that
+  folder in the window already running.
+- An AI Agents page of switches: whether the agents' session logs are read at
+  all, which agents count as one, whether Claude Code's plan bars are asked for
+  over the network, whether a tab spins while a turn runs, and whether a turn
+  that ends out of sight leaves a mark, raises a notification or rings the bell.
+- Pi is read like the other three agents. Its title says nothing about a turn
+  running, so it gets no spinner of its own; data/pi carries an extension that
+  makes it say so, installed with "pi install".
+
 * Wed Aug 05 2026 Unisic <contact@unisic.app> - 1.5.0-1
 - Tuni opens on a fresh shell; restoring the last session is a switch, and it
   is off. A second switch restores each pane's working directory, which is read
