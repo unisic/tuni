@@ -1,3 +1,33 @@
+tuni (1.5.0) unstable; urgency=medium
+
+  * Tuni opens on a fresh shell rather than on the window that was left.
+    Restoring a session is a switch now and it is off, and a second switch
+    decides whether a restored pane starts in the directory its shell was
+    working in. That directory is read from the kernel when a shell does not
+    send OSC 7, which is most of them.
+  * A tab dragged off the strip is a move rather than a loss: onto the desktop
+    it becomes a window of its own, onto another Tuni window's strip it joins
+    that window, and onto a project row it moves into that project. A
+    project's row dragged off the sidebar moves everything in it at once.
+  * `Ctrl+Shift+R` reopens the tab just closed, and the four closed before it,
+    with its panes, the room they had, the name that was typed and what each
+    terminal had printed.
+  * A tab spins while a coding agent is thinking in it and the project's row
+    spins in place of its folder, and a command that ran ten seconds or longer
+    raises a notification when it exits in a tab that is out of sight.
+  * `Ctrl+Shift+Page Up` and `Ctrl+Shift+Page Down` walk the scrollback one
+    prompt at a time, `Ctrl+Alt+I` sends what is typed to every pane of the tab
+    at once, and `Ctrl+Shift+Backspace` wipes a half-typed command whole.
+  * A project's row can carry an icon or an emoji in place of the folder.
+  * Opening a terminal from a file manager reaches the Tuni that is already
+    running and opens a project rooted at the folder that was chosen, rather
+    than a second copy of Tuni that ignores the directory.
+  * Every preferences row says what it does in one line, and what a new tab
+    opens, which shell runs and how much of a session comes back are a Session
+    page of their own.
+
+ -- Unisic <contact@unisic.app>  Wed, 05 Aug 2026 19:00:00 +0200
+
 tuni (1.4.1) unstable; urgency=medium
 
   * The install command in the README runs in fish, which has no process
