@@ -61,6 +61,7 @@ pub fn present(window: &crate::window::TuniWindow, settings: &Settings) {
     dialog.add(&terminal_page(window, settings));
     dialog.add(&session_page(window, settings));
     dialog.add(&shortcuts_page(window, settings));
+    dialog.add(&agents_page(window, settings));
     dialog.connect_closed(|_| PREVIEW.with_borrow_mut(|slot| *slot = None));
     dialog.present(Some(window));
 }
@@ -732,6 +733,228 @@ fn session_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw:
     ));
     updates.add(&check);
     page.add(&updates);
+
+    page
+}
+
+/// The AI Agents page: every place tuni notices a coding agent running in a
+/// pane, and a switch for each.
+///
+/// Nothing here starts an agent or configures one — an agent is a program run
+/// in a shell like any other. These are the things tuni does about one on its
+/// own: reading the session log it already writes, asking its account what is
+/// left of the plan, spinning the tab while a turn runs, and saying so when
+/// one ends. Every switch starts on except the bell, which is what tuni did
+/// before there was a page to turn it off from.
+fn agents_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("AI Agents")
+        .icon_name("applications-engineering-symbolic")
+        .build();
+
+    let reading = adw::PreferencesGroup::builder()
+        .title("Session Logs")
+        .description(
+            "Claude Code, Codex, OpenCode and Pi each write the turn they are running to a \
+             file under the home directory. Reading it is how the Info panel counts tokens \
+             and context without asking the agent anything.",
+        )
+        .build();
+    let usage = adw::SwitchRow::builder()
+        .title("Read Agent Sessions")
+        .subtitle("The Agent section of the Info panel, and everything below")
+        .active(settings.agents.usage)
+        .build();
+    usage.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.agents.usage = on);
+        }
+    ));
+    reading.add(&usage);
+    page.add(&reading);
+
+    let known = adw::PreferencesGroup::builder()
+        .title("Agents to Recognise")
+        .description(
+            "An agent turned off is a pane like any other: no section on the Info panel, no \
+             file read, no request made. The tab spinner and the finished mark are not \
+             filtered here, because a title that spins says a turn is running without saying \
+             whose.",
+        )
+        .build();
+    let claude = adw::SwitchRow::builder()
+        .title("Claude Code")
+        .subtitle("Tokens, context and the plan bars below")
+        .active(settings.agents.claude)
+        .build();
+    claude.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.agents.claude = on);
+        }
+    ));
+    known.add(&claude);
+
+    let codex = adw::SwitchRow::builder()
+        .title("Codex")
+        .subtitle("Tokens, context and the limits its own log carries")
+        .active(settings.agents.codex)
+        .build();
+    codex.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.agents.codex = on);
+        }
+    ));
+    known.add(&codex);
+
+    let opencode = adw::SwitchRow::builder()
+        .title("OpenCode")
+        .subtitle("Tokens and context")
+        .active(settings.agents.opencode)
+        .build();
+    opencode.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.agents.opencode = on);
+        }
+    ));
+    known.add(&opencode);
+
+    let pi = adw::SwitchRow::builder()
+        .title("Pi")
+        .subtitle("Tokens only: its log keeps no context, and its title never spins")
+        .active(settings.agents.pi)
+        .build();
+    pi.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.agents.pi = on);
+        }
+    ));
+    known.add(&pi);
+
+    let plan = adw::SwitchRow::builder()
+        .title("Ask for Claude Code's Plan Limits")
+        .subtitle("At most one request a minute, with the login already on disk")
+        .active(settings.agents.plan)
+        .build();
+    plan.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.agents.plan = on);
+        }
+    ));
+    let network = adw::PreferencesGroup::builder()
+        .title("Network")
+        .description(
+            "The one thing a session log does not carry is how much of the week's plan is \
+             left, so it is the one thing that leaves this machine: the same endpoint the \
+             agent's own website reads, with the agent's own login. Off leaves the token \
+             counts, which cost nothing but a read.",
+        )
+        .build();
+    network.add(&plan);
+    // Nothing under Read Agent Sessions has anything to decide while no log is
+    // being read, and the plan request is made from inside Claude Code's read.
+    usage
+        .bind_property("active", &known, "sensitive")
+        .sync_create()
+        .build();
+    claude
+        .bind_property("active", &network, "sensitive")
+        .sync_create()
+        .build();
+    page.add(&known);
+    page.add(&network);
+
+    let running = adw::PreferencesGroup::builder()
+        .title("While a Turn Runs")
+        .build();
+    let spinner = adw::SwitchRow::builder()
+        .title("Spin the Tab")
+        .subtitle("Also takes the agent's own spinner glyph off the tab name")
+        .active(settings.agents.spinner)
+        .build();
+    spinner.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.agents.spinner = on);
+        }
+    ));
+    running.add(&spinner);
+    page.add(&running);
+
+    let ending = adw::PreferencesGroup::builder()
+        .title("When a Turn Ends")
+        .description("A turn that ends on the tab in front of you has told you already, so none of these fire for it.")
+        .build();
+    let mark = adw::SwitchRow::builder()
+        .title("Mark the Tab")
+        .subtitle("On the tab and on its project's row, cleared by looking at it")
+        .active(settings.agents.mark)
+        .build();
+    mark.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.agents.mark = on);
+        }
+    ));
+    ending.add(&mark);
+
+    let notify = adw::SwitchRow::builder()
+        .title("Send a Desktop Notification")
+        .subtitle("Also when the window itself is behind another one")
+        .active(settings.agents.notify)
+        .build();
+    notify.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.agents.notify = on);
+        }
+    ));
+    ending.add(&notify);
+
+    let bell = adw::SwitchRow::builder()
+        .title("Ring the Bell")
+        .subtitle("The same alert a program rings, and silenced by the same Bell switch")
+        .active(settings.agents.bell)
+        .build();
+    bell.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.agents.bell = on);
+        }
+    ));
+    ending.add(&bell);
+    // The bell rings alongside the notification rather than instead of it, so
+    // it has nothing to ring for once there is no notification.
+    notify
+        .bind_property("active", &bell, "sensitive")
+        .sync_create()
+        .build();
+    page.add(&ending);
 
     page
 }

@@ -172,6 +172,9 @@ impl TuniPanel {
     /// switcher, the same move the Remote page makes when its host goes away.
     pub fn apply_settings(&self, settings: &Settings) {
         let imp = self.imp();
+        if let Some(info) = imp.info.borrow().as_ref() {
+            info.set_agents(&settings.agents);
+        }
         for (page, on) in [
             (&imp.files_page, settings.panel_files),
             (&imp.git_page, settings.panel_git),

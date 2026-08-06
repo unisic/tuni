@@ -594,12 +594,12 @@ impl TuniWindow {
     /// the second window is for the work that does not fit beside the first.
     /// Only the window that opened with the session saves one, so whichever
     /// closes last cannot overwrite the other.
-    fn open_window(&self) {
-        let Some(app) = self.application().and_downcast::<adw::Application>() else {
-            return;
-        };
+    ///
+    /// Handed back rather than only shown, because a launch from the desktop
+    /// has an activation token to give it before it comes to the front.
+    pub(crate) fn open_window(&self) -> Option<Self> {
+        let app = self.application().and_downcast::<adw::Application>()?;
         let window = Self::new(&app, self.imp().settings.borrow().clone());
-        window.present();
         glib::idle_add_local_once(glib::clone!(
             #[weak]
             window,
@@ -607,6 +607,7 @@ impl TuniWindow {
                 window.open_project();
             }
         ));
+        Some(window)
     }
 
     // --- construction ------------------------------------------------------
@@ -1149,7 +1150,11 @@ impl TuniWindow {
                 settings.terminal.mouse_reporting = !settings.terminal.mouse_reporting;
                 window.apply_settings(settings);
             }),
-            entry("new-window", None, |window, _| window.open_window()),
+            entry("new-window", None, |window, _| {
+                if let Some(window) = window.open_window() {
+                    window.present();
+                }
+            }),
             entry("palette", None, |window, _| window.show_palette()),
             // Jumps to a pane wherever it is: its project, then its tab, then
             // the pane itself. What the palette's second section runs.
@@ -1320,6 +1325,7 @@ impl TuniWindow {
         let theme = self.theme();
         for terminal in imp.terminals.borrow().values() {
             terminal.set_config(&settings.terminal);
+            terminal.set_agent_spinner(settings.agents.spinner);
             terminal.set_theme(&theme);
         }
         for diff in imp.diffs.borrow().values() {
@@ -1342,6 +1348,10 @@ impl TuniWindow {
         if let Some(application) = self.application() {
             crate::shortcuts::apply(&application, &settings);
         }
+        // The tabs and the sidebar draw what the two maps say only when a turn
+        // starts or ends, so a switch flipped between turns needs the redraw
+        // asked for.
+        self.refresh_agents();
 
         // Turning history off should not leave the last session's output on
         // disk waiting for the setting to be turned back on.
@@ -2190,6 +2200,7 @@ impl TuniWindow {
         terminal.set_hexpand(true);
         terminal.set_vexpand(true);
         terminal.set_config(&imp.settings.borrow().terminal);
+        terminal.set_agent_spinner(imp.settings.borrow().agents.spinner);
         terminal.set_theme(&self.theme());
         // A pane split off a broadcasting tab is part of it: the split is what
         // was asked for, and a pane that quietly stayed out would be one shell
@@ -3076,8 +3087,26 @@ impl TuniWindow {
                             .borrow()
                             .get(&tab)
                             .is_some_and(adw::TabPage::is_selected);
-                        if !watched {
+                        let (agents, rings) = {
+                            let settings = imp.settings.borrow();
+                            (settings.agents, settings.terminal.bell)
+                        };
+                        if !watched && agents.mark {
                             imp.finished.borrow_mut().insert(pane, (project, tab));
+                        }
+                        // A banner carries further than a mark, so it goes out
+                        // for a window sitting behind another one too: a mark
+                        // on a tab in a window nobody has in front of them is
+                        // a mark nobody sees.
+                        if agents.notify && (!watched || !this.is_active()) {
+                            let where_from =
+                                terminal.title().unwrap_or_else(|| "a terminal".to_owned());
+                            this.notify_desktop(pane, "Agent finished", &where_from);
+                            // A silenced bell is silenced everywhere it would
+                            // have been heard, the same as one a command rings.
+                            if agents.bell && rings {
+                                terminal.error_bell();
+                            }
                         }
                     }
                     this.refresh_agents();
@@ -3321,11 +3350,16 @@ impl TuniWindow {
     /// this spinner goes on.
     fn refresh_agents(&self) {
         let imp = self.imp();
+        // Turned off, a running turn is simply not drawn: the maps stay filled
+        // so that the turn still ends into a mark, and so that turning the
+        // spinner back on shows what is running now rather than what was
+        // running when it was switched.
+        let spinner = imp.settings.borrow().agents.spinner;
         let (busy_projects, busy_tabs) = split_ids(&imp.working.borrow());
         let (done_projects, done_tabs) = split_ids(&imp.finished.borrow());
 
         for (tab, page) in imp.pages.borrow().iter() {
-            let busy = busy_tabs.contains(tab);
+            let busy = spinner && busy_tabs.contains(tab);
             if page.is_loading() != busy {
                 page.set_loading(busy);
             }
@@ -3344,11 +3378,11 @@ impl TuniWindow {
         let icons = imp.icons.borrow();
         let emoji = imp.emoji.borrow();
         let workspace = imp.workspace.borrow();
-        for (project, spinner) in imp.spinners.borrow().iter() {
-            let busy = busy_projects.contains(project);
+        for (project, widget) in imp.spinners.borrow().iter() {
+            let busy = spinner && busy_projects.contains(project);
             // An AdwSpinner animates whenever it is on screen and stops when it
             // is not, so showing it is the whole of starting it.
-            spinner.set_visible(busy);
+            widget.set_visible(busy);
             // What the row would draw with nothing happening in it: the project's
             // own icon if it picked one, the folder otherwise. An emoji is text
             // and goes to the label, a name goes to the image, and the finished

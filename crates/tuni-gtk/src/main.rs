@@ -218,23 +218,35 @@ fn main() -> glib::ExitCode {
             .active_window()
             .or_else(|| app.windows().into_iter().next())
             .and_downcast::<TuniWindow>();
-        match existing {
-            Some(window) => {
-                if let Some(directory) = &directory {
-                    window.open_project_in(Some(directory));
-                }
-                // Without the token the compositor has no reason to believe the
-                // launch and the window stays where it is, behind whatever the
-                // person was looking at when they asked for a terminal.
-                if let Some(token) = cmdline
-                    .getenv("XDG_ACTIVATION_TOKEN")
-                    .or_else(|| cmdline.getenv("DESKTOP_STARTUP_ID"))
-                {
-                    window.set_startup_id(&token);
-                }
-                window.present();
+        let opened = match (existing, &directory) {
+            // A launch that names a place is about that place: "Open Terminal
+            // Here" wants the folder, and a second window with its own sidebar
+            // is not where it was asked to land.
+            (Some(window), Some(directory)) => {
+                window.open_project_in(Some(directory));
+                Some(window)
             }
-            None => build_window(app, directory.as_deref()),
+            // A launch that names none is somebody asking for a terminal - the
+            // desktop's own shortcut for one, or the icon in the menu - and a
+            // terminal is a window. Empty, like New Window on the menu: the
+            // saved session belongs to the window that restored it.
+            (Some(window), None) => window.open_window(),
+            (None, _) => {
+                build_window(app, directory.as_deref());
+                None
+            }
+        };
+        if let Some(window) = opened {
+            // Without the token the compositor has no reason to believe the
+            // launch and the window stays where it is, behind whatever the
+            // person was looking at when they asked for a terminal.
+            if let Some(token) = cmdline
+                .getenv("XDG_ACTIVATION_TOKEN")
+                .or_else(|| cmdline.getenv("DESKTOP_STARTUP_ID"))
+            {
+                window.set_startup_id(&token);
+            }
+            window.present();
         }
         glib::ExitCode::SUCCESS
     });

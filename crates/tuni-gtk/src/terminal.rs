@@ -20,6 +20,7 @@ use gtk::subclass::prelude::*;
 use unicode_width::UnicodeWidthStr;
 
 use tuni_core::TerminalConfig;
+use tuni_core::settings::Agents;
 use tuni_core::theme::Theme;
 use tuni_pty::{Pty, PtyConfig, PtyEvent};
 use tuni_vt::{
@@ -312,6 +313,11 @@ mod imp {
         /// Whether the last title said a coding agent in this pane is working
         /// on a turn. See `tuni_core::usage::thinking`.
         pub(super) working: Cell<bool>,
+        /// Whether the window draws that state as a spinner on the tab, which
+        /// is also what decides whether the agent's own glyph comes off the
+        /// title: the glyph is taken away because the spinner replaces it, so
+        /// with no spinner the title is left exactly as the agent wrote it.
+        pub(super) agent_spinner: Cell<bool>,
         /// Working directory as last reported by OSC 7. Etap 2 infers a
         /// project's directory from this; for now it names the window.
         pub(super) cwd: RefCell<Option<String>>,
@@ -437,6 +443,7 @@ mod imp {
                 broadcast: Cell::new(false),
                 title: RefCell::new(None),
                 working: Cell::new(false),
+                agent_spinner: Cell::new(Agents::default().spinner),
                 cwd: RefCell::new(None),
                 cwd_reported: Cell::new(false),
                 command: RefCell::new(None),
@@ -1359,6 +1366,32 @@ impl TuniTerminal {
     /// reading of being handed a new one. Scrollback depth is fixed when the
     /// shell starts, so a change to it only reaches a session started after
     /// this call.
+    /// Whether the tab shows a turn as a spinner, and so whether the agent's
+    /// glyph comes off the name. The title already on screen is re-derived, or
+    /// the tab keeps whichever spelling was in force when it last changed.
+    pub fn set_agent_spinner(&self, on: bool) {
+        let imp = self.imp();
+        if imp.agent_spinner.replace(on) == on {
+            return;
+        }
+        let title = imp
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|session| session.term.title().map(str::to_owned));
+        if let Some(title) = title {
+            let name = if on {
+                tuni_core::usage::strip_spinner(&title)
+            } else {
+                title.as_str()
+            };
+            if imp.title.borrow().as_deref() != Some(name) {
+                imp.title.replace(Some(name.to_owned()));
+                self.notify("title");
+            }
+        }
+    }
+
     pub fn set_config(&self, config: &TerminalConfig) {
         let imp = self.imp();
         imp.config.replace(config.clone());
@@ -1646,7 +1679,11 @@ impl TuniTerminal {
             if imp.working.replace(working) != working {
                 self.notify("working");
             }
-            let name = tuni_core::usage::strip_spinner(&title);
+            let name = if imp.agent_spinner.get() {
+                tuni_core::usage::strip_spinner(&title)
+            } else {
+                title.as_str()
+            };
             if imp.title.borrow().as_deref() != Some(name) {
                 imp.title.replace(Some(name.to_owned()));
                 self.notify("title");

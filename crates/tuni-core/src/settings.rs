@@ -82,6 +82,78 @@ impl NewTab {
     }
 }
 
+/// What tuni does about a coding agent working in a pane.
+///
+/// An agent announces itself twice, and the two are read separately. It is in
+/// the process list, which is where the Info page learns whose logs to open and
+/// therefore what the turn cost; and it spins a glyph into the terminal title,
+/// which is what a tab's spinner and its finished mark are drawn from. The
+/// second costs nothing — the title arrives as an escape sequence the terminal
+/// parses anyway — so a window with no agent in it pays for none of this.
+///
+/// Every switch here defaults to what tuni already did. They exist because
+/// reading another program's session logs, asking an account's usage page, and
+/// raising a banner are three decisions about somebody's machine, and a
+/// decision that cannot be turned off is one the application made for them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Agents {
+    /// Whether the Info page reads the agent's own session logs. Off takes the
+    /// Agent section away and stops every file below from being opened, which
+    /// is the whole cost of the feature.
+    pub usage: bool,
+    /// Which agents count as one. An agent that is not recognised is a pane
+    /// like any other: no section, no logs read, no request made. The turn
+    /// marks are not filtered by these, because the title's spinner says a turn
+    /// is running without saying whose.
+    pub claude: bool,
+    pub codex: bool,
+    pub opencode: bool,
+    pub pi: bool,
+    /// Whether Claude Code's plan bars are asked of the account's usage page.
+    ///
+    /// The one thing its log does not carry, so it is the one thing that leaves
+    /// the machine: at most one request a minute, with the login the agent
+    /// already keeps on disk, to the same endpoint its own website reads.
+    /// Codex's bars come out of its log and are not affected. Off leaves the
+    /// session's token counts, which cost nothing but a read.
+    pub plan: bool,
+    /// Whether a tab whose agent is thinking draws a spinner.
+    ///
+    /// This also decides the title: the agent's own glyph is taken off the tab
+    /// name exactly while tuni draws the spinner in its place, so turning it
+    /// off leaves the title as the agent wrote it rather than leaving a tab
+    /// with no sign of a turn at all.
+    pub spinner: bool,
+    /// Whether a turn that ends into a tab nobody is looking at leaves a mark
+    /// on that tab and on its project's row, to be cleared by looking at it.
+    pub mark: bool,
+    /// Whether the same moment raises a desktop notification. On, which is what
+    /// a command that finishes out of sight already does; an agent's turn is
+    /// the longest thing a terminal waits on and the least worth watching.
+    pub notify: bool,
+    /// Whether it also rings the bell — the desktop's own alert, the same one a
+    /// `\a` from a command makes, and silenced by the same terminal bell
+    /// setting.
+    pub bell: bool,
+}
+
+impl Default for Agents {
+    fn default() -> Self {
+        Self {
+            usage: true,
+            claude: true,
+            codex: true,
+            opencode: true,
+            pi: true,
+            plan: true,
+            spinner: true,
+            mark: true,
+            notify: true,
+            bell: false,
+        }
+    }
+}
+
 /// Everything the settings window edits.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -164,6 +236,8 @@ pub struct Settings {
     pub panel_git: bool,
     pub panel_info: bool,
     pub panel_debug: bool,
+    /// What tuni does about a coding agent working in a pane.
+    pub agents: Agents,
     /// The command of the editor last opened from the Info page, so the split
     /// button opens the same one next time. Empty until one is chosen; a
     /// command that is no longer installed is simply not found and the button
@@ -198,6 +272,7 @@ impl Default for Settings {
             panel_git: true,
             panel_info: true,
             panel_debug: true,
+            agents: Agents::default(),
             info_editor: String::new(),
             keys: Vec::new(),
         }
@@ -387,6 +462,36 @@ impl Settings {
         if let Some(on) = table.boolean("panel.debug") {
             settings.panel_debug = on;
         }
+        if let Some(on) = table.boolean("agent.usage") {
+            settings.agents.usage = on;
+        }
+        if let Some(on) = table.boolean("agent.claude") {
+            settings.agents.claude = on;
+        }
+        if let Some(on) = table.boolean("agent.codex") {
+            settings.agents.codex = on;
+        }
+        if let Some(on) = table.boolean("agent.opencode") {
+            settings.agents.opencode = on;
+        }
+        if let Some(on) = table.boolean("agent.pi") {
+            settings.agents.pi = on;
+        }
+        if let Some(on) = table.boolean("agent.plan") {
+            settings.agents.plan = on;
+        }
+        if let Some(on) = table.boolean("agent.spinner") {
+            settings.agents.spinner = on;
+        }
+        if let Some(on) = table.boolean("agent.mark") {
+            settings.agents.mark = on;
+        }
+        if let Some(on) = table.boolean("agent.notify") {
+            settings.agents.notify = on;
+        }
+        if let Some(on) = table.boolean("agent.bell") {
+            settings.agents.bell = on;
+        }
         if let Some(command) = table
             .string("info-editor")
             .filter(|command| !command.trim().is_empty())
@@ -556,6 +661,26 @@ impl Settings {
         ] {
             if !on {
                 let _ = writeln!(out, "{page} = false");
+            }
+        }
+        for (key, on, was) in [
+            ("agent.usage", self.agents.usage, default.agents.usage),
+            ("agent.claude", self.agents.claude, default.agents.claude),
+            ("agent.codex", self.agents.codex, default.agents.codex),
+            (
+                "agent.opencode",
+                self.agents.opencode,
+                default.agents.opencode,
+            ),
+            ("agent.pi", self.agents.pi, default.agents.pi),
+            ("agent.plan", self.agents.plan, default.agents.plan),
+            ("agent.spinner", self.agents.spinner, default.agents.spinner),
+            ("agent.mark", self.agents.mark, default.agents.mark),
+            ("agent.notify", self.agents.notify, default.agents.notify),
+            ("agent.bell", self.agents.bell, default.agents.bell),
+        ] {
+            if on != was {
+                let _ = writeln!(out, "{key} = {on}");
             }
         }
         if self.info_editor != default.info_editor {
@@ -843,6 +968,24 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_switch_survives_being_written_and_read_back() {
+        let mut settings = Settings::default();
+        settings.agents.plan = false;
+        settings.agents.bell = true;
+
+        let written = settings.to_toml();
+        assert!(written.contains("agent.plan = false"));
+        assert!(written.contains("agent.bell = true"));
+        // Only what differs, which is what keeps a default turning into a
+        // written-down decision the next version cannot change.
+        assert!(!written.contains("agent.usage"));
+
+        let read = Settings::parse(&written);
+        assert_eq!(read.agents, settings.agents);
+        assert!(!Settings::parse("[agent]\nplan = false\n").agents.plan);
+    }
+
+    #[test]
     fn a_dotted_key_and_a_table_header_mean_the_same_thing() {
         let dotted = Settings::parse("terminal.restore-history = true\n");
         let sectioned = Settings::parse("[terminal]\nrestore-history = true\n");
@@ -917,6 +1060,11 @@ mod tests {
             panel_info: true,
             panel_debug: false,
             info_editor: "zed".to_owned(),
+            agents: Agents {
+                plan: false,
+                bell: true,
+                ..Agents::default()
+            },
             keys: vec![("win.palette".to_owned(), "<Ctrl>p".to_owned())],
         };
         let read = Settings::parse(&settings.to_toml());
@@ -952,6 +1100,7 @@ mod tests {
         assert!(read.ssh_reconnect_on_restore);
         assert!(!read.check_updates);
         assert_eq!(read.info_editor, "zed");
+        assert_eq!(read.agents, settings.agents);
     }
 
     #[test]

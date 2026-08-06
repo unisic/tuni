@@ -1,7 +1,7 @@
 //! What the coding agent running in a pane has spent.
 //!
-//! Claude Code, Codex and OpenCode each keep a record of their own turns on
-//! disk: the first two a JSONL log per session, the third a SQLite database.
+//! Claude Code, Codex, OpenCode and Pi each keep a record of their own turns on
+//! disk: a JSONL log per session for all but OpenCode, which uses SQLite.
 //! Tokens come from those files, and so do Codex's plan bars, which it writes
 //! into its own log. Claude Code's plan is the one thing its log does not
 //! carry, so those bars are asked of the account's usage endpoint, the same
@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use crate::info::Process;
-use crate::settings::home;
+use crate::settings::{Agents, home};
 
 /// How long an answer from the plan endpoint keeps being the answer, in
 /// seconds. The bars move slowly and the panel polls often; a failure is held
@@ -41,6 +41,7 @@ pub enum Agent {
     Claude,
     Codex,
     OpenCode,
+    Pi,
 }
 
 impl Agent {
@@ -60,9 +61,22 @@ impl Agent {
                     "claude" => Some(Self::Claude),
                     "codex" => Some(Self::Codex),
                     "opencode" => Some(Self::OpenCode),
+                    "pi" => Some(Self::Pi),
                     _ => None,
                 })
         })
+    }
+
+    /// Whether this one is watched at all. An agent turned off in the settings
+    /// is a pane like any other: nothing is read and nothing is asked.
+    #[must_use]
+    pub fn watched(self, agents: &Agents) -> bool {
+        match self {
+            Self::Claude => agents.claude,
+            Self::Codex => agents.codex,
+            Self::OpenCode => agents.opencode,
+            Self::Pi => agents.pi,
+        }
     }
 
     #[must_use]
@@ -71,6 +85,7 @@ impl Agent {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex",
             Self::OpenCode => "OpenCode",
+            Self::Pi => "Pi",
         }
     }
 }
@@ -235,18 +250,23 @@ struct Tail {
 
 impl Reader {
     /// What the agent working in `cwd` has spent.
+    ///
+    /// `plan` decides the one part of this that is not a file read: Claude
+    /// Code's plan bars, which come off the account's usage page. Everything
+    /// else is the agent's own logs and stays on the machine either way.
     #[must_use]
-    pub fn read(&mut self, agent: Agent, cwd: &Path) -> Snapshot {
+    pub fn read(&mut self, agent: Agent, cwd: &Path, plan: bool) -> Snapshot {
         match agent {
-            Agent::Claude => self.claude(cwd),
+            Agent::Claude => self.claude(cwd, plan),
             Agent::Codex => self.codex(cwd),
             Agent::OpenCode => opencode(cwd),
+            Agent::Pi => self.pi(cwd),
         }
     }
 
     /// Claude Code: one log per session, under a directory named after the
     /// directory the session works in.
-    fn claude(&mut self, cwd: &Path) -> Snapshot {
+    fn claude(&mut self, cwd: &Path, plan: bool) -> Snapshot {
         let mut snapshot = Snapshot {
             agent: Some(Agent::Claude),
             ..Snapshot::default()
@@ -259,7 +279,14 @@ impl Reader {
             snapshot.model.clone_from(&tail.model);
         }
 
-        snapshot.limits = self.claude_plan();
+        // No bars rather than stale ones: a cached answer redrawn after the
+        // switch went off would look like the request was still being made.
+        snapshot.limits = if plan {
+            self.claude_plan()
+        } else {
+            self.plan = None;
+            Vec::new()
+        };
         snapshot
     }
 
@@ -393,6 +420,82 @@ impl Reader {
                     .flatten()
                     .map(CodexWindow::into_limit)
                     .collect();
+            }
+        });
+        tail
+    }
+
+    /// Pi: one log per session, filed under a directory named after the working
+    /// directory, which the log's own opening line names outright.
+    ///
+    /// Neither the context window nor a plan is written down anywhere in there,
+    /// so the session's spending is all this can honestly report.
+    fn pi(&mut self, cwd: &Path) -> Snapshot {
+        let mut snapshot = Snapshot {
+            agent: Some(Agent::Pi),
+            ..Snapshot::default()
+        };
+
+        let mut logs = newest_first(&home().join(".pi/agent/sessions"));
+        logs.truncate(CANDIDATES);
+        let Some(log) = logs.into_iter().find(|log| self.pi_works_in(log, cwd)) else {
+            return snapshot;
+        };
+        let tail = self.pi_tail(&log);
+        snapshot.session = tail.tokens;
+        snapshot.model.clone_from(&tail.model);
+        snapshot
+    }
+
+    /// Whether a Pi log is this directory's, off the header it opens with.
+    ///
+    /// One line of each candidate rather than the whole of every one: a session
+    /// Pi has been in for a day runs to tens of megabytes and only one of them
+    /// belongs to the pane. The answer is kept with the log, so the line is read
+    /// once however long the session lasts.
+    fn pi_works_in(&mut self, log: &Path, cwd: &Path) -> bool {
+        let tail = self.logs.entry(log.to_path_buf()).or_default();
+        if tail.directory.is_none() {
+            let mut header = String::new();
+            if let Ok(file) = File::open(log) {
+                let _ = BufReader::new(file).read_line(&mut header);
+            }
+            tail.directory = serde_json::from_str::<PiLine>(&header)
+                .ok()
+                .and_then(|entry| entry.cwd)
+                .map(PathBuf::from);
+        }
+        tail.directory.as_deref() == Some(cwd)
+    }
+
+    fn pi_tail(&mut self, log: &Path) -> &Tail {
+        let tail = self.logs.entry(log.to_path_buf()).or_default();
+        read_lines(log, tail, |tail, line| {
+            let Ok(entry) = serde_json::from_str::<PiLine>(line) else {
+                return;
+            };
+            let Some(message) = entry.message else {
+                return;
+            };
+            let Some(usage) = message.usage else {
+                return;
+            };
+            // Pi counts the turn rather than the running total, and the entry's
+            // own identifier tells a turn from a copy of it.
+            if !tail.seen.insert(entry.id.unwrap_or_default()) {
+                return;
+            }
+            // Reasoning is part of the output rather than beside it: these four
+            // are the four that come to the `totalTokens` Pi writes next to
+            // them, and adding the fifth would count it twice.
+            tail.tokens.add(Tokens {
+                input: usage.input,
+                output: usage.output,
+                cache_read: usage.cache_read,
+                cache_write: usage.cache_write,
+            });
+            if message.model.is_some() {
+                tail.model = message.model;
             }
         });
         tail
@@ -846,6 +949,37 @@ struct OpenCodeModel {
     id: String,
 }
 
+/// A line of a Pi session log: the header that opens it, or one message.
+#[derive(Deserialize)]
+struct PiLine {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    message: Option<PiMessage>,
+}
+
+#[derive(Deserialize)]
+struct PiMessage {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: Option<PiUsage>,
+}
+
+#[derive(Deserialize)]
+struct PiUsage {
+    #[serde(default)]
+    input: u64,
+    #[serde(default)]
+    output: u64,
+    #[serde(default, rename = "cacheRead")]
+    cache_read: u64,
+    #[serde(default, rename = "cacheWrite")]
+    cache_write: u64,
+}
+
 /// The file Claude Code keeps its login in.
 #[derive(Deserialize)]
 struct Credentials {
@@ -975,6 +1109,58 @@ mod tests {
         )
         .expect("append");
         assert_eq!(reader.claude_tail(&log).tokens.total(), 300);
+
+        std::fs::remove_dir_all(&directory).expect("clean up");
+    }
+
+    #[test]
+    fn a_pi_session_is_found_by_its_header_and_its_turns_added_up() {
+        let directory = tempdir();
+        let mine = directory.join("mine.jsonl");
+        let theirs = directory.join("theirs.jsonl");
+        let header = |cwd: &str| {
+            format!(
+                r#"{{"type":"session","version":3,"id":"019fc7b1","timestamp":"2026-08-03T12:55:10.016Z","cwd":"{cwd}"}}"#
+            )
+        };
+        let turn = |id: &str| {
+            format!(
+                r#"{{"type":"message","id":"{id}","timestamp":"2026-08-03T15:04:24.287Z","message":{{"role":"assistant","model":"gpt-5.6-sol","usage":{{"input":10,"output":20,"cacheRead":30,"cacheWrite":40,"reasoning":15,"totalTokens":100}}}}}}"#
+            )
+        };
+        std::fs::write(
+            &mine,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                header("/home/dean/Projects/tuni"),
+                turn("a"),
+                // The same turn again: a resumed session writes it out twice.
+                turn("a"),
+                turn("b"),
+            ),
+        )
+        .expect("write");
+        std::fs::write(&theirs, format!("{}\n", header("/home/dean/elsewhere"))).expect("write");
+
+        let mut reader = Reader::default();
+        let cwd = Path::new("/home/dean/Projects/tuni");
+        assert!(reader.pi_works_in(&mine, cwd));
+        assert!(!reader.pi_works_in(&theirs, cwd));
+
+        let tail = reader.pi_tail(&mine);
+        // Reasoning is inside the output, so the total is what Pi's own
+        // `totalTokens` comes to for two turns rather than that plus 30.
+        assert_eq!(
+            tail.tokens,
+            Tokens {
+                input: 20,
+                output: 40,
+                cache_read: 60,
+                cache_write: 80,
+            }
+        );
+        assert_eq!(tail.tokens.total(), 200);
+        assert_eq!(tail.model.as_deref(), Some("gpt-5.6-sol"));
 
         std::fs::remove_dir_all(&directory).expect("clean up");
     }

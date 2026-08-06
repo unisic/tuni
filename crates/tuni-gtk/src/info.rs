@@ -25,6 +25,7 @@ use gtk::gio;
 use gtk::glib;
 
 use tuni_core::info::{self, Port, Process, Snapshot};
+use tuni_core::settings::Agents;
 use tuni_core::ssh::{self, Direction, Forward, Notes, Source};
 use tuni_core::usage::{self, Agent};
 
@@ -42,7 +43,7 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 mod imp {
     use super::{
-        Cell, HashMap, Instant, Link, PathBuf, RefCell, Snapshot, Tunnels, gio, glib, usage,
+        Agents, Cell, HashMap, Instant, Link, PathBuf, RefCell, Snapshot, Tunnels, gio, glib, usage,
     };
     use adw::prelude::*;
     use adw::subclass::prelude::*;
@@ -89,6 +90,9 @@ mod imp {
         /// starting again every poll.
         pub usage: RefCell<usage::Snapshot>,
         pub reader: RefCell<usage::Reader>,
+        /// Which agents are watched and how far the reading goes. Set from the
+        /// settings; the defaults are what the page did before it was asked.
+        pub agents: Cell<Agents>,
 
         /// The row a context menu was opened over.
         pub menu_pid: Cell<u32>,
@@ -713,6 +717,19 @@ impl TuniInfo {
         }
     }
 
+    /// Takes the agent settings. Turning any of them off has to empty the
+    /// section rather than leave the last reading on screen: a panel still
+    /// showing token counts would say the logs were still being read.
+    pub fn set_agents(&self, agents: &Agents) {
+        let imp = self.imp();
+        if imp.agents.replace(*agents) == *agents {
+            return;
+        }
+        imp.usage.replace(usage::Snapshot::default());
+        self.draw_agent(&usage::Snapshot::default());
+        self.reload();
+    }
+
     /// The timer's re-read: nothing above says when a build finishes or a
     /// server binds a port.
     pub fn poll(&self) {
@@ -752,6 +769,7 @@ impl TuniInfo {
         let generation = imp.generation.get();
         let cwd = imp.cwd.borrow().clone();
         let reader = imp.reader.take();
+        let agents = imp.agents.get();
         imp.loading.set(true);
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
@@ -763,7 +781,9 @@ impl TuniInfo {
                     // list has just been walked for anyway.
                     let mut reader = reader;
                     let usage = Agent::running(&snapshot.processes)
-                        .map(|agent| reader.read(agent, &cwd))
+                        .filter(|_| agents.usage)
+                        .filter(|agent| agent.watched(&agents))
+                        .map(|agent| reader.read(agent, &cwd, agents.plan))
                         .unwrap_or_default();
                     (snapshot, usage, reader)
                 })

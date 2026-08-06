@@ -70,9 +70,13 @@ window already on screen, and the activation token the launch came with is what
 brings that window to the front. A launch from the home directory is not read as
 naming one, because that is where an application menu starts everything from; a
 path given as an argument is, so `tuni ~/src/thing` typed in a shell says it
-outright. The alternative is two windows with two saved sessions writing over
-each other, which is the other half of why there is one process.
-`TUNI_SINGLE_INSTANCE=0` puts a separate one back for a build being worked on.
+outright. A launch carrying no directory at all is the other kind of launch —
+the desktop's own key for a terminal, or the icon in the menu — and it opens a
+second window, empty, the same one the menu's New Window opens. Only the first
+window restores the saved session and only that one writes it, so the windows
+beside it cannot overwrite each other, which is the other half of why there is
+one process. `TUNI_SINGLE_INSTANCE=0` puts a separate one back for a build
+being worked on.
 
 On the other side, a panel under `Ctrl+Shift+B` shows the directory the focused
 shell is working in, or the project's own if one is pinned, and follows it as
@@ -114,8 +118,8 @@ made to. Nothing here shells out: it is `/proc`, read on a worker thread while
 the page is showing and no more often than that.
 
 When a coding agent is running under that shell, the page grows an Agent section
-for it. Claude Code, Codex and OpenCode each keep a record of their own turns on
-disk, and that is where the figures come from: what the session working in this
+for it. Claude Code, Codex, OpenCode and Pi each keep a record of their own turns
+on disk, and that is where the figures come from: what the session working in this
 directory has spent, split into fresh input, output and what came back from the
 cache, which is most of a long conversation and costs a fraction of the rest.
 Above the tokens sit the plan's own windows, a bar per window with how much of
@@ -1166,6 +1170,13 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `ssh-reconnect-on-restore` | `false` | Whether a restored ssh pane dials with nothing to attach to. Off, so a window putting eight panes back cannot start eight logins |
 | `check-updates` | `true` | Whether the window asks the GitHub release page for a newer version, once per run. Off leaves the menu's "Check for Updates" to do it by hand |
 | `panel.files`, `panel.git`, `panel.info`, `panel.debug` | `true` | Which pages the panel's switcher offers. The Remote page manages itself: it exists while a pane is on a host |
+| `agent.usage` | `true` | Whether the Info panel reads a coding agent's own session log. Off takes the Agent section away and stops every file below it from being opened |
+| `agent.claude`, `agent.codex`, `agent.opencode`, `agent.pi` | `true` | Which agents count as one. An agent turned off is a pane like any other: no section, no log read, no request made |
+| `agent.plan` | `true` | Whether Claude Code's plan bars are asked of the account's usage page, at most once a minute, with the login the agent already keeps on disk. The one thing a session log does not carry, so the one thing that leaves the machine. Codex's bars come out of its log and are not affected |
+| `agent.spinner` | `true` | Whether a tab whose agent is thinking spins. This also decides the title: the agent's own glyph is taken off the tab name exactly while tuni draws the spinner in its place |
+| `agent.mark` | `true` | Whether a turn that ends into a tab nobody is looking at marks that tab and its project's row, to be cleared by looking at it |
+| `agent.notify` | `true` | Whether the same moment raises a desktop notification, which also fires for a window sitting behind another one |
+| `agent.bell` | `false` | Whether it rings the bell as well. Silenced by `bell` like any other |
 | `key.<action>` | | A window shortcut changed from its default, in GTK accelerator spelling: `key.win.palette = "<Ctrl><Shift>p"`. An empty string turns the shortcut off |
 
 A Ghostty configuration can be pasted in whole. Values do not need the quotes
