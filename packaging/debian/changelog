@@ -1,3 +1,23 @@
+tuni (1.6.0) unstable; urgency=medium
+
+  * A host can keep its password, in the desktop keyring through secret-tool.
+    ssh reads it through a helper, only for a host whose key is already known;
+    Tuni never reads it back. The Keys dialog takes a private key pasted from
+    elsewhere and puts it in ~/.ssh.
+  * The host editor is laid out in cards, and a host can have an icon, with
+    forty-two system logos to choose from.
+  * The mouse wheel over the tab strip moves one tab per notch, and a tab
+    dropped on the desktop becomes a window on Wayland too.
+  * A new tab's shell starts at the size of its pane, so the prompt no longer
+    folds onto itself with the cursor in the middle of it.
+  * Discord Rich Presence: the file or program, the repository, its branch and
+    a button to its remote. Off until turned on, with a switch per part.
+  * UsageFleet's group budget: the 5 hour and weekly share this device's group
+    has spent, beside Claude Code and Pi, and when the group refuses prompts.
+    Asked once a minute at most; a switch under Agents to Recognise.
+
+ -- Unisic <contact@unisic.app>  Sat, 10 Oct 2026 19:30:00 +0200
+
 tuni (1.5.1) unstable; urgency=medium
 
   * A launch that names no directory opens a window again. Since 1.5.0 it only

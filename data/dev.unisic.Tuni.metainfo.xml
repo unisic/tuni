@@ -67,6 +67,35 @@
   </provides>
 
   <releases>
+    <release version="1.6.0" date="2026-10-10">
+      <description>
+        <p>A host can keep its password. It goes into the desktop's keyring
+        through <code>secret-tool</code>, and <code>ssh</code> reads it from
+        there through a small helper, only for a machine whose host key is
+        already known, so the question about a new machine still reaches the
+        person connecting. Tuni never reads it back. The Keys dialog also takes
+        a private key pasted from somewhere else and puts it in
+        <code>~/.ssh</code>, where every ssh tool finds it.</p>
+        <p>The host editor is laid out in cards, in the order a host is filled
+        in, and a host can have an icon. Forty-two system logos come with it,
+        from Debian and Fedora to the BSDs and the services a machine is rented
+        from.</p>
+        <p>The mouse wheel over the tab strip moves one tab per notch. A tab
+        dropped on the desktop becomes a window of its own on Wayland too,
+        where it used to slide back into the strip.</p>
+        <p>A new tab's shell starts at the size of its pane, so the prompt no
+        longer folds onto itself with the cursor left in the middle of it.</p>
+        <p>Tuni can show what is being worked on in Discord: the file being
+        edited or the program in front of the shell, and the repository with
+        its branch and a button to its remote. It is off until turned on, on
+        the Session page, and each part of it has a switch of its own.</p>
+        <p>Where UsageFleet is installed, the Info panel shows how much of the
+        5 hour and weekly share given to this device's group is spent, beside
+        Claude Code and Pi, and says when the group is refusing prompts and
+        until when. It is asked once a minute at most, and it is a switch under
+        Agents to Recognise.</p>
+      </description>
+    </release>
     <release version="1.5.1" date="2026-08-06">
       <description>
         <p>A keyboard shortcut that runs <code>tuni</code> opens a window

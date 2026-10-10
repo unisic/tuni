@@ -6,7 +6,7 @@
 # GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
 # populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.5.1/ -o tuni-1.5.1.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.6.0/ -o tuni-1.6.0.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.15.2
 
 Name:           tuni
-Version:        1.5.1
+Version:        1.6.0
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -89,6 +89,23 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/*/*/*.svg
 
 %changelog
+* Sat Oct 10 2026 Unisic <contact@unisic.app> - 1.6.0-1
+- A host can keep its password, in the desktop keyring through secret-tool. ssh
+  reads it through a helper, only for a host whose key is already known; Tuni
+  never reads it back. The Keys dialog takes a private key pasted from elsewhere
+  and puts it in ~/.ssh.
+- The host editor is laid out in cards, and a host can have an icon, with
+  forty-two system logos to choose from.
+- The mouse wheel over the tab strip moves one tab per notch, and a tab dropped
+  on the desktop becomes a window on Wayland too.
+- A new tab's shell starts at the size of its pane, so the prompt no longer
+  folds onto itself with the cursor in the middle of it.
+- Discord Rich Presence: the file or program, the repository, its branch and a
+  button to its remote. Off until turned on, with a switch per part.
+- UsageFleet's group budget: the 5 hour and weekly share this device's group has
+  spent, beside Claude Code and Pi, and when the group refuses prompts. Asked
+  once a minute at most; a switch under Agents to Recognise.
+
 * Thu Aug 06 2026 Unisic <contact@unisic.app> - 1.5.1-1
 - A launch that names no directory opens a window again. Since 1.5.0 it only
   raised the window already open, so a desktop shortcut bound to Ctrl+Alt+T did
