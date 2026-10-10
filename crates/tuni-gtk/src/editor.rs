@@ -940,9 +940,7 @@ impl TuniEditor {
             return;
         };
         let cursor = buffer.iter_at_mark(&buffer.get_insert());
-        let (start, end) = buffer
-            .selection_bounds()
-            .map_or((cursor, cursor), |bounds| bounds);
+        let (start, end) = buffer.selection_bounds().unwrap_or((cursor, cursor));
         let (start, end) = (start.offset(), end.offset());
         let Some(text) = self.text() else {
             return;

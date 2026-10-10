@@ -1359,7 +1359,7 @@ impl Terminal {
                         .unwrap_or(false);
 
                 let selected = cell.is_selected().unwrap_or(false);
-                let mut fg = cell.fg_color()?.map_or(colors.foreground, |c| c);
+                let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
                 let mut bg = cell.bg_color()?;
 
                 if cell.has_styling().unwrap_or(false) {
