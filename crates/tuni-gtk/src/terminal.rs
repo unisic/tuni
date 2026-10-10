@@ -1751,6 +1751,17 @@ impl TuniTerminal {
     /// exactly once.
     fn apply_size(&self, width: i32, height: i32) {
         let imp = self.imp();
+        // Less than a cell either way is no size for a grid. GTK allocates a
+        // new tab's widget 0x0 before its first real layout, and taken at face
+        // value that is a 1x1 grid: a shell started in the gap before the real
+        // allocation prints its prompt into one column, and widening it reflows
+        // the prompt onto one row with the cursor left in the middle of the
+        // text. Ignored, the grid keeps the last shape it had, and a shell that
+        // starts before any real allocation gets the 80x24 fallback instead.
+        let m = imp.metrics.get();
+        if (width as f32) < m.cell_width || (height as f32) < m.cell_height {
+            return;
+        }
         // Nothing is running: the first allocation decides what size the shell
         // is started at, and a screen nobody is writing to has no reflow to
         // debounce.
