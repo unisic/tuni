@@ -6,6 +6,7 @@ mod blur;
 mod debug;
 mod debugger;
 mod diff;
+mod discord;
 mod editor;
 mod files;
 mod find;

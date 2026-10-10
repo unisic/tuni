@@ -734,6 +734,72 @@ fn session_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw:
     updates.add(&check);
     page.add(&updates);
 
+    // Off until asked for: this is the one setting whose effect is read by
+    // other people, so each part of what it says can be held back on its own.
+    let discord = adw::PreferencesGroup::builder()
+        .title("Discord")
+        .description(
+            "Shown on your Discord profile to everyone who can see it, through the Discord \
+             app on this computer. Nothing is sent while Discord is closed.",
+        )
+        .build();
+    let presence = adw::SwitchRow::builder()
+        .title("Show Activity in Discord")
+        .active(settings.discord.presence)
+        .build();
+    presence.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.discord.presence = on);
+        }
+    ));
+    discord.add(&presence);
+    // Title, subtitle, state, and where a flip of it is written.
+    type Part = (&'static str, &'static str, bool, fn(&mut Settings, bool));
+    let parts: [Part; 3] = [
+        (
+            "Repository and Branch",
+            "The repository's name and its Git branch, or the project's outside one",
+            settings.discord.project,
+            |settings, on| settings.discord.project = on,
+        ),
+        (
+            "File and Program",
+            "The file being edited, or the program running in the terminal",
+            settings.discord.file,
+            |settings, on| settings.discord.file = on,
+        ),
+        (
+            "Repository Button",
+            "A button that opens the project's remote, which names a private one too",
+            settings.discord.repository,
+            |settings, on| settings.discord.repository = on,
+        ),
+    ];
+    for (title, subtitle, active, set) in parts {
+        let row = adw::SwitchRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .active(active)
+            .build();
+        row.connect_active_notify(glib::clone!(
+            #[weak]
+            window,
+            move |row| {
+                let on = row.is_active();
+                edit(&window, |settings| set(settings, on));
+            }
+        ));
+        presence
+            .bind_property("active", &row, "sensitive")
+            .sync_create()
+            .build();
+        discord.add(&row);
+    }
+    page.add(&discord);
+
     page
 }
 

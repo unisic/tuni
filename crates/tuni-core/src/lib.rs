@@ -6,6 +6,7 @@
 
 pub mod dap;
 pub mod diff;
+pub mod discord;
 pub mod editor;
 pub mod editors;
 pub mod files;

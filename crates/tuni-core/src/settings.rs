@@ -154,6 +154,36 @@ impl Default for Agents {
     }
 }
 
+/// What a Discord profile is told, through the Discord client on this machine.
+///
+/// Everything here is read by whoever can see the profile, so the whole thing
+/// is off until it is asked for, and each part of it can be held back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Discord {
+    /// Whether there is a presence at all.
+    pub presence: bool,
+    /// Whether it names the repository and its branch, or the project
+    /// outside a repository.
+    pub project: bool,
+    /// Whether it names the file being edited and the program running in the
+    /// terminal. Off leaves the language and "In the terminal".
+    pub file: bool,
+    /// Whether the project's remote becomes a button that opens it, which on
+    /// a private repository tells everyone its name.
+    pub repository: bool,
+}
+
+impl Default for Discord {
+    fn default() -> Self {
+        Self {
+            presence: false,
+            project: true,
+            file: true,
+            repository: true,
+        }
+    }
+}
+
 /// Everything the settings window edits.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -238,6 +268,7 @@ pub struct Settings {
     pub panel_debug: bool,
     /// What tuni does about a coding agent working in a pane.
     pub agents: Agents,
+    pub discord: Discord,
     /// The command of the editor last opened from the Info page, so the split
     /// button opens the same one next time. Empty until one is chosen; a
     /// command that is no longer installed is simply not found and the button
@@ -273,6 +304,7 @@ impl Default for Settings {
             panel_info: true,
             panel_debug: true,
             agents: Agents::default(),
+            discord: Discord::default(),
             info_editor: String::new(),
             keys: Vec::new(),
         }
@@ -498,6 +530,16 @@ impl Settings {
         {
             settings.info_editor = command.trim().to_owned();
         }
+        for (key, slot) in [
+            ("discord.presence", &mut settings.discord.presence),
+            ("discord.project", &mut settings.discord.project),
+            ("discord.file", &mut settings.discord.file),
+            ("discord.repository", &mut settings.discord.repository),
+        ] {
+            if let Some(on) = table.boolean(key) {
+                *slot = on;
+            }
+        }
         // Which actions exist is the window's business; anything spelled here
         // is carried as written and simply finds no action to land on if a
         // later version renames one.
@@ -685,6 +727,28 @@ impl Settings {
         }
         if self.info_editor != default.info_editor {
             let _ = writeln!(out, "info-editor = {}", toml::quote(&self.info_editor));
+        }
+        for (key, on, was) in [
+            (
+                "discord.presence",
+                self.discord.presence,
+                default.discord.presence,
+            ),
+            (
+                "discord.project",
+                self.discord.project,
+                default.discord.project,
+            ),
+            ("discord.file", self.discord.file, default.discord.file),
+            (
+                "discord.repository",
+                self.discord.repository,
+                default.discord.repository,
+            ),
+        ] {
+            if on != was {
+                let _ = writeln!(out, "{key} = {on}");
+            }
         }
         for (action, accel) in &self.keys {
             let _ = writeln!(out, "key.{action} = {}", toml::quote(accel));
@@ -1060,6 +1124,11 @@ mod tests {
             panel_info: true,
             panel_debug: false,
             info_editor: "zed".to_owned(),
+            discord: Discord {
+                presence: true,
+                file: false,
+                ..Discord::default()
+            },
             agents: Agents {
                 plan: false,
                 bell: true,
@@ -1100,6 +1169,7 @@ mod tests {
         assert!(read.ssh_reconnect_on_restore);
         assert!(!read.check_updates);
         assert_eq!(read.info_editor, "zed");
+        assert_eq!(read.discord, settings.discord);
         assert_eq!(read.agents, settings.agents);
     }
 

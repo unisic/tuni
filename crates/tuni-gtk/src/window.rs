@@ -920,6 +920,7 @@ impl TuniWindow {
             if !window.is_active() {
                 return;
             }
+            window.refresh_discord();
             for hosts in window.imp().hosts.borrow().values() {
                 hosts.refresh_if_stale();
             }
@@ -1392,6 +1393,7 @@ impl TuniWindow {
         // starts or ends, so a switch flipped between turns needs the redraw
         // asked for.
         self.refresh_agents();
+        self.refresh_discord();
 
         // Turning history off should not leave the last session's output on
         // disk waiting for the setting to be turned back on.
@@ -4976,6 +4978,7 @@ impl TuniWindow {
         }
 
         self.refresh_names();
+        self.refresh_discord();
     }
 
     fn refresh_names(&self) {
@@ -5010,6 +5013,64 @@ impl TuniWindow {
                 page.set_tooltip(&tab.directory().map(shorten).unwrap_or_default());
             }
         }
+    }
+
+    /// Tells Discord what this window is showing, if it is the window being
+    /// worked in: one behind another is not what anybody is doing, and its
+    /// prompt redrawing would otherwise take the presence back. Turning the
+    /// presence off is heard from any window, since the settings can be.
+    fn refresh_discord(&self) {
+        use tuni_core::discord::{ActivityKind, PresenceStatus};
+
+        let imp = self.imp();
+        let show = imp.settings.borrow().discord;
+        if !show.presence {
+            crate::discord::show(None);
+            return;
+        }
+        if !self.is_active() {
+            return;
+        }
+
+        let (project, project_directory) = {
+            let workspace = imp.workspace.borrow();
+            let project = workspace.selected_project();
+            (
+                project.map(|project| project.name().to_owned()),
+                project.and_then(|project| project.custom_directory.as_ref().map(PathBuf::from)),
+            )
+        };
+        let (directory, kind) = if let Some(editor) = self.active_editor() {
+            (
+                editor.path().parent().map(Path::to_path_buf),
+                ActivityKind::Editing {
+                    file_name: editor.name(),
+                },
+            )
+        } else if let Some(terminal) = self.active_terminal() {
+            (
+                terminal.cwd().map(PathBuf::from),
+                ActivityKind::Terminal {
+                    shell_pid: terminal.shell_pid(),
+                },
+            )
+        } else if self
+            .focused_pane()
+            .is_some_and(|pane| imp.diffs.borrow().contains_key(&pane))
+        {
+            (None, ActivityKind::Git)
+        } else {
+            (None, ActivityKind::Idle)
+        };
+
+        crate::discord::show(Some((
+            PresenceStatus {
+                project,
+                directory: directory.or(project_directory),
+                kind,
+            },
+            show,
+        )));
     }
 
     /// Rebuilds the sidebar rows. Cheap at the count of projects a person keeps
