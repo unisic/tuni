@@ -783,7 +783,7 @@ impl TuniInfo {
                     let usage = Agent::running(&snapshot.processes)
                         .filter(|_| agents.usage)
                         .filter(|agent| agent.watched(&agents))
-                        .map(|agent| reader.read(agent, &cwd, agents.plan))
+                        .map(|agent| reader.read(agent, &cwd, agents.plan, agents.usagefleet))
                         .unwrap_or_default();
                     (snapshot, usage, reader)
                 })
@@ -1160,6 +1160,24 @@ impl TuniInfo {
                 limit.resets_at.and_then(resets_label).as_deref(),
                 Some(limit.used_percent / 100.0),
             ));
+        }
+        if let Some(fleet) = &usage.fleet {
+            for limit in &fleet.limits {
+                let detail = if fleet.blocked.as_ref() == Some(&limit.window) {
+                    match limit.resets_at.and_then(resets_label) {
+                        Some(resets) => format!("Prompts blocked, {resets}"),
+                        None => "Prompts blocked".to_owned(),
+                    }
+                } else {
+                    fleet.group.clone()
+                };
+                section.list.append(&self.agent_row(
+                    &format!("UsageFleet {}", limit.window),
+                    &format!("{:.0}%", limit.used_percent),
+                    Some(&detail),
+                    Some(limit.used_percent / 100.0),
+                ));
+            }
         }
     }
 

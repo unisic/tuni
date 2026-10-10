@@ -7,6 +7,9 @@
 //! carry, so those bars are asked of the account's usage endpoint, the same
 //! numbers its website shows, with the login the agent already keeps on disk.
 //! Nothing here signs in, and nothing but that one request leaves the machine.
+//! The exception is UsageFleet, where it is installed: its server alone knows
+//! how much of a group's slice of the plan is spent, so that is asked of it,
+//! with the device token its collector keeps.
 //!
 //! The logs are appended to and the panel polls, so a [`Reader`] remembers how
 //! far into each file it read and what that came to. A session log runs to tens
@@ -203,6 +206,22 @@ pub struct Snapshot {
     pub context: Option<Fill>,
     /// The plan's windows, each a share used. The account's, not the pane's.
     pub limits: Vec<Limit>,
+    /// This device's UsageFleet group, where there is one.
+    pub fleet: Option<Fleet>,
+}
+
+/// UsageFleet's view of this device's group: how much of the slice of the plan
+/// the group was given it has spent, window by window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fleet {
+    /// The group, as the dashboard names it.
+    pub group: String,
+    /// "5 hours" and "7 days", and a model's own window when that is the one
+    /// refusing prompts.
+    pub limits: Vec<Limit>,
+    /// The window in `limits` whose share is spent, while UsageFleet refuses
+    /// new prompts.
+    pub blocked: Option<String>,
 }
 
 impl Snapshot {
@@ -210,7 +229,10 @@ impl Snapshot {
     /// has a log with no turns in it yet.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.session.total() == 0 && self.context.is_none() && self.limits.is_empty()
+        self.session.total() == 0
+            && self.context.is_none()
+            && self.limits.is_empty()
+            && self.fleet.is_none()
     }
 }
 
@@ -221,6 +243,9 @@ pub struct Reader {
     /// The last word from Claude Code's plan endpoint and when it arrived,
     /// because a request a minute is plenty for bars that move by the hour.
     plan: Option<Plan>,
+    /// The last word from UsageFleet and when it came, held as long as a plan
+    /// reading and for the same reason.
+    fleet: Option<(i64, Option<Fleet>)>,
 }
 
 /// A fetched reading of the plan, held until it is stale.
@@ -254,14 +279,38 @@ impl Reader {
     /// `plan` decides the one part of this that is not a file read: Claude
     /// Code's plan bars, which come off the account's usage page. Everything
     /// else is the agent's own logs and stays on the machine either way.
+    /// `fleet` decides whether UsageFleet is asked for the group's budget.
     #[must_use]
-    pub fn read(&mut self, agent: Agent, cwd: &Path, plan: bool) -> Snapshot {
-        match agent {
+    pub fn read(&mut self, agent: Agent, cwd: &Path, plan: bool, fleet: bool) -> Snapshot {
+        let mut snapshot = match agent {
             Agent::Claude => self.claude(cwd, plan),
             Agent::Codex => self.codex(cwd),
             Agent::OpenCode => opencode(cwd),
             Agent::Pi => self.pi(cwd),
+        };
+        if !fleet {
+            self.fleet = None;
         }
+        // UsageFleet meters these two agents' logs, and its guard sits in
+        // front of their prompts.
+        if fleet && matches!(agent, Agent::Claude | Agent::Pi) {
+            snapshot.fleet = self.fleet_budget();
+        }
+        snapshot
+    }
+
+    /// The group's budget, asked at most once a minute. A failed ask keeps the
+    /// previous answer, as the plan's does.
+    fn fleet_budget(&mut self) -> Option<Fleet> {
+        let at = now();
+        if let Some((asked, fleet)) = &self.fleet
+            && at - asked < PLAN_FRESH
+        {
+            return fleet.clone();
+        }
+        let fleet = fetch_fleet().or_else(|| self.fleet.take().and_then(|(_, fleet)| fleet));
+        self.fleet = Some((at, fleet.clone()));
+        fleet
     }
 
     /// Claude Code: one log per session, under a directory named after the
@@ -624,11 +673,9 @@ fn newest_first(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Asks the account's usage endpoint how full the plan's windows are, with the
-/// login Claude Code keeps in `~/.claude/.credentials.json`. This is the one
-/// request the module sends anywhere, it goes to the same place the agent
-/// itself talks to, and it carries nothing but the token that was already
-/// there. The token rides in on stdin, where `/proc` cannot read it off the
-/// argument list the way it could a flag.
+/// login Claude Code keeps in `~/.claude/.credentials.json`. The request goes
+/// to the same place the agent itself talks to, and it carries nothing but the
+/// token that was already there.
 fn fetch_plan() -> Option<Vec<Limit>> {
     let credentials = home().join(".claude/.credentials.json");
     let credentials = std::fs::read_to_string(credentials).ok()?;
@@ -641,17 +688,51 @@ fn fetch_plan() -> Option<Vec<Limit>> {
         return None;
     }
 
+    let body = get(
+        "https://api.anthropic.com/api/oauth/usage",
+        &format!("Authorization: Bearer {}", oauth.access_token),
+        &["anthropic-beta: oauth-2025-04-20"],
+    )?;
+    Some(plan_limits(&body))
+}
+
+/// Asks UsageFleet's server for this device's group, the endpoint its own
+/// prompt guard reads before every prompt and which it keeps for status bars.
+/// The device token is the one its collector keeps in
+/// `~/.config/usagefleet/config.json`, picked the way the collector picks it:
+/// the one bound to the Claude account signed in here, else the default.
+fn fetch_fleet() -> Option<Fleet> {
+    // Beside Tuni's own directory, which already honours `XDG_CONFIG_HOME`.
+    let config = crate::settings::config_dir().with_file_name("usagefleet");
+    let config = std::fs::read_to_string(config.join("config.json")).ok()?;
+    let config = serde_json::from_str::<FleetConfig>(&config).ok()?;
+    let account = std::fs::read_to_string(home().join(".claude.json"))
+        .ok()
+        .and_then(|state| serde_json::from_str::<ClaudeState>(&state).ok())
+        .and_then(|state| state.oauth_account)
+        .map(|account| account.account_uuid);
+    let token = account
+        .and_then(|account| config.account_tokens.get(&account))
+        .or(config.token.as_ref())?;
+    let body = get(
+        "https://usagefleet.com/api/v1/limits",
+        &format!("x-api-key: {token}"),
+        &[],
+    )?;
+    fleet(&body)
+}
+
+/// A GET through `curl`, with the header that carries the token written to its
+/// stdin, where `/proc` cannot read it off the argument list the way it could a
+/// flag. These are the only requests the module sends anywhere.
+fn get(url: &str, secret: &str, headers: &[&str]) -> Option<String> {
+    let mut args = vec!["-sf", "--max-time", "4", "-H", "@-"];
+    for header in headers {
+        args.extend(["-H", header]);
+    }
+    args.push(url);
     let mut curl = Command::new("curl")
-        .args([
-            "-sf",
-            "--max-time",
-            "4",
-            "-H",
-            "@-",
-            "-H",
-            "anthropic-beta: oauth-2025-04-20",
-            "https://api.anthropic.com/api/oauth/usage",
-        ])
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -659,13 +740,53 @@ fn fetch_plan() -> Option<Vec<Limit>> {
         .ok()?;
     curl.stdin
         .take()?
-        .write_all(format!("Authorization: Bearer {}\n", oauth.access_token).as_bytes())
+        .write_all(format!("{secret}\n").as_bytes())
         .ok()?;
     let output = curl.wait_with_output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(plan_limits(&String::from_utf8_lossy(&output.stdout)))
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The group's reading, as UsageFleet's limits endpoint answers it.
+fn fleet(json: &str) -> Option<Fleet> {
+    let view = serde_json::from_str::<FleetView>(json).ok()?;
+    // Until a collector has reported, the percentages are zeros standing in
+    // for nothing, and a device in no group has no share to be a part of.
+    view.reported_at?;
+    let group = view.group?;
+    let window = |label: &str, used: Option<f64>| Limit {
+        window: label.to_owned(),
+        used_percent: used.unwrap_or(0.0),
+        resets_at: None,
+    };
+    let mut limits = vec![
+        window("5 hours", view.session_pct),
+        window("7 days", view.weekly_pct),
+    ];
+    let blocked = (view.blocked == Some(true)).then(|| {
+        let tripped = usize::from(view.blocked_window.as_deref() == Some("weekly"));
+        let resets_at = view.blocked_until.as_deref().and_then(unix_time);
+        if let Some(model) = view.blocked_model {
+            // A model's own window ran out rather than the group's share of
+            // the plan, so it gets a bar of its own.
+            let label = format!("{model} {}", limits[tripped].window);
+            limits.push(Limit {
+                resets_at,
+                ..window(&label, view.blocked_pct.or(Some(100.0)))
+            });
+            label
+        } else {
+            limits[tripped].resets_at = resets_at;
+            limits[tripped].window.clone()
+        }
+    });
+    Some(Fleet {
+        group,
+        limits,
+        blocked,
+    })
 }
 
 /// The endpoint's windows, shortest first. Every window with a reading becomes
@@ -980,6 +1101,45 @@ struct PiUsage {
     cache_write: u64,
 }
 
+/// UsageFleet's configuration, for its device tokens.
+#[derive(Deserialize)]
+struct FleetConfig {
+    token: Option<String>,
+    /// A token per Claude account, for a machine that signs in to more than
+    /// one and files each one's usage in its own fleet.
+    #[serde(default, rename = "accountTokens")]
+    account_tokens: HashMap<String, String>,
+}
+
+/// `~/.claude.json`, for which account Claude Code is signed in to.
+#[derive(Deserialize)]
+struct ClaudeState {
+    #[serde(rename = "oauthAccount")]
+    oauth_account: Option<OauthAccount>,
+}
+
+#[derive(Deserialize)]
+struct OauthAccount {
+    #[serde(rename = "accountUuid")]
+    account_uuid: String,
+}
+
+/// What UsageFleet's limits endpoint answers. Every field may be missing,
+/// which is how a server older than one of them answers.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FleetView {
+    group: Option<String>,
+    session_pct: Option<f64>,
+    weekly_pct: Option<f64>,
+    blocked: Option<bool>,
+    blocked_window: Option<String>,
+    blocked_model: Option<String>,
+    blocked_pct: Option<f64>,
+    blocked_until: Option<String>,
+    reported_at: Option<String>,
+}
+
 /// The file Claude Code keeps its login in.
 #[derive(Deserialize)]
 struct Credentials {
@@ -1267,6 +1427,53 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&directory).expect("clean up");
+    }
+
+    #[test]
+    fn a_group_reading_becomes_a_bar_per_window() {
+        let json = r#"{"group":"laptops","sessionPct":20,"weeklyPct":10.4,"blocked":false,
+            "blockedWindow":null,"blockedModel":null,"blockedPct":null,"blockedUntil":null,
+            "reportedAt":"2026-10-10T16:47:50.808Z"}"#;
+        let fleet = fleet(json).expect("a reading");
+        assert_eq!(fleet.group, "laptops");
+        let bars: Vec<(&str, f64)> = fleet
+            .limits
+            .iter()
+            .map(|limit| (limit.window.as_str(), limit.used_percent))
+            .collect();
+        assert_eq!(bars, [("5 hours", 20.0), ("7 days", 10.4)]);
+        assert_eq!(fleet.blocked, None);
+    }
+
+    #[test]
+    fn a_spent_share_names_its_window_and_when_it_resets() {
+        let json = r#"{"group":"laptops","sessionPct":40,"weeklyPct":101,"blocked":true,
+            "blockedWindow":"weekly","blockedPct":101,"blockedUntil":"2026-10-12T08:00:00.000Z",
+            "reportedAt":"2026-10-10T16:47:50.808Z"}"#;
+        let fleet = fleet(json).expect("a reading");
+        assert_eq!(fleet.blocked.as_deref(), Some("7 days"));
+        assert_eq!(fleet.limits[1].resets_at, unix_time("2026-10-12T08:00:00Z"));
+        assert_eq!(fleet.limits[0].resets_at, None);
+    }
+
+    #[test]
+    fn a_model_window_that_refuses_prompts_gets_a_bar_of_its_own() {
+        let json = r#"{"group":"laptops","sessionPct":40,"weeklyPct":50,"blocked":true,
+            "blockedWindow":"session","blockedModel":"Fable","blockedPct":100,
+            "reportedAt":"2026-10-10T16:47:50.808Z"}"#;
+        let fleet = fleet(json).expect("a reading");
+        assert_eq!(fleet.limits.len(), 3);
+        assert_eq!(fleet.limits[2].window, "Fable 5 hours");
+        assert_eq!(fleet.blocked.as_deref(), Some("Fable 5 hours"));
+    }
+
+    #[test]
+    fn no_report_yet_or_no_group_draws_nothing() {
+        let unreported = r#"{"group":"laptops","sessionPct":0,"weeklyPct":0,"reportedAt":null}"#;
+        let groupless = r#"{"group":null,"sessionPct":0,"weeklyPct":0,"reportedAt":"2026-10-10T16:47:50.808Z"}"#;
+        assert_eq!(fleet(unreported), None);
+        assert_eq!(fleet(groupless), None);
+        assert_eq!(fleet("not json"), None);
     }
 
     /// A directory of this test's own, named after the test binary and the

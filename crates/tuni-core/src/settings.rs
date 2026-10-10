@@ -117,6 +117,13 @@ pub struct Agents {
     /// Codex's bars come out of its log and are not affected. Off leaves the
     /// session's token counts, which cost nothing but a read.
     pub plan: bool,
+    /// Whether UsageFleet is asked how much of this device's group budget is
+    /// spent, and whether it is refusing new prompts for it.
+    ///
+    /// One request to usagefleet.com at most once a minute while Claude Code or
+    /// Pi is in the pane, with the device token UsageFleet's collector keeps.
+    /// Where it is not installed there is no token and nothing is sent.
+    pub usagefleet: bool,
     /// Whether a tab whose agent is thinking draws a spinner.
     ///
     /// This also decides the title: the agent's own glyph is taken off the tab
@@ -146,6 +153,7 @@ impl Default for Agents {
             opencode: true,
             pi: true,
             plan: true,
+            usagefleet: true,
             spinner: true,
             mark: true,
             notify: true,
@@ -512,6 +520,9 @@ impl Settings {
         if let Some(on) = table.boolean("agent.plan") {
             settings.agents.plan = on;
         }
+        if let Some(on) = table.boolean("agent.usagefleet") {
+            settings.agents.usagefleet = on;
+        }
         if let Some(on) = table.boolean("agent.spinner") {
             settings.agents.spinner = on;
         }
@@ -716,6 +727,11 @@ impl Settings {
             ),
             ("agent.pi", self.agents.pi, default.agents.pi),
             ("agent.plan", self.agents.plan, default.agents.plan),
+            (
+                "agent.usagefleet",
+                self.agents.usagefleet,
+                default.agents.usagefleet,
+            ),
             ("agent.spinner", self.agents.spinner, default.agents.spinner),
             ("agent.mark", self.agents.mark, default.agents.mark),
             ("agent.notify", self.agents.notify, default.agents.notify),
@@ -1035,14 +1051,16 @@ mod tests {
     fn an_agent_switch_survives_being_written_and_read_back() {
         let mut settings = Settings::default();
         settings.agents.plan = false;
+        settings.agents.usagefleet = false;
         settings.agents.bell = true;
 
         let written = settings.to_toml();
         assert!(written.contains("agent.plan = false"));
+        assert!(written.contains("agent.usagefleet = false"));
         assert!(written.contains("agent.bell = true"));
         // Only what differs, which is what keeps a default turning into a
         // written-down decision the next version cannot change.
-        assert!(!written.contains("agent.usage"));
+        assert!(!written.contains("agent.usage ="));
 
         let read = Settings::parse(&written);
         assert_eq!(read.agents, settings.agents);

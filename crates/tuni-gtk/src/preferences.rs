@@ -911,6 +911,24 @@ fn agents_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw::
     ));
     known.add(&pi);
 
+    let fleet = adw::SwitchRow::builder()
+        .title("UsageFleet")
+        .subtitle(
+            "The group's 5 hour and weekly budget beside Claude Code and Pi, asked of its \
+             server once a minute",
+        )
+        .active(settings.agents.usagefleet)
+        .build();
+    fleet.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.agents.usagefleet = on);
+        }
+    ));
+    known.add(&fleet);
+
     let plan = adw::SwitchRow::builder()
         .title("Ask for Claude Code's Plan Limits")
         .subtitle("At most one request a minute, with the login already on disk")
