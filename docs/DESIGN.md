@@ -286,6 +286,20 @@ desktop is a gesture a tiling compositor can swallow before it reaches the
 window. The last project in a window may go too; what stays behind is the same
 New Project screen that closing it would have left.
 
+A tab let go of over the desktop needs a hook of its own on Wayland. libadwaita
+makes the window only when GTK says the drop had no target, which is what X11
+says; on Wayland the compositor reports the drop as performed and then cancels
+it, and GTK passes that on as an error, the same reason an Escape arrives with.
+So the window hooks every tab drag that crosses it and reads a performed drop
+followed by that cancel as the desktop, which KWin never sends for an Escape. A
+project row dragged off the sidebar reads its drag the same way.
+
+A mouse wheel over the tab strip moves to the next or previous tab, a tab per
+notch and stopping at either end, the way every Qt tab bar on a KDE desktop
+does; libadwaita would slide the strip instead, which most of the time has
+nothing to slide. A touchpad still slides it, since its scroll comes in pixels
+and a tab per pixel would race through all of them.
+
 `Ctrl+Alt+I` sends what is typed to every pane of the tab rather than to the one
 with the keyboard, and a banner across the top says so until it is pressed
 again, because a mode this loud has to be visible from the pane being typed

@@ -142,6 +142,11 @@ thread_local! {
     /// nothing else in it. A project that does gets the tab at the end, where a
     /// new tab goes and where the menu's "Move to Project" puts it.
     static DROPPED_OUTSIDE: Cell<bool> = const { Cell::new(false) };
+
+    /// The tab drag [`TuniWindow::watch_tab_drags`] has already hooked. A drag
+    /// enters a window again every time it comes back over one, and two hooks
+    /// on one drag would make two windows of one tab.
+    static HOOKED: glib::WeakRef<gdk::Drag> = glib::WeakRef::new();
 }
 
 /// What a Find command found to act on. The bar over a terminal belongs to the
@@ -478,6 +483,7 @@ mod imp {
             crate::debug::mark("  build_ui");
             obj.install_actions();
             obj.install_switcher();
+            obj.watch_tab_drags();
             obj.watch_appearance();
         }
 
@@ -753,6 +759,40 @@ impl TuniWindow {
             .expand_tabs(false)
             .end_action_widget(&new_tab)
             .build();
+        // A mouse wheel over the strip moves through the tabs, the way a Qt tab
+        // bar does everywhere else on a KDE desktop, rather than sliding a strip
+        // that usually has nothing to slide. The capture phase, so the wheel
+        // gets here before `AdwTabBox`, which would scroll with it. A wheel
+        // only: a touchpad reports pixels, and a tab per pixel would race
+        // through all of them, so a swipe still slides the strip. Discrete, so
+        // a free-spinning wheel reporting fractions of a notch turns one tab
+        // per notch, and no wrap at the ends, so a hard spin stops on the last
+        // tab instead of cycling.
+        let wheel = gtk::EventControllerScroll::new(
+            gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
+        );
+        wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
+        wheel.connect_scroll(|wheel, _, dy| {
+            let view = wheel
+                .widget()
+                .and_downcast::<adw::TabBar>()
+                .and_then(|bar| bar.view());
+            let Some(view) = view.filter(|_| wheel.unit() == gdk::ScrollUnit::Wheel) else {
+                return glib::Propagation::Proceed;
+            };
+            for _ in 0..dy.abs() as u32 {
+                let moved = if dy > 0.0 {
+                    view.select_next_page()
+                } else {
+                    view.select_previous_page()
+                };
+                if !moved {
+                    break;
+                }
+            }
+            glib::Propagation::Stop
+        });
+        tab_bar.add_controller(wheel);
 
         // --- the Files and Git panel, on the far side of the terminals
 
@@ -3884,6 +3924,81 @@ impl TuniWindow {
         Some(view)
     }
 
+    /// Makes a window of a tab let go of over the desktop on Wayland, which
+    /// `AdwTabBox` does only on X11.
+    ///
+    /// libadwaita makes the window when a drag is cancelled for `NoTarget`. A
+    /// Wayland compositor has no such reason to give: KWin tells the source the
+    /// drop was performed and then cancels it, and GTK 4.22 passes that cancel
+    /// on as `Error`, so the tab slid back into its strip. `Error` is also what
+    /// an Escape arrives as, and the `drop-performed` before it is what tells
+    /// the two apart: KWin sends it for a button let go of over a surface that
+    /// refused the drop, or over none, and not for an Escape.
+    ///
+    /// The drag is libadwaita's own and nothing hands it out, but a drop over
+    /// a window carries it, and every tab drag starts over the strip of one.
+    /// By the time the cancel reaches the hook libadwaita has put the page back
+    /// where it was, and it is moved on from there.
+    fn watch_tab_drags(&self) {
+        let motion = gtk::DropControllerMotion::new();
+        motion.connect_enter(|motion, _, _| {
+            let Some(drag) = motion.drop().and_then(|drop| drop.drag()) else {
+                return;
+            };
+            if !drag
+                .content()
+                .formats()
+                .contains_type(adw::TabPage::static_type())
+                || HOOKED.with(|hooked| hooked.upgrade().as_ref() == Some(&drag))
+            {
+                return;
+            }
+            HOOKED.with(|hooked| hooked.set(Some(&drag)));
+            let dropped = std::rc::Rc::new(Cell::new(false));
+            drag.connect_drop_performed(glib::clone!(
+                #[strong]
+                dropped,
+                move |_| dropped.set(true)
+            ));
+            drag.connect_cancel(move |drag, reason| {
+                if reason != gdk::DragCancelReason::Error || !dropped.get() {
+                    return;
+                }
+                let page = drag
+                    .content()
+                    .value(adw::TabPage::static_type())
+                    .ok()
+                    .and_then(|value| value.get::<adw::TabPage>().ok());
+                // Out of the drag's own signal, the way the strip's attach is
+                // left to finish before anything reorders it.
+                if let Some(page) = page {
+                    glib::idle_add_local_once(move || Self::tear_out_tab(&page));
+                }
+            });
+        });
+        self.add_controller(motion);
+    }
+
+    /// Moves a tab into a window of its own, by the same transfer a drop on the
+    /// desktop makes on X11: the widgets, and so the shells, go across live.
+    fn tear_out_tab(page: &adw::TabPage) {
+        let Some(view) = page
+            .child()
+            .ancestor(adw::TabView::static_type())
+            .and_downcast::<adw::TabView>()
+        else {
+            return;
+        };
+        let Some(other) = view
+            .root()
+            .and_downcast::<Self>()
+            .and_then(|window| window.window_for_torn_out_tab())
+        else {
+            return;
+        };
+        view.transfer_page(page, &other, 0);
+    }
+
     /// Moves a whole project into a window of its own, shells and all.
     ///
     /// The tab strip has this for a single tab and gets it from `AdwTabView`,
@@ -5048,10 +5163,19 @@ impl TuniWindow {
         // itself is the honest answer, at its own size and held at the point it
         // was taken hold of, so what leaves under the pointer is what was
         // pressed and it does not jump.
+        let dropped = std::rc::Rc::new(Cell::new(false));
         source.connect_drag_begin(glib::clone!(
             #[weak]
             row,
-            move |source, _| {
+            #[strong]
+            dropped,
+            move |source, drag| {
+                dropped.set(false);
+                drag.connect_drop_performed(glib::clone!(
+                    #[strong]
+                    dropped,
+                    move |_| dropped.set(true)
+                ));
                 let size = (f64::from(row.width()), f64::from(row.height()));
                 let Some((texture, width, height)) = crate::grid::thumbnail(&row, size) else {
                     return;
@@ -5068,14 +5192,21 @@ impl TuniWindow {
         // application, the terminals beside the sidebar — asks for the project
         // in a window of its own, which is what dragging a tab off the strip
         // above already means. Deferred, because the answer closes this project
-        // and so destroys the row whose controller is running.
+        // and so destroys the row whose controller is running. Wayland says
+        // "nothing took it" as a performed drop and then an `Error`, for the
+        // reason `watch_tab_drags` gives.
         source.connect_drag_cancel(glib::clone!(
             #[weak(rename_to = this)]
             self,
             #[upgrade_or]
             false,
             move |_, _, reason| {
-                if reason != gdk::DragCancelReason::NoTarget {
+                let refused = match reason {
+                    gdk::DragCancelReason::NoTarget => true,
+                    gdk::DragCancelReason::Error => dropped.get(),
+                    _ => false,
+                };
+                if !refused {
                     return false;
                 }
                 glib::idle_add_local_once(move || this.tear_out_project(id));
