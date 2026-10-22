@@ -1267,6 +1267,16 @@ impl Terminal {
     ///
     /// `None` when there is nothing on screen worth keeping.
     pub fn dump_history(&self, max_lines: usize) -> Result<Option<String>> {
+        self.export(Format::Vt, max_lines)
+    }
+
+    /// The same lines as plain text, the way a person reads them off the
+    /// screen: what a program that has exited said last, for finding out why.
+    pub fn history_text(&self, max_lines: usize) -> Result<Option<String>> {
+        self.export(Format::Plain, max_lines)
+    }
+
+    fn export(&self, format: Format, max_lines: usize) -> Result<Option<String>> {
         // Not installed as the terminal's selection: this runs on a live
         // terminal, and saving the session should not take away what the user
         // had highlighted.
@@ -1277,7 +1287,7 @@ impl Terminal {
         let mut buf = vec![0u8; 64 * 1024];
         let text = loop {
             let options = FormatOptions::new()
-                .with_emit_format(Format::Vt)
+                .with_emit_format(format)
                 .with_selection(&selection)
                 .with_unwrap(true)
                 .with_trim(true);
@@ -1296,7 +1306,12 @@ impl Terminal {
         if text.trim().is_empty() {
             return Ok(None);
         }
-        Ok(Some(last_lines(text, max_lines)))
+        let reset = if matches!(format, Format::Vt) {
+            "\x1b[0m"
+        } else {
+            ""
+        };
+        Ok(Some(last_lines(text, max_lines, reset)))
     }
 
     /// Flatten the current viewport into an owned grid.
@@ -1433,16 +1448,16 @@ impl Drop for Terminal {
 /// The tail of `text`, at most `max_lines` lines of it.
 ///
 /// Trimming a VT dump from the front can cut away the escape that turned a
-/// color on, so what survives starts with a reset rather than with whatever
+/// color on, so what survives starts with `reset` rather than with whatever
 /// style the discarded lines happened to leave behind.
-fn last_lines(text: String, max_lines: usize) -> String {
+fn last_lines(text: String, max_lines: usize, reset: &str) -> String {
     if max_lines == 0 {
         return String::new();
     }
     let Some((offset, _)) = text.rmatch_indices('\n').nth(max_lines - 1) else {
         return text;
     };
-    format!("\x1b[0m{}", &text[offset + 1..])
+    format!("{reset}{}", &text[offset + 1..])
 }
 
 /// The local path a `file://` URI names, or `None` when it names another host.

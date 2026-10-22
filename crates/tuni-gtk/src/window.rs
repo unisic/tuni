@@ -3561,10 +3561,37 @@ impl TuniWindow {
             self.close_pane(project, tab, pane);
             return;
         };
-        let remote = self.imp().remotes.borrow().get(&pane).cloned();
-        if let Some(remote) = remote {
-            remote.set_idle(&format!("Disconnected from {alias}"), "Reconnect");
-        }
+        let Some(remote) = self.imp().remotes.borrow().get(&pane).cloned() else {
+            return;
+        };
+        let disconnected = format!("Disconnected from {alias}");
+        // Forty lines is the whole warning with room to spare, and all that is
+        // read: what ssh says last is the only part that is about this attempt.
+        let changed = self
+            .imp()
+            .terminals
+            .borrow()
+            .get(&pane)
+            .and_then(|terminal| terminal.text(40))
+            .and_then(|text| tuni_core::ssh::changed_key(&text));
+        let Some(key) = changed else {
+            remote.set_idle(&disconnected, "Reconnect");
+            return;
+        };
+        remote.set_offer(
+            &format!("The host key of {alias} has changed"),
+            "Forget Old Key",
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[weak]
+                remote,
+                move || {
+                    this.run_locally(&key.forget());
+                    remote.set_idle(&disconnected, "Reconnect");
+                }
+            ),
+        );
     }
 
     /// A pane took the keyboard: move the ring, and rename the tab, which is

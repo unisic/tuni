@@ -226,7 +226,15 @@ host declared in `~/.ssh/config` is read, listed and connected to but never
 rewritten, and editing one opens that file at the line that declares it, in an
 editor pane. A session that ends leaves its last screen where it is with a
 Reconnect button over it, rather than closing the pane, since a connection that
-dropped has usually just said why. The panel grows another page while a pane is
+dropped has usually just said why. When what it said is that the host's key
+has changed, the button is Forget Old Key instead, and it types the
+`ssh-keygen -R` that removes the old one, naming the exact file and name ssh
+complained about, onto a local shell's prompt without running it. A changed key
+is also what a man in the middle looks like, so the decision is the person's to
+make with the fingerprint still on the screen beside it; after it the bar goes
+back to Reconnect, and the new key is asked about in the pane like any unknown
+one. Only a screen that ends on the refusal counts, so a warning some remote
+command echoed before the session carried on is not mistaken for one. The panel grows another page while a pane is
 on a host: the files at the other end, in the same tree the Files page draws,
 opened over the connection that is already there.
 

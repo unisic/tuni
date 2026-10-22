@@ -1859,6 +1859,74 @@ pub fn shell_line(argv: &[String]) -> String {
         .join(" ")
 }
 
+/// A host key ssh refused because the far end now sends another one: the name
+/// it is filed under and the file holding the old one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedKey {
+    pub name: String,
+    pub file: PathBuf,
+}
+
+impl ChangedKey {
+    /// The command that forgets the old key, for typing onto a prompt rather
+    /// than running. A changed key is what a man in the middle looks like, so
+    /// the decision that it is not one is the person's, made with the
+    /// fingerprint in front of them.
+    #[must_use]
+    pub fn forget(&self) -> Vec<String> {
+        vec![
+            "ssh-keygen".to_owned(),
+            "-R".to_owned(),
+            self.name.clone(),
+            "-f".to_owned(),
+            self.file.to_string_lossy().into_owned(),
+        ]
+    }
+}
+
+/// The changed key ssh is complaining about, read off what it left on screen.
+///
+/// Read from the screen rather than from `ssh -G`, because the warning names
+/// the exact file and name ssh matched, `HostKeyAlias` and a port included,
+/// and asking again could only arrive at the same answer by a longer road.
+/// Only a screen that ends on the refusal counts: a session can print anything
+/// before it exits, and text a remote shell echoed must not turn into an offer
+/// to edit some other file.
+#[must_use]
+pub fn changed_key(screen: &str) -> Option<ChangedKey> {
+    let mut lines = screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    if lines.next_back()? != "Host key verification failed." {
+        return None;
+    }
+    let mut name = None;
+    let mut file = None;
+    for line in screen.lines().map(str::trim) {
+        if let Some((found, _)) = line
+            .strip_prefix("Host key for ")
+            .and_then(|rest| rest.split_once(" has changed"))
+        {
+            name = Some(found);
+        }
+        if let Some((path, number)) = line
+            .strip_prefix("Offending ")
+            .and_then(|rest| rest.split_once(" key in "))
+            .and_then(|(_, rest)| rest.rsplit_once(':'))
+            && number.parse::<u32>().is_ok()
+        {
+            file = Some(path);
+        }
+    }
+    let name = name.filter(|name| !name.is_empty() && !name.contains(char::is_whitespace))?;
+    let file = PathBuf::from(file?);
+    file.is_absolute().then(|| ChangedKey {
+        name: name.to_owned(),
+        file,
+    })
+}
+
 /// Whether `text` matches an ssh pattern: `*` for any run of characters, `?`
 /// for exactly one, and everything else literal. What `Host` lines and
 /// `Include` globs are both written in.
@@ -2228,6 +2296,45 @@ fn modified(path: &Path) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CHANGED: &str = "\
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+The fingerprint for the ED25519 key sent by the remote host is
+SHA256:/w4hHeRrJJl/8JiT7Ue/YvdQyZuX91gSGoxAKsEAIsM.
+Please contact your system administrator.
+Add correct host key in /home/dean/.ssh/known hosts to get rid of this message.
+Offending ED25519 key in /home/dean/.ssh/known hosts:1
+Host key for [127.0.0.1]:22222 has changed and you have requested strict checking.
+Host key verification failed.
+
+";
+
+    #[test]
+    fn a_changed_key_names_the_file_and_the_name_it_is_filed_under() {
+        let key = changed_key(CHANGED).unwrap();
+        assert_eq!(key.name, "[127.0.0.1]:22222");
+        assert_eq!(key.file, PathBuf::from("/home/dean/.ssh/known hosts"));
+        assert_eq!(
+            shell_line(&key.forget()),
+            "ssh-keygen -R '[127.0.0.1]:22222' -f '/home/dean/.ssh/known hosts'"
+        );
+    }
+
+    #[test]
+    fn a_warning_the_session_printed_before_carrying_on_is_not_a_changed_key() {
+        let echoed = format!("{CHANGED}dean@box:~$ exit\nConnection to box closed.\n");
+        assert_eq!(changed_key(&echoed), None);
+    }
+
+    #[test]
+    fn an_unknown_host_refused_is_not_a_changed_key() {
+        let screen = "No ED25519 host key is known for box and you have requested strict checking.\n\
+                      Host key verification failed.\n";
+        assert_eq!(changed_key(screen), None);
+    }
 
     fn report(lines: &[&str]) -> Vec<(String, String)> {
         lines

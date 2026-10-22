@@ -1626,6 +1626,13 @@ impl TuniTerminal {
         session.term.dump_history(max_lines).ok().flatten()
     }
 
+    /// The last `max_lines` lines this terminal is holding, as plain text.
+    pub fn text(&self, max_lines: usize) -> Option<String> {
+        let guard = self.imp().session.borrow();
+        let session = guard.as_ref()?;
+        session.term.history_text(max_lines).ok().flatten()
+    }
+
     /// Replays a saved terminal above the prompt of the shell that just
     /// started.
     ///
