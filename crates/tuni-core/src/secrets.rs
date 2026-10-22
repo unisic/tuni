@@ -236,8 +236,14 @@ mod tests {
         let Some(helper) = super::helper() else {
             return;
         };
+        // Read by `sh` rather than run as itself. A file written a moment ago
+        // cannot be run while any process holds it open for writing, and a
+        // test beside this one forking a child at the wrong moment hands that
+        // child the descriptor until it execs: `Text file busy`, now and then.
+        // What is under test is what the script answers, not the exec bit.
         let ask = |prompt: &str| {
-            std::process::Command::new(&helper)
+            std::process::Command::new("sh")
+                .arg(&helper)
                 .arg(prompt)
                 .env("TUNI_SSH_HOST", "")
                 .stdout(std::process::Stdio::null())
