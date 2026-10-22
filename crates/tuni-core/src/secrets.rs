@@ -141,17 +141,32 @@ pub fn askpass(destination: &str) -> Vec<(String, String)> {
 /// Whether `ssh` would connect to `destination` without asking anybody about
 /// its key. `ssh-keygen -F` is the same `known_hosts` lookup `ssh` does,
 /// hashed entries included.
+///
+/// Under the name and in the files `ssh -G` says, not the alias in
+/// `~/.ssh/known_hosts`: a key is filed under the `HostName`, with the port when
+/// it is not 22, and asking for the alias missed every host that has either.
+/// Only a destination with a saved password gets this far, and a saved password
+/// belongs to a saved host, so the alias is all `ssh -G` needs to know the port.
 fn known_host(destination: &str) -> bool {
-    let host = destination
-        .rsplit_once('@')
-        .map_or(destination, |(_, host)| host);
-    Command::new("ssh-keygen")
-        .args(["-F", host])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let report = crate::ssh::describe(destination);
+    let Some(name) = crate::ssh::known_name(&report) else {
+        return false;
+    };
+    crate::ssh::known_files(&report)
+        .iter()
+        .filter(|file| file.exists())
+        .any(|file| {
+            Command::new("ssh-keygen")
+                .arg("-F")
+                .arg(&name)
+                .arg("-f")
+                .arg(file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
 }
 
 /// Writes the askpass helper and returns where it is, or nothing if it could

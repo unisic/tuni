@@ -1290,6 +1290,46 @@ pub fn describe(alias: &str) -> Vec<(String, String)> {
     described(&[], alias)
 }
 
+/// The name `ssh` files a host's key under in `known_hosts`, from its
+/// [`describe`] report.
+///
+/// Neither the alias nor anything typed: the `HostKeyAlias` when there is one,
+/// as it is, and otherwise the `HostName`, in brackets with the port when the
+/// port is not 22. Read off what OpenSSH 10.2 writes rather than its source.
+#[must_use]
+pub fn known_name(report: &[(String, String)]) -> Option<String> {
+    let value = |keyword: &str| {
+        report
+            .iter()
+            .find(|(key, _)| key == keyword)
+            .map(|(_, value)| value.as_str())
+    };
+    if let Some(alias) = value("hostkeyalias") {
+        return Some(alias.to_owned());
+    }
+    let host = value("hostname")?;
+    Some(match value("port") {
+        Some(port) if port != "22" => format!("[{host}]:{port}"),
+        _ => host.to_owned(),
+    })
+}
+
+/// Every file `ssh` looks a host key up in, the user's before the system's.
+///
+/// `ssh -G` prints a list of them unquoted, so a path with a space in it comes
+/// apart into pieces that are not absolute or do not exist. That is a lookup
+/// that misses, which costs a prompt in the pane and nothing worse.
+#[must_use]
+pub fn known_files(report: &[(String, String)]) -> Vec<PathBuf> {
+    report
+        .iter()
+        .filter(|(key, _)| key == "userknownhostsfile" || key == "globalknownhostsfile")
+        .flat_map(|(_, files)| files.split_whitespace())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .collect()
+}
+
 /// The same report with settings of tuni's own applied first, which is the only
 /// way to learn where a connection tuni asked to share actually ends up: a
 /// command-line `-o` is obtained before the file, and `%C` is a hash this crate
@@ -2101,6 +2141,42 @@ fn modified(path: &Path) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report(lines: &[&str]) -> Vec<(String, String)> {
+        lines
+            .iter()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(keyword, value)| (keyword.to_owned(), value.to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_host_key_is_looked_up_under_the_name_ssh_files_it_under() {
+        let plain = report(&["hostname 10.0.0.4", "port 22"]);
+        assert_eq!(known_name(&plain).as_deref(), Some("10.0.0.4"));
+        let moved = report(&["hostname 10.0.0.4", "port 2222"]);
+        assert_eq!(known_name(&moved).as_deref(), Some("[10.0.0.4]:2222"));
+        let aliased = report(&["hostname 10.0.0.4", "port 2222", "hostkeyalias gate"]);
+        assert_eq!(known_name(&aliased).as_deref(), Some("gate"));
+        assert_eq!(known_name(&[]), None);
+    }
+
+    #[test]
+    fn host_keys_are_looked_for_in_every_file_ssh_reads() {
+        let files = report(&[
+            "globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2",
+            "userknownhostsfile /home/a/.ssh/known_hosts none",
+        ]);
+        assert_eq!(
+            known_files(&files),
+            [
+                "/etc/ssh/ssh_known_hosts",
+                "/etc/ssh/ssh_known_hosts2",
+                "/home/a/.ssh/known_hosts"
+            ]
+            .map(PathBuf::from)
+        );
+    }
     use std::time::UNIX_EPOCH;
 
     fn tempdir() -> PathBuf {
