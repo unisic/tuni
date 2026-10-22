@@ -122,6 +122,9 @@ pub struct Session {
     /// The status code of the last refusal, for the one caller that acts on
     /// which code it was rather than only on the sentence.
     refusal: Option<u32>,
+    /// Raised when the pipe broke or the far end lost the thread, after which
+    /// nothing sent on this session will be answered.
+    lost: bool,
 }
 
 impl Session {
@@ -163,6 +166,7 @@ impl Session {
             next: 1,
             failure: None,
             refusal: None,
+            lost: false,
         };
         if session.handshake() {
             // Read for as long as the pipe is open and thrown away: ssh stops
@@ -208,14 +212,15 @@ impl Session {
     ///
     /// One `OPENDIR` and then `READDIR` until the server says there is no more,
     /// which is how the protocol spells the end of a listing: a status packet
-    /// carrying `EOF` rather than an empty answer.
+    /// carrying `EOF` rather than an empty answer. A connection that ends
+    /// before that is no listing at all, since half a directory drawn as the
+    /// whole of it is a folder that looks emptier than it is.
     pub fn list(&mut self, path: &str) -> Option<Vec<Entry>> {
         let handle = self.opendir(path)?;
         let mut entries = Vec::new();
-        while let Some(id) = self.request(READDIR, &encode_string_bytes(&handle)) {
-            let Some((kind, body)) = self.reply(id) else {
-                break;
-            };
+        loop {
+            let id = self.request(READDIR, &encode_string_bytes(&handle))?;
+            let (kind, body) = self.reply(id)?;
             if kind == REPLY_STATUS {
                 let mut reader = Reader::new(&body);
                 if reader.u32() != Some(EOF) {
@@ -239,7 +244,13 @@ impl Session {
                 reader.string()?;
                 let mut entry = reader.attributes()?;
                 entry.name = String::from_utf8_lossy(&name).into_owned();
-                if entry.name != "." && entry.name != ".." {
+                // A name is one component, and a server that sends `../x` or
+                // `a/b` is either broken or hoping something here joins it
+                // onto a path and walks out of the directory. Neither is
+                // listed.
+                if !matches!(entry.name.as_str(), "" | "." | "..")
+                    && !entry.name.contains(['/', '\0'])
+                {
                     entries.push(entry);
                 }
             }
@@ -525,6 +536,13 @@ impl Session {
     #[must_use]
     pub fn failure(&self) -> Option<&Failure> {
         self.failure.as_ref()
+    }
+
+    /// Whether the connection under this session has gone, so the next thing
+    /// to do is open another rather than ask this one again.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.lost
     }
 
     /// Asks the far end one more question with the failure that prompted it
@@ -845,6 +863,7 @@ impl Session {
     }
 
     fn lost(&mut self, detail: &str) {
+        self.lost = true;
         self.failure = Some(Failure::new("The connection ended.", detail));
     }
 
@@ -1044,6 +1063,7 @@ mod tests {
             next: 1,
             failure: None,
             refusal: None,
+            lost: false,
         };
         (session, far)
     }
@@ -1103,6 +1123,49 @@ mod tests {
         let asked = far.join().expect("the far end");
         assert_eq!(asked[1].0, OPENDIR);
         assert_eq!(asked[2].0, READDIR);
+    }
+
+    #[test]
+    fn a_listing_cut_off_halfway_is_no_listing() {
+        let mut one = 1_u32.to_be_bytes().to_vec();
+        one.extend_from_slice(&name_entry("notes.txt", 0o100_644, 12));
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        // The script ends after the first page, so the pipe closes where the
+        // second `READDIR` is waiting for its answer.
+        let (mut session, _far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_HANDLE, body(1, &encode_string("h"))),
+            (REPLY_NAME, body(2, &one)),
+        ]);
+        assert!(session.handshake());
+        assert!(session.list("/home/dean").is_none());
+        assert!(session.is_lost());
+    }
+
+    #[test]
+    fn a_name_the_far_end_sends_with_a_slash_in_it_is_not_listed() {
+        let mut four = 4_u32.to_be_bytes().to_vec();
+        four.extend_from_slice(&name_entry("../../etc/passwd", 0o100_644, 1));
+        four.extend_from_slice(&name_entry("a/b", 0o100_644, 1));
+        four.extend_from_slice(&name_entry("", 0o100_644, 1));
+        four.extend_from_slice(&name_entry("notes.txt", 0o100_644, 1));
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let (mut session, _far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_HANDLE, body(1, &encode_string("h"))),
+            (REPLY_NAME, body(2, &four)),
+            (REPLY_STATUS, body(3, &EOF.to_be_bytes())),
+            (REPLY_STATUS, body(4, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+        let entries = session.list("/home/dean").expect("a listing");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["notes.txt"]);
+        assert!(!session.is_lost());
     }
 
     #[test]

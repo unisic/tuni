@@ -88,6 +88,9 @@ mod imp {
         pub list: RefCell<Option<gtk::ListView>>,
         pub stack: RefCell<Option<gtk::Stack>>,
         pub status: RefCell<Option<adw::StatusPage>>,
+        /// Under the sentence when the connection is what failed, since the
+        /// panel asks again only when the host changes.
+        pub reconnect: RefCell<Option<gtk::Button>>,
         pub title: RefCell<Option<gtk::Label>>,
         pub subtitle: RefCell<Option<gtk::Label>>,
         pub menu: RefCell<Option<gtk::PopoverMenu>>,
@@ -300,9 +303,21 @@ impl TuniSftp {
         ));
         scroller.add_controller(drop);
 
+        let reconnect = gtk::Button::builder()
+            .label("Reconnect")
+            .halign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        reconnect.add_css_class("pill");
+        reconnect.connect_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.reconnect()
+        ));
         let status = adw::StatusPage::builder()
             .icon_name("network-server-symbolic")
             .vexpand(true)
+            .child(&reconnect)
             .build();
 
         let stack = gtk::Stack::new();
@@ -323,6 +338,7 @@ impl TuniSftp {
         imp.list.replace(Some(list));
         imp.stack.replace(Some(stack));
         imp.status.replace(Some(status));
+        imp.reconnect.replace(Some(reconnect));
         imp.title.replace(Some(title));
         imp.subtitle.replace(Some(subtitle));
         imp.menu.replace(Some(menu));
@@ -533,7 +549,13 @@ impl TuniSftp {
         imp.pending.borrow_mut().clear();
         // Queued against the host that is going away, and every one of them
         // names a path on it. The history goes with them, for the same reason.
+        // The one already moving is stopped too: it holds its own handle on
+        // the old session, and left going it would keep the pipe to a host
+        // the page has left and hold back whatever is asked of the new one.
         imp.queue.borrow_mut().clear();
+        if let Some(moved) = imp.moving.borrow().as_ref() {
+            moved.stop.store(true, Ordering::Relaxed);
+        }
         imp.back.borrow_mut().clear();
         imp.forward.borrow_mut().clear();
         imp.listed.replace(Listed::default());
@@ -553,6 +575,26 @@ impl TuniSftp {
         };
         self.say(&format!("Opening {alias}"), "");
         self.open(alias.to_owned());
+    }
+
+    /// The button under a failure: the same host, from the start.
+    ///
+    /// Not done on its own when the host comes round again, because the panel
+    /// syncs on a timer and a host that cannot be reached would be dialled
+    /// every two seconds for as long as the page is open.
+    fn reconnect(&self) {
+        let alias = self.imp().alias.take();
+        self.sync(alias.as_deref());
+    }
+
+    /// Lets go of a session that will not answer again, and says why in place
+    /// of a listing that can no longer be trusted.
+    fn lose(&self, failure: &Failure) {
+        let imp = self.imp();
+        imp.link.replace(None);
+        imp.queue.borrow_mut().clear();
+        imp.pending.borrow_mut().clear();
+        self.fail(&failure.message, &failure.detail);
     }
 
     /// Starts a session and lists whatever the far end calls home.
@@ -593,7 +635,7 @@ impl TuniSftp {
                         this.reload();
                         this.refresh_header();
                     }
-                    Err(detail) => this.say(&format!("Couldn't Read {name}"), &detail),
+                    Err(detail) => this.fail(&format!("Couldn't Read {name}"), &detail),
                 }
             }
         ));
@@ -698,9 +740,12 @@ impl TuniSftp {
             self,
             async move {
                 let remote = path.to_string_lossy().into_owned();
-                let Ok(listed) = gio::spawn_blocking(move || {
-                    let mut session = link.lock().ok()?;
-                    rows(&mut session, &remote)
+                let Ok((listed, gone)) = gio::spawn_blocking(move || {
+                    let Ok(mut session) = link.lock() else {
+                        return (None, Some(ended()));
+                    };
+                    let listed = rows(&mut session, &remote);
+                    (listed, gone(&session))
                 })
                 .await
                 else {
@@ -710,6 +755,10 @@ impl TuniSftp {
                     return;
                 }
                 this.imp().pending.borrow_mut().remove(&path);
+                if let Some(failure) = gone {
+                    this.lose(&failure);
+                    return;
+                }
                 // A directory that would not open is left closed and left
                 // where it is: the row above it is still a row, and the tree
                 // has nowhere to say more than that.
@@ -906,10 +955,7 @@ impl TuniSftp {
             async move {
                 let moved = gio::spawn_blocking(move || {
                     let Ok(mut session) = link.lock() else {
-                        return Err(Failure {
-                            message: String::from("The connection ended."),
-                            detail: String::from("Nothing is holding it open any more."),
-                        });
+                        return Err((ended(), true));
                     };
                     let mut note = |done: u64, total: u64| {
                         moved.done.store(done, Ordering::Relaxed);
@@ -923,7 +969,7 @@ impl TuniSftp {
                         Way::Up => session.put(&local, &remote, &mut note),
                         Way::Down => session.get(&remote, &local, &mut note),
                     };
-                    done.ok_or_else(|| failed(&session))
+                    done.ok_or_else(|| (failed(&session), session.is_lost()))
                 })
                 .await;
 
@@ -931,34 +977,51 @@ impl TuniSftp {
                 if let Some(row) = this.imp().progress_row.borrow().as_ref() {
                     row.set_visible(false);
                 }
-                if generation != this.imp().generation.get() {
-                    return;
-                }
-                match moved {
-                    // The cancel button doing its job is not news: the press
-                    // already emptied the queue, and a dialog would only
-                    // repeat what the hand that pressed it knows.
-                    Ok(Err(_)) if flag.stop.load(Ordering::Relaxed) => {}
-                    Ok(Err(failure)) => {
-                        // What was behind it goes no further. A connection that
-                        // died on the first file is going to die on the other
-                        // eleven, and eleven more dialogs is not eleven more
-                        // pieces of news.
-                        let waiting = this.imp().queue.borrow_mut().drain(..).count();
-                        this.report(&stopped(&failure, waiting));
-                    }
-                    // The directory has something in it that it did not have,
-                    // and nothing remote will say so on its own.
-                    Ok(Ok(())) => {
-                        if let (Way::Up, Some(directory)) = (way, directory) {
-                            this.list(directory, false);
-                        }
-                    }
-                    Err(_) => {}
+                // Whatever happened to this one, the queue moves on: after a
+                // change of host it holds the new host's files, which have
+                // been waiting for this pipe to come free.
+                if generation == this.imp().generation.get() {
+                    this.finish(moved, flag.stop.load(Ordering::Relaxed), way, directory);
                 }
                 this.pump();
             }
         ));
+    }
+
+    /// What one transfer's end means for the page.
+    fn finish(
+        &self,
+        moved: Result<Result<(), (Failure, bool)>, Box<dyn std::any::Any + Send>>,
+        stopped_by_hand: bool,
+        way: Way,
+        directory: Option<PathBuf>,
+    ) {
+        match moved {
+            // The cancel button doing its job is not news: the press already
+            // emptied the queue, and a dialog would only repeat what the hand
+            // that pressed it knows.
+            Ok(Err(_)) if stopped_by_hand => {}
+            Ok(Err((failure, lost))) => {
+                // What was behind it goes no further. A connection that died
+                // on the first file is going to die on the other eleven, and
+                // eleven more dialogs is not eleven more pieces of news.
+                let waiting = self.imp().queue.borrow_mut().drain(..).count();
+                let failure = stopped(&failure, waiting);
+                if lost {
+                    self.lose(&failure);
+                } else {
+                    self.report(&failure);
+                }
+            }
+            // The directory has something in it that it did not have, and
+            // nothing remote will say so on its own.
+            Ok(Ok(())) => {
+                if let (Way::Up, Some(directory)) = (way, directory) {
+                    self.list(directory, false);
+                }
+            }
+            Err(_) => {}
+        }
     }
 
     // --- changing them --------------------------------------------------------
@@ -1075,12 +1138,9 @@ impl TuniSftp {
             async move {
                 let Ok(done) = gio::spawn_blocking(move || {
                     let Ok(mut session) = link.lock() else {
-                        return Err(Failure {
-                            message: String::from("The connection ended."),
-                            detail: String::from("Nothing is holding it open any more."),
-                        });
+                        return Err((ended(), true));
                     };
-                    apply(&mut session).ok_or_else(|| failed(&session))
+                    apply(&mut session).ok_or_else(|| (failed(&session), session.is_lost()))
                 })
                 .await
                 else {
@@ -1095,7 +1155,8 @@ impl TuniSftp {
                         // writes over it with what is there now.
                         this.list(directory, expand);
                     }
-                    Err(failure) => this.report(&failure),
+                    Err((failure, true)) => this.lose(&failure),
+                    Err((failure, false)) => this.report(&failure),
                 }
             }
         ));
@@ -1190,7 +1251,19 @@ impl TuniSftp {
 
     /// Shows a sentence instead of a listing.
     fn say(&self, heading: &str, body: &str) {
+        self.tell(heading, body, false);
+    }
+
+    /// Shows why the connection failed, with the button that tries again.
+    fn fail(&self, heading: &str, body: &str) {
+        self.tell(heading, body, true);
+    }
+
+    fn tell(&self, heading: &str, body: &str, retry: bool) {
         let imp = self.imp();
+        if let Some(button) = imp.reconnect.borrow().as_ref() {
+            button.set_visible(retry);
+        }
         if let Some(status) = imp.status.borrow().as_ref() {
             status.set_title(heading);
             status.set_description(Some(body).filter(|body| !body.is_empty()));
@@ -1327,6 +1400,20 @@ fn stopped(failure: &Failure, waiting: usize) -> Failure {
     }
 }
 
+/// The session behind a lock that a panicked thread left poisoned, which is
+/// as gone as a broken pipe.
+fn ended() -> Failure {
+    Failure {
+        message: String::from("The connection ended."),
+        detail: String::from("Nothing is holding it open any more."),
+    }
+}
+
+/// Why the session will not answer again, if it will not.
+fn gone(session: &Session) -> Option<Failure> {
+    session.is_lost().then(|| failed(session))
+}
+
 /// Why a transfer stopped, in the two parts a dialog wants.
 fn failed(session: &Session) -> Failure {
     session.failure().cloned().unwrap_or_else(|| Failure {
@@ -1365,6 +1452,11 @@ fn rows(session: &mut Session, directory: &str) -> Option<Vec<Item>> {
             }
         })
         .collect();
+    // A pipe that broke on one of the links' second round trip leaves every
+    // link after it drawn as a file.
+    if session.is_lost() {
+        return None;
+    }
     items.sort_by(|a, b| {
         b.is_directory
             .cmp(&a.is_directory)

@@ -821,9 +821,9 @@ unknown host key says the pane is where ssh can ask about it, a server without
 SFTP says that, and anything else is ssh's own last line. Every one of them
 exits 255, so the text is all there is to tell them apart, and `LC_ALL=C` keeps
 it the text. After the handshake the pipe is drained into nothing by a small
-thread, because an ssh writing to a full pipe stops dead. The rows come from the tree the Files page already has: `Tree` reads
-through a `Directory`, which is the disk on one page and, on the other, what has
-so far come back. That indirection is the whole of the rule that nothing remote
+thread, because an ssh writing to a full pipe stops dead. The rows come from
+the tree the Files page already has: `Tree` reads through a `Directory`, which
+is the disk on one page and, on the other, what has so far come back. That indirection is the whole of the rule that nothing remote
 touches the main loop. A directory nobody has asked about yet reads as empty and
 a request goes out on a worker thread, the rows appear when the answer lands, and
 an answer about a host that is no longer the one on screen is dropped by a
@@ -837,6 +837,19 @@ chevron opens a directory where it stands, a double click makes it the root, the
 header takes a typed path, and the buttons under the thumb walk the history,
 which empties with the session since every path in it names a machine this page
 has left.
+
+A connection that ends under the page is said rather than drawn around. A
+listing cut off before the far end said it was finished is no listing, since
+half a directory shown as the whole of it is a folder that looks emptier than it
+is, and the page puts the reason where the rows were with a Reconnect button
+under it. The button is the only thing that dials again. The panel syncs on its
+two-second timer, so asking again whenever the same host came round would ring a
+host that cannot be reached every two seconds for as long as the page is open.
+A name in a listing that holds a slash or a NUL, or is empty, is left out: a
+name is one component, and a server sending `../x` is either broken or hoping
+something here joins it onto a path. A change of host stops the transfer that is
+moving, whose handle on the old session would otherwise keep that pipe busy
+while the new host's files wait behind it.
 
 Files move one at a time. Both ways a file is written beside where it is going
 under a dotted name and renamed onto it once it is whole, the discipline the
