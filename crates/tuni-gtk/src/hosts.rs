@@ -99,6 +99,8 @@ mod imp {
         ConnectToSide(String),
         /// In a tab of its own.
         ConnectInTab(String),
+        /// The host's files beside this machine's, in a pane next to the list.
+        Browse(String),
         /// Put a plain shell in this pane instead.
         LocalShell,
         /// Open a file for editing at a line, which is how the real
@@ -423,6 +425,11 @@ impl TuniHosts {
             }),
             entry("connect-in-tab", self, |hosts| {
                 hosts.send_target(Where::Tab);
+            }),
+            entry("browse", self, |hosts| {
+                if let Some(alias) = hosts.imp().target.borrow().clone() {
+                    hosts.send(Message::Browse(alias));
+                }
             }),
             entry("copy-command", self, |hosts| {
                 let Some(alias) = hosts.imp().target.borrow().clone() else {
@@ -940,6 +947,7 @@ fn row_menu(source: Source, declared: bool, live: bool) -> gio::Menu {
     open.append(Some("Connect"), Some("hosts.connect"));
     open.append(Some("Connect to the Side"), Some("hosts.connect-to-side"));
     open.append(Some("Connect in a New Tab"), Some("hosts.connect-in-tab"));
+    open.append(Some("Browse Files"), Some("hosts.browse"));
     if live {
         open.append(Some("Disconnect"), Some("hosts.disconnect"));
     }

@@ -45,6 +45,17 @@ pub struct Moved {
     stop: AtomicBool,
 }
 
+/// What a drag off the list carries: the rows, and the page they came off,
+/// since that page holds the connection they are fetched over. A type only
+/// this process knows, on purpose: a file manager handed a remote path as a
+/// file would go looking for it on this disk.
+#[derive(Clone, glib::Boxed)]
+#[boxed_type(name = "TuniRemoteRows")]
+pub struct Dragged {
+    pub source: glib::WeakRef<TuniSftp>,
+    pub items: Vec<Item>,
+}
+
 /// The directories that have come back, which is everything there is to draw.
 #[derive(Default)]
 pub struct Listed(HashMap<PathBuf, Vec<Item>>);
@@ -92,6 +103,9 @@ mod imp {
         /// Under the sentence when the connection is what failed, since the
         /// panel asks again only when the host changes.
         pub reconnect: RefCell<Option<gtk::Button>>,
+        /// Opens the host being browsed in a pane of its own, beside the files
+        /// here. Hidden on the page that already is that pane.
+        pub beside: RefCell<Option<gtk::Button>>,
         pub title: RefCell<Option<gtk::Label>>,
         pub subtitle: RefCell<Option<gtk::Label>>,
         pub menu: RefCell<Option<gtk::PopoverMenu>>,
@@ -249,6 +263,16 @@ impl TuniSftp {
             ),
         );
         header.append(&refresh);
+
+        // Its action and target are set with the host, since an action that
+        // takes a host and is handed none is a warning on every redraw.
+        let beside = gtk::Button::builder()
+            .icon_name("view-dual-symbolic")
+            .tooltip_text("Open in Pane")
+            .valign(gtk::Align::Center)
+            .build();
+        beside.add_css_class("flat");
+        header.append(&beside);
 
         let progress = gtk::ProgressBar::builder()
             .show_text(true)
@@ -441,6 +465,7 @@ impl TuniSftp {
         imp.stack.replace(Some(stack));
         imp.status.replace(Some(status));
         imp.reconnect.replace(Some(reconnect));
+        imp.beside.replace(Some(beside));
         imp.title.replace(Some(title));
         imp.subtitle.replace(Some(subtitle));
         imp.menu.replace(Some(menu));
@@ -577,6 +602,45 @@ impl TuniSftp {
         ));
         content.add_controller(drop);
 
+        // Dragged, a row takes the selection with it if it is in it, and goes
+        // alone otherwise, the same rule the context menu follows.
+        let drag = gtk::DragSource::new();
+        drag.set_actions(gdk::DragAction::COPY);
+        drag.connect_prepare(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            list_item,
+            #[upgrade_or]
+            None,
+            move |_, _, _| {
+                let item = list_item
+                    .item()
+                    .and_downcast::<Row>()
+                    .and_then(|row| row.item())?;
+                if let Some(selection) = this
+                    .imp()
+                    .list
+                    .borrow()
+                    .as_ref()
+                    .and_then(|list| list.model())
+                    && !selection.is_selected(list_item.position())
+                {
+                    selection.select_item(list_item.position(), true);
+                }
+                let mut items = this.selected();
+                if items.is_empty() {
+                    items.push(item);
+                }
+                let dragged = Dragged {
+                    source: this.downgrade(),
+                    items,
+                };
+                Some(gdk::ContentProvider::for_value(&dragged.to_value()))
+            }
+        ));
+        content.add_controller(drag);
+
         list_item.set_child(Some(&content));
     }
 
@@ -689,9 +753,29 @@ impl TuniSftp {
     /// the focus moves, so a host that has not changed is left entirely alone:
     /// re-reading it here would be a round trip per click.
     pub fn sync(&self, host: Option<&str>) {
+        self.point(host, true);
+    }
+
+    /// Puts the page on one host for good, which is what a pane of its own
+    /// is: the focus moving elsewhere is no reason for it to follow. `dial`
+    /// false is a window putting the pane back, and then it reads only over
+    /// a connection that is already up, the rule a restored shell follows,
+    /// and says how to open one otherwise.
+    pub fn open_host(&self, alias: &str, dial: bool) {
+        if let Some(beside) = self.imp().beside.borrow().as_ref() {
+            beside.set_visible(false);
+        }
+        self.point(Some(alias), dial);
+    }
+
+    fn point(&self, host: Option<&str>, dial: bool) {
         let imp = self.imp();
         if imp.alias.borrow().as_deref() == host {
             return;
+        }
+        if let Some(beside) = imp.beside.borrow().as_ref() {
+            beside.set_action_target_value(host.map(ToVariant::to_variant).as_ref());
+            beside.set_action_name(host.map(|_| "win.browse-files"));
         }
         imp.generation.set(imp.generation.get().wrapping_add(1));
         imp.alias.replace(host.map(ToOwned::to_owned));
@@ -719,7 +803,7 @@ impl TuniSftp {
             return;
         };
         self.say(&format!("Opening {alias}"), "");
-        self.open(alias.to_owned());
+        self.open(alias.to_owned(), dial);
     }
 
     /// The button under a failure: the same host, from the start.
@@ -772,7 +856,7 @@ impl TuniSftp {
     }
 
     /// Starts a session and lists whatever the far end calls home.
-    fn open(&self, alias: String) {
+    fn open(&self, alias: String, dial: bool) {
         let generation = self.imp().generation.get();
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
@@ -782,13 +866,11 @@ impl TuniSftp {
                 let Ok(opened) = gio::spawn_blocking(move || {
                     let control = crate::hosts::control();
                     let host = tuni_core::ssh::host(&alias);
+                    if !dial && !control.is_live(&host.target()) {
+                        return None;
+                    }
                     let argv = tuni_core::ssh::sftp_command(&host, &control);
-                    let mut session = Session::open(&argv).map_err(|failure| failure.detail)?;
-                    let Some(home) = session.realpath(".") else {
-                        return Err(reason(&session));
-                    };
-                    let rows = rows(&mut session, &home).ok_or_else(|| reason(&session))?;
-                    Ok((session, PathBuf::from(home), rows))
+                    Some(connect(&argv))
                 })
                 .await
                 else {
@@ -798,7 +880,12 @@ impl TuniSftp {
                     return;
                 }
                 match opened {
-                    Ok((session, home, rows)) => {
+                    None => this.tell(
+                        &format!("Not Connected to {name}"),
+                        "A window putting its panes back does not dial on its own.",
+                        Some("Connect"),
+                    ),
+                    Some(Ok((session, home, rows))) => {
                         this.imp().link.replace(Some(Arc::new(Mutex::new(session))));
                         this.imp().listed.borrow_mut().0.insert(home.clone(), rows);
                         this.imp()
@@ -809,7 +896,7 @@ impl TuniSftp {
                         this.reload();
                         this.refresh_header();
                     }
-                    Err(detail) => this.fail(&format!("Couldn't Read {name}"), &detail),
+                    Some(Err(detail)) => this.fail(&format!("Couldn't Read {name}"), &detail),
                 }
             }
         ));
@@ -888,7 +975,10 @@ impl TuniSftp {
     /// directory that is open under it.
     fn reread(&self) {
         let imp = self.imp();
+        // With nothing to re-read it dials, which is the one thing the button
+        // can usefully mean over a host the page is not connected to.
         if imp.link.borrow().is_none() {
+            self.reconnect();
             return;
         }
         let open: Vec<PathBuf> = imp.listed.borrow().0.keys().cloned().collect();
@@ -1101,6 +1191,20 @@ impl TuniSftp {
             dialog.select_folder(self.window().as_ref(), gio::Cancellable::NONE, chosen);
         } else {
             dialog.open(self.window().as_ref(), gio::Cancellable::NONE, chosen);
+        }
+    }
+
+    /// Fetches rows into a directory on this machine under the names they
+    /// have there, which is what dropping them on the files here asks for.
+    pub fn fetch(&self, items: Vec<Item>, directory: &Path) {
+        for item in items {
+            let local = directory.join(&item.name);
+            self.start(
+                Way::Down,
+                item.path.to_string_lossy().into_owned(),
+                local,
+                false,
+            );
         }
     }
 
@@ -1981,18 +2085,23 @@ impl TuniSftp {
 
     /// Shows a sentence instead of a listing.
     fn say(&self, heading: &str, body: &str) {
-        self.tell(heading, body, false);
+        self.tell(heading, body, None);
     }
 
     /// Shows why the connection failed, with the button that tries again.
     fn fail(&self, heading: &str, body: &str) {
-        self.tell(heading, body, true);
+        self.tell(heading, body, Some("Reconnect"));
     }
 
-    fn tell(&self, heading: &str, body: &str, retry: bool) {
+    /// The sentence, and the button under it when there is one, which always
+    /// dials the host from the start.
+    fn tell(&self, heading: &str, body: &str, button: Option<&str>) {
         let imp = self.imp();
-        if let Some(button) = imp.reconnect.borrow().as_ref() {
-            button.set_visible(retry);
+        if let Some(reconnect) = imp.reconnect.borrow().as_ref() {
+            reconnect.set_visible(button.is_some());
+            if let Some(label) = button {
+                reconnect.set_label(label);
+            }
         }
         if let Some(status) = imp.status.borrow().as_ref() {
             status.set_title(heading);
@@ -2270,6 +2379,17 @@ fn failed(session: &Session) -> Failure {
         message: String::from("The transfer stopped."),
         detail: String::from("The connection ended."),
     })
+}
+
+/// A session on a host, and where it starts and what is there. Run on a
+/// worker: it is a login and two round trips.
+fn connect(argv: &[String]) -> Result<(Session, PathBuf, Vec<Item>), String> {
+    let mut session = Session::open(argv).map_err(|failure| failure.detail)?;
+    let Some(home) = session.realpath(".") else {
+        return Err(reason(&session));
+    };
+    let rows = rows(&mut session, &home).ok_or_else(|| reason(&session))?;
+    Ok((session, PathBuf::from(home), rows))
 }
 
 /// One directory's rows, in the order a file manager shows them.

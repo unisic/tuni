@@ -31,6 +31,7 @@ use tuni_core::settings::{Appearance, HISTORY_LINE_LIMIT, NewTab, Settings};
 use tuni_core::theme::{Rgb, Theme};
 use tuni_core::workspace::{Id, Tab, Workspace};
 
+use crate::browser::TuniBrowser;
 use crate::diff::TuniDiff;
 use crate::editor::TuniEditor;
 use crate::find::TuniFind;
@@ -341,9 +342,9 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
 
 mod imp {
     use super::{
-        Cell, ClosedTab, HashMap, Id, PathBuf, RefCell, Settings, TuniDiff, TuniEditor, TuniFind,
-        TuniGrid, TuniHosts, TuniPanel, TuniRemote, TuniSwitcher, TuniTerminal, VecDeque,
-        Workspace, gio, glib,
+        Cell, ClosedTab, HashMap, Id, PathBuf, RefCell, Settings, TuniBrowser, TuniDiff,
+        TuniEditor, TuniFind, TuniGrid, TuniHosts, TuniPanel, TuniRemote, TuniSwitcher,
+        TuniTerminal, VecDeque, Workspace, gio, glib,
     };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
@@ -364,6 +365,8 @@ mod imp {
         pub remotes: RefCell<HashMap<Id, TuniRemote>>,
         /// One host list per pane showing one, by pane id.
         pub hosts: RefCell<HashMap<Id, TuniHosts>>,
+        /// One file browser per pane showing a host's files, by pane id.
+        pub browsers: RefCell<HashMap<Id, TuniBrowser>>,
         /// One layout of panes per tab, by tab id.
         pub grids: RefCell<HashMap<Id, TuniGrid>>,
         /// The strip entry each tab was given, by tab id.
@@ -1219,6 +1222,13 @@ impl TuniWindow {
             entry("connect", string, |window, target| {
                 if let Some(alias) = target.and_then(glib::Variant::str) {
                     window.open_pane(Pane::ssh(alias.to_owned()));
+                }
+            }),
+            // A host's files beside the ones here, in a pane next to the one
+            // being worked in. The target is the host's alias.
+            entry("browse-files", string, |window, target| {
+                if let Some(alias) = target.and_then(glib::Variant::str) {
+                    window.browse_files(alias);
                 }
             }),
             // Opens the host list in a tab of its own, whatever a new tab is
@@ -2182,14 +2192,14 @@ impl TuniWindow {
         let started: Vec<(TuniTerminal, Id, Content, Option<PathBuf>)> = panes
             .into_iter()
             .filter_map(|(pane, directory, content)| {
-                if !matches!(content, Content::Terminal | Content::Ssh { .. }) {
-                    self.new_content(tab, pane, &content);
-                    return None;
-                }
                 let cwd = directory
                     .map(PathBuf::from)
                     .filter(|path| path.is_dir())
                     .or_else(|| fallback.clone());
+                if !matches!(content, Content::Terminal | Content::Ssh { .. }) {
+                    self.new_content(tab, pane, &content, cwd, requested);
+                    return None;
+                }
                 let terminal = self.new_terminal(tab, pane);
                 if is_remote(&content) {
                     self.new_remote(tab, pane, &terminal);
@@ -2424,6 +2434,7 @@ impl TuniWindow {
                     Message::LocalShell => this.replace_pane(project, tab, pane, Pane::new()),
                     Message::ConnectToSide(alias) => this.open_pane_to_side(Pane::ssh(alias)),
                     Message::ConnectInTab(alias) => this.open_pane(Pane::ssh(alias)),
+                    Message::Browse(alias) => this.browse_files(&alias),
                     Message::OpenFile(path, line) => this.open_file_at(&path, line),
                     Message::RunLocally(argv) => this.run_locally(&argv),
                 }
@@ -2431,6 +2442,35 @@ impl TuniWindow {
         ));
         self.imp().hosts.borrow_mut().insert(pane, hosts.clone());
         hosts
+    }
+
+    /// A host's files beside the ones here, for one pane. The local side asks
+    /// the window for what it cannot do itself, the same way the panel's
+    /// Files page does.
+    fn new_browser(&self, pane: Id, alias: &str, directory: &Path, dial: bool) -> TuniBrowser {
+        let browser = TuniBrowser::new(alias, directory, dial);
+        browser.set_hexpand(true);
+        browser.set_vexpand(true);
+        browser.files().connect_message(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |message| this.files_message(&message)
+        ));
+        self.imp()
+            .browsers
+            .borrow_mut()
+            .insert(pane, browser.clone());
+        browser
+    }
+
+    /// Opens a host's files beside the pane being worked in, with this
+    /// machine's side where a new shell would start.
+    fn browse_files(&self, alias: &str) {
+        let directory = self
+            .selected_tab()
+            .and_then(|(project, _)| self.directory_for_new_shell(project))
+            .map(|path| path.to_string_lossy().into_owned());
+        self.open_pane_to_side(Pane::sftp(alias.to_owned(), directory));
     }
 
     /// Puts something else in a pane that is already on screen: the model, the
@@ -2469,7 +2509,7 @@ impl TuniWindow {
                 Some(terminal)
             }
             _ => {
-                self.new_content(tab, pane, content);
+                self.new_content(tab, pane, content, cwd.clone(), true);
                 None
             }
         };
@@ -2784,8 +2824,23 @@ impl TuniWindow {
     /// Builds whatever a pane holds, for a pane already in the layout. Not a
     /// terminal or a connection: those need a directory to start in and
     /// something to start, which only the caller knows.
-    fn new_content(&self, tab: Id, pane: Id, content: &Content) {
+    ///
+    /// `cwd` is where a file browser's local side starts, and `requested`
+    /// whether it may dial its host, the same two things a connection is told.
+    fn new_content(
+        &self,
+        tab: Id,
+        pane: Id,
+        content: &Content,
+        cwd: Option<PathBuf>,
+        requested: bool,
+    ) {
         match content {
+            Content::Sftp { alias } => {
+                let dial = requested || self.settings().ssh_reconnect_on_restore;
+                let directory = cwd.unwrap_or_else(glib::home_dir);
+                self.new_browser(pane, alias, &directory, dial);
+            }
             Content::Terminal | Content::Ssh { .. } => (),
             Content::File(path) => {
                 self.new_editor(tab, pane, path);
@@ -3192,6 +3247,12 @@ impl TuniWindow {
                 .borrow()
                 .iter()
                 .map(|(id, hosts)| (*id, hosts.clone().upcast())),
+        );
+        widgets.extend(
+            imp.browsers
+                .borrow()
+                .iter()
+                .map(|(id, browser)| (*id, browser.clone().upcast())),
         );
         // Last, so a connection's bar replaces the bare terminal already
         // entered for it above.
@@ -3639,6 +3700,7 @@ impl TuniWindow {
         imp.editors.borrow_mut().remove(&pane);
         imp.remotes.borrow_mut().remove(&pane);
         imp.hosts.borrow_mut().remove(&pane);
+        imp.browsers.borrow_mut().remove(&pane);
         // A pane closed mid-turn never sends the notify that would have said it
         // stopped, so both marks are cleared here instead.
         let forgotten = imp.working.borrow_mut().remove(&pane).is_some()
@@ -4250,6 +4312,7 @@ impl TuniWindow {
             move_entry(&imp.diffs, &other.diffs, id);
             move_entry(&imp.remotes, &other.remotes, id);
             move_entry(&imp.hosts, &other.hosts, id);
+            move_entry(&imp.browsers, &other.browsers, id);
             // An agent still thinking, or one that finished into a tab nobody
             // was watching, is now thinking or finished in the other window.
             for (from, to) in [
@@ -4850,6 +4913,7 @@ impl TuniWindow {
                     .unwrap_or_else(|| alias.clone()),
             ),
             Content::Hosts => ("network-server-symbolic", "Connect".to_owned()),
+            Content::Sftp { alias } => ("folder-remote-symbolic", format!("{alias} files")),
             Content::File(path) => ("text-x-generic-symbolic", shorten(&path.to_string_lossy())),
             Content::Diff { path, staged } => (
                 "media-record-symbolic",
@@ -4982,6 +5046,16 @@ impl TuniWindow {
                 target: Some(host.alias.to_variant()),
                 terminal: false,
             });
+            entries.push(palette::Entry {
+                search: format!("{} {} sftp files browse", host.alias, host.address()),
+                title: format!("Browse Files on {}", host.alias),
+                subtitle: Some(host.address()),
+                icon: "folder-remote-symbolic",
+                shortcut: None,
+                action: "win.browse-files",
+                target: Some(host.alias.to_variant()),
+                terminal: false,
+            });
         }
 
         for snippet in tuni_core::snippets::Snippets::load().all() {
@@ -5080,10 +5154,17 @@ impl TuniWindow {
         self.imp().hosts.borrow().get(&pane).cloned()
     }
 
-    /// The panel's Remote page, which a capture drives the way it drives the
+    /// The remote list of the file browser holding the keyboard, or else the
+    /// panel's Remote page, which a capture drives the way it drives the
     /// editor: by its own action group.
     pub(crate) fn active_sftp(&self) -> Option<crate::sftp::TuniSftp> {
-        self.imp().panel_view.borrow().as_ref()?.sftp()
+        let browser = self
+            .focused_pane()
+            .and_then(|pane| self.imp().browsers.borrow().get(&pane).cloned());
+        match browser {
+            Some(browser) => Some(browser.sftp().clone()),
+            None => self.imp().panel_view.borrow().as_ref()?.sftp(),
+        }
     }
 
     // --- rendering the model -----------------------------------------------

@@ -1010,6 +1010,27 @@ Copies are not swept when the pane closes: they sit on the tmpfs a logout
 empties, each one at most the 5 MiB the editor opens, and sweeping on close
 would race a save still on its way.
 
+A host's files also open in a pane of their own, beside the files here: the
+Files page's tree on the left, the Remote page's list on the right, and a handle
+between them that starts in the middle. "Browse Files" in a host's row menu, the
+palette's "Browse Files on …" for each host, and the button on the Remote page's
+header all open one next to the pane being worked in, with this side where a new
+shell would start. The pane belongs to its host, so the focus moving to another
+pane leaves it where it is, which is the difference from the panel. A row
+dragged from the left lands where a dropped file always has; one dragged from
+the right lands in the directory the left is standing in, fetched under its own
+name and queued like a download. A remote row travels as a type only this
+process reads, because a remote path handed out as a file would send a file
+manager looking for it on this disk. A local row travels as a file, so it also
+drops into a terminal as its path. The left side is read every two seconds while
+the pane is on screen and the window is in front, the cadence the panel uses,
+so a file just fetched shows up. A restored pane follows the rule a restored
+connection does: it reads over a connection that is already up, and otherwise
+says "Not Connected" with a button that dials, since a window opening should not
+log into a list of hosts on its own. The local directory is kept in the session
+file as the pane's directory, which is also what an older build that does not
+know the pane opens a shell in.
+
 sshfs would have been free: mount the host, and every page in this window works
 on it unchanged, the editor and the git panel included. It is the worst idea
 available. The panel polls on the main thread, so each tick becomes a round trip

@@ -68,6 +68,10 @@ pub enum Content {
     Ssh { alias: String },
     /// The list of everything there is to connect to.
     Hosts,
+    /// The files on a host beside the files here, the two sides of a copy.
+    /// Held by alias for the same reason a connection is. The directory on
+    /// this side is the pane's own [`Pane::directory`].
+    Sftp { alias: String },
 }
 
 /// One tile: what it holds, and what that last said about itself.
@@ -142,6 +146,18 @@ impl Pane {
         }
     }
 
+    /// A pane browsing a host's files beside this machine's, opened with the
+    /// local side in `directory`.
+    #[must_use]
+    pub fn sftp(alias: String, directory: Option<String>) -> Self {
+        Self {
+            title: Some(format!("{alias} files")),
+            content: Content::Sftp { alias },
+            directory,
+            ..Self::new()
+        }
+    }
+
     /// A pane holding what changed in a file, named for the file with the side
     /// of the comparison after it, since both sides can be open at once.
     #[must_use]
@@ -170,7 +186,7 @@ impl Pane {
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         match &self.content {
-            Content::Terminal | Content::Ssh { .. } | Content::Hosts => None,
+            Content::Terminal | Content::Ssh { .. } | Content::Hosts | Content::Sftp { .. } => None,
             Content::File(path) | Content::Diff { path, .. } => Some(path),
         }
     }

@@ -384,6 +384,26 @@ impl TuniFiles {
         ));
         content.add_controller(press);
 
+        // Dragged out as a file, which is what a file manager, a terminal's
+        // prompt and a remote host's list all take.
+        let drag = gtk::DragSource::new();
+        drag.set_actions(gdk::DragAction::COPY);
+        drag.connect_prepare(glib::clone!(
+            #[weak]
+            list_item,
+            #[upgrade_or]
+            None,
+            move |_, _, _| {
+                let item = list_item
+                    .item()
+                    .and_downcast::<Row>()
+                    .and_then(|row| row.item())?;
+                let files = gdk::FileList::from_array(&[gio::File::for_path(&item.path)]);
+                Some(gdk::ContentProvider::for_value(&files.to_value()))
+            }
+        ));
+        content.add_controller(drag);
+
         list_item.set_child(Some(&content));
     }
 
@@ -575,6 +595,11 @@ impl TuniFiles {
 
     /// Re-reads what is open. Draws nothing when nothing moved, which is the
     /// usual answer.
+    /// The directory the tree is standing in, browsed to or given.
+    pub fn directory(&self) -> std::path::PathBuf {
+        self.imp().tree.borrow().root().to_path_buf()
+    }
+
     pub fn poll(&self) {
         if self.imp().tree.borrow_mut().rebuild(&mut Disk) {
             self.reload();

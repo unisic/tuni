@@ -66,6 +66,11 @@ pub struct PaneSnapshot {
     /// own, so there is nothing to write down beyond that it was there.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hosts: bool,
+    /// The host a file browser pane was showing. The local side is the pane's
+    /// `directory`. A build that predates it reads the pane as a shell in
+    /// that directory, which is a pane that still opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sftp: Option<String>,
 }
 
 /// What the window knows about a pane that the model does not: the scrollback
@@ -372,6 +377,10 @@ fn snap_tab(tab: &Tab, state: &impl Fn(Id) -> PaneState) -> TabSnapshot {
                                 _ => None,
                             },
                             hosts: pane.content == Content::Hosts,
+                            sftp: match &pane.content {
+                                Content::Sftp { alias } => Some(alias.clone()),
+                                _ => None,
+                            },
                         }
                     })
                     .collect(),
@@ -397,6 +406,10 @@ fn restore_tab(
                 .iter()
                 .map(|saved| {
                     let mut pane = match (saved.hosts, &saved.ssh, &saved.file, saved.diff) {
+                        _ if saved.sftp.is_some() => Pane::sftp(
+                            saved.sftp.clone().unwrap_or_default(),
+                            saved.directory.clone(),
+                        ),
                         (true, ..) => Pane::hosts(),
                         (false, Some(alias), _, _) => Pane::ssh(alias.clone()),
                         (false, None, Some(path), Some(staged)) => {
@@ -768,6 +781,36 @@ mod tests {
 
         let panes = restored.projects()[0].tabs()[0].layout().columns()[1].panes();
         assert_eq!(panes[0].content, Content::Hosts);
+    }
+
+    #[test]
+    fn a_file_browser_comes_back_on_its_host_and_its_local_directory() {
+        let mut saved = workspace(&[1]);
+        let project = saved.projects()[0].id();
+        let tab = saved.projects()[0].tabs()[0].id();
+        saved
+            .project_mut(project)
+            .and_then(|project| project.tab_mut(tab))
+            .expect("just built")
+            .layout_mut()
+            .split(
+                Pane::sftp("prod-db".to_owned(), Some("/srv/www".to_owned())),
+                Edge::Right,
+            );
+
+        let text = serde_json::to_string(&Snapshot::of(&saved, |_| PaneState::default()))
+            .expect("plain data");
+        let read: Snapshot = serde_json::from_str(&text).expect("what we just wrote");
+        let restored = read.restore().workspace;
+
+        let panes = restored.projects()[0].tabs()[0].layout().columns()[1].panes();
+        assert_eq!(
+            panes[0].content,
+            Content::Sftp {
+                alias: "prod-db".to_owned()
+            }
+        );
+        assert_eq!(panes[0].directory.as_deref(), Some("/srv/www"));
     }
 
     #[test]

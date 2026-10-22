@@ -3,6 +3,7 @@
 //! Everything the window does lives in `window.rs`; this file is the process.
 
 mod blur;
+mod browser;
 mod debug;
 mod debugger;
 mod diff;
@@ -480,12 +481,20 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                         let (name, target) = match action.split_once('(') {
                             // A bare number is the i32 most actions take; the
                             // project actions take a u64 id, which a `u` suffix
-                            // asks for: `close-project(3u)`.
+                            // asks for: `close-project(3u)`. Quotes are a
+                            // string, which is how a host is named:
+                            // `browse-files('web')`.
                             Some((name, rest)) => {
                                 let rest = rest.trim_end_matches(')');
-                                let target = match rest.strip_suffix('u') {
-                                    Some(id) => id.parse::<u64>().ok().map(|id| id.to_variant()),
-                                    None => rest.parse::<i32>().ok().map(|n| n.to_variant()),
+                                let quoted = rest
+                                    .strip_prefix('\'')
+                                    .and_then(|rest| rest.strip_suffix('\''));
+                                let target = match (quoted, rest.strip_suffix('u')) {
+                                    (Some(text), _) => Some(text.to_variant()),
+                                    (_, Some(id)) => {
+                                        id.parse::<u64>().ok().map(|id| id.to_variant())
+                                    }
+                                    _ => rest.parse::<i32>().ok().map(|n| n.to_variant()),
                                 };
                                 (name.to_owned(), target)
                             }
