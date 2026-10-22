@@ -757,6 +757,21 @@ a label, tags, when a host was last opened, lives in
 `~/.config/tuni/ssh/meta.json` keyed by alias, which is what lets a hand-written
 host carry them without tuni putting a byte in the file that declares it.
 
+Agent forwarding and environment variables get rows of their own in the host
+editor, and both are still lines of ssh syntax: `ForwardAgent` and `SetEnv`,
+kept among the extra lines the block already carries and taken out of the text
+box while the rows show them, so the box and the row cannot say two different
+things. A second store for them would have been a second answer to what `ssh -G`
+reports. The agent row warns, because the man page does: anybody who is root on
+the far end can ask the forwarded agent to sign while the connection is up, and
+a switch that hides that is a switch nobody should flip blind. Turning it off
+writes `ForwardAgent no` when a value was there rather than deleting the line,
+since a missing line hands the question to whatever `Host *` says further down;
+turning it on keeps a socket path somebody wrote by hand, because the switch
+only says whether. `SetEnv` is sent by the client, and a server that does not
+`AcceptEnv` the name drops it without a word, which is the server's answer and
+not something the row can check.
+
 A forwarded port is two different things under one name. A `LocalForward` in the
 host's own block belongs to ssh, which brings it up with the connection, and
 there is nothing in the window that could start or stop it. One kept in

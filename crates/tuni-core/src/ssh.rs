@@ -706,6 +706,38 @@ impl Host {
         }
     }
 
+    /// What the extra lines give `keyword`, found the way ssh finds it: in any
+    /// case, after a space or an `=`. The first line, since the first value
+    /// obtained is the one ssh uses.
+    #[must_use]
+    pub fn option(&self, keyword: &str) -> Option<String> {
+        let keyword = keyword.to_lowercase();
+        self.extra
+            .iter()
+            .filter_map(|line| split(line))
+            .find_map(|(found, value)| (found == keyword).then_some(value))
+    }
+
+    /// Gives `keyword` one line among the extra lines, in the place of the
+    /// first one that gave it a value, and drops every other. An empty value
+    /// takes it out, which leaves it to ssh's default.
+    pub fn set_option(&mut self, keyword: &str, value: &str) {
+        let lower = keyword.to_lowercase();
+        let gives = |line: &String| split(line).is_some_and(|(found, _)| found == lower);
+        let at = self.extra.iter().position(gives);
+        self.extra.retain(|line| !gives(line));
+        let value = value.trim();
+        if value.is_empty() {
+            return;
+        }
+        // Nothing before the first match was removed, so its index still holds.
+        let line = format!("{keyword} {value}");
+        match at {
+            Some(at) => self.extra.insert(at, line),
+            None => self.extra.push(line),
+        }
+    }
+
     /// The address to show beside the name: `deploy@10.0.0.1:2222`, with the
     /// parts the configuration does not say left out rather than guessed at.
     #[must_use]
@@ -2148,6 +2180,57 @@ mod tests {
             .filter_map(|line| line.split_once(' '))
             .map(|(keyword, value)| (keyword.to_owned(), value.to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn an_option_is_found_in_any_case_and_after_an_equals_sign_and_the_first_one_wins() {
+        let host = Host {
+            extra: vec![
+                "# ForwardAgent yes".to_owned(),
+                "forwardagent=no".to_owned(),
+                "ForwardAgent yes".to_owned(),
+            ],
+            ..Host::default()
+        };
+        assert_eq!(host.option("ForwardAgent").as_deref(), Some("no"));
+        assert_eq!(host.option("SetEnv"), None);
+    }
+
+    #[test]
+    fn setting_an_option_leaves_one_line_where_the_first_one_was() {
+        let mut host = Host {
+            extra: vec![
+                "Compression yes".to_owned(),
+                "SetEnv A=1".to_owned(),
+                "ServerAliveInterval 30".to_owned(),
+                "setenv=B=2".to_owned(),
+            ],
+            ..Host::default()
+        };
+        host.set_option("SetEnv", " LANG=C.UTF-8 EDITOR=vim ");
+        assert_eq!(
+            host.extra,
+            [
+                "Compression yes",
+                "SetEnv LANG=C.UTF-8 EDITOR=vim",
+                "ServerAliveInterval 30",
+            ]
+        );
+        host.set_option("ForwardAgent", "yes");
+        assert_eq!(
+            host.extra.last().map(String::as_str),
+            Some("ForwardAgent yes")
+        );
+    }
+
+    #[test]
+    fn an_empty_value_takes_the_option_out() {
+        let mut host = Host {
+            extra: vec!["ForwardAgent yes".to_owned(), "# a note".to_owned()],
+            ..Host::default()
+        };
+        host.set_option("ForwardAgent", "  ");
+        assert_eq!(host.extra, ["# a note"]);
     }
 
     #[test]

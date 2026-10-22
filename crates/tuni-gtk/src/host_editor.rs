@@ -273,8 +273,26 @@ pub fn present<F>(
                 .unwrap_or(0) as u32,
         )
         .build();
+    // Two options with rows of their own. They are taken out of the extra
+    // lines below, so the text there cannot say something else about them.
+    // A value other than yes or no names a socket, which on keeps, since the
+    // switch only says whether.
+    let agent_was = host
+        .option("ForwardAgent")
+        .filter(|value| !value.eq_ignore_ascii_case("no"));
+    let agent = adw::SwitchRow::builder()
+        .title("Forward the agent")
+        .subtitle("Root on the host can sign with your keys while you are connected")
+        .active(agent_was.is_some())
+        .build();
+    let environment = adw::EntryRow::builder()
+        .title("Environment, as NAME=value")
+        .text(host.option("SetEnv").unwrap_or_default())
+        .build();
     let session = adw::PreferencesGroup::builder().title("Session").build();
     session.add(&on_connect);
+    session.add(&agent);
+    session.add(&environment);
     advanced.append(&session);
 
     // Held apart from the rows, because a forward is added and removed rather
@@ -332,7 +350,10 @@ pub fn present<F>(
         .left_margin(6)
         .right_margin(6)
         .build();
-    extra.buffer().set_text(&host.extra.join("\n"));
+    let mut rest = host.clone();
+    rest.set_option("ForwardAgent", "");
+    rest.set_option("SetEnv", "");
+    extra.buffer().set_text(&rest.extra.join("\n"));
     let extra_frame = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .min_content_height(90)
@@ -435,7 +456,7 @@ pub fn present<F>(
         name,
         move |_| {
             let buffer = extra.buffer();
-            let written = Host {
+            let mut written = Host {
                 alias: name.text().trim().to_owned(),
                 hostname: address.text().trim().to_owned(),
                 port: port.value() as u16,
@@ -448,6 +469,16 @@ pub fn present<F>(
                 origin: None,
                 shadowed: false,
             };
+            // Off writes `no` over a value that was there, because taking the
+            // line out hands the question to whatever `Host *` says further
+            // down, and that may well be yes.
+            let forward = match (agent.is_active(), host.option("ForwardAgent")) {
+                (true, _) => agent_was.clone().unwrap_or_else(|| "yes".to_owned()),
+                (false, Some(_)) => "no".to_owned(),
+                (false, None) => String::new(),
+            };
+            written.set_option("ForwardAgent", &forward);
+            written.set_option("SetEnv", &environment.text());
             let written_meta = Meta {
                 label: label.text().trim().to_owned(),
                 tags: split_tags(&tags.text()),
