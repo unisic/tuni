@@ -5080,6 +5080,12 @@ impl TuniWindow {
         self.imp().hosts.borrow().get(&pane).cloned()
     }
 
+    /// The panel's Remote page, which a capture drives the way it drives the
+    /// editor: by its own action group.
+    pub(crate) fn active_sftp(&self) -> Option<crate::sftp::TuniSftp> {
+        self.imp().panel_view.borrow().as_ref()?.sftp()
+    }
+
     // --- rendering the model -----------------------------------------------
 
     /// Titles, names, and which of the two empty states is showing. Cheap

@@ -238,38 +238,18 @@ impl TuniFiles {
         header.append(&jump);
         header.append(&add);
 
-        // A place to say where to go, shown when asked for and typed into the
-        // way a shell would be: Enter goes, Escape thinks better of it.
-        let location = gtk::Entry::builder()
-            .placeholder_text("Directory path")
-            .margin_start(12)
-            .margin_end(6)
-            .margin_bottom(8)
-            .build();
-        location.connect_activate(glib::clone!(
-            #[weak(rename_to = this)]
-            self,
-            move |entry| this.go_to(&entry.text())
-        ));
-        // A path that led nowhere reddens the entry; typing again is the start
-        // of a new answer, not more of the wrong one.
-        location.connect_changed(|entry| entry.remove_css_class("error"));
-        let escape = gtk::EventControllerKey::new();
-        escape.connect_key_pressed(glib::clone!(
-            #[weak(rename_to = this)]
-            self,
-            #[upgrade_or]
-            glib::Propagation::Proceed,
-            move |_, key, _, _| {
-                if key == gdk::Key::Escape {
-                    this.show_location(false);
-                    return glib::Propagation::Stop;
-                }
-                glib::Propagation::Proceed
-            }
-        ));
-        location.add_controller(escape);
-        let location_bar = gtk::Revealer::builder().child(&location).build();
+        let (location_bar, location) = location_bar(
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |text: &str| this.go_to(text)
+            ),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move || this.show_location(false)
+            ),
+        );
 
         let rows = gio::ListStore::new::<Row>();
         let selection = gtk::SingleSelection::builder()
@@ -797,7 +777,36 @@ impl TuniFiles {
     }
 }
 
-/// Draws one row: the indent, the chevron, the icon, and the name.
+/// A place to say where to go, shown when asked for and typed into the way a
+/// shell would be: Enter goes, Escape thinks better of it.
+pub(crate) fn location_bar(
+    go: impl Fn(&str) + 'static,
+    close: impl Fn() + 'static,
+) -> (gtk::Revealer, gtk::Entry) {
+    let location = gtk::Entry::builder()
+        .placeholder_text("Directory path")
+        .margin_start(12)
+        .margin_end(6)
+        .margin_bottom(8)
+        .build();
+    location.connect_activate(move |entry| go(&entry.text()));
+    // A path that led nowhere reddens the entry; typing again is the start of a
+    // new answer, not more of the wrong one.
+    location.connect_changed(|entry| entry.remove_css_class("error"));
+    let escape = gtk::EventControllerKey::new();
+    escape.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Escape {
+            close();
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    location.add_controller(escape);
+    (gtk::Revealer::builder().child(&location).build(), location)
+}
+
+/// Draws one row: the indent, the chevron, the icon, and the name, and a
+/// remote file's size when the row has a fourth widget for it.
 pub(crate) fn bind_row(object: &glib::Object) {
     let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
         return;
@@ -817,7 +826,7 @@ pub(crate) fn bind_row(object: &glib::Object) {
         children = child.next_sibling();
         widgets.push(child);
     }
-    let [expander, icon, label] = widgets.as_slice() else {
+    let [expander, icon, label, rest @ ..] = widgets.as_slice() else {
         return;
     };
 
@@ -844,9 +853,24 @@ pub(crate) fn bind_row(object: &glib::Object) {
             "text-x-generic-symbolic"
         }));
     }
+    if let Some(size) = rest
+        .first()
+        .and_then(|size| size.downcast_ref::<gtk::Label>())
+    {
+        let text = item
+            .details
+            .filter(|_| !item.is_directory)
+            .map(|details| tuni_core::editor::size_text(details.size));
+        size.set_text(text.as_deref().unwrap_or_default());
+    }
     if let Some(label) = label.downcast_ref::<gtk::Label>() {
         label.set_text(&item.name);
-        label.set_tooltip_text(Some(&item.path.to_string_lossy()));
+        let mut tooltip = item.path.to_string_lossy().into_owned();
+        if let Some(details) = item.details {
+            tooltip.push('\n');
+            tooltip.push_str(&details_text(&details));
+        }
+        label.set_tooltip_text(Some(&tooltip));
         // A name the shell hides is shown, but shown quietly.
         if item.is_hidden() {
             label.add_css_class("dim-label");
@@ -854,6 +878,28 @@ pub(crate) fn bind_row(object: &glib::Object) {
             label.remove_css_class("dim-label");
         }
     }
+}
+
+/// Size, permissions and when it last changed, the three things `ls -l` says
+/// about a file that its name does not.
+fn details_text(details: &tuni_core::files::Details) -> String {
+    format!(
+        "{}  {}  {}",
+        tuni_core::editor::size_text(details.size),
+        tuni_core::sftp::permissions(details.mode),
+        when(details.mtime)
+    )
+}
+
+/// A time in seconds since the epoch, in this machine's time zone. A remote
+/// file's is the far end's clock, which is the only one there is to read.
+pub(crate) fn when(seconds: u64) -> String {
+    i64::try_from(seconds)
+        .ok()
+        .and_then(|seconds| glib::DateTime::from_unix_local(seconds).ok())
+        .and_then(|date| date.format("%Y-%m-%d %H:%M").ok())
+        .map(|date| date.to_string())
+        .unwrap_or_default()
 }
 
 /// One action, holding the panel weakly: the group is inserted into the panel,

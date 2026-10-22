@@ -54,6 +54,7 @@ const STAT: u8 = 17;
 const RENAME: u8 = 18;
 const LSTAT: u8 = 7;
 const CLOSE: u8 = 4;
+const SETSTAT: u8 = 9;
 const FSETSTAT: u8 = 10;
 /// A request named by a string rather than a number, for what a server offers
 /// past version 3.
@@ -79,6 +80,8 @@ const READABLE: u32 = 0x0000_0001;
 const WRITABLE: u32 = 0x0000_0002;
 const CREATE: u32 = 0x0000_0008;
 const TRUNCATE: u32 = 0x0000_0010;
+/// With `CREATE`, refuse rather than open a file that is already there.
+const EXCLUSIVE: u32 = 0x0000_0020;
 
 /// How much of a file moves in one request, which is what OpenSSH's own client
 /// asks for.
@@ -175,17 +178,15 @@ impl Plan {
     pub fn inside(&self) -> Option<String> {
         let folders = self.steps.iter().filter(|step| step.is_directory).count();
         let files = self.steps.len() - folders;
-        let folders = folders.checked_sub(1)?;
-        match (files, folders) {
-            (0, 0) => None,
-            (files, 0) => Some(counted(files, "file")),
-            (0, folders) => Some(counted(folders, "folder")),
-            (files, folders) => Some(format!(
-                "{} and {}",
-                counted(files, "file"),
-                counted(folders, "folder")
-            )),
-        }
+        files_and_folders(files, folders.checked_sub(1)?)
+    }
+
+    /// Everything in the plan, what was chosen included: "3 files and 1
+    /// folder", for the question about deleting several things at once.
+    #[must_use]
+    pub fn count(&self) -> String {
+        let folders = self.steps.iter().filter(|step| step.is_directory).count();
+        files_and_folders(self.steps.len() - folders, folders).unwrap_or_else(|| counted(0, "file"))
     }
 
     /// `false` once the plan is as big as it may get.
@@ -261,6 +262,27 @@ pub fn seen(local: &Path) -> Option<(u64, u64)> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?;
     Some((data.len(), mtime.as_secs()))
+}
+
+/// Permission bits the way `ls -l` writes them, `rwxr-xr-x`, with the set-id
+/// and sticky bits in the execute column.
+#[must_use]
+pub fn permissions(mode: u32) -> String {
+    let special = [(0o4000, 's'), (0o2000, 's'), (0o1000, 't')];
+    let mut text = String::with_capacity(9);
+    for (who, (bit, mark)) in special.into_iter().enumerate() {
+        let shift = 6 - 3 * who;
+        let bits = (mode >> shift) & 0o7;
+        text.push(if bits & 4 != 0 { 'r' } else { '-' });
+        text.push(if bits & 2 != 0 { 'w' } else { '-' });
+        text.push(match (bits & 1 != 0, mode & bit != 0) {
+            (true, true) => mark,
+            (false, true) => mark.to_ascii_uppercase(),
+            (true, false) => 'x',
+            (false, false) => '-',
+        });
+    }
+    text
 }
 
 fn copies() -> PathBuf {
@@ -803,6 +825,28 @@ impl Session {
         self.settle(RENAME, &request, "rename", from)
     }
 
+    /// Makes one empty file, which the far end refuses if the name is taken,
+    /// so nothing that was there is emptied.
+    pub fn create(&mut self, path: &str) -> Option<()> {
+        if let Some(handle) = self.open_file(path, WRITABLE | CREATE | EXCLUSIVE, None) {
+            self.close(&handle);
+            return Some(());
+        }
+        if self.probe(|session| session.lstat(path)).is_some() {
+            self.because("There is already something there with that name.");
+        }
+        None
+    }
+
+    /// Sets the permission bits of one path, set-id and sticky bits included,
+    /// and leaves its type alone.
+    pub fn chmod(&mut self, path: &str, mode: u32) -> Option<()> {
+        let mut request = encode_string(path);
+        request.extend_from_slice(&PERMISSIONS.to_be_bytes());
+        request.extend_from_slice(&(mode & 0o7777).to_be_bytes());
+        self.settle(SETSTAT, &request, "change the permissions of", path)
+    }
+
     /// Fetches a remote file into its copy from [`copy_path`] for the editor,
     /// refusing what the editor would refuse to open before any of it moves.
     pub fn fetch_to_edit(&mut self, remote: &str, local: &Path) -> Option<()> {
@@ -939,22 +983,30 @@ impl Session {
         Some(plan)
     }
 
-    /// What deleting `remote` comes to. A link is never followed, here or
-    /// anywhere under it: it goes, and what it points at stays.
-    pub fn plan_delete(&mut self, remote: &str) -> Option<Plan> {
-        let top = self.lstat(remote)?;
+    /// What deleting `remotes` comes to, as one plan. A link is never
+    /// followed, here or anywhere under it: it goes, and what it points at
+    /// stays. Something inside another of them is left to that one, so a
+    /// folder and a file in it, both selected, are not deleted twice.
+    pub fn plan_delete(&mut self, remotes: &[String]) -> Option<Plan> {
         let mut plan = Plan::default();
-        if top.is_directory {
-            self.gather_there(&mut plan, remote, None, 1)?;
-        }
-        let top = Step {
-            remote: remote.to_owned(),
-            is_directory: top.is_directory,
-            ..Step::default()
-        };
-        if !plan.add(top) {
-            self.failure = Some(too_many());
-            return None;
+        for remote in remotes {
+            let under = |other: &String| other != remote && Path::new(remote).starts_with(other);
+            if remotes.iter().any(under) {
+                continue;
+            }
+            let top = self.lstat(remote)?;
+            if top.is_directory {
+                self.gather_there(&mut plan, remote, None, 1)?;
+            }
+            let top = Step {
+                remote: remote.clone(),
+                is_directory: top.is_directory,
+                ..Step::default()
+            };
+            if !plan.add(top) {
+                self.failure = Some(too_many());
+                return None;
+            }
         }
         Some(plan)
     }
@@ -1671,6 +1723,19 @@ fn join(directory: &str, name: &str) -> String {
         .join(name)
         .to_string_lossy()
         .into_owned()
+}
+
+fn files_and_folders(files: usize, folders: usize) -> Option<String> {
+    match (files, folders) {
+        (0, 0) => None,
+        (files, 0) => Some(counted(files, "file")),
+        (0, folders) => Some(counted(folders, "folder")),
+        (files, folders) => Some(format!(
+            "{} and {}",
+            counted(files, "file"),
+            counted(folders, "folder")
+        )),
+    }
 }
 
 fn too_many() -> Failure {
@@ -2717,7 +2782,7 @@ mod tests {
         std::os::unix::fs::symlink(root.join("outside"), gone.join("link")).unwrap();
         let mut session = real_server();
 
-        let plan = session.plan_delete(&text(&gone)).expect("planned");
+        let plan = session.plan_delete(&[text(&gone)]).expect("planned");
         assert_eq!(plan.inside().as_deref(), Some("4 files and 2 folders"));
         assert_eq!(
             plan.steps.last().map(|step| step.remote.clone()),
@@ -2847,6 +2912,70 @@ mod tests {
         assert!(!local.exists());
         let failure = session.failure().expect("said why");
         assert!(failure.detail.contains("past the"), "{failure:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn permissions_read_the_way_ls_writes_them() {
+        assert_eq!(permissions(0o100_644), "rw-r--r--");
+        assert_eq!(permissions(0o040_755), "rwxr-xr-x");
+        assert_eq!(permissions(0o4755), "rwsr-xr-x");
+        assert_eq!(permissions(0o2750), "rwxr-s---");
+        assert_eq!(permissions(0o1777), "rwxrwxrwt");
+        assert_eq!(permissions(0o1666), "rw-rw-rwT");
+        assert_eq!(permissions(0), "---------");
+    }
+
+    #[test]
+    fn a_new_file_is_empty_and_a_taken_name_is_left_as_it_was() {
+        let root = scratch("create");
+        let path = root.join("new.txt");
+        let mut session = real_server();
+        session.create(&text(&path)).expect("created");
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+        std::fs::write(&path, "keep me").unwrap();
+        assert_eq!(session.create(&text(&path)), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+        let failure = session.failure().expect("said why");
+        assert!(
+            failure.detail.contains("already something there"),
+            "{failure:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chmod_sets_the_bits_asked_for_and_nothing_else() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("chmod");
+        let path = root.join("run.sh");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        let mut session = real_server();
+        session.chmod(&text(&path), 0o100_750).expect("changed");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode, 0o100_750);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deleting_a_folder_and_a_file_in_it_together_deletes_each_once() {
+        let root = scratch("delete-many");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/inner"), "").unwrap();
+        std::fs::write(root.join("loose"), "").unwrap();
+        let mut session = real_server();
+
+        let chosen = [
+            text(&root.join("dir/inner")),
+            text(&root.join("dir")),
+            text(&root.join("loose")),
+        ];
+        let plan = session.plan_delete(&chosen).expect("planned");
+        assert_eq!(plan.count(), "2 files and 1 folder");
+        let report = session.delete(&plan);
+        assert_eq!((report.done, report.failed), (3, 0));
+        assert!(!root.join("dir").exists() && !root.join("loose").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

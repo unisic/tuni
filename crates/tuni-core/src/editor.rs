@@ -144,7 +144,8 @@ pub(crate) fn temporary_name(target: &Path) -> PathBuf {
     PathBuf::from(format!(".{name}.tuni-{}", std::process::id()))
 }
 
-fn size_text(bytes: u64) -> String {
+#[must_use]
+pub fn size_text(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     const KIB: f64 = 1024.0;
     #[expect(

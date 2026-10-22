@@ -13,6 +13,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -116,9 +117,13 @@ mod imp {
         /// paths on a machine the page has left.
         pub back: RefCell<Vec<PathBuf>>,
         pub forward: RefCell<Vec<PathBuf>>,
-        /// The row whose context menu is open, and so the one its actions act
-        /// on.
-        pub target: RefCell<Option<Item>>,
+        /// The rows a context menu or a key was opened on, and so the ones its
+        /// actions act on. Taken when it opens rather than read from the
+        /// selection when it is chosen, since a listing landing in between
+        /// rebuilds the rows and the selection with them.
+        pub targets: RefCell<Vec<Item>>,
+        pub location: RefCell<Option<gtk::Entry>>,
+        pub location_bar: RefCell<Option<gtk::Revealer>>,
     }
 
     #[glib::object_subclass]
@@ -191,9 +196,18 @@ impl TuniSftp {
             .build();
         up.add_css_class("flat");
 
+        let jump = gtk::Button::builder()
+            .icon_name("folder-open-symbolic")
+            .tooltip_text("Go to Directory")
+            .action_name("sftp.location")
+            .valign(gtk::Align::Center)
+            .build();
+        jump.add_css_class("flat");
+
         let here = gio::Menu::new();
         here.append(Some("Upload File Here…"), Some("sftp.upload-here"));
         here.append(Some("Upload Folder Here…"), Some("sftp.upload-folder-here"));
+        here.append(Some("New File…"), Some("sftp.new-file-here"));
         here.append(Some("New Folder…"), Some("sftp.new-folder-here"));
         let more = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
@@ -218,7 +232,21 @@ impl TuniSftp {
         header.set_margin_bottom(8);
         header.append(&names);
         header.append(&up);
+        header.append(&jump);
         header.append(&more);
+
+        let (location_bar, location) = crate::files::location_bar(
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |text: &str| this.go_to(text)
+            ),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move || this.show_location(false)
+            ),
+        );
         header.append(&refresh);
 
         let progress = gtk::ProgressBar::builder()
@@ -246,11 +274,10 @@ impl TuniSftp {
         progress_row.append(&cancel);
 
         let rows = gio::ListStore::new::<Row>();
-        let selection = gtk::SingleSelection::builder()
-            .model(&rows)
-            .autoselect(false)
-            .can_unselect(true)
-            .build();
+        // Several at once, with the clicks and keys a file manager takes for
+        // that, because deleting or fetching twenty files one menu at a time is
+        // twenty menus.
+        let selection = gtk::MultiSelection::new(Some(rows.clone()));
 
         let factory = gtk::SignalListItemFactory::new();
         factory.connect_setup(glib::clone!(
@@ -266,6 +293,41 @@ impl TuniSftp {
             .vexpand(true)
             .build();
         list.add_css_class("navigation-sidebar");
+        // On the list, not the window: Delete and F2 mean nothing to a shell
+        // in the pane beside it, and the list is what has the focus when they
+        // are meant for it.
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, modifiers| {
+                // Caps Lock and Num Lock are modifiers too, and say nothing
+                // about which key was meant.
+                let held = modifiers
+                    & (gdk::ModifierType::CONTROL_MASK
+                        | gdk::ModifierType::ALT_MASK
+                        | gdk::ModifierType::SHIFT_MASK);
+                let plain = held.is_empty();
+                match key {
+                    gdk::Key::Delete | gdk::Key::KP_Delete if plain => {
+                        this.delete(this.selected());
+                    }
+                    gdk::Key::F2 if plain => {
+                        if let [item] = this.selected().as_slice() {
+                            this.rename(item);
+                        }
+                    }
+                    gdk::Key::l if held == gdk::ModifierType::CONTROL_MASK => {
+                        this.show_location(true);
+                    }
+                    _ => return glib::Propagation::Proceed,
+                }
+                glib::Propagation::Stop
+            }
+        ));
+        list.add_controller(keys);
         list.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -334,6 +396,7 @@ impl TuniSftp {
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&header);
+        content.append(&location_bar);
         content.append(&progress_row);
         content.append(&stack);
         self.set_child(Some(&content));
@@ -351,6 +414,8 @@ impl TuniSftp {
         imp.menu.replace(Some(menu));
         imp.progress.replace(Some(progress));
         imp.progress_row.replace(Some(progress_row));
+        imp.location.replace(Some(location));
+        imp.location_bar.replace(Some(location_bar));
 
         self.say(
             "No Connection",
@@ -358,9 +423,9 @@ impl TuniSftp {
         );
     }
 
-    /// One row's widgets, in the shape [`bind_row`] fills: a chevron, an icon
-    /// and a name. The chevron opens a directory on one click, which the row
-    /// itself asks two for.
+    /// One row's widgets, in the shape [`bind_row`] fills: a chevron, an icon,
+    /// a name and a size. The chevron opens a directory on one click, which
+    /// the row itself asks two for.
     fn setup_row(&self, object: &glib::Object) {
         let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -375,10 +440,16 @@ impl TuniSftp {
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .build();
 
+        let size = gtk::Label::builder().xalign(1.0).build();
+        size.add_css_class("caption");
+        size.add_css_class("dim-label");
+        size.add_css_class("numeric");
+
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         content.append(&expander);
         content.append(&icon);
         content.append(&label);
+        content.append(&size);
 
         let toggle = gtk::GestureClick::new();
         toggle.connect_released(glib::clone!(
@@ -438,9 +509,9 @@ impl TuniSftp {
                 // Selected while the pointer is over it, since a row that is
                 // about to be dropped on should say so before the drop.
                 if let Some(list) = this.imp().list.borrow().as_ref()
-                    && let Some(selection) = list.model().and_downcast::<gtk::SingleSelection>()
+                    && let Some(selection) = list.model()
                 {
-                    selection.set_selected(list_item.position());
+                    selection.select_item(list_item.position(), true);
                 }
                 gdk::DragAction::COPY
             }
@@ -491,27 +562,27 @@ impl TuniSftp {
             entry("back", self, |sftp| sftp.walk(false)),
             entry("forward", self, |sftp| sftp.walk(true)),
             entry("refresh", self, TuniSftp::reread),
+            entry("location", self, |sftp| {
+                let bar = sftp.imp().location_bar.borrow().clone();
+                let open = bar.is_some_and(|bar| bar.reveals_child());
+                sftp.show_location(!open);
+            }),
             entry("edit", self, |sftp| {
-                let target = sftp.imp().target.borrow().clone();
-                if let Some(item) = target.filter(|item| !item.is_directory) {
+                if let Some(item) = sftp.target().filter(|item| !item.is_directory) {
                     sftp.edit(&item);
                 }
             }),
             entry("download", self, |sftp| {
-                let target = sftp.imp().target.borrow().clone();
-                if let Some(item) = target {
-                    sftp.download(&item);
-                }
+                let targets = sftp.imp().targets.borrow().clone();
+                sftp.download(targets);
             }),
             entry("upload", self, |sftp| {
-                let target = sftp.imp().target.borrow().clone();
-                if let Some(item) = target.filter(|item| item.is_directory) {
+                if let Some(item) = sftp.folder_target() {
                     sftp.upload(&item.path, false);
                 }
             }),
             entry("upload-folder", self, |sftp| {
-                let target = sftp.imp().target.borrow().clone();
-                if let Some(item) = target.filter(|item| item.is_directory) {
+                if let Some(item) = sftp.folder_target() {
                     sftp.upload(&item.path, true);
                 }
             }),
@@ -524,8 +595,7 @@ impl TuniSftp {
                 sftp.upload(&root, true);
             }),
             entry("new-folder", self, |sftp| {
-                let target = sftp.imp().target.borrow().clone();
-                if let Some(item) = target.filter(|item| item.is_directory) {
+                if let Some(item) = sftp.folder_target() {
                     sftp.new_folder(&item.path);
                 }
             }),
@@ -533,21 +603,41 @@ impl TuniSftp {
                 let root = sftp.imp().tree.borrow().root().to_path_buf();
                 sftp.new_folder(&root);
             }),
+            entry("new-file", self, |sftp| {
+                if let Some(item) = sftp.folder_target() {
+                    sftp.new_file(&item.path);
+                }
+            }),
+            entry("new-file-here", self, |sftp| {
+                let root = sftp.imp().tree.borrow().root().to_path_buf();
+                sftp.new_file(&root);
+            }),
             entry("rename", self, |sftp| {
-                let target = sftp.imp().target.borrow().clone();
-                if let Some(item) = target {
+                if let Some(item) = sftp.target() {
                     sftp.rename(&item);
                 }
             }),
             entry("delete", self, |sftp| {
-                let target = sftp.imp().target.borrow().clone();
-                if let Some(item) = target {
-                    sftp.delete(&item);
+                let targets = sftp.imp().targets.borrow().clone();
+                sftp.delete(targets);
+            }),
+            entry("properties", self, |sftp| {
+                if let Some(item) = sftp.target() {
+                    sftp.properties(&item);
                 }
             }),
             entry("copy-path", self, |sftp| {
-                if let Some(item) = sftp.imp().target.borrow().as_ref() {
+                if let Some(item) = sftp.target() {
                     sftp.clipboard().set_text(&item.path.to_string_lossy());
+                }
+            }),
+            // Host and path in the one string `scp` and `rsync` take, under the
+            // name the pane connected with.
+            entry("copy-address", self, |sftp| {
+                let alias = sftp.imp().alias.borrow().clone();
+                if let (Some(alias), Some(item)) = (alias, sftp.target()) {
+                    let address = format!("{alias}:{}", item.path.to_string_lossy());
+                    sftp.clipboard().set_text(&address);
                 }
             }),
         ]);
@@ -808,8 +898,6 @@ impl TuniSftp {
 
     // --- moving files ---------------------------------------------------------
 
-    /// Copies a remote file to wherever the user says, or a folder and
-    /// everything in it into the folder the user picks.
     /// Opens a remote file in an editor pane, from a copy fetched over the
     /// browsing session; saving the pane sends the copy back.
     ///
@@ -870,21 +958,26 @@ impl TuniSftp {
         ));
     }
 
-    fn download(&self, item: &Item) {
-        let remote = item.path.to_string_lossy().into_owned();
-        let name = item.name.clone();
-        let is_directory = item.is_directory;
+    /// Copies one remote file to wherever the user says, or folders and
+    /// several files, each under its own name, into the folder the user picks.
+    fn download(&self, items: Vec<Item>) {
+        let one_file = match items.as_slice() {
+            [] => return,
+            [item] if !item.is_directory => Some(item.name.clone()),
+            _ => None,
+        };
         let dialog = gtk::FileDialog::builder()
-            .title(if is_directory {
-                "Download Folder"
-            } else {
-                "Download File"
+            .title(match items.as_slice() {
+                [item] if item.is_directory => "Download Folder",
+                [_] => "Download File",
+                _ => "Download",
             })
             .accept_label("Download")
             .build();
         if let Some(folder) = glib::user_special_dir(glib::UserDirectory::Downloads) {
             dialog.set_initial_folder(Some(&gio::File::for_path(folder)));
         }
+        let into_folder = one_file.is_none();
         let chosen = glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -892,19 +985,21 @@ impl TuniSftp {
                 let Some(local) = chosen.ok().and_then(|file| file.path()) else {
                     return;
                 };
-                let local = if is_directory {
-                    local.join(&name)
-                } else {
-                    local
-                };
-                this.start(Way::Down, remote, local);
+                for item in items {
+                    let local = if into_folder {
+                        local.join(&item.name)
+                    } else {
+                        local.clone()
+                    };
+                    this.start(Way::Down, item.path.to_string_lossy().into_owned(), local);
+                }
             }
         );
-        if is_directory {
-            dialog.select_folder(self.window().as_ref(), gio::Cancellable::NONE, chosen);
-        } else {
-            dialog.set_initial_name(Some(&item.name));
+        if let Some(name) = one_file {
+            dialog.set_initial_name(Some(&name));
             dialog.save(self.window().as_ref(), gio::Cancellable::NONE, chosen);
+        } else {
+            dialog.select_folder(self.window().as_ref(), gio::Cancellable::NONE, chosen);
         }
     }
 
@@ -1227,6 +1322,127 @@ impl TuniSftp {
         );
     }
 
+    /// Makes an empty file, refused rather than emptied when the name is
+    /// taken.
+    fn new_file(&self, directory: &Path) {
+        let directory = directory.to_path_buf();
+        self.ask(
+            "New File",
+            &format!("Inside “{}”", directory.to_string_lossy()),
+            "",
+            "Create",
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |name: String| {
+                    let Some(path) = this.named(&directory, &name) else {
+                        return;
+                    };
+                    this.change(directory.clone(), true, move |session| {
+                        session.create(&path)
+                    });
+                }
+            ),
+        );
+    }
+
+    /// What `ls -l` would say about one thing, with its permissions as nine
+    /// boxes to tick. The kind of file and the setuid, setgid and sticky bits
+    /// are kept as they were: nothing here offers them, so nothing here
+    /// changes them.
+    fn properties(&self, item: &Item) {
+        let Some(directory) = item.path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let details = item.details.unwrap_or_default();
+        let grid = gtk::Grid::builder()
+            .row_spacing(6)
+            .column_spacing(12)
+            .halign(gtk::Align::Center)
+            .build();
+        for (column, heading) in ["Read", "Write", "Run"].into_iter().enumerate() {
+            let label = gtk::Label::new(Some(heading));
+            label.add_css_class("dim-label");
+            grid.attach(&label, column as i32 + 1, 0, 1, 1);
+        }
+        let octal = gtk::Label::new(None);
+        octal.add_css_class("numeric");
+        let mut boxes = Vec::with_capacity(9);
+        for (row, who) in ["Owner", "Group", "Others"].into_iter().enumerate() {
+            let label = gtk::Label::builder().label(who).xalign(0.0).build();
+            grid.attach(&label, 0, row as i32 + 1, 1, 1);
+            for column in 0..3 {
+                let bit = 0o400 >> (row * 3 + column);
+                let check = gtk::CheckButton::builder()
+                    .active(details.mode & bit != 0)
+                    .halign(gtk::Align::Center)
+                    .build();
+                grid.attach(&check, column as i32 + 1, row as i32 + 1, 1, 1);
+                boxes.push((check, bit));
+            }
+        }
+        let boxes = Rc::new(boxes);
+        let kept = details.mode & 0o7000;
+        let mode = {
+            let boxes = Rc::clone(&boxes);
+            move || {
+                boxes
+                    .iter()
+                    .filter(|(check, _)| check.is_active())
+                    .fold(kept, |mode, (_, bit)| mode | bit)
+            }
+        };
+        let show = {
+            let mode = mode.clone();
+            let octal = octal.clone();
+            move || octal.set_text(&format!("{:04o}", mode()))
+        };
+        show();
+        for (check, _) in boxes.iter() {
+            let show = show.clone();
+            check.connect_toggled(move |_| show());
+        }
+        grid.attach(&octal, 0, 4, 4, 1);
+
+        let mut body = item.path.to_string_lossy().into_owned();
+        if item.details.is_some() {
+            body.push('\n');
+            if !item.is_directory {
+                body.push_str(&tuni_core::editor::size_text(details.size));
+                body.push_str(", ");
+            }
+            body.push_str("changed ");
+            body.push_str(&crate::files::when(details.mtime));
+        }
+        let dialog = adw::AlertDialog::new(Some(&item.name), Some(&body));
+        dialog.set_extra_child(Some(&grid));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("apply", "Apply");
+        dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("apply"));
+        dialog.set_close_response("cancel");
+        let path = item.path.to_string_lossy().into_owned();
+        let before = details.mode & 0o7777;
+        dialog.connect_response(
+            None,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_, response| {
+                    let after = mode();
+                    if response != "apply" || after == before {
+                        return;
+                    }
+                    let path = path.clone();
+                    this.change(directory.clone(), false, move |session| {
+                        session.chmod(&path, after)
+                    });
+                }
+            ),
+        );
+        dialog.present(Some(self));
+    }
+
     /// Gives one file or directory another name in the same directory.
     fn rename(&self, item: &Item) {
         let Some(directory) = item.path.parent().map(Path::to_path_buf) else {
@@ -1258,7 +1474,7 @@ impl TuniSftp {
         );
     }
 
-    /// Deletes a file, or a folder and everything in it.
+    /// Deletes files, and folders with everything in them.
     ///
     /// A folder is walked first, so the question can say what it holds, and
     /// then emptied from the bottom up.
@@ -1266,15 +1482,28 @@ impl TuniSftp {
     /// ponytail: walk and delete both hold the session the page browses with,
     /// one round trip a folder for the walk, so a big tree stops browsing
     /// until it is gone. On the carrier, behind the queue, if that matters.
-    fn delete(&self, item: &Item) {
-        let Some(directory) = item.path.parent().map(Path::to_path_buf) else {
+    fn delete(&self, items: Vec<Item>) {
+        if items.is_empty() {
             return;
-        };
+        }
         let Some(link) = self.imp().link.borrow().clone() else {
             return;
         };
-        let path = item.path.to_string_lossy().into_owned();
-        let name = item.name.clone();
+        let paths: Vec<String> = items
+            .iter()
+            .map(|item| item.path.to_string_lossy().into_owned())
+            .collect();
+        // Each directory something went from, read again once it is gone.
+        let mut directories: Vec<PathBuf> = items
+            .iter()
+            .filter_map(|item| item.path.parent().map(Path::to_path_buf))
+            .collect();
+        directories.sort();
+        directories.dedup();
+        let title = match items.as_slice() {
+            [item] => format!("Delete “{}”?", item.name),
+            _ => format!("Delete {} items?", items.len()),
+        };
         let generation = self.imp().generation.get();
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
@@ -1286,7 +1515,7 @@ impl TuniSftp {
                         return Err((ended(), true));
                     };
                     session
-                        .plan_delete(&path)
+                        .plan_delete(&paths)
                         .ok_or_else(|| (failed(&session), session.is_lost()))
                 })
                 .await
@@ -1308,16 +1537,23 @@ impl TuniSftp {
                     }
                 };
 
-                let body = match plan.inside() {
+                // `inside` counts under the one folder chosen, which says
+                // nothing true about several.
+                let inside = if items.len() == 1 {
+                    plan.inside().map(|inside| format!("It holds {inside}."))
+                } else {
+                    Some(format!("That is {}.", plan.count()))
+                };
+                let body = match inside {
                     Some(inside) => format!(
-                        "It holds {inside}. There is no trash on the other machine, \
+                        "{inside} There is no trash on the other machine, \
                          so all of it is gone for good."
                     ),
                     None => String::from(
                         "There is no trash on the other machine, so this is gone for good.",
                     ),
                 };
-                let dialog = adw::AlertDialog::new(Some(&format!("Delete “{name}”?")), Some(&body));
+                let dialog = adw::AlertDialog::new(Some(&title), Some(&body));
                 dialog.add_response("cancel", "Cancel");
                 dialog.add_response("delete", "Delete");
                 dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
@@ -1346,18 +1582,16 @@ impl TuniSftp {
                 if generation != this.imp().generation.get() {
                     return;
                 }
+                if let Err((failure, true)) = &done {
+                    this.lose(failure);
+                    return;
+                }
+                for directory in directories {
+                    this.list(directory, false);
+                }
                 match done {
-                    Err((failure, true)) => this.lose(&failure),
-                    Err((failure, false)) => {
-                        this.list(directory, false);
-                        this.report(&failure);
-                    }
-                    Ok(partly) => {
-                        this.list(directory, false);
-                        if let Some(partly) = partly {
-                            this.report(&partly);
-                        }
-                    }
+                    Err((failure, _)) | Ok(Some(failure)) => this.report(&failure),
+                    Ok(None) => {}
                 }
             }
         ));
@@ -1520,33 +1754,51 @@ impl TuniSftp {
         }
     }
 
+    /// The context menu for a row. A click on a row inside the selection acts
+    /// on all of it, and anywhere else selects that row alone first, which is
+    /// what a file manager does.
     fn popup_menu(&self, widget: &gtk::Box, item: &Item, position: u32, x: f64, y: f64) {
         let imp = self.imp();
         let (Some(menu), Some(list)) = (imp.menu.borrow().clone(), imp.list.borrow().clone())
         else {
             return;
         };
-        if let Some(selection) = list.model().and_downcast::<gtk::SingleSelection>() {
-            selection.set_selected(position);
+        if let Some(selection) = list.model()
+            && !selection.is_selected(position)
+        {
+            selection.select_item(position, true);
         }
-        imp.target.replace(Some(item.clone()));
+        let mut targets = self.selected();
+        if targets.is_empty() {
+            targets.push(item.clone());
+        }
+        let many = targets.len() > 1;
+        imp.targets.replace(targets);
+
         let model = gio::Menu::new();
         let move_files = gio::Menu::new();
-        if !item.is_directory {
-            move_files.append(Some("Edit"), Some("sftp.edit"));
-        }
-        move_files.append(Some("Download…"), Some("sftp.download"));
-        if item.is_directory {
-            move_files.append(Some("Upload File Here…"), Some("sftp.upload"));
-            move_files.append(Some("Upload Folder Here…"), Some("sftp.upload-folder"));
-            move_files.append(Some("New Folder…"), Some("sftp.new-folder"));
-        }
-        move_files.append(Some("Copy Path"), Some("sftp.copy-path"));
-        model.append_section(None, &move_files);
-
         let edit = gio::Menu::new();
-        edit.append(Some("Rename…"), Some("sftp.rename"));
-        edit.append(Some("Delete…"), Some("sftp.delete"));
+        if many {
+            move_files.append(Some("Download…"), Some("sftp.download"));
+            edit.append(Some("Delete…"), Some("sftp.delete"));
+        } else {
+            if !item.is_directory {
+                move_files.append(Some("Edit"), Some("sftp.edit"));
+            }
+            move_files.append(Some("Download…"), Some("sftp.download"));
+            if item.is_directory {
+                move_files.append(Some("Upload File Here…"), Some("sftp.upload"));
+                move_files.append(Some("Upload Folder Here…"), Some("sftp.upload-folder"));
+                move_files.append(Some("New File…"), Some("sftp.new-file"));
+                move_files.append(Some("New Folder…"), Some("sftp.new-folder"));
+            }
+            move_files.append(Some("Copy Path"), Some("sftp.copy-path"));
+            move_files.append(Some("Copy Remote Address"), Some("sftp.copy-address"));
+            edit.append(Some("Rename…"), Some("sftp.rename"));
+            edit.append(Some("Properties…"), Some("sftp.properties"));
+            edit.append(Some("Delete…"), Some("sftp.delete"));
+        }
+        model.append_section(None, &move_files);
         model.append_section(None, &edit);
         menu.set_menu_model(Some(&model));
 
@@ -1554,6 +1806,128 @@ impl TuniSftp {
             .compute_point(&list, &gtk::graphene::Point::new(x as f32, y as f32))
             .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
         crate::menu::popup_at(&menu, point);
+    }
+
+    /// The rows selected now, top to bottom.
+    fn selected(&self) -> Vec<Item> {
+        let Some(model) = self
+            .imp()
+            .list
+            .borrow()
+            .as_ref()
+            .and_then(|list| list.model())
+        else {
+            return Vec::new();
+        };
+        let set = model.selection();
+        let Some((rest, first)) = gtk::BitsetIter::init_first(&set) else {
+            return Vec::new();
+        };
+        std::iter::once(first)
+            .chain(rest)
+            .filter_map(|position| model.item(position).and_downcast::<Row>())
+            .filter_map(|row| row.item())
+            .collect()
+    }
+
+    /// The one row a menu was opened on, for the actions that act on one.
+    fn target(&self) -> Option<Item> {
+        match self.imp().targets.borrow().as_slice() {
+            [item] => Some(item.clone()),
+            _ => None,
+        }
+    }
+
+    fn folder_target(&self) -> Option<Item> {
+        self.target().filter(|item| item.is_directory)
+    }
+
+    /// Goes to a path typed into the bar. `~` is wherever the session started,
+    /// which is the far end's home, and a path that is not absolute starts
+    /// from the directory being shown, the way `cd` would take it.
+    fn go_to(&self, text: &str) {
+        let imp = self.imp();
+        let Some(link) = imp.link.borrow().clone() else {
+            return;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let asked = match text.strip_prefix('~') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                format!(".{rest}")
+            }
+            _ if text.starts_with('/') => text.to_owned(),
+            _ => imp
+                .tree
+                .borrow()
+                .root()
+                .join(text)
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let generation = imp.generation.get();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let Ok((found, lost)) = gio::spawn_blocking(move || {
+                    let Ok(mut session) = link.lock() else {
+                        return (None, Some(ended()));
+                    };
+                    let found = session.realpath(&asked).and_then(|path| {
+                        let is_directory = session.stat(&path)?.is_directory;
+                        Some((path, is_directory))
+                    });
+                    (found, gone(&session))
+                })
+                .await
+                else {
+                    return;
+                };
+                if generation != this.imp().generation.get() {
+                    return;
+                }
+                if let Some(failure) = lost {
+                    this.lose(&failure);
+                    return;
+                }
+                match found {
+                    Some((path, true)) => {
+                        this.show_location(false);
+                        this.browse(Path::new(&path));
+                    }
+                    _ => {
+                        if let Some(location) = this.imp().location.borrow().as_ref() {
+                            location.add_css_class("error");
+                        }
+                    }
+                }
+            }
+        ));
+    }
+
+    fn show_location(&self, show: bool) {
+        let imp = self.imp();
+        let (Some(bar), Some(location)) = (
+            imp.location_bar.borrow().clone(),
+            imp.location.borrow().clone(),
+        ) else {
+            return;
+        };
+        if show && imp.link.borrow().is_none() {
+            return;
+        }
+        location.remove_css_class("error");
+        bar.set_reveal_child(show);
+        if show {
+            location.set_text(&imp.tree.borrow().root().to_string_lossy());
+            location.set_position(-1);
+            location.grab_focus();
+        } else if let Some(list) = imp.list.borrow().as_ref() {
+            list.grab_focus();
+        }
     }
 
     /// A name typed into a dialog, joined onto the directory it belongs in.
@@ -1684,6 +2058,11 @@ fn rows(session: &mut Session, directory: &str) -> Option<Vec<Item>> {
                 path,
                 is_directory,
                 depth: 0,
+                details: Some(tuni_core::files::Details {
+                    size: entry.size,
+                    mtime: entry.mtime,
+                    mode: entry.mode,
+                }),
             }
         })
         .collect();

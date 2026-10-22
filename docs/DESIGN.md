@@ -943,6 +943,35 @@ should have answered, and the dialog says that something is already there with
 that name, or that the directory still has something in it, rather than repeating
 the far end's least useful word. That costs nothing until something goes wrong.
 
+A file's row carries its size at the right edge, and its tooltip adds the
+permissions as `ls -l` spells them and when it was last changed, all of it from
+the attributes the listing already brought back, so none of it costs a request.
+A folder shows no size because the far end's number for one is the size of the
+directory entry, not of what is in it, and adding that up is a walk. The list
+takes a selection the way the desktop's does, Ctrl and Shift with the click, and
+the row menu acts on all of it when the row it opened on is part of it:
+"Download…" asks for a folder and sends each item there, "Delete…" counts
+everything that goes in one question, and a file picked along with the folder
+that holds it is deleted once rather than failing the second time. The items are
+taken when the menu opens rather than when it is clicked, because a listing that
+lands in between rebuilds the rows and would hand the action a different set.
+Delete, F2 and Ctrl+L on the list are the menu's Delete, Rename and the typed
+path; the keys are read with Caps Lock and Num Lock masked off, since a Delete
+that only works with Caps Lock off is a key that sometimes does nothing. The
+typed path is the Files page's own bar: `~` is the far end's home, a relative
+path starts at the root being shown, and the answer is the far end's `realpath`
+and `stat`, so a name that is not a directory turns the bar red instead of
+listing nothing. "New File…" creates with the exclusive flag, which refuses a
+name that is taken rather than truncating what is there. "Properties…" shows
+the nine read, write and run bits as boxes with the octal beside them and sends
+a `chmod` only when a box changed; setuid, setgid and sticky are kept as they
+were, since a checkbox for them is a way to switch one off by accident.
+"Copy Remote Address" puts `alias:path` on the clipboard, which is what `scp`
+and `rsync` take. Hidden files are dimmed rather than filtered, as on the Files
+page, and there is no "Open Terminal Here": a pane on that host is the one
+already open, and typing a `cd` into it would land in whatever program it is
+running.
+
 A file on the host opens in an editor pane: activate its row, or "Edit" in its
 menu. The file is fetched into `$XDG_RUNTIME_DIR/tuni/sftp/<alias>/<path>`, a
 place named by nothing but the host and the path, so the same file opened twice
