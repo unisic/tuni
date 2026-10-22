@@ -2866,8 +2866,11 @@ impl TuniWindow {
                         tuni_core::ssh::Control::new(persist, shared).is_live(&destination)
                     })
                     .await;
+                    // Into this pane only. `send_text` is what the keyboard
+                    // goes through, and in a tab that broadcasts it would type
+                    // one host's snippet into every other pane in the tab.
                     if live.unwrap_or(false) {
-                        terminal.send_text(&body);
+                        terminal.send_bytes(body.as_bytes());
                     }
                     return;
                 }
