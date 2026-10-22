@@ -64,8 +64,8 @@ impl Directory for Listed {
 
 mod imp {
     use super::{
-        Arc, Cell, HashSet, Item, Job, Link, Listed, Moved, PathBuf, RefCell, Tree, VecDeque, gio,
-        glib,
+        Arc, Cell, HashSet, Item, Job, Link, Listed, Moved, PathBuf, RefCell, Session, Tree,
+        VecDeque, gio, glib,
     };
     use adw::prelude::*;
     use adw::subclass::prelude::*;
@@ -75,6 +75,12 @@ mod imp {
         pub tree: RefCell<Tree>,
         pub listed: RefCell<Listed>,
         pub link: RefCell<Option<Link>>,
+        /// A second session that only carries files, so a long one does not
+        /// hold the listing behind its lock. Opened by the first transfer
+        /// rather than with the page, since most visits never move a file,
+        /// and kept until the host changes. A transfer takes it and hands it
+        /// back, which is all the sharing one transfer at a time needs.
+        pub carrier: RefCell<Option<Session>>,
         /// The host being browsed, and nothing at all when no pane is on one.
         pub alias: RefCell<Option<String>>,
         /// Bumped when the host changes. A listing already in flight names the
@@ -97,9 +103,9 @@ mod imp {
         pub progress: RefCell<Option<gtk::ProgressBar>>,
         /// The bar and its cancel button, shown and hidden as one.
         pub progress_row: RefCell<Option<gtk::Box>>,
-        /// The transfer running, if one is. One pipe carries one at a time, so
-        /// a second would sit behind the lock with nothing on screen saying
-        /// why; this is what refuses it instead.
+        /// The transfer running, if one is. The carrier moves one at a time,
+        /// so a second would wait for it with nothing on screen saying why;
+        /// this is what refuses it instead.
         pub moving: RefCell<Option<Arc<Moved>>>,
         /// What is waiting for the pipe, in the order it was asked for. A drop
         /// of a directory's worth of files fills this and empties it one file
@@ -549,9 +555,9 @@ impl TuniSftp {
         imp.pending.borrow_mut().clear();
         // Queued against the host that is going away, and every one of them
         // names a path on it. The history goes with them, for the same reason.
-        // The one already moving is stopped too: it holds its own handle on
-        // the old session, and left going it would keep the pipe to a host
-        // the page has left and hold back whatever is asked of the new one.
+        // The one already moving is stopped too: it holds the old host's
+        // carrier, and left going it would keep a pipe to a host the page has
+        // left and hold back whatever the new one is asked to carry.
         imp.queue.borrow_mut().clear();
         if let Some(moved) = imp.moving.borrow().as_ref() {
             moved.stop.store(true, Ordering::Relaxed);
@@ -562,6 +568,7 @@ impl TuniSftp {
         // Dropped, which kills the child and lets the master close the
         // channel. A session is one host's, and this is another host now.
         imp.link.replace(None);
+        imp.carrier.replace(None);
         *imp.tree.borrow_mut() = Tree::new();
         self.reload();
         self.refresh_header();
@@ -592,6 +599,7 @@ impl TuniSftp {
     fn lose(&self, failure: &Failure) {
         let imp = self.imp();
         imp.link.replace(None);
+        imp.carrier.replace(None);
         imp.queue.borrow_mut().clear();
         imp.pending.borrow_mut().clear();
         self.fail(&failure.message, &failure.detail);
@@ -918,16 +926,19 @@ impl TuniSftp {
 
     /// Moves one file, and draws how far it has got while it goes.
     ///
-    /// One at a time, since the session is a single pipe behind a lock: a
-    /// second transfer would wait there with nothing on screen to say why. What
-    /// is waiting waits in [`imp::TuniSftp::queue`] instead, where the bar can
-    /// count it.
+    /// One at a time, on [`imp::TuniSftp::carrier`] rather than the session
+    /// the page lists with, so browsing goes on while a file moves. What is
+    /// waiting waits in [`imp::TuniSftp::queue`], where the bar can count it.
     fn transfer(&self, job: Job) {
         let Job { way, remote, local } = job;
         let imp = self.imp();
-        let Some(link) = imp.link.borrow().clone() else {
+        let Some(alias) = imp.alias.borrow().clone() else {
             return;
         };
+        if imp.link.borrow().is_none() {
+            return;
+        }
+        let carrier = imp.carrier.take();
         let moved = Arc::new(Moved::default());
         imp.moving.replace(Some(Arc::clone(&moved)));
 
@@ -954,8 +965,20 @@ impl TuniSftp {
             self,
             async move {
                 let moved = gio::spawn_blocking(move || {
-                    let Ok(mut session) = link.lock() else {
-                        return Err((ended(), true));
+                    // Opened the way the page's own session was. Over a shared
+                    // connection that is one more channel on the master;
+                    // without one it is a second login, as unattended as the
+                    // first.
+                    let mut session = match carrier {
+                        Some(session) => session,
+                        None => {
+                            let host = tuni_core::ssh::host(&alias);
+                            let control = crate::hosts::control();
+                            match Session::open(&tuni_core::ssh::sftp_command(&host, &control)) {
+                                Ok(session) => session,
+                                Err(failure) => return (Err((failure, false)), None),
+                            }
+                        }
                     };
                     let mut note = |done: u64, total: u64| {
                         moved.done.store(done, Ordering::Relaxed);
@@ -969,9 +992,20 @@ impl TuniSftp {
                         Way::Up => session.put(&local, &remote, &mut note),
                         Way::Down => session.get(&remote, &local, &mut note),
                     };
-                    done.ok_or_else(|| (failed(&session), session.is_lost()))
+                    let done = done.ok_or_else(|| (failed(&session), session.is_lost()));
+                    // A session that will not answer again ends here, and the
+                    // next file opens another.
+                    (done, (!session.is_lost()).then_some(session))
                 })
                 .await;
+                let moved = moved.map(|(done, session)| {
+                    // Back for the next file, unless the page is on another
+                    // host by now.
+                    if generation == this.imp().generation.get() {
+                        this.imp().carrier.replace(session);
+                    }
+                    done
+                });
 
                 this.imp().moving.replace(None);
                 if let Some(row) = this.imp().progress_row.borrow().as_ref() {

@@ -848,8 +848,8 @@ host that cannot be reached every two seconds for as long as the page is open.
 A name in a listing that holds a slash or a NUL, or is empty, is left out: a
 name is one component, and a server sending `../x` is either broken or hoping
 something here joins it onto a path. A change of host stops the transfer that is
-moving, whose handle on the old session would otherwise keep that pipe busy
-while the new host's files wait behind it.
+moving, which would otherwise keep a pipe to the old host busy while the new
+host's files wait behind it.
 
 Files move one at a time. Both ways a file is written beside where it is going
 under a dotted name and renamed onto it once it is whole, the discipline the
@@ -881,10 +881,13 @@ and widens it with every read answered in full, the way OpenSSH's client does,
 so a small file costs what it did. Answers may come back in any order and each
 lands at its own offset. A cancel or a refusal stops asking and still waits for
 what is in flight, so the next request on the session meets its own answer
-rather than a stale one. A second transfer waits
-behind the first in a queue the bar counts down, since one pipe carries one file
-and a request blocked on a lock is the thing with nothing on screen to say so. A
-failure empties that queue rather than trying the rest: whatever the far end
+rather than a stale one. Files travel on a session of their own, opened by the
+first transfer and kept until the host changes, so the listing goes on
+answering while a large file is under way. Over a shared connection that is one
+more channel on the master; without one it is a second login, as unattended as
+the first. A second transfer waits behind the first in a queue the bar counts
+down, since a request waiting on a busy session is the thing with nothing on
+screen to say so. A failure empties that queue rather than trying the rest: whatever the far end
 refused this file for is what the ones behind it were about to meet, and the
 dialog says how many were left where they are.
 
