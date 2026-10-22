@@ -1106,9 +1106,20 @@ fn render(hosts: &[Host]) -> Result<String, String> {
             if extra.contains(['\n', '\r', '\0']) {
                 return Err(format!("{extra} cannot be an option"));
             }
-            let keyword = extra.split_whitespace().next().unwrap_or_default();
-            if keyword.eq_ignore_ascii_case("host") || keyword.eq_ignore_ascii_case("match") {
-                return Err(format!("{keyword} would start another host's block"));
+            // The keyword found the way ssh finds it, which ends at an `=` as
+            // well as at a space: `Host=*` and a quoted `"Host" *` both open a
+            // block to ssh. Every keyword ssh has is letters and digits, so a
+            // quote or anything else in its place is refused rather than
+            // guessed at. A line that is only a comment has no keyword and
+            // carries nothing.
+            if let Some((keyword, _)) = split(extra) {
+                if keyword.is_empty() || !keyword.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    return Err(format!("{extra} cannot be an option"));
+                }
+                if keyword == "host" || keyword == "match" {
+                    let typed = &extra[..keyword.len()];
+                    return Err(format!("{typed} would start another host's block"));
+                }
             }
             out.push_str(&format!("    {extra}\n"));
         }
@@ -2395,6 +2406,26 @@ mod tests {
             ..Host::default()
         };
         assert!(render(&[smuggled]).is_err());
+    }
+
+    #[test]
+    fn a_host_line_spelled_with_an_equals_sign_is_still_refused() {
+        // Each of these opens a block to `ssh -G`, checked by hand against
+        // OpenSSH 10.
+        for line in ["Host=*", "\"Host\" *", "MATCH all", "host\t*", "=Host *"] {
+            let smuggled = Host {
+                alias: "web".to_owned(),
+                extra: vec![line.to_owned()],
+                ..Host::default()
+            };
+            assert!(render(&[smuggled]).is_err(), "{line} was written");
+        }
+        let fine = Host {
+            alias: "web".to_owned(),
+            extra: vec!["ServerAliveInterval=30".to_owned(), "# a note".to_owned()],
+            ..Host::default()
+        };
+        assert!(render(&[fine]).is_ok());
     }
 
     #[test]
