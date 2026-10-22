@@ -2057,6 +2057,13 @@ struct Line {
 
 /// Reads one file and everything it includes, in place, so a block opened
 /// before an `Include` and continued after it stays one block.
+///
+/// In place the way ssh reads it, which is not quite line for line: ssh puts
+/// the block that was open back after each included file, so what an included
+/// file says before its first `Host` and what follows the `Include` both
+/// belong to the block around it. The blocks an included file opens are held
+/// back until that block ends, which keeps every line in the block ssh reads
+/// it in without a marker the parser would have to learn.
 fn flatten(
     path: &Path,
     base: &Path,
@@ -2076,6 +2083,7 @@ fn flatten(
         return Vec::new();
     };
     let mut lines = Vec::new();
+    let mut held = Vec::new();
     for (index, text) in text.lines().enumerate() {
         if text.trim().is_empty() {
             continue;
@@ -2085,10 +2093,19 @@ fn flatten(
         {
             for glob in words(&value) {
                 for file in expand(&glob, base) {
-                    lines.extend(flatten(&file, base, depth + 1, seen, read));
+                    let mut included = flatten(&file, base, depth + 1, seen, read);
+                    let opens = included
+                        .iter()
+                        .position(|line| opens_block(&line.text))
+                        .unwrap_or(included.len());
+                    held.extend(included.split_off(opens));
+                    lines.extend(included);
                 }
             }
             continue;
+        }
+        if opens_block(text) {
+            lines.append(&mut held);
         }
         lines.push(Line {
             path: path.clone(),
@@ -2096,7 +2113,12 @@ fn flatten(
             text: text.to_owned(),
         });
     }
+    lines.append(&mut held);
     lines
+}
+
+fn opens_block(text: &str) -> bool {
+    split(text).is_some_and(|(keyword, _)| keyword == "host" || keyword == "match")
 }
 
 /// The block being read, held open until the next `Host`, `Match` or the end
@@ -2720,6 +2742,43 @@ Host key verification failed.
         // `Include`, and the block the included file opens survives it.
         assert_eq!(hosts.get("web").expect("web").user, "deploy");
         assert_eq!(hosts.get("db").expect("db").port, 5433);
+    }
+
+    #[test]
+    fn what_follows_an_include_belongs_to_the_block_around_it() {
+        // Checked against `ssh -G`: `web` gets `User after` and the second
+        // file's leading `Compression yes`, and at the top level the line
+        // after the `Include` is global rather than the last included host's.
+        let directory = tempdir();
+        fs::write(directory.join("a.conf"), "Host db\n  Port 5433\n").expect("write");
+        fs::write(
+            directory.join("b.conf"),
+            "Compression yes\nHost beta\n  Port 2\n",
+        )
+        .expect("write");
+        let path = directory.join("config");
+        fs::write(
+            &path,
+            "Host web\n  Include *.conf\n  User after\nHost other\n  Port 7\n",
+        )
+        .expect("write");
+        let hosts = Hosts::read_from(&path);
+        let web = hosts.get("web").expect("web");
+        assert_eq!(web.user, "after");
+        assert!(web.extra.iter().any(|line| line.contains("Compression")));
+        assert_eq!(hosts.get("beta").expect("beta").user, "");
+        assert_eq!(hosts.get("beta").expect("beta").port, 2);
+
+        fs::write(&path, "Include *.conf\nUser global\nHost other\n").expect("write");
+        assert_eq!(Hosts::read_from(&path).get("beta").expect("beta").user, "");
+        assert!(
+            !Hosts::read_from(&path)
+                .get("beta")
+                .expect("beta")
+                .extra
+                .iter()
+                .any(|line| line.contains("global"))
+        );
     }
 
     #[test]
