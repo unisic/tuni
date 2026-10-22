@@ -3158,17 +3158,27 @@ Host key verification failed.
             "{refused}"
         );
 
-        // The far end's ports are the far end's business, and a forward that
-        // asks for whichever port is free cannot be checked at all.
-        drop(held);
-        assert!(check_port(&taken).is_ok());
+        // The far end's ports are the far end's business, so a remote forward
+        // on the very port held here passes, and a forward that asks for
+        // whichever port is free cannot be checked at all. Both asked while the
+        // port is still held: once it is let go, anything on the machine that
+        // binds port 0, another test included, can be handed it before this
+        // looks, which is how a check that it had come free used to fail.
         assert!(
             check_port(&Forward {
                 direction: Direction::Remote,
+                ..taken.clone()
+            })
+            .is_ok()
+        );
+        assert!(
+            check_port(&Forward {
+                listen_port: 0,
                 ..taken
             })
             .is_ok()
         );
+        drop(held);
     }
 
     #[test]
