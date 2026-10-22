@@ -391,6 +391,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+,` | Preferences |
 | `Ctrl+S` | Save the file in the focused pane |
 | `Ctrl+Shift+P` | The command palette |
+| `Ctrl+Shift+S` | The command palette with only the snippets in it |
 | `Ctrl+Shift+F` | Find in the pane that has the keyboard; Enter and `Shift+Enter` walk the matches, `Escape` closes |
 | `F3` / `Shift+F3` | Next match, previous match |
 | `Ctrl+Shift+H` | Find and replace in the file pane that has the keyboard |
@@ -815,8 +816,10 @@ is a race, and the real failure path is still there: the check only makes the
 ordinary case readable.
 
 Snippets are a file of the same kind, `{name, body}` in
-`~/.config/tuni/ssh/snippets.json`, offered by name in the command palette. One
-is typed into the pane that has the keyboard rather than run behind it, so it
+`~/.config/tuni/ssh/snippets.json`, offered by name in the command palette and
+on their own on `Ctrl+Shift+S`, which is the palette with everything else taken
+out. With none written yet that key opens the list they are written in. One is
+typed into the pane that has the keyboard rather than run behind it, so it
 works against whatever shell is there, on this machine or the far end, and what
 ran is on the screen where the person who ran it can read it. The last character
 carries the rest of the meaning: a body ending in a newline runs, one that does

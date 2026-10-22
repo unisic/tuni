@@ -1247,6 +1247,7 @@ impl TuniWindow {
             entry("snippets", None, |window, _| {
                 crate::snippets::present(window);
             }),
+            entry("pick-snippet", None, |window, _| window.pick_snippet()),
             entry("keys", None, |window, _| {
                 crate::keys::present(
                     window,
@@ -5038,7 +5039,23 @@ impl TuniWindow {
     }
 
     fn show_palette(&self) {
-        crate::palette::present(self, self.palette_entries());
+        crate::palette::present(
+            self,
+            self.palette_entries(),
+            "Search commands and terminals",
+        );
+    }
+
+    /// The palette with the snippets in it and nothing else, for somebody who
+    /// knows it is a snippet they want. With none written yet it is the list
+    /// they are written in instead, rather than a palette with no rows.
+    fn pick_snippet(&self) {
+        let entries = snippet_entries();
+        if entries.is_empty() {
+            crate::snippets::present(self);
+        } else {
+            crate::palette::present(self, entries, "Search snippets");
+        }
     }
 
     /// What the palette lists: the window's own actions, every host ssh knows
@@ -5080,18 +5097,7 @@ impl TuniWindow {
             });
         }
 
-        for snippet in tuni_core::snippets::Snippets::load().all() {
-            entries.push(palette::Entry {
-                search: format!("{} snippet run", snippet.name),
-                title: snippet.name.clone(),
-                subtitle: Some(crate::snippets::summary(&snippet.body)),
-                icon: "text-x-generic-symbolic",
-                shortcut: None,
-                action: "win.run-snippet",
-                target: Some(snippet.name.to_variant()),
-                terminal: false,
-            });
-        }
+        entries.extend(snippet_entries());
 
         let workspace = self.imp().workspace.borrow();
         let selected = workspace.selected_id();
@@ -5794,6 +5800,24 @@ impl TuniWindow {
             ),
         );
     }
+}
+
+/// A palette row per snippet, each running it by name.
+fn snippet_entries() -> Vec<palette::Entry> {
+    tuni_core::snippets::Snippets::load()
+        .all()
+        .iter()
+        .map(|snippet| palette::Entry {
+            search: format!("{} snippet run", snippet.name),
+            title: snippet.name.clone(),
+            subtitle: Some(crate::snippets::summary(&snippet.body)),
+            icon: "text-x-generic-symbolic",
+            shortcut: None,
+            action: "win.run-snippet",
+            target: Some(snippet.name.to_variant()),
+            terminal: false,
+        })
+        .collect()
 }
 
 /// What a host asked to have typed once it answers, if it asked for anything
