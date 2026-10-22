@@ -166,9 +166,10 @@ pub struct Plan {
     /// sentence.
     pub skipped: usize,
     pub left_out: Option<String>,
-    /// Whether the folder lands on one of the same name that is already
-    /// there, so that a file in both is replaced.
-    pub merges: bool,
+    /// Whether what is at the top lands on something of the same name and
+    /// kind that is already there: a file that it replaces, or a folder it
+    /// goes into, so that a file in both is replaced.
+    pub replaces: bool,
 }
 
 impl Plan {
@@ -373,6 +374,10 @@ pub struct Job {
     pub way: Way,
     pub remote: String,
     pub local: PathBuf,
+    /// Whether the name it lands on was chosen in a dialog that has already
+    /// asked about replacing what is there, so asking again would be asking
+    /// twice.
+    pub asked: bool,
 }
 
 impl Job {
@@ -407,7 +412,14 @@ pub struct Queue {
 
 impl Queue {
     /// Puts a job at the back and returns its id.
-    pub fn push(&mut self, alias: &str, way: Way, remote: String, local: PathBuf) -> u64 {
+    pub fn push(
+        &mut self,
+        alias: &str,
+        way: Way,
+        remote: String,
+        local: PathBuf,
+        asked: bool,
+    ) -> u64 {
         self.next += 1;
         self.waiting.push_back(Job {
             id: self.next,
@@ -415,6 +427,7 @@ impl Queue {
             way,
             remote,
             local,
+            asked,
         });
         self.next
     }
@@ -1067,6 +1080,9 @@ impl Session {
             size: if data.is_file() { data.len() } else { 0 },
         };
         if data.is_file() {
+            plan.replaces = self
+                .probe(|session| session.stat(remote))
+                .is_some_and(|entry| !entry.is_directory);
             plan.add(top);
             return Some(plan);
         }
@@ -1077,7 +1093,7 @@ impl Session {
             ));
             return None;
         }
-        plan.merges = self
+        plan.replaces = self
             .probe(|session| session.stat(remote))
             .is_some_and(|entry| entry.is_directory);
         if !plan.add(top) || !gather_here(&mut plan, local, remote, 1) {
@@ -1101,7 +1117,11 @@ impl Session {
             return None;
         }
         let mut plan = Plan {
-            merges: top.is_directory && local.is_dir(),
+            replaces: if top.is_directory {
+                local.is_dir()
+            } else {
+                local.is_file()
+            },
             ..Plan::default()
         };
         plan.add(Step {
@@ -1152,7 +1172,7 @@ impl Session {
     /// account may not read is no reason to leave the other two hundred where
     /// they are. A cancel or a lost connection stops it there. A directory
     /// that is already there is gone into rather than refused, which is what
-    /// [`Plan::merges`] warned about.
+    /// [`Plan::replaces`] warned about.
     ///
     /// ponytail: one file at a time, about six round trips each before its
     /// bytes, so a tree of many small files is as slow as the link is far.
@@ -2852,14 +2872,17 @@ mod tests {
                 format!("{there}/sub/b.txt"),
             ]
         );
-        assert_eq!((plan.bytes, plan.skipped, plan.merges), (10, 1, false));
+        assert_eq!((plan.bytes, plan.skipped, plan.replaces), (10, 1, false));
         let report = session.copy(Way::Up, &plan, &mut |_, _| true);
         assert_eq!((report.done, report.failed, report.stopped), (4, 0, false));
         assert!(!root.join("there/link").exists());
 
         let back = root.join("back");
         let plan = session.plan_download(&there, &back).expect("planned");
-        assert_eq!((plan.steps.len(), plan.bytes, plan.merges), (4, 10, false));
+        assert_eq!(
+            (plan.steps.len(), plan.bytes, plan.replaces),
+            (4, 10, false)
+        );
         let mut seen = 0;
         let report = session.copy(Way::Down, &plan, &mut |at, total| {
             seen = at;
@@ -2877,6 +2900,37 @@ mod tests {
     }
 
     #[test]
+    fn a_file_onto_a_file_of_the_same_name_is_a_replace_either_way_and_onto_nothing_is_not() {
+        let root = scratch("replace");
+        std::fs::create_dir_all(root.join("here")).unwrap();
+        std::fs::create_dir_all(root.join("there")).unwrap();
+        std::fs::write(root.join("here/a.txt"), "new").unwrap();
+        std::fs::write(root.join("there/a.txt"), "old").unwrap();
+        let mut session = real_server();
+
+        let onto = text(&root.join("there/a.txt"));
+        let plan = session
+            .plan_upload(&root.join("here/a.txt"), &onto)
+            .unwrap();
+        assert!(plan.replaces);
+        let fresh = text(&root.join("there/b.txt"));
+        let plan = session
+            .plan_upload(&root.join("here/a.txt"), &fresh)
+            .unwrap();
+        assert!(!plan.replaces);
+
+        let plan = session
+            .plan_download(&onto, &root.join("here/a.txt"))
+            .unwrap();
+        assert!(plan.replaces);
+        let plan = session
+            .plan_download(&onto, &root.join("here/c.txt"))
+            .unwrap();
+        assert!(!plan.replaces);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_folder_sent_onto_one_of_the_same_name_replaces_what_is_in_both_and_keeps_the_rest() {
         let root = scratch("merge");
         std::fs::create_dir_all(root.join("here")).unwrap();
@@ -2889,7 +2943,7 @@ mod tests {
         let plan = session
             .plan_upload(&root.join("here"), &text(&root.join("there")))
             .unwrap();
-        assert!(plan.merges);
+        assert!(plan.replaces);
         let report = session.copy(Way::Up, &plan, &mut |_, _| true);
         assert_eq!((report.done, report.failed), (2, 0));
         assert_eq!(
@@ -2972,7 +3026,13 @@ mod tests {
     fn a_failure_gives_up_on_its_own_host_and_leaves_the_others_waiting() {
         let mut queue = Queue::default();
         let push = |queue: &mut Queue, alias: &str, name: &str| {
-            queue.push(alias, Way::Up, format!("/srv/{name}"), PathBuf::from(name))
+            queue.push(
+                alias,
+                Way::Up,
+                format!("/srv/{name}"),
+                PathBuf::from(name),
+                false,
+            )
         };
         push(&mut queue, "web", "a");
         push(&mut queue, "web", "b");
@@ -3004,8 +3064,8 @@ mod tests {
     #[test]
     fn a_job_is_cancelled_by_its_id_after_the_queue_has_moved() {
         let mut queue = Queue::default();
-        let first = queue.push("web", Way::Down, "/a".into(), "a".into());
-        let second = queue.push("web", Way::Down, "/b".into(), "b".into());
+        let first = queue.push("web", Way::Down, "/a".into(), "a".into(), false);
+        let second = queue.push("web", Way::Down, "/b".into(), "b".into(), false);
         assert_eq!(queue.pop().map(|job| job.id), Some(first));
         assert!(!queue.remove(first), "running is not waiting");
         assert!(queue.remove(second));
@@ -3017,7 +3077,13 @@ mod tests {
     fn the_failed_list_keeps_the_newest_and_cancelling_the_rest_keeps_it() {
         let mut queue = Queue::default();
         for name in 0..=FAILED_KEPT {
-            let id = queue.push("web", Way::Up, format!("/{name}"), name.to_string().into());
+            let id = queue.push(
+                "web",
+                Way::Up,
+                format!("/{name}"),
+                name.to_string().into(),
+                false,
+            );
             let job = queue.pop().unwrap();
             assert_eq!(job.id, id);
             queue.fail(job, Failure::new("No.", ""), false);
@@ -3025,7 +3091,7 @@ mod tests {
         assert_eq!(queue.failed().len(), FAILED_KEPT);
         assert_eq!(queue.failed()[0].0.name(), "1");
 
-        queue.push("web", Way::Up, "/x".into(), "x".into());
+        queue.push("web", Way::Up, "/x".into(), "x".into(), false);
         queue.clear();
         assert!(queue.waiting().is_empty());
         assert_eq!(queue.failed().len(), FAILED_KEPT);

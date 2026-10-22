@@ -1050,7 +1050,13 @@ impl TuniSftp {
                     } else {
                         local.clone()
                     };
-                    this.start(Way::Down, item.path.to_string_lossy().into_owned(), local);
+                    // A name typed into the save dialog was asked about there.
+                    this.start(
+                        Way::Down,
+                        item.path.to_string_lossy().into_owned(),
+                        local,
+                        !into_folder,
+                    );
                 }
             }
         );
@@ -1088,7 +1094,7 @@ impl TuniSftp {
                     return;
                 };
                 let remote = directory.join(name).to_string_lossy().into_owned();
-                this.start(Way::Up, remote, local);
+                this.start(Way::Up, remote, local, false);
             }
         );
         if folder {
@@ -1116,7 +1122,7 @@ impl TuniSftp {
                 continue;
             };
             let remote = directory.join(name).to_string_lossy().into_owned();
-            self.start(Way::Up, remote, local.clone());
+            self.start(Way::Up, remote, local.clone(), false);
             any = true;
         }
         any
@@ -1124,14 +1130,14 @@ impl TuniSftp {
 
     /// Puts one transfer at the back of the queue, against the host the page
     /// is on, and starts it if the pipe is free.
-    fn start(&self, way: Way, remote: String, local: PathBuf) {
+    fn start(&self, way: Way, remote: String, local: PathBuf, asked: bool) {
         let Some(alias) = self.imp().alias.borrow().clone() else {
             return;
         };
         self.imp()
             .queue
             .borrow_mut()
-            .push(&alias, way, remote, local);
+            .push(&alias, way, remote, local, asked);
         self.pump();
         self.refresh_transfers();
     }
@@ -1188,6 +1194,7 @@ impl TuniSftp {
         self.watch(label, Arc::clone(&moved));
 
         let flag = Arc::clone(&moved);
+        let asked = job.asked;
         let (alias, way, remote, local) = (
             job.alias.clone(),
             job.way,
@@ -1240,7 +1247,9 @@ impl TuniSftp {
                         Ok((Err(failure), session)) => break 'run (Some(Err(failure)), session),
                         Ok((Ok(_), None)) | Err(_) => break 'run (None, None),
                     };
-                    if halted() || (plan.merges && !this.merge(&name).await) || halted() {
+                    let ask = plan.replaces && !asked;
+                    let folder = plan.steps.first().is_some_and(|step| step.is_directory);
+                    if halted() || (ask && !this.replace(&name, folder).await) || halted() {
                         break 'run (None, Some(session));
                     }
                     let verb = match way {
@@ -1295,23 +1304,38 @@ impl TuniSftp {
         ));
     }
 
-    /// Whether a folder may land on one of the same name, which replaces what
-    /// is in both. Asked once the walk has found it there and before anything
-    /// is written.
-    async fn merge(&self, name: &str) -> bool {
-        let dialog = adw::AlertDialog::new(
-            Some(&format!("Merge with “{name}”?")),
-            Some(&format!(
-                "There is already a folder called “{name}” where this is going. A \
-                 file in both is replaced by the copy coming in; the rest stays."
-            )),
-        );
+    /// Whether a transfer may land on something of the same name: a file it
+    /// replaces, or a folder it goes into, which replaces what is in both.
+    /// Asked once the walk has found it there and before anything is written.
+    /// Cancel skips this one and leaves the queue behind it going.
+    ///
+    /// ponytail: one question per clash, so a drop of fifty files that are
+    /// all there already is fifty questions. An "all of them" switch when
+    /// that turns out to be a thing people do.
+    async fn replace(&self, name: &str, folder: bool) -> bool {
+        let dialog = if folder {
+            adw::AlertDialog::new(
+                Some(&format!("Merge with “{name}”?")),
+                Some(&format!(
+                    "There is already a folder called “{name}” where this is going. A \
+                     file in both is replaced by the copy coming in; the rest stays."
+                )),
+            )
+        } else {
+            adw::AlertDialog::new(
+                Some(&format!("Replace “{name}”?")),
+                Some(&format!(
+                    "There is already a file called “{name}” where this is going. It \
+                     is replaced by the copy coming in."
+                )),
+            )
+        };
         dialog.add_response("cancel", "Cancel");
-        dialog.add_response("merge", "Merge");
-        dialog.set_response_appearance("merge", adw::ResponseAppearance::Destructive);
+        dialog.add_response("replace", if folder { "Merge" } else { "Replace" });
+        dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
-        dialog.choose_future(Some(self)).await == "merge"
+        dialog.choose_future(Some(self)).await == "replace"
     }
 
     /// What one transfer's end means for the page. Nothing here is a dialog:

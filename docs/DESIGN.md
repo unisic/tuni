@@ -923,7 +923,11 @@ trees in step. The folder is walked whole before anything moves, so the bar
 counts bytes across all of it, and a folder of the same name already at the
 other end is a question, "Merge with …?", asked before anything is written: a
 file in both is replaced, through the same temporary name a single file uses, and
-the rest stays. What was chosen is followed if it is a link, since that is what
+the rest stays. A file landing on a file of the same name is the same question,
+"Replace …?", whichever way it is going, since a drop names no destination and
+used to replace what was there without a word. A name typed into the save dialog
+is the exception, because that dialog has just asked. Cancel skips that one and
+the queue behind it carries on. What was chosen is followed if it is a link, since that is what
 choosing it meant. Nothing inside it is: a link in a folder is either a loop back
 up it or a way out of it, so it is left out, and so is a device, a pipe, a name
 that is not text, and anything more than 32 folders deep, the same limit the
