@@ -276,10 +276,10 @@ impl TuniSftp {
                     .and_downcast::<Row>();
                 // Stepped into, which is what the parent button undoes. The
                 // chevron is the one that opens a directory in place.
-                if let Some(item) = row.and_then(|row| row.item())
-                    && item.is_directory
-                {
-                    this.browse(&item.path);
+                match row.and_then(|row| row.item()) {
+                    Some(item) if item.is_directory => this.browse(&item.path),
+                    Some(item) => this.edit(&item),
+                    None => {}
                 }
             }
         ));
@@ -491,6 +491,12 @@ impl TuniSftp {
             entry("back", self, |sftp| sftp.walk(false)),
             entry("forward", self, |sftp| sftp.walk(true)),
             entry("refresh", self, TuniSftp::reread),
+            entry("edit", self, |sftp| {
+                let target = sftp.imp().target.borrow().clone();
+                if let Some(item) = target.filter(|item| !item.is_directory) {
+                    sftp.edit(&item);
+                }
+            }),
             entry("download", self, |sftp| {
                 let target = sftp.imp().target.borrow().clone();
                 if let Some(item) = target {
@@ -804,6 +810,66 @@ impl TuniSftp {
 
     /// Copies a remote file to wherever the user says, or a folder and
     /// everything in it into the folder the user picks.
+    /// Opens a remote file in an editor pane, from a copy fetched over the
+    /// browsing session; saving the pane sends the copy back.
+    ///
+    /// A copy some pane already has open is shown rather than fetched again,
+    /// since fetching would write the far end's text under an unsaved buffer.
+    fn edit(&self, item: &Item) {
+        let imp = self.imp();
+        let Some(window) = self.root().and_downcast::<crate::window::TuniWindow>() else {
+            return;
+        };
+        let Some(alias) = imp.alias.borrow().clone() else {
+            return;
+        };
+        let remote = item.path.to_string_lossy().into_owned();
+        let Some(local) = tuni_core::sftp::copy_path(&alias, &remote) else {
+            self.report(&Failure {
+                message: format!("Couldn't edit {remote}."),
+                detail: String::from("The host or the path cannot name a file on this machine."),
+            });
+            return;
+        };
+        if window.is_editing(&local) {
+            window.open_file(&local);
+            return;
+        }
+        let Some(link) = imp.link.borrow().clone() else {
+            return;
+        };
+        let generation = imp.generation.get();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            window,
+            async move {
+                let into = local.clone();
+                let Ok(fetched) = gio::spawn_blocking(move || {
+                    let Ok(mut session) = link.lock() else {
+                        return Err((ended(), true));
+                    };
+                    session
+                        .fetch_to_edit(&remote, &into)
+                        .ok_or_else(|| (failed(&session), session.is_lost()))
+                })
+                .await
+                else {
+                    return;
+                };
+                if generation != this.imp().generation.get() {
+                    return;
+                }
+                match fetched {
+                    Ok(()) => window.edit_fetched(&local),
+                    Err((failure, true)) => this.lose(&failure),
+                    Err((failure, false)) => this.report(&failure),
+                }
+            }
+        ));
+    }
+
     fn download(&self, item: &Item) {
         let remote = item.path.to_string_lossy().into_owned();
         let name = item.name.clone();
@@ -1466,6 +1532,9 @@ impl TuniSftp {
         imp.target.replace(Some(item.clone()));
         let model = gio::Menu::new();
         let move_files = gio::Menu::new();
+        if !item.is_directory {
+            move_files.append(Some("Edit"), Some("sftp.edit"));
+        }
         move_files.append(Some("Download…"), Some("sftp.download"));
         if item.is_directory {
             move_files.append(Some("Upload File Here…"), Some("sftp.upload"));

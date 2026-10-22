@@ -23,7 +23,7 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{DirBuilderExt, FileExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -214,6 +214,90 @@ pub struct Report {
     pub first: Option<Failure>,
     /// Cancelled, or the connection went, and nothing after that was tried.
     pub stopped: bool,
+}
+
+/// How sending an edited file back went, when it did not fail outright.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SaveBack {
+    /// It is there now, and this is its size and time as the far end says
+    /// them, which the next save compares against.
+    Sent((u64, u64)),
+    /// Somebody else changed it there, or took it away, since it was fetched,
+    /// so nothing was written over it.
+    Changed,
+}
+
+/// Where a remote file is kept while it is edited here:
+/// `$XDG_RUNTIME_DIR/tuni/sftp/<alias>/<path>`, so the same file on the same
+/// host is always the same copy and opening it twice shows the pane it is
+/// already in. Nothing for an alias that would be a path, or a remote path
+/// that is not absolute or steps up.
+///
+/// ponytail: copies are never swept. They live on the tmpfs a logout empties
+/// and are at most [`crate::editor::MAX_BYTES`] each; a sweep on the last pane
+/// closing would race a save still on its way.
+#[must_use]
+pub fn copy_path(alias: &str, remote: &str) -> Option<PathBuf> {
+    copy_path_in(&copies(), alias, remote)
+}
+
+/// The host and remote path a copy from [`copy_path`] stands for, or nothing
+/// for any other file. Read off the path rather than kept, so a pane restored
+/// from the session still saves to where it came from.
+#[must_use]
+pub fn origin(local: &Path) -> Option<(String, String)> {
+    origin_in(&copies(), local)
+}
+
+/// A local file's size and time to the second, which is what a copy fresh off
+/// [`Session::get`] shares with the remote file, and so what
+/// [`Session::send_back`] compares against.
+#[must_use]
+pub fn seen(local: &Path) -> Option<(u64, u64)> {
+    let data = std::fs::metadata(local).ok()?;
+    let mtime = data
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((data.len(), mtime.as_secs()))
+}
+
+fn copies() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| crate::settings::home().join(".cache"))
+        .join("tuni/sftp")
+}
+
+fn copy_path_in(base: &Path, alias: &str, remote: &str) -> Option<PathBuf> {
+    if alias.is_empty() || alias == "." || alias == ".." || alias.contains(['/', '\0']) {
+        return None;
+    }
+    let inside = Path::new(remote).strip_prefix("/").ok()?;
+    let plain = inside
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)));
+    if !plain || inside.as_os_str().is_empty() || remote.contains('\0') {
+        return None;
+    }
+    Some(base.join(alias).join(inside))
+}
+
+fn origin_in(base: &Path, local: &Path) -> Option<(String, String)> {
+    let mut parts = local.strip_prefix(base).ok()?.components();
+    let std::path::Component::Normal(alias) = parts.next()? else {
+        return None;
+    };
+    let inside = parts.as_path();
+    if inside.as_os_str().is_empty() {
+        return None;
+    }
+    Some((
+        alias.to_str()?.to_owned(),
+        Path::new("/").join(inside).to_str()?.to_owned(),
+    ))
 }
 
 /// What a finished copy or delete has to say, or nothing when all of it went
@@ -717,6 +801,68 @@ impl Session {
         let mut request = encode_string(from);
         request.extend_from_slice(&encode_string(to));
         self.settle(RENAME, &request, "rename", from)
+    }
+
+    /// Fetches a remote file into its copy from [`copy_path`] for the editor,
+    /// refusing what the editor would refuse to open before any of it moves.
+    pub fn fetch_to_edit(&mut self, remote: &str, local: &Path) -> Option<()> {
+        let entry = self.stat(remote)?;
+        let refuse =
+            |detail: String| Some(Failure::new(format!("Couldn't edit {remote}."), detail));
+        if entry.is_directory || (entry.mode != 0 && entry.mode & TYPE != REGULAR) {
+            self.failure = refuse("It is not a file.".to_owned());
+            return None;
+        }
+        if entry.size > crate::editor::MAX_BYTES {
+            let said = crate::editor::Document::TooLarge(entry.size).message();
+            self.failure = refuse(said.unwrap_or_default());
+            return None;
+        }
+        // Owner-only all the way down, in case the runtime directory was not
+        // there and this is under the home directory instead.
+        let made = local.parent().map(|parent| {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+        });
+        if let Some(Err(error)) = made {
+            self.failure = refuse(error.to_string());
+            return None;
+        }
+        self.get(remote, local, &mut |_, _| true)
+    }
+
+    /// Sends an edited copy back over `remote`, unless the file there is no
+    /// longer the one `seen` describes. `force` sends it anyway, which is what
+    /// the person says once they have been told.
+    ///
+    /// The look and the write are two requests, so a change landing between
+    /// them is still written over. Version 3 has no way to make them one.
+    pub fn send_back(
+        &mut self,
+        local: &Path,
+        remote: &str,
+        seen: Option<(u64, u64)>,
+        force: bool,
+    ) -> Option<SaveBack> {
+        if !force {
+            let now = self.probe(|session| session.stat(remote));
+            if self.lost {
+                return None;
+            }
+            if seen.is_none() || now.map(|entry| (entry.size, entry.mtime)) != seen {
+                return Some(SaveBack::Changed);
+            }
+        }
+        self.put(local, remote, &mut |_, _| true)?;
+        // What the far end says now rather than what was sent, since a server
+        // that will not set times has stamped its own.
+        let after = self
+            .probe(|session| session.stat(remote))
+            .map(|entry| (entry.size, entry.mtime))
+            .or_else(|| crate::sftp::seen(local))?;
+        Some(SaveBack::Sent(after))
     }
 
     /// Works out what sending `local` to `remote` comes to.
@@ -2622,5 +2768,85 @@ mod tests {
         };
         assert_eq!(summary(&one, &report, "send"), Some(refused));
         assert_eq!(one.inside(), None);
+    }
+
+    #[test]
+    fn a_copy_to_edit_is_named_by_its_host_and_path_and_nothing_else() {
+        let base = Path::new("/run/user/1000/tuni/sftp");
+        let copy = copy_path_in(base, "web", "/etc/nginx/site.conf").unwrap();
+        assert_eq!(copy, base.join("web/etc/nginx/site.conf"));
+        assert_eq!(
+            origin_in(base, &copy),
+            Some(("web".to_owned(), "/etc/nginx/site.conf".to_owned()))
+        );
+        for (alias, remote) in [
+            ("web", "etc/passwd"),
+            ("web", "/etc/../../escape"),
+            ("web", "/"),
+            ("a/b", "/etc/hosts"),
+            ("..", "/etc/hosts"),
+            ("", "/etc/hosts"),
+        ] {
+            assert_eq!(copy_path_in(base, alias, remote), None, "{alias} {remote}");
+        }
+        assert_eq!(origin_in(base, Path::new("/home/dean/notes.txt")), None);
+        assert_eq!(origin_in(base, &base.join("web")), None);
+    }
+
+    #[test]
+    fn an_edited_file_goes_back_unless_it_changed_there_meanwhile() {
+        let root = scratch("edit");
+        let remote = root.join("there.conf");
+        std::fs::write(&remote, "listen 80;").unwrap();
+        let local = root.join("copy/there.conf");
+        let mut session = real_server();
+
+        session
+            .fetch_to_edit(&text(&remote), &local)
+            .expect("fetched");
+        let fetched = seen(&local);
+        let there = session
+            .stat(&text(&remote))
+            .map(|entry| (entry.size, entry.mtime));
+        assert_eq!(fetched, there);
+
+        std::fs::write(&local, "listen 8080;").unwrap();
+        let sent = session.send_back(&local, &text(&remote), fetched, false);
+        let Some(SaveBack::Sent(now)) = sent else {
+            panic!("{sent:?} {:?}", session.failure());
+        };
+        assert_eq!(std::fs::read_to_string(&remote).unwrap(), "listen 8080;");
+
+        // Somebody else's edit, a different length and so a different file.
+        std::fs::write(&remote, "listen 443 ssl;").unwrap();
+        std::fs::write(&local, "listen 81;").unwrap();
+        assert_eq!(
+            session.send_back(&local, &text(&remote), Some(now), false),
+            Some(SaveBack::Changed)
+        );
+        assert_eq!(std::fs::read_to_string(&remote).unwrap(), "listen 443 ssl;");
+        assert!(matches!(
+            session.send_back(&local, &text(&remote), Some(now), true),
+            Some(SaveBack::Sent(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&remote).unwrap(), "listen 81;");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_too_big_for_the_editor_is_not_fetched_at_all() {
+        let root = scratch("big");
+        let remote = root.join("big.log");
+        std::fs::File::create(&remote)
+            .unwrap()
+            .set_len(crate::editor::MAX_BYTES + 1)
+            .unwrap();
+        let local = root.join("copy/big.log");
+        let mut session = real_server();
+        assert_eq!(session.fetch_to_edit(&text(&remote), &local), None);
+        assert!(!local.exists());
+        let failure = session.failure().expect("said why");
+        assert!(failure.detail.contains("past the"), "{failure:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

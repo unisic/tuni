@@ -72,6 +72,9 @@ mod imp {
         pub changed: RefCell<Option<Handler>>,
         /// The window's, called when the text takes the keyboard.
         pub focused: RefCell<Option<Handler>>,
+        /// The window's, called once the file is written, which is when a
+        /// copy of a remote file goes back where it came from.
+        pub on_saved: RefCell<Option<Handler>>,
 
         /// The language server watching this file, while one is.
         pub lsp: RefCell<Option<crate::lsp::Attachment>>,
@@ -589,6 +592,11 @@ impl TuniEditor {
         self.imp().focused.replace(Some(Rc::new(callback)));
     }
 
+    /// Called after every save that reached the disk.
+    pub fn connect_saved<F: Fn() + 'static>(&self, callback: F) {
+        self.imp().on_saved.replace(Some(Rc::new(callback)));
+    }
+
     #[must_use]
     pub fn path(&self) -> PathBuf {
         self.imp().path.borrow().clone()
@@ -659,7 +667,11 @@ impl TuniEditor {
 
         self.show_page(TEXT);
         self.refresh_dirty();
-        crate::lsp::attach(self, path, text);
+        // A copy of a remote file sits in no project this machine has, so a
+        // language server would index a runtime directory and say nothing true.
+        if tuni_core::sftp::origin(path).is_none() {
+            crate::lsp::attach(self, path, text);
+        }
         self.redraw_breakpoints();
     }
 
@@ -683,6 +695,10 @@ impl TuniEditor {
                 self.hide_error();
                 self.refresh_dirty();
                 crate::lsp::saved(self);
+                let handler = imp.on_saved.borrow().clone();
+                if let Some(handler) = handler {
+                    handler();
+                }
             }
             Err(error) => self.show_error(&format!("Cannot save {}: {error}", self.name())),
         }
@@ -1082,7 +1098,14 @@ impl TuniEditor {
                 .parent()
                 .map(|parent| parent.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            place.set_text(&crate::window::shorten(&directory));
+            // Where the file really is, rather than where its copy is kept.
+            match tuni_core::sftp::origin(&path) {
+                Some((alias, remote)) => {
+                    let parent = Path::new(&remote).parent().unwrap_or(Path::new("/"));
+                    place.set_text(&format!("{alias}:{}", parent.display()));
+                }
+                None => place.set_text(&crate::window::shorten(&directory)),
+            }
         }
         // Nothing to find in a picture and nothing to write back from one, so
         // neither button is there to be pressed.
@@ -1096,7 +1119,7 @@ impl TuniEditor {
         }
     }
 
-    fn show_error(&self, message: &str) {
+    pub fn show_error(&self, message: &str) {
         if let Some(banner) = self.imp().banner.borrow().as_ref() {
             banner.set_title(message);
             banner.set_revealed(true);

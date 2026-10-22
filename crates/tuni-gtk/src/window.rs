@@ -341,9 +341,9 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
 
 mod imp {
     use super::{
-        Cell, ClosedTab, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniFind, TuniGrid,
-        TuniHosts, TuniPanel, TuniRemote, TuniSwitcher, TuniTerminal, VecDeque, Workspace, gio,
-        glib,
+        Cell, ClosedTab, HashMap, Id, PathBuf, RefCell, Settings, TuniDiff, TuniEditor, TuniFind,
+        TuniGrid, TuniHosts, TuniPanel, TuniRemote, TuniSwitcher, TuniTerminal, VecDeque,
+        Workspace, gio, glib,
     };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
@@ -377,6 +377,15 @@ mod imp {
         /// Where the cursor was in each restored file pane, by pane id, until
         /// its editor exists to be told.
         pub pending_cursors: RefCell<HashMap<Id, usize>>,
+        /// The size and time each copy of a remote file had on the far end
+        /// when it was last fetched or sent, by copy, which is what the next
+        /// save checks nobody has changed it since. One entry per remote file
+        /// edited in this run.
+        pub remote_seen: RefCell<HashMap<PathBuf, (u64, u64)>>,
+        /// The copies on their way back, and whether another save landed while
+        /// one was, which sends again once it is there. Two sends of one file
+        /// at once would race to the rename.
+        pub uploading: RefCell<HashMap<PathBuf, bool>>,
         /// The "Move to Project" part of every tab's context menu, filled in
         /// as the menu opens. One `GMenu` shared by every strip in the window,
         /// because `AdwTabBox` builds its popover from the model once and
@@ -2500,8 +2509,151 @@ impl TuniWindow {
                 }
             }
         ));
+        if tuni_core::sftp::origin(path).is_some() {
+            // A copy restored with the session was not fetched in this run,
+            // and the time a fetch left on it is the far end's.
+            if let Some(seen) = tuni_core::sftp::seen(path) {
+                imp.remote_seen
+                    .borrow_mut()
+                    .entry(path.to_path_buf())
+                    .or_insert(seen);
+            }
+            let local = path.to_path_buf();
+            editor.connect_saved(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move || this.send_back(local.clone(), false)
+            ));
+        }
         imp.editors.borrow_mut().insert(pane, editor.clone());
         editor
+    }
+
+    /// Whether a pane in any project already has `path` open.
+    pub fn is_editing(&self, path: &Path) -> bool {
+        self.imp()
+            .editors
+            .borrow()
+            .values()
+            .any(|editor| editor.path() == path)
+    }
+
+    /// Opens a copy of a remote file that has just been fetched, remembering
+    /// what the far end had so a save can tell whether it still does.
+    pub fn edit_fetched(&self, local: &Path) {
+        if let Some(seen) = tuni_core::sftp::seen(local) {
+            self.imp()
+                .remote_seen
+                .borrow_mut()
+                .insert(local.to_path_buf(), seen);
+        }
+        self.open_file(local);
+    }
+
+    /// Sends a saved copy back to the host it came from, asking first when the
+    /// file there has changed since.
+    ///
+    /// ponytail: one ssh channel per save, on a shared connection or a fresh
+    /// login without one. A session per edited host if saves feel slow.
+    fn send_back(&self, local: PathBuf, force: bool) {
+        use tuni_core::sftp::{SaveBack, Session};
+        let imp = self.imp();
+        let Some((alias, remote)) = tuni_core::sftp::origin(&local) else {
+            return;
+        };
+        if let Some(again) = imp.uploading.borrow_mut().get_mut(&local) {
+            *again = true;
+            return;
+        }
+        imp.uploading.borrow_mut().insert(local.clone(), false);
+        let seen = imp.remote_seen.borrow().get(&local).copied();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let host = alias.clone();
+                let (from, to) = (local.clone(), remote.clone());
+                let sent = gio::spawn_blocking(move || {
+                    let control = crate::hosts::control();
+                    let argv = tuni_core::ssh::sftp_command(&tuni_core::ssh::host(&host), &control);
+                    let mut session = Session::open(&argv)?;
+                    session.send_back(&from, &to, seen, force).ok_or_else(|| {
+                        session
+                            .failure()
+                            .cloned()
+                            .unwrap_or_else(|| tuni_core::files::Failure {
+                                message: format!("Couldn't send {to} back."),
+                                detail: String::from("The connection ended."),
+                            })
+                    })
+                })
+                .await;
+                let again = this
+                    .imp()
+                    .uploading
+                    .borrow_mut()
+                    .remove(&local)
+                    .unwrap_or(false);
+                let editor = this
+                    .imp()
+                    .editors
+                    .borrow()
+                    .values()
+                    .find(|editor| editor.path() == local)
+                    .cloned();
+                match sent {
+                    Ok(Ok(SaveBack::Sent(now))) => {
+                        this.imp()
+                            .remote_seen
+                            .borrow_mut()
+                            .insert(local.clone(), now);
+                        if again {
+                            this.send_back(local, false);
+                        }
+                    }
+                    Ok(Ok(SaveBack::Changed)) => {
+                        let name = Path::new(&remote)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| remote.clone());
+                        let dialog = adw::AlertDialog::new(
+                            Some(&format!("Overwrite “{name}” on {alias}?")),
+                            Some(
+                                "It has changed there since it was opened here, or is not \
+                                 there any more. Overwriting replaces it with what you saved; \
+                                 your copy stays saved here either way.",
+                            ),
+                        );
+                        dialog.add_response("cancel", "Cancel");
+                        dialog.add_response("overwrite", "Overwrite");
+                        dialog.set_response_appearance(
+                            "overwrite",
+                            adw::ResponseAppearance::Destructive,
+                        );
+                        dialog.set_default_response(Some("cancel"));
+                        dialog.set_close_response("cancel");
+                        if dialog.choose_future(Some(&this)).await == "overwrite" {
+                            this.send_back(local, true);
+                        }
+                    }
+                    Ok(Err(failure)) => {
+                        let said = format!("{} {}", failure.message, failure.detail);
+                        match editor {
+                            Some(editor) => editor.show_error(&said),
+                            None => {
+                                let dialog = adw::AlertDialog::new(
+                                    Some(&failure.message),
+                                    Some(&failure.detail),
+                                );
+                                dialog.add_response("close", "Close");
+                                dialog.present(Some(&this));
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        ));
     }
 
     /// A diff for one pane, opened on a file and remembered.

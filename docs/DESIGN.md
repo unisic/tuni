@@ -943,6 +943,27 @@ should have answered, and the dialog says that something is already there with
 that name, or that the directory still has something in it, rather than repeating
 the far end's least useful word. That costs nothing until something goes wrong.
 
+A file on the host opens in an editor pane: activate its row, or "Edit" in its
+menu. The file is fetched into `$XDG_RUNTIME_DIR/tuni/sftp/<alias>/<path>`, a
+place named by nothing but the host and the path, so the same file opened twice
+is the pane that already has it, and a copy some pane holds is shown rather than
+fetched over an unsaved buffer. The editor does everything it does with a local
+file, except start a language server, which would index a runtime directory, and
+the line under the name says `alias:/dir` rather than where the copy lives.
+Saving writes the copy and then sends it back on a channel of its own, through
+the same temporary name and rename an upload uses. Before it writes, it compares
+the size and time the far end has now with what it had when the copy was fetched
+or last sent, and if somebody changed the file there meanwhile, or took it away,
+it asks "Overwrite …?" rather than replacing their work with an older base under
+it. Answering no leaves the copy saved here. A failure to send lands in the
+editor's banner, since the save itself worked and the dirty mark has gone. The
+look and the write are two requests, which version 3 cannot make one, so a change
+in between them is still overwritten. A file the editor would not open, past
+5 MiB or not a regular file, is refused by a `stat` before any of it moves.
+Copies are not swept when the pane closes: they sit on the tmpfs a logout
+empties, each one at most the 5 MiB the editor opens, and sweeping on close
+would race a save still on its way.
+
 sshfs would have been free: mount the host, and every page in this window works
 on it unchanged, the editor and the git panel included. It is the worst idea
 available. The panel polls on the main thread, so each tick becomes a round trip
