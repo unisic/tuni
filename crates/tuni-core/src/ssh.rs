@@ -140,7 +140,13 @@ impl Control {
     pub fn at(directory: PathBuf, persist: u32, enabled: bool) -> Self {
         Self {
             directory,
-            persist,
+            // Zero is the setting's word for "close with the last pane", and
+            // to ssh `ControlPersist=0` means the opposite: kept forever. `no`
+            // is not the answer either, since it keeps the master in the
+            // foreground of the first pane, which then cannot finish until
+            // every other pane on the host has. One second is the closest
+            // thing ssh has to what zero promises.
+            persist: persist.max(1),
             enabled,
         }
     }
@@ -2320,6 +2326,13 @@ mod tests {
             .set_modified(later)
             .expect("touch");
         assert!(hosts.stale());
+    }
+
+    #[test]
+    fn a_linger_of_zero_is_not_written_as_zero_because_zero_means_forever_to_ssh() {
+        let directory = PathBuf::from("/nowhere");
+        assert_eq!(Control::at(directory.clone(), 0, true).persist, 1);
+        assert_eq!(Control::at(directory, CONTROL_PERSIST, true).persist, 600);
     }
 
     #[test]
