@@ -15,14 +15,15 @@
 //! terminal. Here names are bytes, attributes are integers, and nothing is
 //! parsed out of prose.
 //!
-//! There is no timer in here. Every call blocks on a round trip, so the caller
-//! belongs off the main thread, and a connection that has died is noticed the
+//! There is no timer in here. Every call blocks until it is answered, so the
+//! caller belongs off the main thread, and a connection that has died is noticed the
 //! way it always is: the master gives up on its own `ServerAlive` count, the
 //! pipe closes, and the next read ends short.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::process::{Child, ChildStderr, Command, Stdio};
 
@@ -71,9 +72,15 @@ const CREATE: u32 = 0x0000_0008;
 const TRUNCATE: u32 = 0x0000_0010;
 
 /// How much of a file moves in one request, which is what OpenSSH's own client
-/// asks for. Nothing here pipelines, so this is also the round trip: a file
-/// crosses a 50 ms link at about 640 KB/s and a distant host feels it.
+/// asks for.
 const CHUNK: usize = 32 * 1024;
+
+/// How many of those a transfer keeps in flight, OpenSSH's default as well. One
+/// at a time made the round trip the speed limit, 640 KB/s across a 50 ms link
+/// however fast the link was; 64 is 2 MiB on the wire, which a 50 ms link fills
+/// at 40 MB/s. None of it is held here: the requests are a few bytes each on
+/// the way down, and the answers are read one at a time as they arrive.
+const WINDOW: usize = 64;
 
 // The status codes worth telling apart. The rest are one failure.
 const OK: u32 = 0;
@@ -111,7 +118,8 @@ pub struct Entry {
 
 /// A connection to one host's sftp subsystem.
 ///
-/// Every call blocks on a round trip. The child is killed when this is dropped,
+/// Every call blocks until it is answered, and a transfer keeps up to
+/// [`WINDOW`] requests in flight on the way. The child is killed when this is dropped,
 /// which is what closes the channel; the shared master it went over stays up.
 pub struct Session {
     child: Option<Child>,
@@ -656,60 +664,91 @@ impl Session {
 
     /// The body of a download, split out so the handle is closed on every way
     /// out of it.
+    ///
+    /// The window opens one read at a time and grows by one with each read
+    /// answered in full, which is how OpenSSH's client starts too: a small file
+    /// costs the round trips it always did, and a short answer, usually the
+    /// tail of the file, asks for nothing past it. Answers may arrive in any order,
+    /// so each lands at its own offset. A refusal or a cancel stops new reads
+    /// and still waits for the ones in flight, which is what lets the session
+    /// carry on afterwards rather than meet their answers as a lost thread.
     fn download(
         &mut self,
         handle: &[u8],
-        mut file: File,
+        file: File,
         remote: &str,
         total: u64,
         progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Option<()> {
+        let mut flight: Vec<(u32, u64, u32)> = Vec::with_capacity(WINDOW);
+        let mut window = 1;
+        let mut next = 0_u64;
         let mut at = 0_u64;
+        let mut ended = false;
+        let mut stopped = false;
         if !progress(0, total) {
             return self.cancelled();
         }
         loop {
-            let mut request = encode_string_bytes(handle);
-            request.extend_from_slice(&at.to_be_bytes());
-            request.extend_from_slice(&(CHUNK as u32).to_be_bytes());
-            let id = self.request(READ, &request)?;
-            let (kind, body) = self.reply(id)?;
-            if kind == REPLY_STATUS {
-                // The end of a file is a status packet, the way the end of a
-                // listing is.
-                if Reader::new(&body).u32() != Some(EOF) {
-                    self.blame(kind, &body, "read", remote);
-                    return None;
-                }
+            while !ended && flight.len() < window {
+                let id = self.read_request(handle, next, CHUNK as u32)?;
+                flight.push((id, next, CHUNK as u32));
+                next += CHUNK as u64;
+            }
+            if flight.is_empty() {
                 break;
             }
-            if kind != REPLY_DATA {
+            let ((offset, length), kind, body) = self.answer_in(&mut flight)?;
+            if stopped {
+                continue;
+            }
+            // The end of a file is a status packet, the way the end of a
+            // listing is. Reads already past it get the same answer.
+            if kind == REPLY_STATUS && Reader::new(&body).u32() == Some(EOF) {
+                ended = true;
+                continue;
+            }
+            let Some(mut chunk) = (kind == REPLY_DATA)
+                .then(|| Reader::new(&body).string())
+                .flatten()
+            else {
                 self.blame(kind, &body, "read", remote);
-                return None;
-            }
-            let chunk = Reader::new(&body).string()?;
-            // A server may answer with less than was asked for and that means
-            // nothing; only the status packet above says the file has ended.
+                (ended, stopped) = (true, true);
+                continue;
+            };
             if chunk.is_empty() {
-                break;
+                ended = true;
+                continue;
             }
-            if let Err(error) = file.write_all(&chunk) {
+            // More than was asked for would land on the next read's bytes.
+            chunk.truncate(length as usize);
+            if let Err(error) = file.write_all_at(&chunk, offset) {
                 self.wrote(&error.to_string());
-                return None;
+                (ended, stopped) = (true, true);
+                continue;
             }
-            at += chunk.len() as u64;
+            let got = chunk.len() as u32;
+            at += u64::from(got);
+            // Less than was asked for means nothing about the end of the file,
+            // only about the server, so the rest of the span is asked again.
+            if got < length {
+                let id = self.read_request(handle, offset + u64::from(got), length - got)?;
+                flight.push((id, offset + u64::from(got), length - got));
+            } else {
+                window = (window + 1).min(WINDOW);
+            }
             if !progress(at, total.max(at)) {
-                return self.cancelled();
+                self.cancelled();
+                (ended, stopped) = (true, true);
             }
         }
-        if let Err(error) = file.flush() {
-            self.wrote(&error.to_string());
-            return None;
-        }
-        Some(())
+        (!stopped).then_some(())
     }
 
-    /// The body of an upload, closed over the same way.
+    /// The body of an upload, closed over the same way, with the window full
+    /// from the start: the size is known here, so there is nothing to find out
+    /// by asking slowly. The same waiting on whatever is in flight when it
+    /// stops, for the same reason.
     fn upload(
         &mut self,
         handle: &[u8],
@@ -720,37 +759,57 @@ impl Session {
         progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Option<()> {
         let mut buffer = vec![0_u8; CHUNK];
+        let mut flight: Vec<(u32, u64, u32)> = Vec::with_capacity(WINDOW);
+        let mut next = 0_u64;
         let mut at = 0_u64;
+        let mut ended = false;
+        let mut stopped = false;
         if !progress(0, total) {
             return self.cancelled();
         }
         loop {
-            let read = match file.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => read,
-                Err(error) => {
-                    self.failure = Some(Failure::new(
-                        format!("Couldn't read {}.", local.display()),
-                        error.to_string(),
-                    ));
-                    return None;
-                }
-            };
-            let mut request = encode_string_bytes(handle);
-            request.extend_from_slice(&at.to_be_bytes());
-            request.extend_from_slice(&encode_string_bytes(&buffer[..read]));
-            let id = self.request(WRITE, &request)?;
-            let (kind, body) = self.reply(id)?;
+            while !ended && flight.len() < WINDOW {
+                let read = match file.read(&mut buffer) {
+                    Ok(0) => {
+                        ended = true;
+                        break;
+                    }
+                    Ok(read) => read,
+                    Err(error) => {
+                        self.failure = Some(Failure::new(
+                            format!("Couldn't read {}.", local.display()),
+                            error.to_string(),
+                        ));
+                        (ended, stopped) = (true, true);
+                        break;
+                    }
+                };
+                let mut request = encode_string_bytes(handle);
+                request.extend_from_slice(&next.to_be_bytes());
+                request.extend_from_slice(&encode_string_bytes(&buffer[..read]));
+                let id = self.request(WRITE, &request)?;
+                flight.push((id, next, read as u32));
+                next += read as u64;
+            }
+            if flight.is_empty() {
+                break;
+            }
+            let ((_, length), kind, body) = self.answer_in(&mut flight)?;
+            if stopped {
+                continue;
+            }
             if kind != REPLY_STATUS || Reader::new(&body).u32() != Some(OK) {
                 self.blame(kind, &body, "write", remote);
-                return None;
+                (ended, stopped) = (true, true);
+                continue;
             }
-            at += read as u64;
+            at += u64::from(length);
             if !progress(at, total.max(at)) {
-                return self.cancelled();
+                self.cancelled();
+                (ended, stopped) = (true, true);
             }
         }
-        Some(())
+        (!stopped).then_some(())
     }
 
     /// The failure a refused `progress` callback turns into. A message all the
@@ -762,6 +821,31 @@ impl Session {
             String::new(),
         ));
         None
+    }
+
+    /// Asks for `length` bytes of `handle` from `offset`.
+    fn read_request(&mut self, handle: &[u8], offset: u64, length: u32) -> Option<u32> {
+        let mut request = encode_string_bytes(handle);
+        request.extend_from_slice(&offset.to_be_bytes());
+        request.extend_from_slice(&length.to_be_bytes());
+        self.request(READ, &request)
+    }
+
+    /// The next answer to one of the requests in `flight`, taken off it with
+    /// the offset and length it was for. `None` when the connection went, or
+    /// the answer was to a request nobody made, which is a server that has lost
+    /// the thread.
+    fn answer_in(
+        &mut self,
+        flight: &mut Vec<(u32, u64, u32)>,
+    ) -> Option<((u64, u32), u8, Vec<u8>)> {
+        let (id, kind, body) = self.any_reply()?;
+        let Some(index) = flight.iter().position(|(asked, ..)| *asked == id) else {
+            self.lost("The far end answered a request nobody made.");
+            return None;
+        };
+        let (_, offset, length) = flight.swap_remove(index);
+        Some(((offset, length), kind, body))
     }
 
     fn close(&mut self, handle: &[u8]) {
@@ -798,16 +882,26 @@ impl Session {
 
     /// The answer to one request, with the id checked off the front.
     ///
-    /// Requests go out one at a time, so anything carrying another id is a
-    /// server that has lost the thread and the session with it.
+    /// Outside a transfer requests go out one at a time, so anything carrying
+    /// another id is a server that has lost the thread and the session with it.
     fn reply(&mut self, id: u32) -> Option<(u8, Vec<u8>)> {
-        let (kind, body) = self.packet()?;
-        let mut reader = Reader::new(&body);
-        if reader.u32()? != id {
+        let (answered, kind, body) = self.any_reply()?;
+        if answered != id {
             self.lost("The far end answered a request nobody made.");
             return None;
         }
-        Some((kind, body[4..].to_vec()))
+        Some((kind, body))
+    }
+
+    /// The next answer to anything, with the id it carries split off.
+    fn any_reply(&mut self) -> Option<(u32, u8, Vec<u8>)> {
+        let (kind, mut body) = self.packet()?;
+        let Some(id) = Reader::new(&body).u32() else {
+            self.lost("The far end sent an answer with no request in it.");
+            return None;
+        };
+        body.drain(..4);
+        Some((id, kind, body))
     }
 
     /// One packet off the wire: its type, and everything after it.
@@ -1056,16 +1150,167 @@ mod tests {
             }
             asked
         });
-        let session = Session {
+        (session_on(ours), far)
+    }
+
+    fn session_on(stream: UnixStream) -> Session {
+        Session {
             child: None,
-            out: Box::new(ours.try_clone().expect("a writer")),
-            input: BufReader::new(Box::new(ours)),
+            out: Box::new(stream.try_clone().expect("a writer")),
+            input: BufReader::new(Box::new(stream)),
             next: 1,
             failure: None,
             refusal: None,
             lost: false,
-        };
-        (session, far)
+        }
+    }
+
+    /// A far end holding one file, `content` to read and whatever arrives to
+    /// write, that answers everything asked together in the reverse of the
+    /// order it was asked. Out of order is within the protocol, and this is
+    /// how to be sure the client copes. Every third chunk is read short.
+    ///
+    /// Answers with the most requests that were ever waiting at once, and the
+    /// bytes that were written.
+    fn serve_file(content: Vec<u8>) -> (Session, std::thread::JoinHandle<(usize, Vec<u8>)>) {
+        use std::io::{BufRead, ErrorKind};
+        let (ours, theirs) = UnixStream::pair().expect("a pipe");
+        let far = std::thread::spawn(move || {
+            let mut out = theirs.try_clone().expect("a writer");
+            let mut input = BufReader::new(theirs);
+            let mut waiting: Vec<Vec<u8>> = Vec::new();
+            let (mut widest, mut written) = (0, Vec::new());
+            loop {
+                // Whatever has arrived by the time the pipe goes quiet is one
+                // batch. Waiting on the buffer rather than in a read means a
+                // packet is never cut in half by the timeout.
+                let quiet = Some(std::time::Duration::from_millis(20));
+                input.get_ref().set_read_timeout(quiet).expect("a timeout");
+                match input.fill_buf() {
+                    Ok([]) => break,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                    {
+                        widest = widest.max(waiting.len());
+                        for packet in waiting.drain(..).rev() {
+                            out.write_all(&packet).expect("an answer");
+                        }
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+                input.get_ref().set_read_timeout(None).expect("no timeout");
+                let mut header = [0_u8; 5];
+                input.read_exact(&mut header).expect("a header");
+                let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+                let mut rest = vec![0_u8; length as usize - 1];
+                input.read_exact(&mut rest).expect("a request");
+                let mut reader = Reader::new(&rest);
+                let id = reader.u32().expect("an id");
+                let (kind, answer) = match header[4] {
+                    INIT => (REPLY_VERSION, VERSION.to_be_bytes().to_vec()),
+                    STAT => {
+                        let mut attributes = SIZE.to_be_bytes().to_vec();
+                        attributes.extend_from_slice(&(content.len() as u64).to_be_bytes());
+                        (REPLY_ATTRS, body(id, &attributes))
+                    }
+                    LSTAT => (REPLY_STATUS, body(id, &NO_SUCH_FILE.to_be_bytes())),
+                    OPEN => (REPLY_HANDLE, body(id, &encode_string("h"))),
+                    READ => {
+                        reader.string().expect("a handle");
+                        let at = reader.u64().expect("an offset") as usize;
+                        let mut asked = reader.u32().expect("a length") as usize;
+                        if (at / CHUNK) % 3 == 1 {
+                            asked = asked.min(CHUNK / 2);
+                        }
+                        if at >= content.len() {
+                            (REPLY_STATUS, body(id, &EOF.to_be_bytes()))
+                        } else {
+                            let end = content.len().min(at + asked);
+                            (
+                                REPLY_DATA,
+                                body(id, &encode_string_bytes(&content[at..end])),
+                            )
+                        }
+                    }
+                    WRITE => {
+                        reader.string().expect("a handle");
+                        let at = reader.u64().expect("an offset") as usize;
+                        let data = reader.string().expect("the bytes");
+                        if written.len() < at + data.len() {
+                            written.resize(at + data.len(), 0);
+                        }
+                        written[at..at + data.len()].copy_from_slice(&data);
+                        (REPLY_STATUS, body(id, &OK.to_be_bytes()))
+                    }
+                    _ => (REPLY_STATUS, body(id, &OK.to_be_bytes())),
+                };
+                let mut packet = ((answer.len() + 1) as u32).to_be_bytes().to_vec();
+                packet.push(kind);
+                packet.extend_from_slice(&answer);
+                waiting.push(packet);
+            }
+            (widest, written)
+        });
+        (session_on(ours), far)
+    }
+
+    fn a_megabyte() -> Vec<u8> {
+        (0..1_000_003_u32).map(|at| (at % 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_download_keeps_many_reads_in_flight_and_lands_each_where_it_belongs() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-many-{}", std::process::id()));
+        let content = a_megabyte();
+        let (mut session, far) = serve_file(content.clone());
+        assert!(session.handshake());
+        assert_eq!(session.get("/srv/big", &local, &mut |_, _| true), Some(()));
+        assert!(std::fs::read(&local).expect("the file") == content);
+
+        drop(session);
+        let (widest, _) = far.join().expect("the far end");
+        assert!(widest > 1, "never more than {widest} at once");
+        let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn an_upload_keeps_many_writes_in_flight_and_lands_each_where_it_belongs() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-send-{}", std::process::id()));
+        let content = a_megabyte();
+        std::fs::write(&local, &content).expect("a file to send");
+        let (mut session, far) = serve_file(Vec::new());
+        assert!(session.handshake());
+        assert_eq!(session.put(&local, "/srv/big", &mut |_, _| true), Some(()));
+
+        drop(session);
+        let (widest, written) = far.join().expect("the far end");
+        assert!(written == content);
+        assert!(widest > 1, "never more than {widest} at once");
+        let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn a_cancelled_download_waits_for_its_reads_and_the_session_carries_on() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-halt-{}", std::process::id()));
+        let (mut session, _far) = serve_file(a_megabyte());
+        assert!(session.handshake());
+        let enough = 4 * CHUNK as u64;
+        assert!(
+            session
+                .get("/srv/big", &local, &mut |at, _| at < enough)
+                .is_none()
+        );
+        assert!(!local.exists());
+        // The reads still in flight were answered into the cancelled transfer
+        // rather than into whatever was asked next.
+        assert!(
+            session.stat("/srv/big").is_some(),
+            "{:?}",
+            session.failure()
+        );
+        assert!(!session.is_lost());
     }
 
     /// A reply body: the id it answers, then the rest.

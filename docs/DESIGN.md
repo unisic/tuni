@@ -872,10 +872,16 @@ replaced by a file. How far it has got is
 counted rather than guessed, since this drives the loop instead of reading
 another program's output, and the number reaches the progress bar through two
 integers a worker writes and a local timer reads, which is a timer over memory
-and not a poll of anything remote. What it is not is quick: one request is
-outstanding at a time, so a file crosses at one round trip per 32 KiB, roughly
-640 KB/s on a 50 ms link. The protocol's request ids exist so that sixty-four
-can be in the air at once and that is a later commit. A second transfer waits
+and not a poll of anything remote. Up to sixty-four requests of 32 KiB are in
+the air at once, OpenSSH's own default, because one at a time made the round
+trip the speed limit: 640 KB/s on a 50 ms link however fast the link was. Over
+an emulated 50 ms link an 8 MiB file took 16.6 s down and 14.7 s up that way,
+and takes 0.9 s and 0.5 s now. A download opens its window one read at a time
+and widens it with every read answered in full, the way OpenSSH's client does,
+so a small file costs what it did. Answers may come back in any order and each
+lands at its own offset. A cancel or a refusal stops asking and still waits for
+what is in flight, so the next request on the session meets its own answer
+rather than a stale one. A second transfer waits
 behind the first in a queue the bar counts down, since one pipe carries one file
 and a request blocked on a lock is the thing with nothing on screen to say so. A
 failure empties that queue rather than trying the rest: whatever the far end
