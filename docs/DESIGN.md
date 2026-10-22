@@ -875,6 +875,15 @@ managing the agent are all missing on purpose: `ssh-agent` and the desktop's
 keyring do that job already, and a wrong button in this window would be a
 security bug rather than a bad row.
 
+A key made here is Ed25519, and the one choice offered is where its private
+half lives: in a file, or on a FIDO2 security key, which is `-t ed25519-sk` and
+leaves in `~/.ssh` only a handle that is useless without the device. The device
+is reached by `ssh-keygen` itself, in the pane, which is where its request to
+touch the key and any PIN belong, and the key list needs nothing new because
+`ssh-keygen -l` reports the type as `ED25519-SK`. Resident keys and requiring
+a PIN on every use are options a person who wants them can add to the typed
+command before pressing Return.
+
 The files on the far machine are a fourth panel page, on the switcher while the
 pane holding the keyboard is on a host and off it the moment that pane is not,
 under a server icon rather than a second folder, because two folders a small
