@@ -857,10 +857,17 @@ editor already saves with, so an interrupted transfer costs the copy rather than
 leaving half a file under the name something else would open. That matters most
 going up: a cancelled upload over a file that was already there used to leave
 that file truncated and then delete it, and now it leaves it untouched and
-sweeps only the temporary. The price is two more round trips at the end, a
-remove and a rename, since version 3 lets OpenSSH's server refuse a rename onto
-a taken name, and the moment between them has nothing under the name; when the
-rename is what fails, the new copy is whole and the dialog says where it is. A
+sweeps only the temporary. A server that offers OpenSSH's `posix-rename`
+extension, which OpenSSH's own has for years, puts the new copy over the old in
+one step, the way `rename(2)` does. One that does not costs two more round
+trips at the end, a remove and a rename, since version 3 lets a server refuse a
+rename onto a taken name and OpenSSH's does, and the moment between them has
+nothing under the name. A name that was free gets the plain rename either way,
+which refuses rather than replaces whatever appeared there meanwhile. When the
+rename is what fails, the new copy is whole and the dialog says where it is.
+Both ways a file keeps the time it was last changed, as `gio copy` does on the
+desktop, so a sort by date says when somebody edited it rather than when it was
+fetched. A
 replaced file also changes owner to the account that logged in, the one thing a
 rename cannot carry across, and a directory that account may not write into gets
 the old in-place write instead, since a file it may write to is still worth

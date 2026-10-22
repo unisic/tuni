@@ -26,6 +26,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::process::{Child, ChildStderr, Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::editor::temporary_name;
 use crate::files::Failure;
@@ -54,6 +55,14 @@ const RENAME: u8 = 18;
 const LSTAT: u8 = 7;
 const CLOSE: u8 = 4;
 const FSETSTAT: u8 = 10;
+/// A request named by a string rather than a number, for what a server offers
+/// past version 3.
+const EXTENSION: u8 = 200;
+
+/// OpenSSH's rename that replaces a taken name in one step, the way
+/// `rename(2)` does, where version 3's own leaves it to the server and
+/// OpenSSH's refuses.
+const POSIX_RENAME: &str = "posix-rename@openssh.com";
 
 // Replies.
 const REPLY_VERSION: u8 = 2;
@@ -133,6 +142,8 @@ pub struct Session {
     /// Raised when the pipe broke or the far end lost the thread, after which
     /// nothing sent on this session will be answered.
     lost: bool,
+    /// The extensions the server named when it said hello.
+    extensions: Vec<String>,
 }
 
 impl Session {
@@ -175,6 +186,7 @@ impl Session {
             failure: None,
             refusal: None,
             lost: false,
+            extensions: Vec::new(),
         };
         if session.handshake() {
             // Read for as long as the pipe is open and thrown away: ssh stops
@@ -292,7 +304,12 @@ impl Session {
         local: &Path,
         progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Option<()> {
-        let total = self.stat(remote).map_or(0, |entry| entry.size);
+        let found = self.stat(remote);
+        let total = found.as_ref().map_or(0, |entry| entry.size);
+        // Zero from a server that did not say.
+        let changed = found
+            .filter(|entry| entry.mtime != 0)
+            .map(|entry| UNIX_EPOCH + std::time::Duration::from_secs(entry.mtime));
         let handle = self.open_file(remote, READABLE, None)?;
         let part = local.with_file_name(temporary_name(local));
         let file = match File::create(&part) {
@@ -306,8 +323,16 @@ impl Session {
                 return None;
             }
         };
-        let done = self.download(&handle, file, remote, total, progress);
+        let done = self.download(&handle, &file, remote, total, progress);
         self.close(&handle);
+        if done.is_some()
+            && let Some(changed) = changed
+        {
+            // When it was last changed over there, which is what a file
+            // manager's copy keeps too. Not worth failing for: the bytes are
+            // what was asked for, and they are right.
+            let _ = file.set_modified(changed);
+        }
         let landed = match done.map(|()| std::fs::rename(&part, local)) {
             Some(Ok(())) => Some(()),
             Some(Err(error)) => {
@@ -360,6 +385,7 @@ impl Session {
         };
         let data = file.metadata().ok();
         let total = data.as_ref().map_or(0, std::fs::Metadata::len);
+        let times = data.as_ref().and_then(times);
         let here = data.map_or(0o644, |data| {
             std::os::unix::fs::PermissionsExt::mode(&data.permissions()) & 0o777
         });
@@ -414,17 +440,10 @@ impl Session {
             return None;
         };
         let done = self.upload(&handle, file, local, remote, total, progress);
-        if done.is_some()
-            && let Some(mode) = kept
-        {
+        if done.is_some() {
             // The mode went through the far end's umask on the way in, so a
-            // file that was group-writable would come back without it. Set on
-            // the handle, past the mask, and not fatal when refused: the bytes
-            // are the thing that was asked for, and they are right.
-            let mut request = encode_string_bytes(&handle);
-            request.extend_from_slice(&PERMISSIONS.to_be_bytes());
-            request.extend_from_slice(&mode.to_be_bytes());
-            self.probe(|session| session.settle(FSETSTAT, &request, "write", &part));
+            // file that was group-writable would come back without it.
+            self.stamp(&handle, &part, kept, times);
         }
         self.close(&handle);
         if done.is_none() {
@@ -448,28 +467,64 @@ impl Session {
         mode: u32,
         progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Option<()> {
+        let times = file.metadata().ok().as_ref().and_then(times);
         let handle = self.open_file(remote, WRITABLE | CREATE | TRUNCATE, Some(mode))?;
         let done = self.upload(&handle, file, local, remote, total, progress);
+        if done.is_some() {
+            self.stamp(&handle, remote, None, times);
+        }
         self.close(&handle);
         done
     }
 
+    /// Sets on an open handle what the bytes do not carry: a mode, past the
+    /// far end's umask, and the access and change times the file has here,
+    /// which is what a file manager's copy keeps. Not fatal when refused: the
+    /// bytes are the thing that was asked for, and they are right.
+    fn stamp(&mut self, handle: &[u8], path: &str, mode: Option<u32>, times: Option<(u32, u32)>) {
+        let flags = mode.map_or(0, |_| PERMISSIONS) | times.map_or(0, |_| ACMODTIME);
+        if flags == 0 {
+            return;
+        }
+        let mut request = encode_string_bytes(handle);
+        request.extend_from_slice(&flags.to_be_bytes());
+        if let Some(mode) = mode {
+            request.extend_from_slice(&mode.to_be_bytes());
+        }
+        if let Some((accessed, changed)) = times {
+            request.extend_from_slice(&accessed.to_be_bytes());
+            request.extend_from_slice(&changed.to_be_bytes());
+        }
+        self.probe(|session| session.settle(FSETSTAT, &request, "write", path));
+    }
+
     /// Moves a finished upload onto the name it was for.
     ///
-    /// Version 3 leaves a rename onto a taken name to the server and OpenSSH's
-    /// refuses, so a file that is there goes first. Between the two there is a
-    /// moment with nothing under the name. The new bytes are whole by then, so
-    /// when the rename is what fails they stay where they landed and the
-    /// failure says where.
+    /// A file that is there is replaced in one step where the server offers
+    /// [`POSIX_RENAME`]. Elsewhere version 3 leaves a rename onto a taken name
+    /// to the server and OpenSSH's refuses, so the file goes first, and between
+    /// the two there is a moment with nothing under the name. A name that was
+    /// free gets the plain rename either way, which refuses rather than
+    /// replaces whatever appeared there in the meantime. The new bytes are
+    /// whole by then, so when the rename is what fails they stay where they
+    /// landed and the failure says where.
     fn replace(&mut self, part: &str, target: &str, taken: bool) -> Option<()> {
-        if taken && self.remove(target).is_none() {
-            if let Some(failure) = self.failure.as_mut() {
-                failure.message = format!("Couldn't replace {target}.");
+        let moved = if taken && self.offers(POSIX_RENAME) {
+            let mut request = encode_string(POSIX_RENAME);
+            request.extend_from_slice(&encode_string(part));
+            request.extend_from_slice(&encode_string(target));
+            self.settle(EXTENSION, &request, "replace", target)
+        } else {
+            if taken && self.remove(target).is_none() {
+                if let Some(failure) = self.failure.as_mut() {
+                    failure.message = format!("Couldn't replace {target}.");
+                }
+                self.probe(|session| session.remove(part));
+                return None;
             }
-            self.probe(|session| session.remove(part));
-            return None;
-        }
-        if self.rename(part, target).is_some() {
+            self.rename(part, target)
+        };
+        if moved.is_some() {
             return Some(());
         }
         if let Some(failure) = self.failure.as_mut() {
@@ -615,14 +670,25 @@ impl Session {
         // A server may answer with a version below ours and every one of them
         // answers with three, since three is where the protocol stopped being
         // the same protocol.
-        if kind != REPLY_VERSION || Reader::new(&body).u32() != Some(VERSION) {
+        let mut reader = Reader::new(&body);
+        if kind != REPLY_VERSION || reader.u32() != Some(VERSION) {
             self.failure = Some(Failure::new(
                 "Couldn't start a file transfer.",
                 "The far end does not speak SFTP version 3.".to_owned(),
             ));
             return false;
         }
+        // The rest is name and version pairs. Only the names are kept, since
+        // every extension used here has had one version.
+        while let (Some(name), Some(_)) = (reader.string(), reader.string()) {
+            self.extensions
+                .push(String::from_utf8_lossy(&name).into_owned());
+        }
         true
+    }
+
+    fn offers(&self, extension: &str) -> bool {
+        self.extensions.iter().any(|name| name == extension)
     }
 
     fn opendir(&mut self, path: &str) -> Option<Vec<u8>> {
@@ -675,7 +741,7 @@ impl Session {
     fn download(
         &mut self,
         handle: &[u8],
-        file: File,
+        file: &File,
         remote: &str,
         total: u64,
         progress: &mut dyn FnMut(u64, u64) -> bool,
@@ -976,6 +1042,19 @@ impl Drop for Session {
     }
 }
 
+/// A local file's access and change times in the seconds version 3 carries,
+/// or nothing for one outside what 32 bits can say.
+fn times(data: &std::fs::Metadata) -> Option<(u32, u32)> {
+    let seconds = |time: SystemTime| {
+        let since = time.duration_since(UNIX_EPOCH).ok()?;
+        u32::try_from(since.as_secs()).ok()
+    };
+    Some((
+        seconds(data.accessed().ok()?)?,
+        seconds(data.modified().ok()?)?,
+    ))
+}
+
 /// Whatever `ssh` left in its error pipe, up to 4 KiB, without waiting for
 /// more. Non-blocking because the pipe can outlive the ssh that wrote to it: a
 /// `ProxyCommand` inherits it and may hold it open long after.
@@ -1162,6 +1241,7 @@ mod tests {
             failure: None,
             refusal: None,
             lost: false,
+            extensions: Vec::new(),
         }
     }
 
@@ -1431,15 +1511,17 @@ mod tests {
     }
 
     #[test]
-    fn a_download_lands_as_the_bytes_the_far_end_sent() {
+    fn a_download_lands_as_the_bytes_and_the_time_the_far_end_sent() {
         let local = std::env::temp_dir().join(format!("tuni-sftp-get-{}", std::process::id()));
         let _ = std::fs::remove_file(&local);
 
         let mut version = Vec::new();
         version.extend_from_slice(&VERSION.to_be_bytes());
-        let mut attributes = (SIZE | PERMISSIONS).to_be_bytes().to_vec();
+        let mut attributes = (SIZE | PERMISSIONS | ACMODTIME).to_be_bytes().to_vec();
         attributes.extend_from_slice(&5_u64.to_be_bytes());
         attributes.extend_from_slice(&0o100_644_u32.to_be_bytes());
+        attributes.extend_from_slice(&1_700_000_000_u32.to_be_bytes());
+        attributes.extend_from_slice(&A_WHILE_AGO.to_be_bytes());
         let (mut session, far) = serve(vec![
             (REPLY_VERSION, version),
             (REPLY_ATTRS, body(1, &attributes)),
@@ -1458,6 +1540,11 @@ mod tests {
         assert_eq!(done, Some(()));
         assert_eq!(std::fs::read(&local).expect("the file"), b"hello");
         assert_eq!(seen, vec![(0, 5), (5, 5)]);
+        let changed = std::fs::metadata(&local).and_then(|data| data.modified());
+        assert_eq!(
+            changed.ok(),
+            Some(UNIX_EPOCH + std::time::Duration::from_secs(A_WHILE_AGO.into()))
+        );
 
         drop(session);
         let asked = far.join().expect("the far end");
@@ -1504,9 +1591,9 @@ mod tests {
     }
 
     #[test]
-    fn an_upload_sends_the_file_from_its_start() {
+    fn an_upload_sends_the_file_from_its_start_and_the_time_it_was_changed() {
         let local = std::env::temp_dir().join(format!("tuni-sftp-put-{}", std::process::id()));
-        std::fs::write(&local, b"hello").expect("a file to send");
+        a_file_changed_a_while_ago(&local);
 
         let mut version = Vec::new();
         version.extend_from_slice(&VERSION.to_be_bytes());
@@ -1517,6 +1604,7 @@ mod tests {
             (REPLY_STATUS, body(3, &OK.to_be_bytes())),
             (REPLY_STATUS, body(4, &OK.to_be_bytes())),
             (REPLY_STATUS, body(5, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(6, &OK.to_be_bytes())),
         ]);
         assert!(session.handshake());
         assert_eq!(
@@ -1528,7 +1616,17 @@ mod tests {
         let asked = far.join().expect("the far end");
         let kinds: Vec<u8> = asked.iter().map(|(kind, _)| *kind).collect();
         // Nothing was there, so nothing is removed before the rename.
-        assert_eq!(kinds, vec![INIT, LSTAT, OPEN, WRITE, CLOSE, RENAME]);
+        assert_eq!(
+            kinds,
+            vec![INIT, LSTAT, OPEN, WRITE, FSETSTAT, CLOSE, RENAME]
+        );
+        // A new file's mode went with the open, so only the times are set.
+        let mut reader = Reader::new(&asked[4].1);
+        reader.u32().expect("the request id");
+        reader.string().expect("the handle");
+        assert_eq!(reader.u32(), Some(ACMODTIME));
+        reader.u32().expect("the access time");
+        assert_eq!(reader.u32(), Some(A_WHILE_AGO));
 
         let mut reader = Reader::new(&asked[3].1);
         reader.u32().expect("the request id");
@@ -1547,6 +1645,17 @@ mod tests {
             .collect()
     }
 
+    /// A time well before the test runs, so one that was kept is not the
+    /// same number as one the clock happened to give.
+    const A_WHILE_AGO: u32 = 1_000_000_000;
+
+    fn a_file_changed_a_while_ago(path: &Path) {
+        std::fs::write(path, b"hello").expect("a file to send");
+        let file = File::options().write(true).open(path).expect("the file");
+        let then = UNIX_EPOCH + std::time::Duration::from_secs(A_WHILE_AGO.into());
+        file.set_modified(then).expect("a time");
+    }
+
     fn a_regular_file(mode: u32) -> Vec<u8> {
         let mut attributes = (SIZE | PERMISSIONS).to_be_bytes().to_vec();
         attributes.extend_from_slice(&3_u64.to_be_bytes());
@@ -1557,7 +1666,7 @@ mod tests {
     #[test]
     fn an_upload_over_a_file_lands_under_a_temporary_name_and_is_moved_on_at_the_end() {
         let local = std::env::temp_dir().join(format!("tuni-sftp-over-{}", std::process::id()));
-        std::fs::write(&local, b"hello").expect("a file to send");
+        a_file_changed_a_while_ago(&local);
 
         let mut version = Vec::new();
         version.extend_from_slice(&VERSION.to_be_bytes());
@@ -1592,12 +1701,60 @@ mod tests {
             vec![temporary, "/srv/notes.txt".to_owned()]
         );
 
-        // The bits the file had over there, set past the far end's umask.
+        // The bits the file had over there, set past the far end's umask, and
+        // the time it was changed here.
         let mut reader = Reader::new(&asked[4].1);
         reader.u32().expect("the request id");
         reader.string().expect("the handle");
-        assert_eq!(reader.u32(), Some(PERMISSIONS));
+        assert_eq!(reader.u32(), Some(PERMISSIONS | ACMODTIME));
         assert_eq!(reader.u32(), Some(0o664));
+        reader.u32().expect("the access time");
+        assert_eq!(reader.u32(), Some(A_WHILE_AGO));
+        let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn a_server_that_can_replace_a_name_in_one_step_is_asked_to() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-posix-{}", std::process::id()));
+        std::fs::write(&local, b"hello").expect("a file to send");
+
+        let mut version = VERSION.to_be_bytes().to_vec();
+        for (name, revision) in [("statvfs@openssh.com", "2"), (POSIX_RENAME, "1")] {
+            version.extend_from_slice(&encode_string(name));
+            version.extend_from_slice(&encode_string(revision));
+        }
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_ATTRS, body(1, &a_regular_file(0o644))),
+            (REPLY_HANDLE, body(2, &encode_string("h"))),
+            (REPLY_STATUS, body(3, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(4, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(5, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(6, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+        assert_eq!(
+            session.put(&local, "/srv/notes.txt", &mut |_, _| true),
+            Some(())
+        );
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        let kinds: Vec<u8> = asked.iter().map(|(kind, _)| *kind).collect();
+        // No remove: there is never a moment with nothing under the name.
+        assert_eq!(
+            kinds,
+            vec![INIT, LSTAT, OPEN, WRITE, FSETSTAT, CLOSE, EXTENSION]
+        );
+        let temporary = format!("/srv/.notes.txt.tuni-{}", std::process::id());
+        assert_eq!(
+            paths(&asked[6]),
+            vec![
+                POSIX_RENAME.to_owned(),
+                temporary,
+                "/srv/notes.txt".to_owned()
+            ]
+        );
         let _ = std::fs::remove_file(&local);
     }
 
