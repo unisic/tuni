@@ -127,6 +127,13 @@ mod imp {
         /// widgets are rebuilt on every keystroke and this with them.
         pub(super) rows: RefCell<Vec<(gtk::ListBoxRow, Choice)>>,
         pub search: RefCell<Option<gtk::SearchEntry>>,
+        /// The tag the list is narrowed to, or All Tags. The picker is the
+        /// record: nothing else remembers which one was chosen.
+        pub tags: RefCell<Option<gtk::DropDown>>,
+        /// Groups folded away, for as long as the pane is open. Not saved: a
+        /// fold is tidying up for the moment, and a host a restart hid would
+        /// be a host somebody looks for and cannot find.
+        pub folded: RefCell<HashSet<String>>,
         pub banner: RefCell<Option<adw::Banner>>,
         pub list: RefCell<Option<gtk::ListBox>>,
         pub scroller: RefCell<Option<gtk::ScrolledWindow>>,
@@ -257,10 +264,20 @@ impl TuniHosts {
 
         let search = gtk::SearchEntry::builder()
             .placeholder_text("Search hosts, or type an address")
-            .margin_start(12)
-            .margin_end(12)
-            .margin_bottom(6)
+            .hexpand(true)
             .build();
+        // Hidden until a host has a tag, because a filter with one choice in it
+        // is a control that does nothing.
+        let tags = gtk::DropDown::builder()
+            .tooltip_text("Show only the hosts with this tag")
+            .visible(false)
+            .build();
+        let filter = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        filter.set_margin_start(12);
+        filter.set_margin_end(12);
+        filter.set_margin_bottom(6);
+        filter.append(&search);
+        filter.append(&tags);
 
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Browse);
@@ -306,7 +323,7 @@ impl TuniHosts {
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&header);
         content.append(&banner);
-        content.append(&search);
+        content.append(&filter);
         content.append(&stack);
 
         let clamp = adw::Clamp::builder()
@@ -323,6 +340,7 @@ impl TuniHosts {
 
         imp.banner.replace(Some(banner));
         imp.search.replace(Some(search.clone()));
+        imp.tags.replace(Some(tags.clone()));
         imp.list.replace(Some(list.clone()));
         imp.scroller.replace(Some(scroller));
         imp.stack.replace(Some(stack));
@@ -330,12 +348,17 @@ impl TuniHosts {
         imp.menu.replace(Some(menu));
 
         self.install_actions();
-        self.wire(&search, &list);
+        self.wire(&search, &tags, &list);
         self.reload();
     }
 
-    fn wire(&self, search: &gtk::SearchEntry, list: &gtk::ListBox) {
+    fn wire(&self, search: &gtk::SearchEntry, tags: &gtk::DropDown, list: &gtk::ListBox) {
         search.connect_search_changed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.fill()
+        ));
+        tags.connect_selected_notify(glib::clone!(
             #[weak(rename_to = this)]
             self,
             move |_| this.fill()
@@ -713,12 +736,106 @@ impl TuniHosts {
                 imp.hosts.replace(hosts);
                 imp.notes.replace(notes);
                 imp.live.replace(live);
+                this.offer_tags();
                 this.fill();
             }
         ));
     }
 
     // --- drawing -----------------------------------------------------------
+
+    /// Fills the tag picker with what the listed hosts carry, keeping the tag
+    /// that was picked while a host still has it. Left alone when nothing
+    /// changed, since a new model is a selection change and a redraw.
+    fn offer_tags(&self) {
+        let imp = self.imp();
+        let Some(picker) = imp.tags.borrow().clone() else {
+            return;
+        };
+        let tags = imp.notes.borrow().tags(
+            imp.hosts
+                .borrow()
+                .all()
+                .iter()
+                .map(|host| host.alias.as_str()),
+        );
+        let mut names = vec!["All Tags"];
+        names.extend(tags.iter().map(String::as_str));
+        let same = picker
+            .model()
+            .and_downcast::<gtk::StringList>()
+            .is_some_and(|model| {
+                model.n_items() as usize == names.len()
+                    && names
+                        .iter()
+                        .enumerate()
+                        .all(|(at, name)| model.string(at as u32).as_deref() == Some(*name))
+            });
+        picker.set_visible(!tags.is_empty());
+        if same {
+            return;
+        }
+        let picked = picked_tag(&picker);
+        picker.set_model(Some(&gtk::StringList::new(&names)));
+        let at = picked
+            .and_then(|picked| tags.iter().position(|tag| *tag == picked))
+            .map_or(0, |at| at + 1);
+        picker.set_selected(at as u32);
+    }
+
+    /// A group's heading, which folds the group away and opens it again. A
+    /// button inside a row the list cannot activate, because activating a
+    /// row is what connects, and the selection is on a host when this is hit.
+    fn group_header(&self, name: &str, count: usize, folded: bool) -> gtk::ListBoxRow {
+        let label = gtk::Label::new(Some(name));
+        label.add_css_class("heading");
+        let number = gtk::Label::new(Some(&count.to_string()));
+        number.add_css_class("dim-label");
+        let arrow = gtk::Image::from_icon_name(if folded {
+            "pan-end-symbolic"
+        } else {
+            "pan-down-symbolic"
+        });
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        content.append(&label);
+        content.append(&number);
+        content.append(&arrow);
+
+        let button = gtk::Button::builder()
+            .child(&content)
+            .halign(gtk::Align::Start)
+            .margin_top(6)
+            .margin_start(6)
+            // The search entry keeps the keyboard; the arrows and Return there
+            // are how this list is driven, and a click here must not end that.
+            .focus_on_click(false)
+            .build();
+        button.add_css_class("flat");
+        button.add_css_class("dim-label");
+        button.update_state(&[gtk::accessible::State::Expanded(Some(!folded))]);
+        let name = name.to_owned();
+        button.connect_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| {
+                {
+                    let mut folded = this.imp().folded.borrow_mut();
+                    if !folded.remove(&name) {
+                        folded.insert(name.clone());
+                    }
+                }
+                this.fill();
+            }
+        ));
+
+        let row = gtk::ListBoxRow::builder()
+            .child(&button)
+            .selectable(false)
+            .activatable(false)
+            .build();
+        row.set_can_focus(false);
+        row
+    }
 
     /// Rebuilds the list for whatever is in the search entry.
     fn fill(&self) {
@@ -745,20 +862,34 @@ impl TuniHosts {
             label.set_text(&count(hosts.all().len()));
         }
 
+        let tag = imp.tags.borrow().as_ref().and_then(picked_tag);
+        let shown: Vec<&Host> = hosts
+            .all()
+            .iter()
+            .filter(|host| {
+                tag.as_ref()
+                    .is_none_or(|tag| notes.get(&host.alias).tags.contains(tag))
+            })
+            .collect();
+
         let mut rows = Vec::new();
         if query.is_empty() {
-            list.append(&header("Local"));
-            let row = local_row();
-            list.append(&row);
-            rows.push((row, Choice::Local));
+            // A tag picked is a question about those hosts, and neither a
+            // local shell nor what was opened last is an answer to it.
+            if tag.is_none() {
+                list.append(&header("Local"));
+                let row = local_row();
+                list.append(&row);
+                rows.push((row, Choice::Local));
+            }
 
-            // Last connected first, and then everything else by name. A host
-            // in the first group is not repeated in the second: two rows for
-            // one machine is two answers to the question of where to click.
-            let mut recent: Vec<(&Host, u64)> = hosts
-                .all()
+            // Last connected first, and then everything else by group and
+            // name. A host in the first is not repeated further down: two
+            // rows for one machine is two answers to where to click.
+            let mut recent: Vec<(&Host, u64)> = shown
                 .iter()
-                .filter_map(|host| Some((host, notes.get(&host.alias).last_used?)))
+                .filter(|_| tag.is_none())
+                .filter_map(|host| Some((*host, notes.get(&host.alias).last_used?)))
                 .collect();
             recent.sort_by_key(|(_, when)| std::cmp::Reverse(*when));
             recent.truncate(RECENT);
@@ -771,34 +902,41 @@ impl TuniHosts {
                 rows.push((row, Choice::Host(host.alias.clone())));
             }
 
-            let mut sorted: Vec<&Host> = hosts
-                .all()
+            let rest = shown
                 .iter()
-                .filter(|host| !recent.iter().any(|(shown, _)| shown.alias == host.alias))
-                .collect();
-            sorted.sort_by(|left, right| left.alias.cmp(&right.alias));
-            if !sorted.is_empty() {
-                list.append(&header("Hosts"));
-            }
-            for host in sorted {
-                let row = host_row(host, &notes.get(&host.alias), live.contains(&host.alias));
-                list.append(&row);
-                rows.push((row, Choice::Host(host.alias.clone())));
+                .copied()
+                .filter(|host| !recent.iter().any(|(seen, _)| seen.alias == host.alias));
+            let folded = imp.folded.borrow();
+            for (group, members) in ssh::grouped(rest, &notes) {
+                if group.is_empty() {
+                    list.append(&header("Hosts"));
+                } else {
+                    let closed = folded.contains(&group);
+                    list.append(&self.group_header(&group, members.len(), closed));
+                    if closed {
+                        continue;
+                    }
+                }
+                for host in members {
+                    let row = host_row(host, &notes.get(&host.alias), live.contains(&host.alias));
+                    list.append(&row);
+                    rows.push((row, Choice::Host(host.alias.clone())));
+                }
             }
         } else {
-            let mut ranked: Vec<(&Host, Meta, i32)> = hosts
-                .all()
+            let mut ranked: Vec<(&Host, Meta, i32)> = shown
                 .iter()
                 .filter_map(|host| {
                     let meta = notes.get(&host.alias);
                     let searchable = format!(
-                        "{} {} {} {}",
+                        "{} {} {} {} {}",
                         host.alias,
                         host.address(),
                         meta.label,
+                        meta.group,
                         meta.tags.join(" ")
                     );
-                    fuzzy::score(&searchable, &query).map(|score| (host, meta, score))
+                    fuzzy::score(&searchable, &query).map(|score| (*host, meta, score))
                 })
                 .collect();
             ranked.sort_by(|left, right| {
@@ -812,7 +950,7 @@ impl TuniHosts {
                 list.append(&row);
                 rows.push((row, Choice::Host(host.alias.clone())));
             }
-            if fuzzy::score("local shell terminal", &query).is_some() {
+            if tag.is_none() && fuzzy::score("local shell terminal", &query).is_some() {
                 let row = local_row();
                 list.append(&row);
                 rows.push((row, Choice::Local));
@@ -820,6 +958,7 @@ impl TuniHosts {
             // Nothing saved answers to it, so take it for what it looks like:
             // an address somebody wants to reach once.
             if rows.is_empty()
+                && tag.is_none()
                 && let Some(host) = Host::adhoc(&query)
             {
                 let row = adhoc_row(&host);
@@ -828,7 +967,10 @@ impl TuniHosts {
             }
         }
 
-        stack.set_visible_child_name(if !rows.is_empty() {
+        // On what the list holds rather than on what can be chosen in it: a
+        // folded group is a heading and no rows, and the heading is how it
+        // opens again.
+        stack.set_visible_child_name(if list.first_child().is_some() {
             "list"
         } else if query.is_empty() {
             "nothing"
@@ -971,6 +1113,17 @@ fn row_menu(source: Source, declared: bool, live: bool) -> gio::Menu {
     menu.append_section(None, &rest);
 
     menu
+}
+
+/// The tag a picker has chosen, or nothing for All Tags in the first place.
+fn picked_tag(picker: &gtk::DropDown) -> Option<String> {
+    if picker.selected() == 0 {
+        return None;
+    }
+    picker
+        .selected_item()
+        .and_downcast::<gtk::StringObject>()
+        .map(|item| item.string().into())
 }
 
 fn header(title: &str) -> gtk::ListBoxRow {

@@ -139,8 +139,13 @@ pub fn present<F>(
         .title("Tags")
         .text(meta.tags.join(", "))
         .build();
+    let group = adw::EntryRow::builder()
+        .title("Group")
+        .text(&meta.group)
+        .build();
     general.add(&name);
     general.add(&label);
+    general.add(&group);
     general.add(&tags);
     page.append(&general);
 
@@ -482,6 +487,7 @@ pub fn present<F>(
             let written_meta = Meta {
                 label: label.text().trim().to_owned(),
                 tags: split_tags(&tags.text()),
+                group: group.text().trim().to_owned(),
                 icon: icon.borrow().clone(),
                 on_connect: snippets
                     .get(on_connect.selected() as usize)

@@ -202,6 +202,19 @@ Enter connecting in this pane, `Ctrl+Enter` in a split beside it, and
 Setting `new-tab` to `hosts` makes that list what `Ctrl+Shift+T` opens, for
 people who connect more often than they start a shell here.
 
+A host can sit in one group and carry any number of tags, both kept in
+`meta.json` beside the label, so a host from `~/.ssh/config` takes them as
+readily as one saved here. Groups are headings under Recent, by name, with the
+hosts in none of them last under Hosts; a heading folds its hosts away until the
+pane closes, and the fold is not saved, because a host a restart hid is a host
+somebody looks for and cannot find. Groups do not nest and do not hand settings
+down: `Host` patterns in ssh already give several hosts one setting, and a
+second way of doing that would answer differently from `ssh -G`. Tags narrow the
+list through a picker beside the search, one at a time, which drops the local
+shell and Recent from the list since neither answers which hosts are `prod`. A
+picker rather than a strip of chips because the pane is often a third of a
+window wide and a strip wraps into rows that push the hosts off it.
+
 None of the connecting is tuni's own work. Opening a host runs `ssh` in the
 pane, so every prompt an authentication can raise, the unknown-host question
 included, is asked in a terminal and answered there, and tuni sees no password

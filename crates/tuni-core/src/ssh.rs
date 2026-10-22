@@ -872,6 +872,10 @@ pub struct Meta {
     pub label: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// The heading the host is listed under. One per host, where tags are
+    /// many: a group is where a host sits, a tag is what it is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
     /// A themed icon name or an emoji, written the way a project's row writes
     /// one. Nothing means the server icon every unmarked host shares, which is
     /// exactly what a launcher of identical rows is not worth marking.
@@ -942,6 +946,21 @@ impl Notes {
         }
     }
 
+    /// Every tag the given hosts carry, once each and in order. Asked of the
+    /// hosts on the list rather than of the file, which still holds the tags
+    /// of a host somebody deleted from their own configuration by hand.
+    #[must_use]
+    pub fn tags<'a>(&self, aliases: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        let mut tags: Vec<String> = aliases
+            .into_iter()
+            .filter_map(|alias| self.0.get(alias))
+            .flat_map(|meta| meta.tags.iter().cloned())
+            .collect();
+        tags.sort_by(|left, right| (left.to_lowercase(), left).cmp(&(right.to_lowercase(), right)));
+        tags.dedup();
+        tags
+    }
+
     /// Records that a connection was opened, which is what puts a host at the
     /// top of the list next time.
     pub fn used(&mut self, alias: &str) {
@@ -966,6 +985,36 @@ impl Notes {
         fs::write(&temporary, text)?;
         fs::rename(&temporary, &path)
     }
+}
+
+/// Hosts under the group each is filed in, groups by name and hosts by alias
+/// inside each, with the hosts in no group last under an empty name. Last,
+/// because a group is something somebody made on purpose and the rest is
+/// whatever was left over.
+#[must_use]
+pub fn grouped<'a>(
+    hosts: impl IntoIterator<Item = &'a Host>,
+    notes: &Notes,
+) -> Vec<(String, Vec<&'a Host>)> {
+    let mut groups: Vec<(String, Vec<&'a Host>)> = Vec::new();
+    for host in hosts {
+        let group = notes.get(&host.alias).group.trim().to_owned();
+        match groups.iter_mut().find(|(name, _)| *name == group) {
+            Some((_, members)) => members.push(host),
+            None => groups.push((group, vec![host])),
+        }
+    }
+    groups.sort_by(|(left, _), (right, _)| {
+        (left.is_empty(), left.to_lowercase(), left).cmp(&(
+            right.is_empty(),
+            right.to_lowercase(),
+            right,
+        ))
+    });
+    for (_, members) in &mut groups {
+        members.sort_by(|left, right| left.alias.cmp(&right.alias));
+    }
+    groups
 }
 
 /// What tuni writes at the top of the file it owns, so somebody who opens it
@@ -2180,6 +2229,64 @@ mod tests {
             .filter_map(|line| line.split_once(' '))
             .map(|(keyword, value)| (keyword.to_owned(), value.to_owned()))
             .collect()
+    }
+
+    fn noted(entries: &[(&str, &str, &[&str])]) -> Notes {
+        let mut notes = Notes::default();
+        for (alias, group, tags) in entries {
+            notes.set(
+                alias,
+                Meta {
+                    group: (*group).to_owned(),
+                    tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+                    ..Meta::default()
+                },
+            );
+        }
+        notes
+    }
+
+    #[test]
+    fn groups_come_by_name_and_the_hosts_in_none_come_last() {
+        let hosts: Vec<Host> = ["web", "db", "box", "api"]
+            .into_iter()
+            .map(|alias| Host {
+                alias: alias.to_owned(),
+                ..Host::default()
+            })
+            .collect();
+        let notes = noted(&[
+            ("web", "Prod", &[]),
+            ("api", "prod", &[]),
+            ("db", " Prod ", &[]),
+        ]);
+        let names: Vec<(String, Vec<&str>)> = grouped(&hosts, &notes)
+            .into_iter()
+            .map(|(name, members)| {
+                (
+                    name,
+                    members.iter().map(|host| host.alias.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Prod".to_owned(), vec!["db", "web"]),
+                ("prod".to_owned(), vec!["api"]),
+                (String::new(), vec!["box"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn tags_are_listed_once_and_only_for_the_hosts_asked_about() {
+        let notes = noted(&[
+            ("web", "", &["prod", "nginx"]),
+            ("db", "", &["Prod", "prod"]),
+            ("gone", "", &["old"]),
+        ]);
+        assert_eq!(notes.tags(["web", "db"]), ["nginx", "Prod", "prod"]);
     }
 
     #[test]
