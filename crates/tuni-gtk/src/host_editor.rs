@@ -282,11 +282,14 @@ pub fn present<F>(
     page.append(&revealer);
 
     // Same shape as the jump host: nothing is the first answer and a real one.
+    // A snippet with blanks is left off, since a pane that is still connecting
+    // has nobody in front of it to fill them in.
     let mut snippets = vec!["None".to_owned()];
     snippets.extend(
         tuni_core::snippets::Snippets::load()
             .all()
             .iter()
+            .filter(|snippet| tuni_core::snippets::blanks(&snippet.body).is_empty())
             .map(|snippet| snippet.name.clone()),
     );
     let on_connect = adw::ComboRow::builder()

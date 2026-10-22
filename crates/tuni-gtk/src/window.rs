@@ -1644,6 +1644,9 @@ impl TuniWindow {
     /// seen from the keyboard, so nothing here has to know which shell it is,
     /// and whether the last of them is a newline decides whether it runs or
     /// waits on the prompt.
+    ///
+    /// The pane is the one that had the keyboard when the snippet was picked,
+    /// not whichever has it once the blanks are filled in.
     fn run_snippet(&self, name: &str) {
         let Some(snippet) = tuni_core::snippets::Snippets::load().get(name).cloned() else {
             return;
@@ -1651,8 +1654,18 @@ impl TuniWindow {
         let Some(terminal) = self.active_terminal() else {
             return;
         };
-        terminal.send_text(&snippet.body);
-        terminal.grab_focus();
+        crate::snippets::ask(
+            self,
+            &snippet,
+            glib::clone!(
+                #[weak]
+                terminal,
+                move |text| {
+                    terminal.send_text(&text);
+                    terminal.grab_focus();
+                }
+            ),
+        );
     }
 
     /// Puts a command on the prompt of a shell of its own, and leaves it there.
@@ -5786,6 +5799,10 @@ impl TuniWindow {
 /// What a host asked to have typed once it answers, if it asked for anything
 /// and the snippet it named is still there. One file read: the caller has
 /// the host's notes already.
+///
+/// A snippet with blanks is not typed: nobody is looking at a pane that is
+/// still connecting, so there is nobody to fill them in. The editor does not
+/// offer one; this is for a snippet that gained a blank after it was picked.
 fn greeting(meta: &tuni_core::ssh::Meta) -> Option<String> {
     if meta.on_connect.is_empty() {
         return None;
@@ -5793,6 +5810,7 @@ fn greeting(meta: &tuni_core::ssh::Meta) -> Option<String> {
     tuni_core::snippets::Snippets::load()
         .get(&meta.on_connect)
         .map(|snippet| snippet.body.clone())
+        .filter(|body| tuni_core::snippets::blanks(body).is_empty())
 }
 
 /// One action, spelled the way `add_action_entries` wants it.

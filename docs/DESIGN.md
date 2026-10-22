@@ -829,6 +829,19 @@ the control socket, which ssh binds only after it has authenticated, and then
 asks the master once whether it is answering. A host whose configuration shares
 nothing has no such moment to point at and gets nothing typed.
 
+A body can leave blanks, `{{name}}`, and running it asks for each one once,
+however often it appears, before a character is typed. A name is a letter or an
+underscore followed by letters, digits, underscores and hyphens, and double
+braces around anything else are text, so `docker ps --format '{{.Names}}'` and
+a template's `{{ .Field }}` type as written without an escape. A value is typed
+as keystrokes, which is why a control character in one is refused and its row
+turns red rather than the snippet going out: a newline would run the line before
+the rest of it arrived, and Ctrl+C or Escape are keys of their own. The answers
+are not remembered. A field that offered last time's value would be a store of
+whatever was typed into it, and a password is one of the things that gets typed
+into a blank. A snippet with blanks cannot be a host's on-connect snippet,
+since nobody is in front of a pane that is still connecting to fill them in.
+
 Keys are read and never held. The list under the launcher's menu is `~/.ssh`
 scanned for `.pub` files, one `ssh-keygen -l` each for the type, the size, the
 comment and the fingerprint, and one `ssh-add -l` for what the agent has, which
