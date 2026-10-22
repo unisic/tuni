@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 /// How deep an expansion may go. A symlink pointing at one of its own parents
 /// is a cycle the tree would otherwise follow forever.
-const MAX_DEPTH: usize = 32;
+pub(crate) const MAX_DEPTH: usize = 32;
 
 /// One row.
 #[derive(Clone, Debug, Eq, PartialEq)]

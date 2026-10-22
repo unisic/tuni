@@ -24,12 +24,12 @@ use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::editor::temporary_name;
-use crate::files::Failure;
+use crate::files::{Failure, MAX_DEPTH};
 
 /// The protocol version this speaks and the only one it accepts.
 const VERSION: u32 = 3;
@@ -108,6 +108,13 @@ const EXTENDED: u32 = 0x8000_0000;
 const TYPE: u32 = 0o170_000;
 const DIRECTORY: u32 = 0o040_000;
 const LINK: u32 = 0o120_000;
+const REGULAR: u32 = 0o100_000;
+
+/// How many files and folders one copy or delete of a folder may come to. The
+/// plan is held whole before any of it is carried out, under two hundred bytes
+/// a step, so this is what keeps a home directory dropped by mistake to a
+/// couple of dozen megabytes rather than whatever it holds.
+const MAX_STEPS: usize = 100_000;
 
 /// One name in a directory, with what the server said about it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -123,6 +130,123 @@ pub struct Entry {
     pub mtime: u64,
     pub is_directory: bool,
     pub is_link: bool,
+}
+
+/// Which way a copy goes. Everything else about the two is the same.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Way {
+    Up,
+    Down,
+}
+
+/// One thing a copy makes or moves, or a delete removes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Step {
+    pub remote: String,
+    /// Where it comes from or lands on this machine, and empty in a delete,
+    /// which has no side here.
+    pub local: PathBuf,
+    pub is_directory: bool,
+    pub size: u64,
+}
+
+/// What a copy or a delete comes to, worked out before any of it is done: one
+/// file, or a folder and everything in it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Plan {
+    /// In the order they are carried out. A copy makes every directory before
+    /// what goes in it, and a delete empties every directory before it goes.
+    pub steps: Vec<Step>,
+    pub bytes: u64,
+    /// How many things were left out, and why the first of them was, as a
+    /// sentence.
+    pub skipped: usize,
+    pub left_out: Option<String>,
+    /// Whether the folder lands on one of the same name that is already
+    /// there, so that a file in both is replaced.
+    pub merges: bool,
+}
+
+impl Plan {
+    /// What the folder at the top holds, for the sentence that asks whether
+    /// to delete it: "214 files and 9 folders". Nothing for a file, or for a
+    /// folder with nothing in it.
+    #[must_use]
+    pub fn inside(&self) -> Option<String> {
+        let folders = self.steps.iter().filter(|step| step.is_directory).count();
+        let files = self.steps.len() - folders;
+        let folders = folders.checked_sub(1)?;
+        match (files, folders) {
+            (0, 0) => None,
+            (files, 0) => Some(counted(files, "file")),
+            (0, folders) => Some(counted(folders, "folder")),
+            (files, folders) => Some(format!(
+                "{} and {}",
+                counted(files, "file"),
+                counted(folders, "folder")
+            )),
+        }
+    }
+
+    /// `false` once the plan is as big as it may get.
+    fn add(&mut self, step: Step) -> bool {
+        if self.steps.len() >= MAX_STEPS {
+            return false;
+        }
+        self.bytes += step.size;
+        self.steps.push(step);
+        true
+    }
+
+    fn leave_out(&mut self, why: String) {
+        self.skipped += 1;
+        self.left_out.get_or_insert(why);
+    }
+}
+
+/// How a plan went.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Report {
+    pub done: usize,
+    pub failed: usize,
+    /// Why the first step that failed did. The ones after it are counted, not
+    /// kept, since a folder of a hundred thousand refusals is one piece of news.
+    pub first: Option<Failure>,
+    /// Cancelled, or the connection went, and nothing after that was tried.
+    pub stopped: bool,
+}
+
+/// What a finished copy or delete has to say, or nothing when all of it went
+/// and nothing was left out. `verb` is what was being done to it.
+#[must_use]
+pub fn summary(plan: &Plan, report: &Report, verb: &str) -> Option<Failure> {
+    let left_out = plan.left_out.as_ref().map(|first| match plan.skipped {
+        1 => first.clone(),
+        more => format!("{first} {} more left out as well.", more - 1),
+    });
+    if report.failed == 0 {
+        return left_out
+            .map(|why| Failure::new(format!("Left out {}.", counted(plan.skipped, "item")), why));
+    }
+    let first = report
+        .first
+        .clone()
+        .unwrap_or_else(|| Failure::new(format!("Couldn't {verb} it."), "The far end refused."));
+    if plan.steps.len() == 1 && left_out.is_none() {
+        return Some(first);
+    }
+    let mut detail = format!("{} {}", first.message, first.detail);
+    if let Some(left_out) = left_out {
+        detail = format!("{detail}\n\n{left_out}");
+    }
+    Some(Failure::new(
+        format!(
+            "Couldn't {verb} {} of {}.",
+            report.failed,
+            counted(plan.steps.len(), "item")
+        ),
+        detail,
+    ))
 }
 
 /// A connection to one host's sftp subsystem.
@@ -595,6 +719,299 @@ impl Session {
         self.settle(RENAME, &request, "rename", from)
     }
 
+    /// Works out what sending `local` to `remote` comes to.
+    ///
+    /// What was chosen is followed if it is a link, since that is what
+    /// choosing it meant. Nothing inside it is: a link in a folder is either a
+    /// loop back up it or a way out of it, so it is left out and counted, and
+    /// so is a device, a socket, and a folder more than [`MAX_DEPTH`] deep.
+    pub fn plan_upload(&mut self, local: &Path, remote: &str) -> Option<Plan> {
+        let data = match std::fs::metadata(local) {
+            Ok(data) => data,
+            Err(error) => {
+                self.failure = Some(Failure::new(
+                    format!("Couldn't read {}.", local.display()),
+                    error.to_string(),
+                ));
+                return None;
+            }
+        };
+        let mut plan = Plan::default();
+        let top = Step {
+            remote: remote.to_owned(),
+            local: local.to_path_buf(),
+            is_directory: data.is_dir(),
+            size: if data.is_file() { data.len() } else { 0 },
+        };
+        if data.is_file() {
+            plan.add(top);
+            return Some(plan);
+        }
+        if !data.is_dir() {
+            self.failure = Some(Failure::new(
+                format!("Couldn't send {}.", local.display()),
+                "It is not a file or a folder.",
+            ));
+            return None;
+        }
+        plan.merges = self
+            .probe(|session| session.stat(remote))
+            .is_some_and(|entry| entry.is_directory);
+        if !plan.add(top) || !gather_here(&mut plan, local, remote, 1) {
+            self.failure = Some(too_many());
+            return None;
+        }
+        Some(plan)
+    }
+
+    /// The same for fetching `remote` to `local`, read off the far end one
+    /// directory at a time.
+    pub fn plan_download(&mut self, remote: &str, local: &Path) -> Option<Plan> {
+        let top = self.stat(remote)?;
+        // A pipe or a device reads forever, or never, and either way is no
+        // file to keep.
+        if !top.is_directory && top.mode != 0 && top.mode & TYPE != REGULAR {
+            self.failure = Some(Failure::new(
+                format!("Couldn't fetch {remote}."),
+                "It is not a file or a folder.",
+            ));
+            return None;
+        }
+        let mut plan = Plan {
+            merges: top.is_directory && local.is_dir(),
+            ..Plan::default()
+        };
+        plan.add(Step {
+            remote: remote.to_owned(),
+            local: local.to_path_buf(),
+            is_directory: top.is_directory,
+            size: if top.is_directory { 0 } else { top.size },
+        });
+        if top.is_directory {
+            self.gather_there(&mut plan, remote, Some(local), 1)?;
+        }
+        Some(plan)
+    }
+
+    /// What deleting `remote` comes to. A link is never followed, here or
+    /// anywhere under it: it goes, and what it points at stays.
+    pub fn plan_delete(&mut self, remote: &str) -> Option<Plan> {
+        let top = self.lstat(remote)?;
+        let mut plan = Plan::default();
+        if top.is_directory {
+            self.gather_there(&mut plan, remote, None, 1)?;
+        }
+        let top = Step {
+            remote: remote.to_owned(),
+            is_directory: top.is_directory,
+            ..Step::default()
+        };
+        if !plan.add(top) {
+            self.failure = Some(too_many());
+            return None;
+        }
+        Some(plan)
+    }
+
+    /// Carries out a plan from [`Self::plan_upload`] or
+    /// [`Self::plan_download`], calling `progress` with the bytes moved across
+    /// the whole of it.
+    ///
+    /// A step that fails is counted and the rest go on, since one file the
+    /// account may not read is no reason to leave the other two hundred where
+    /// they are. A cancel or a lost connection stops it there. A directory
+    /// that is already there is gone into rather than refused, which is what
+    /// [`Plan::merges`] warned about.
+    ///
+    /// ponytail: one file at a time, about six round trips each before its
+    /// bytes, so a tree of many small files is as slow as the link is far.
+    /// Several files in flight at once if that ever matters more than rsync.
+    pub fn copy(
+        &mut self,
+        way: Way,
+        plan: &Plan,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Report {
+        let mut report = Report::default();
+        let mut before = 0_u64;
+        for step in &plan.steps {
+            let mut halted = false;
+            let mut note = |at: u64, _: u64| {
+                let go = progress(before + at, plan.bytes.max(before + at));
+                halted |= !go;
+                go
+            };
+            let done = match (way, step.is_directory) {
+                (Way::Up, true) => self.make_there(&step.remote),
+                (Way::Up, false) => self.put(&step.local, &step.remote, &mut note),
+                (Way::Down, true) => self.make_here(&step.local),
+                (Way::Down, false) => self.get(&step.remote, &step.local, &mut note),
+            };
+            before += step.size;
+            if halted || self.lost {
+                report.stopped = true;
+                break;
+            }
+            self.tally(&mut report, done);
+        }
+        report
+    }
+
+    /// Carries out a plan from [`Self::plan_delete`].
+    ///
+    /// Up to [`WINDOW`] removals are in flight at once, the way a transfer's
+    /// chunks are, since one round trip a name would make a build directory
+    /// take minutes across a slow link. A directory waits for every answer
+    /// owed before it is asked for, and those are the answers for what was in
+    /// it. Something that would not go is counted and the rest carry on; the
+    /// directory holding it then refuses too, which is the truth.
+    pub fn delete(&mut self, plan: &Plan) -> Report {
+        let mut report = Report::default();
+        // Request ids, and the step each one is for.
+        let mut flight: Vec<(u32, usize)> = Vec::with_capacity(WINDOW);
+        for (index, step) in plan.steps.iter().enumerate() {
+            while !flight.is_empty() && (step.is_directory || flight.len() == WINDOW) {
+                if self.deleted(&mut flight, plan, &mut report).is_none() {
+                    report.stopped = true;
+                    return report;
+                }
+            }
+            let kind = if step.is_directory { RMDIR } else { REMOVE };
+            let Some(id) = self.request(kind, &encode_string(&step.remote)) else {
+                report.stopped = true;
+                return report;
+            };
+            flight.push((id, index));
+        }
+        while !flight.is_empty() {
+            if self.deleted(&mut flight, plan, &mut report).is_none() {
+                report.stopped = true;
+                break;
+            }
+        }
+        report
+    }
+
+    /// Takes one answer off a delete's flight and counts it.
+    fn deleted(
+        &mut self,
+        flight: &mut Vec<(u32, usize)>,
+        plan: &Plan,
+        report: &mut Report,
+    ) -> Option<()> {
+        let (id, kind, body) = self.any_reply()?;
+        let Some(at) = flight.iter().position(|(asked, _)| *asked == id) else {
+            self.lost("The far end answered a request nobody made.");
+            return None;
+        };
+        let (_, index) = flight.swap_remove(at);
+        let done = (kind == REPLY_STATUS && Reader::new(&body).u32() == Some(OK)).then_some(());
+        if done.is_none() {
+            self.blame(kind, &body, "delete", &plan.steps[index].remote);
+        }
+        self.tally(report, done);
+        Some(())
+    }
+
+    fn tally(&self, report: &mut Report, done: Option<()>) {
+        if done.is_some() {
+            report.done += 1;
+            return;
+        }
+        report.failed += 1;
+        if report.first.is_none() {
+            report.first.clone_from(&self.failure);
+        }
+    }
+
+    /// A directory at the far end for a copy to go into, made unless it is
+    /// there already.
+    fn make_there(&mut self, path: &str) -> Option<()> {
+        if self.mkdir(path).is_some() {
+            return Some(());
+        }
+        self.probe(|session| session.stat(path))
+            .filter(|entry| entry.is_directory)
+            .map(|_| ())
+    }
+
+    /// The same on this machine.
+    fn make_here(&mut self, path: &Path) -> Option<()> {
+        match std::fs::create_dir(path) {
+            Ok(()) => Some(()),
+            Err(_) if path.is_dir() => Some(()),
+            Err(error) => {
+                self.failure = Some(Failure::new(
+                    format!("Couldn't make {}.", path.display()),
+                    error.to_string(),
+                ));
+                None
+            }
+        }
+    }
+
+    /// Adds everything inside the remote directory `remote` to `plan`: for a
+    /// download, landing under `local`, every directory before what is in it;
+    /// for a delete, with no `local`, every directory after. `None` when the
+    /// plan has to be given up, because the connection went or it grew past
+    /// [`MAX_STEPS`].
+    fn gather_there(
+        &mut self,
+        plan: &mut Plan,
+        remote: &str,
+        local: Option<&Path>,
+        depth: usize,
+    ) -> Option<()> {
+        let Some(mut entries) = self.list(remote) else {
+            if self.lost {
+                return None;
+            }
+            plan.leave_out(format!("{remote} could not be read."));
+            return Some(());
+        };
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for entry in entries {
+            let there = join(remote, &entry.name);
+            let here = local.map(|local| local.join(&entry.name));
+            let step = Step {
+                remote: there.clone(),
+                local: here.clone().unwrap_or_default(),
+                is_directory: entry.is_directory,
+                size: if entry.is_directory { 0 } else { entry.size },
+            };
+            let added = if entry.is_directory {
+                if depth >= MAX_DEPTH {
+                    plan.leave_out(format!("{there} is more than {MAX_DEPTH} folders deep."));
+                    continue;
+                }
+                if let Some(here) = here {
+                    plan.add(step)
+                        && self
+                            .gather_there(plan, &there, Some(&here), depth + 1)
+                            .is_some()
+                } else {
+                    self.gather_there(plan, &there, None, depth + 1).is_some() && plan.add(step)
+                }
+            // A delete takes a link or a device away like a file. A copy
+            // leaves it, for the reasons `plan_upload` gives.
+            } else if local.is_none() || (entry.mode == 0 || entry.mode & TYPE == REGULAR) {
+                plan.add(step)
+            } else {
+                plan.leave_out(format!(
+                    "{there} is a link or a device, which is not copied."
+                ));
+                continue;
+            };
+            if !added {
+                if !self.lost {
+                    self.failure = Some(too_many());
+                }
+                return None;
+            }
+        }
+        Some(())
+    }
+
     /// Why the last call failed, in the two parts a dialog wants.
     #[must_use]
     pub fn failure(&self) -> Option<&Failure> {
@@ -1039,6 +1456,93 @@ impl Drop for Session {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// Adds everything inside the local directory `local` to `plan`, going to
+/// `remote`. `false` once the plan has grown past [`MAX_STEPS`].
+fn gather_here(plan: &mut Plan, local: &Path, remote: &str, depth: usize) -> bool {
+    let mut entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(local) {
+        Ok(read) => read.filter_map(Result::ok).collect(),
+        Err(error) => {
+            plan.leave_out(format!("{} could not be read: {error}.", local.display()));
+            return true;
+        }
+    };
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        // Names go across as text, so one that is not would land spelled
+        // otherwise.
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            plan.leave_out(format!("{} has a name that is not text.", path.display()));
+            continue;
+        };
+        let there = join(remote, &name);
+        // Not followed, which is what the directory entry's own type is.
+        let kind = entry.file_type().ok();
+        if kind.is_some_and(|kind| kind.is_dir()) {
+            if depth >= MAX_DEPTH {
+                plan.leave_out(format!(
+                    "{} is more than {MAX_DEPTH} folders deep.",
+                    path.display()
+                ));
+                continue;
+            }
+            let step = Step {
+                remote: there.clone(),
+                local: path.clone(),
+                is_directory: true,
+                size: 0,
+            };
+            if !plan.add(step) || !gather_here(plan, &path, &there, depth + 1) {
+                return false;
+            }
+        } else if kind.is_some_and(|kind| kind.is_file()) {
+            let size = entry.metadata().map_or(0, |data| data.len());
+            let step = Step {
+                remote: there,
+                local: path,
+                is_directory: false,
+                size,
+            };
+            if !plan.add(step) {
+                return false;
+            }
+        } else {
+            plan.leave_out(format!(
+                "{} is a link or a device, which is not copied.",
+                path.display()
+            ));
+        }
+    }
+    true
+}
+
+/// A name inside a remote directory.
+fn join(directory: &str, name: &str) -> String {
+    Path::new(directory)
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn too_many() -> Failure {
+    Failure::new(
+        "That is too much to do in one go.",
+        format!(
+            "It comes to more than {MAX_STEPS} files and folders. rsync, or a shell \
+             in a pane, is the tool for a tree that size."
+        ),
+    )
+}
+
+/// "1 file", "2 files".
+fn counted(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
     }
 }
 
@@ -1956,5 +2460,167 @@ mod tests {
         ]);
         assert!(session.handshake());
         assert_eq!(session.realpath(".").as_deref(), Some("/home/dean"));
+    }
+
+    /// OpenSSH's own server, run as a plain process on this machine's files,
+    /// for what a script of answers cannot stand in for: a walk of a real tree.
+    fn real_server() -> Session {
+        let found = [
+            "/usr/libexec/openssh/sftp-server",
+            "/usr/lib/openssh/sftp-server",
+        ]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+        .expect("these tests need sftp-server, which openssh-server installs");
+        Session::open(&[found.to_owned()]).expect("sftp-server started")
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("tuni-sftp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn text(path: &Path) -> String {
+        path.to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn a_folder_goes_across_and_comes_back_with_everything_in_it_but_a_link() {
+        let root = scratch("tree");
+        let here = root.join("here");
+        std::fs::create_dir_all(here.join("sub")).unwrap();
+        std::fs::write(here.join("a.txt"), "one").unwrap();
+        std::fs::write(here.join("sub/b.txt"), "two two").unwrap();
+        std::os::unix::fs::symlink(here.join("a.txt"), here.join("link")).unwrap();
+        let there = text(&root.join("there"));
+        let mut session = real_server();
+
+        let plan = session.plan_upload(&here, &there).expect("planned");
+        let order: Vec<&str> = plan.steps.iter().map(|step| step.remote.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                there.clone(),
+                format!("{there}/a.txt"),
+                format!("{there}/sub"),
+                format!("{there}/sub/b.txt"),
+            ]
+        );
+        assert_eq!((plan.bytes, plan.skipped, plan.merges), (10, 1, false));
+        let report = session.copy(Way::Up, &plan, &mut |_, _| true);
+        assert_eq!((report.done, report.failed, report.stopped), (4, 0, false));
+        assert!(!root.join("there/link").exists());
+
+        let back = root.join("back");
+        let plan = session.plan_download(&there, &back).expect("planned");
+        assert_eq!((plan.steps.len(), plan.bytes, plan.merges), (4, 10, false));
+        let mut seen = 0;
+        let report = session.copy(Way::Down, &plan, &mut |at, total| {
+            seen = at;
+            assert!(at <= total);
+            true
+        });
+        assert_eq!((report.done, report.failed), (4, 0));
+        assert_eq!(seen, 10);
+        assert_eq!(
+            std::fs::read_to_string(back.join("sub/b.txt")).unwrap(),
+            "two two"
+        );
+        assert_eq!(std::fs::read_to_string(back.join("a.txt")).unwrap(), "one");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_folder_sent_onto_one_of_the_same_name_replaces_what_is_in_both_and_keeps_the_rest() {
+        let root = scratch("merge");
+        std::fs::create_dir_all(root.join("here")).unwrap();
+        std::fs::create_dir_all(root.join("there")).unwrap();
+        std::fs::write(root.join("here/a.txt"), "new").unwrap();
+        std::fs::write(root.join("there/a.txt"), "old").unwrap();
+        std::fs::write(root.join("there/only.txt"), "kept").unwrap();
+        let mut session = real_server();
+
+        let plan = session
+            .plan_upload(&root.join("here"), &text(&root.join("there")))
+            .unwrap();
+        assert!(plan.merges);
+        let report = session.copy(Way::Up, &plan, &mut |_, _| true);
+        assert_eq!((report.done, report.failed), (2, 0));
+        assert_eq!(
+            std::fs::read_to_string(root.join("there/a.txt")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("there/only.txt")).unwrap(),
+            "kept"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deleting_a_folder_empties_it_first_and_leaves_what_a_link_in_it_points_at() {
+        let root = scratch("delete");
+        let gone = root.join("gone");
+        std::fs::create_dir_all(gone.join("sub/deep")).unwrap();
+        std::fs::write(gone.join("a"), "").unwrap();
+        std::fs::write(gone.join("sub/b"), "").unwrap();
+        std::fs::write(gone.join("sub/deep/c"), "").unwrap();
+        std::fs::write(root.join("outside"), "stays").unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), gone.join("link")).unwrap();
+        let mut session = real_server();
+
+        let plan = session.plan_delete(&text(&gone)).expect("planned");
+        assert_eq!(plan.inside().as_deref(), Some("4 files and 2 folders"));
+        assert_eq!(
+            plan.steps.last().map(|step| step.remote.clone()),
+            Some(text(&gone))
+        );
+        let report = session.delete(&plan);
+        assert_eq!((report.done, report.failed, report.stopped), (7, 0, false));
+        assert!(!gone.exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("outside")).unwrap(),
+            "stays"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_summary_counts_what_failed_and_what_was_left_out() {
+        let step = Step::default();
+        let mut plan = Plan {
+            steps: vec![step.clone(), step.clone(), step],
+            ..Plan::default()
+        };
+        assert_eq!(summary(&plan, &Report::default(), "send"), None);
+
+        plan.leave_out("x is a link or a device, which is not copied.".to_owned());
+        plan.leave_out("y is a link or a device, which is not copied.".to_owned());
+        let refused = Failure::new("Couldn't send y.", "Permission denied.");
+        let report = Report {
+            done: 2,
+            failed: 1,
+            first: Some(refused.clone()),
+            stopped: false,
+        };
+        let said = summary(&plan, &report, "send").expect("something to say");
+        assert_eq!(said.message, "Couldn't send 1 of 3 items.");
+        assert_eq!(
+            said.detail,
+            "Couldn't send y. Permission denied.\n\n\
+             x is a link or a device, which is not copied. 1 more left out as well."
+        );
+
+        let nothing_failed = summary(&plan, &Report::default(), "send").expect("left out");
+        assert_eq!(nothing_failed.message, "Left out 2 items.");
+
+        let one = Plan {
+            steps: vec![Step::default()],
+            ..Plan::default()
+        };
+        assert_eq!(summary(&one, &report, "send"), Some(refused));
+        assert_eq!(one.inside(), None);
     }
 }

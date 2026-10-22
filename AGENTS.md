@@ -19,8 +19,9 @@ make check                # fmt --check, clippy -D warnings, test, desktop/AppSt
 ```
 
 `make check` is what CI runs, so run it before pushing rather than reading the
-failure in a mail. It needs four packages a build does not: `rustfmt`, `clippy`,
-`desktop-file-utils` and `appstream`. README lists both sets for Fedora.
+failure in a mail. It needs five packages a build does not: `rustfmt`, `clippy`,
+`desktop-file-utils`, `appstream`, and `openssh-server` for the `sftp-server`
+the SFTP tests copy real folders through. README lists both sets for Fedora.
 
 Tests:
 

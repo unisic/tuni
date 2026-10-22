@@ -898,17 +898,43 @@ screen to say so. A failure empties that queue rather than trying the rest: what
 refused this file for is what the ones behind it were about to meet, and the
 dialog says how many were left where they are.
 
-Files dragged onto the page go up. They land in the directory being shown, or in
-the one whose row they were dropped on, and they queue like any other transfer.
-A folder is refused, and the refusal says what to reach for instead: there is no
-recursive copy here, and one written on top of a single outstanding request
-would lose to `rsync` at the job `rsync` exists for.
+Files and folders dragged onto the page go up. They land in the directory being
+shown, or in the one whose row they were dropped on, and they queue like any
+other transfer. A folder goes across with everything in it, either way: "Upload
+Folder Here…" on a directory or the page's menu, "Download…" on a folder's row.
+This used to be refused with a pointer to `rsync`, because a recursive copy on top
+of one outstanding request would have lost to it badly. With sixty-four requests
+in the air and a session of its own, a folder of source or photos is now a
+reasonable thing to send from here, and `rsync` is still the tool for keeping two
+trees in step. The folder is walked whole before anything moves, so the bar
+counts bytes across all of it, and a folder of the same name already at the
+other end is a question, "Merge with …?", asked before anything is written: a
+file in both is replaced, through the same temporary name a single file uses, and
+the rest stays. What was chosen is followed if it is a link, since that is what
+choosing it meant. Nothing inside it is: a link in a folder is either a loop back
+up it or a way out of it, so it is left out, and so is a device, a pipe, a name
+that is not text, and anything more than 32 folders deep, the same limit the
+Files page draws to. What was left out is counted and the first reason is given
+when the copy ends. A file that fails is counted too and the rest carry on, since
+one file the account may not read is no reason to leave the other two hundred
+where they are; a cancel or a lost connection stops it there. The walk stops at
+100,000 files and folders, a couple of dozen megabytes of plan, with a dialog
+that says a tree that size is a job for `rsync` or a shell. Each small file
+still costs about six round trips, so a tree of many tiny files over a far link
+is as slow as the link is far.
 
 Making a directory, renaming and deleting are the rest of it. Deleting asks
 first, and the question says that there is no trash on the other machine, since
 nothing here can put one there and a dialog that implies otherwise is a lie a
-person only finds out about once. A directory goes only when it is empty, which
-is the far end's rule and not this one's. Every change re-reads the directory it
+person only finds out about once. A folder is walked before the question, so
+it says what will go with it: "It holds 214 files and 9 folders." Then it is
+emptied from the bottom up, sixty-four removals in flight at once, each
+directory once what was in it has answered, since one round trip a name would
+make a build directory take minutes over a slow link. A link inside is removed
+and what it points at stays. Something that would not go is counted, the folder
+holding it then refuses as well, and the dialog afterwards says how many of how
+many. The walk and the removals hold the session the page browses with, so a
+very large tree stops the listing until it is gone. Every change re-reads the directory it
 happened in, because nothing over there will say what changed. What version 3
 will not say is why it refused: OpenSSH's server answers a name that is taken and
 a directory that is not empty with the same bare failure, whose text is the word

@@ -136,11 +136,12 @@ not build against it. To build the 0.16 way instead - that toolchain, and the
 newer Ghostty commit which requires it - `make build-next`.
 
 `make check` is what CI runs: format, clippy, tests, and the desktop and
-AppStream files. It needs four more packages, and none of them are needed to
-build:
+AppStream files. It needs five more packages, and none of them are needed to
+build. `openssh-server` is there for its `sftp-server`, which the SFTP tests
+copy real folders through; nothing starts a daemon:
 
 ```sh
-sudo dnf install rustfmt clippy desktop-file-utils appstream
+sudo dnf install rustfmt clippy desktop-file-utils appstream openssh-server
 make check
 ```
 
