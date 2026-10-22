@@ -11,7 +11,7 @@
 //! reads on navigation, and when somebody asks it to.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,7 +24,7 @@ use gtk::gio;
 use gtk::glib;
 
 use tuni_core::files::{Directory, Failure, Item, Tree, natural_cmp};
-use tuni_core::sftp::{Session, Way, summary};
+use tuni_core::sftp::{Job, Queue, Session, Way, summary};
 
 use crate::files::bind_row;
 use crate::files::row::Row;
@@ -45,14 +45,6 @@ pub struct Moved {
     stop: AtomicBool,
 }
 
-/// One file or folder waiting its turn. A drop of five is five of these, four
-/// of them behind the one the pipe is carrying.
-pub struct Job {
-    way: Way,
-    remote: String,
-    local: PathBuf,
-}
-
 /// The directories that have come back, which is everything there is to draw.
 #[derive(Default)]
 pub struct Listed(HashMap<PathBuf, Vec<Item>>);
@@ -65,8 +57,8 @@ impl Directory for Listed {
 
 mod imp {
     use super::{
-        Arc, Cell, HashSet, Item, Job, Link, Listed, Moved, PathBuf, RefCell, Session, Tree,
-        VecDeque, gio, glib,
+        Arc, Cell, HashSet, Item, Job, Link, Listed, Moved, PathBuf, Queue, RefCell, Session, Tree,
+        gio, glib,
     };
     use adw::prelude::*;
     use adw::subclass::prelude::*;
@@ -79,9 +71,11 @@ mod imp {
         /// A second session that only carries files, so a long one does not
         /// hold the listing behind its lock. Opened by the first transfer
         /// rather than with the page, since most visits never move a file,
-        /// and kept until the host changes. A transfer takes it and hands it
-        /// back, which is all the sharing one transfer at a time needs.
-        pub carrier: RefCell<Option<Session>>,
+        /// and kept while the page is on its host or a job waits for it. A
+        /// transfer takes it and hands it back, which is all the sharing one
+        /// transfer at a time needs. Named by its host, because the queue
+        /// outlives the page's visit to one.
+        pub carrier: RefCell<Option<(String, Session)>>,
         /// The host being browsed, and nothing at all when no pane is on one.
         pub alias: RefCell<Option<String>>,
         /// Bumped when the host changes. A listing already in flight names the
@@ -102,16 +96,23 @@ mod imp {
         pub subtitle: RefCell<Option<gtk::Label>>,
         pub menu: RefCell<Option<gtk::PopoverMenu>>,
         pub progress: RefCell<Option<gtk::ProgressBar>>,
-        /// The bar and its cancel button, shown and hidden as one.
+        /// The bar, the list of transfers and the cancel button, shown while
+        /// any of them has something to say.
         pub progress_row: RefCell<Option<gtk::Box>>,
+        /// In place of the bar once nothing is moving and something failed.
+        pub failed: RefCell<Option<gtk::Label>>,
+        pub cancel: RefCell<Option<gtk::Button>>,
+        /// The rows of the transfers popover, rebuilt each time it opens and
+        /// whenever a transfer changes while it is open.
+        pub transfers: RefCell<Option<gtk::ListBox>>,
+        pub transfers_popover: RefCell<Option<gtk::Popover>>,
         /// The transfer running, if one is. The carrier moves one at a time,
-        /// so a second would wait for it with nothing on screen saying why;
-        /// this is what refuses it instead.
-        pub moving: RefCell<Option<Arc<Moved>>>,
-        /// What is waiting for the pipe, in the order it was asked for. A drop
-        /// of a directory's worth of files fills this and empties it one file
-        /// at a time.
-        pub queue: RefCell<VecDeque<Job>>,
+        /// so a second waits in [`Self::queue`] where the list can show it.
+        pub moving: RefCell<Option<(Job, Arc<Moved>)>>,
+        /// What is waiting for the pipe, in the order it was asked for, and
+        /// what failed. A drop of a directory's worth of files fills it and
+        /// empties it one file at a time.
+        pub queue: RefCell<Queue>,
         /// Where browsing has been, and where it was called back from, on the
         /// host being browsed now. Emptied with the session, since both are
         /// paths on a machine the page has left.
@@ -254,9 +255,38 @@ impl TuniSftp {
             .hexpand(true)
             .valign(gtk::Align::Center)
             .build();
+        let failed = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .visible(false)
+            .build();
+        failed.add_css_class("error");
+        let transfers = gtk::ListBox::new();
+        transfers.set_selection_mode(gtk::SelectionMode::None);
+        let scrolled = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(320)
+            .min_content_width(280)
+            .child(&transfers)
+            .build();
+        let transfers_popover = gtk::Popover::new();
+        transfers_popover.set_child(Some(&scrolled));
+        transfers_popover.connect_show(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.list_transfers()
+        ));
+        let list_button = gtk::MenuButton::builder()
+            .icon_name("view-list-symbolic")
+            .tooltip_text("Transfers")
+            .popover(&transfers_popover)
+            .valign(gtk::Align::Center)
+            .build();
+        list_button.add_css_class("flat");
         let cancel = gtk::Button::builder()
             .icon_name("window-close-symbolic")
-            .tooltip_text("Cancel Transfer")
+            .tooltip_text("Cancel All Transfers")
             .valign(gtk::Align::Center)
             .build();
         cancel.add_css_class("flat");
@@ -271,6 +301,8 @@ impl TuniSftp {
         progress_row.set_margin_bottom(6);
         progress_row.set_visible(false);
         progress_row.append(&progress);
+        progress_row.append(&failed);
+        progress_row.append(&list_button);
         progress_row.append(&cancel);
 
         let rows = gio::ListStore::new::<Row>();
@@ -414,6 +446,10 @@ impl TuniSftp {
         imp.menu.replace(Some(menu));
         imp.progress.replace(Some(progress));
         imp.progress_row.replace(Some(progress_row));
+        imp.failed.replace(Some(failed));
+        imp.cancel.replace(Some(cancel));
+        imp.transfers.replace(Some(transfers));
+        imp.transfers_popover.replace(Some(transfers_popover));
         imp.location.replace(Some(location));
         imp.location_bar.replace(Some(location_bar));
 
@@ -660,22 +696,17 @@ impl TuniSftp {
         imp.generation.set(imp.generation.get().wrapping_add(1));
         imp.alias.replace(host.map(ToOwned::to_owned));
         imp.pending.borrow_mut().clear();
-        // Queued against the host that is going away, and every one of them
-        // names a path on it. The history goes with them, for the same reason.
-        // The one already moving is stopped too: it holds the old host's
-        // carrier, and left going it would keep a pipe to a host the page has
-        // left and hold back whatever the new one is asked to carry.
-        imp.queue.borrow_mut().clear();
-        if let Some(moved) = imp.moving.borrow().as_ref() {
-            moved.stop.store(true, Ordering::Relaxed);
-        }
+        // The history names paths on the host that is going away. The queue
+        // does too, but each job knows its host, and a file halfway up to one
+        // machine has no reason to stop because the page went to look at
+        // another.
         imp.back.borrow_mut().clear();
         imp.forward.borrow_mut().clear();
         imp.listed.replace(Listed::default());
         // Dropped, which kills the child and lets the master close the
         // channel. A session is one host's, and this is another host now.
         imp.link.replace(None);
-        imp.carrier.replace(None);
+        self.release();
         *imp.tree.borrow_mut() = Tree::new();
         self.reload();
         self.refresh_header();
@@ -703,13 +734,41 @@ impl TuniSftp {
 
     /// Lets go of a session that will not answer again, and says why in place
     /// of a listing that can no longer be trusted.
+    ///
+    /// The carrier goes too when it is this host's, since it came over the
+    /// same connection. What is queued stays: the first of this host's jobs
+    /// to meet the same failure takes the rest with it, and the other hosts'
+    /// jobs were never on this connection.
     fn lose(&self, failure: &Failure) {
         let imp = self.imp();
         imp.link.replace(None);
-        imp.carrier.replace(None);
-        imp.queue.borrow_mut().clear();
+        let alias = imp.alias.borrow().clone();
+        let mine = matches!(
+            (imp.carrier.borrow().as_ref(), alias),
+            (Some((carried, _)), Some(alias)) if *carried == alias
+        );
+        if mine {
+            imp.carrier.replace(None);
+        }
         imp.pending.borrow_mut().clear();
         self.fail(&failure.message, &failure.detail);
+    }
+
+    /// Drops the carrier if nothing needs it: not the host the page is on, and
+    /// nothing waiting to go to or from the host it is for. A transfer that is
+    /// running has it, so there is nothing here to drop while it does.
+    fn release(&self) {
+        let imp = self.imp();
+        let idle = match imp.carrier.borrow().as_ref() {
+            Some((carried, _)) => {
+                imp.alias.borrow().as_deref() != Some(carried.as_str())
+                    && !imp.queue.borrow().wants(carried)
+            }
+            None => false,
+        };
+        if idle {
+            imp.carrier.replace(None);
+        }
     }
 
     /// Starts a session and lists whatever the far end calls home.
@@ -1063,23 +1122,32 @@ impl TuniSftp {
         any
     }
 
-    /// Puts one transfer at the back of the queue and starts it if the pipe is
-    /// free.
+    /// Puts one transfer at the back of the queue, against the host the page
+    /// is on, and starts it if the pipe is free.
     fn start(&self, way: Way, remote: String, local: PathBuf) {
+        let Some(alias) = self.imp().alias.borrow().clone() else {
+            return;
+        };
         self.imp()
             .queue
             .borrow_mut()
-            .push_back(Job { way, remote, local });
+            .push(&alias, way, remote, local);
         self.pump();
+        self.refresh_transfers();
     }
 
     /// The button on the bar. Stops the transfer at its next chunk and
     /// forgets the ones queued behind it: the press means "stop
     /// transferring", and eleven files nobody wants any more would otherwise
-    /// start the moment this one dies.
+    /// start the moment this one dies. One of them alone is the list's.
     fn cancel_transfer(&self) {
         self.imp().queue.borrow_mut().clear();
-        if let Some(moved) = self.imp().moving.borrow().as_ref() {
+        self.stop_moving();
+        self.refresh_transfers();
+    }
+
+    fn stop_moving(&self) {
+        if let Some((_, moved)) = self.imp().moving.borrow().as_ref() {
             moved.stop.store(true, Ordering::Relaxed);
         }
     }
@@ -1089,7 +1157,7 @@ impl TuniSftp {
         if self.imp().moving.borrow().is_some() {
             return;
         }
-        let next = self.imp().queue.borrow_mut().pop_front();
+        let next = self.imp().queue.borrow_mut().pop();
         if let Some(job) = next {
             self.transfer(job);
         }
@@ -1100,41 +1168,37 @@ impl TuniSftp {
     /// One at a time, on [`imp::TuniSftp::carrier`] rather than the session
     /// the page lists with, so browsing goes on while a file moves. What is
     /// waiting waits in [`imp::TuniSftp::queue`], where the bar can count it.
+    /// The job names its host, so the page going to another one changes
+    /// nothing here: the carrier is the job's host's, not the page's.
     fn transfer(&self, job: Job) {
-        let Job { way, remote, local } = job;
         let imp = self.imp();
-        let Some(alias) = imp.alias.borrow().clone() else {
-            return;
-        };
-        if imp.link.borrow().is_none() {
-            return;
-        }
-        let carrier = imp.carrier.take();
+        let carrier = imp
+            .carrier
+            .take()
+            .filter(|(carried, _)| *carried == job.alias)
+            .map(|(_, session)| session);
         let moved = Arc::new(Moved::default());
-        imp.moving.replace(Some(Arc::clone(&moved)));
+        imp.moving.replace(Some((job.clone(), Arc::clone(&moved))));
 
-        let directory = Path::new(&remote).parent().map(Path::to_path_buf);
-        let name = Path::new(&remote).file_name().map_or_else(
-            || remote.clone(),
-            |name| name.to_string_lossy().into_owned(),
-        );
-        let label = match way {
+        let name = job.name();
+        let label = match job.way {
             Way::Up => format!("Sending {name}"),
             Way::Down => format!("Fetching {name}"),
         };
-        let waiting = imp.queue.borrow().len();
-        self.watch(&if waiting == 0 {
-            label
-        } else {
-            format!("{label}, {waiting} to go")
-        });
+        self.watch(label, Arc::clone(&moved));
 
-        let generation = imp.generation.get();
         let flag = Arc::clone(&moved);
+        let (alias, way, remote, local) = (
+            job.alias.clone(),
+            job.way,
+            job.remote.clone(),
+            job.local.clone(),
+        );
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
             self,
             async move {
+                let host = alias.clone();
                 let planned = gio::spawn_blocking(move || {
                     // Opened the way the page's own session was. Over a shared
                     // connection that is one more channel on the master;
@@ -1143,7 +1207,7 @@ impl TuniSftp {
                     let mut session = match carrier {
                         Some(session) => session,
                         None => {
-                            let host = tuni_core::ssh::host(&alias);
+                            let host = tuni_core::ssh::host(&host);
                             let control = crate::hosts::control();
                             match Session::open(&tuni_core::ssh::sftp_command(&host, &control)) {
                                 Ok(session) => session,
@@ -1169,9 +1233,7 @@ impl TuniSftp {
                 })
                 .await;
 
-                let halted = || {
-                    flag.stop.load(Ordering::Relaxed) || generation != this.imp().generation.get()
-                };
+                let halted = || flag.stop.load(Ordering::Relaxed);
                 let (moved, session) = 'run: {
                     let (plan, session) = match planned {
                         Ok((Ok(plan), Some(session))) => (plan, session),
@@ -1218,24 +1280,17 @@ impl TuniSftp {
                     }
                 };
 
-                // Back for the next file, unless the page is on another host
-                // by now.
-                if generation == this.imp().generation.get() {
-                    this.imp().carrier.replace(session);
-                }
-                this.imp().moving.replace(None);
-                if let Some(row) = this.imp().progress_row.borrow().as_ref() {
-                    row.set_visible(false);
-                }
-                // Whatever happened to this one, the queue moves on: after a
-                // change of host it holds the new host's files, which have
-                // been waiting for this pipe to come free.
-                if let Some(moved) = moved
-                    && generation == this.imp().generation.get()
-                {
-                    this.finish(moved, flag.stop.load(Ordering::Relaxed), way, directory);
+                // Back for the next file, and let go of at once if no file
+                // for that host is coming.
+                let imp = this.imp();
+                imp.carrier.replace(session.map(|session| (alias, session)));
+                let job = imp.moving.take().map(|(job, _)| job);
+                this.release();
+                if let (Some(job), Some(moved)) = (job, moved) {
+                    this.finish(job, moved, flag.stop.load(Ordering::Relaxed));
                 }
                 this.pump();
+                this.refresh_transfers();
             }
         ));
     }
@@ -1259,40 +1314,46 @@ impl TuniSftp {
         dialog.choose_future(Some(self)).await == "merge"
     }
 
-    /// What one transfer's end means for the page.
+    /// What one transfer's end means for the page. Nothing here is a dialog:
+    /// a failure goes on the transfers list, where it waits to be read
+    /// without standing in front of whatever is being done meanwhile.
     fn finish(
         &self,
+        job: Job,
         moved: Result<Option<Failure>, (Failure, bool)>,
         stopped_by_hand: bool,
-        way: Way,
-        directory: Option<PathBuf>,
     ) {
+        let here = self.imp().alias.borrow().as_deref() == Some(job.alias.as_str());
         // The directory has something in it that it did not have, even after a
         // folder stopped partway, and nothing remote will say so on its own.
-        if let (Way::Up, Some(directory), false) = (way, directory, matches!(moved, Err((_, true))))
+        // Only if the page is still showing that host, and only if the
+        // connection is still there to ask.
+        if job.way == Way::Up
+            && here
+            && !matches!(moved, Err((_, true)))
+            && let Some(directory) = Path::new(&job.remote).parent()
         {
-            self.list(directory, false);
+            self.list(directory.to_path_buf(), false);
         }
         match moved {
-            // The cancel button doing its job is not news: the press already
-            // emptied the queue, and a dialog would only repeat what the hand
-            // that pressed it knows.
+            // The cancel button doing its job is not news, and a failure line
+            // would only repeat what the hand that pressed it knows.
             Err(_) if stopped_by_hand => {}
             Err((failure, lost)) => {
-                // What was behind it goes no further. A connection that died
-                // on the first file is going to die on the other eleven, and
-                // eleven more dialogs is not eleven more pieces of news.
-                let waiting = self.imp().queue.borrow_mut().drain(..).count();
-                let failure = stopped(&failure, waiting);
-                if lost {
+                // A connection that died under the carrier died under the
+                // listing too, since both go over the same one.
+                if lost && here {
                     self.lose(&failure);
-                } else {
-                    self.report(&failure);
                 }
+                // What was behind it for the same host goes no further: a
+                // connection that died on the first file is going to die on
+                // the other eleven, and eleven failures is not eleven pieces
+                // of news.
+                self.imp().queue.borrow_mut().fail(job, failure, true);
             }
             // Some of a folder went and some did not, which is said without
             // holding up what is queued behind it.
-            Ok(Some(partly)) => self.report(&partly),
+            Ok(Some(partly)) => self.imp().queue.borrow_mut().fail(job, partly, false),
             Ok(None) => {}
         }
     }
@@ -1639,16 +1700,16 @@ impl TuniSftp {
 
     /// Draws a transfer while it runs: a local timer over two numbers, not a
     /// poll of anything on the other machine.
-    fn watch(&self, label: &str) {
+    ///
+    /// The timer ends when `moved` is no longer the transfer running, which
+    /// the next one starting in the same turn of the loop would otherwise hide
+    /// from it: two timers on one bar, each writing its own file's name.
+    fn watch(&self, label: String, moved: Arc<Moved>) {
         let Some(bar) = self.imp().progress.borrow().clone() else {
             return;
         };
-        bar.set_text(Some(label));
+        bar.set_text(Some(&label));
         bar.set_fraction(0.0);
-        if let Some(row) = self.imp().progress_row.borrow().as_ref() {
-            row.set_visible(true);
-        }
-        let label = label.to_owned();
         let started = std::time::Instant::now();
         glib::timeout_add_local(
             std::time::Duration::from_millis(100),
@@ -1658,41 +1719,211 @@ impl TuniSftp {
                 #[upgrade_or]
                 glib::ControlFlow::Break,
                 move || {
-                    let Some(moved) = this.imp().moving.borrow().clone() else {
+                    let imp = this.imp();
+                    let running = imp
+                        .moving
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|(_, now)| Arc::ptr_eq(now, &moved));
+                    if !running {
                         return glib::ControlFlow::Break;
-                    };
+                    }
                     let done = moved.done.load(Ordering::Relaxed);
                     let total = moved.total.load(Ordering::Relaxed);
-                    if let Some(bar) = this.imp().progress.borrow().as_ref() {
-                        // Bytes over the whole run rather than over the last
-                        // tick: an average settles where a 100ms sample
-                        // flickers between a stall and a burst. Held back for
-                        // the first moment because dividing by almost no time
-                        // opens every transfer on a nonsense number.
-                        let elapsed = started.elapsed().as_secs_f64();
-                        let speed = if elapsed < 0.5 {
-                            String::new()
-                        } else {
-                            let rate = done as f64 / elapsed;
-                            format!(" · {}/s", glib::format_size(rate as u64))
-                        };
-                        // A server that did not say how big a file is leaves
-                        // nothing to draw a fraction from, so the bar moves
-                        // without claiming to know how far along it is.
-                        if total == 0 {
-                            bar.pulse();
-                            bar.set_text(Some(&format!("{label}{speed}")));
-                        } else {
-                            let fraction = done as f64 / total as f64;
-                            bar.set_fraction(fraction);
-                            let percent = (fraction * 100.0) as u32;
-                            bar.set_text(Some(&format!("{label} — {percent}%{speed}")));
-                        }
+                    // Counted each tick rather than when the file started,
+                    // since the list can take one off while this one moves.
+                    let waiting = imp.queue.borrow().waiting().len();
+                    let rest = if waiting == 0 {
+                        String::new()
+                    } else {
+                        format!(" · {waiting} to go")
+                    };
+                    // Bytes over the whole run rather than over the last
+                    // tick: an average settles where a 100ms sample flickers
+                    // between a stall and a burst. Held back for the first
+                    // moment because dividing by almost no time opens every
+                    // transfer on a nonsense number.
+                    let elapsed = started.elapsed().as_secs_f64();
+                    let speed = if elapsed < 0.5 {
+                        String::new()
+                    } else {
+                        let rate = done as f64 / elapsed;
+                        format!(" · {}/s", glib::format_size(rate as u64))
+                    };
+                    // A server that did not say how big a file is leaves
+                    // nothing to draw a fraction from, so the bar moves
+                    // without claiming to know how far along it is.
+                    if total == 0 {
+                        bar.pulse();
+                        bar.set_text(Some(&format!("{label}{speed}{rest}")));
+                    } else {
+                        let fraction = done as f64 / total as f64;
+                        bar.set_fraction(fraction);
+                        let percent = (fraction * 100.0) as u32;
+                        bar.set_text(Some(&format!("{label} · {percent}%{speed}{rest}")));
                     }
                     glib::ControlFlow::Continue
                 }
             ),
         );
+    }
+
+    /// Shows the transfers row while it has anything to say, and says it: the
+    /// bar while something moves, a count once nothing does and something
+    /// failed. The list under its button is redrawn if it is open.
+    fn refresh_transfers(&self) {
+        let imp = self.imp();
+        let moving = imp.moving.borrow().is_some();
+        let (waiting, failed) = {
+            let queue = imp.queue.borrow();
+            (queue.waiting().len(), queue.failed().len())
+        };
+        let busy = moving || waiting > 0;
+        if let Some(row) = imp.progress_row.borrow().as_ref() {
+            row.set_visible(busy || failed > 0);
+        }
+        if let Some(bar) = imp.progress.borrow().as_ref() {
+            bar.set_visible(busy);
+        }
+        if let Some(cancel) = imp.cancel.borrow().as_ref() {
+            cancel.set_visible(busy);
+        }
+        if let Some(label) = imp.failed.borrow().as_ref() {
+            label.set_visible(!busy && failed > 0);
+            label.set_text(&if failed == 1 {
+                String::from("A transfer failed")
+            } else {
+                format!("{failed} transfers failed")
+            });
+        }
+        if imp
+            .transfers_popover
+            .borrow()
+            .as_ref()
+            .is_some_and(gtk::Popover::is_visible)
+        {
+            self.list_transfers();
+        }
+    }
+
+    /// Fills the transfers popover: the one running, the ones waiting, the ones
+    /// that failed, each with the button that takes it away.
+    ///
+    /// ponytail: rebuilt whole on every change while open, and cut at
+    /// [`SHOWN_TRANSFERS`] rows with a count of the rest, since a drop of a
+    /// thousand files would otherwise be a thousand rows rebuilt per file.
+    fn list_transfers(&self) {
+        let imp = self.imp();
+        let Some(list) = imp.transfers.borrow().clone() else {
+            return;
+        };
+        list.remove_all();
+        let mut shown = 0;
+        let mut more = 0;
+        let mut add = |row: gtk::Box| {
+            if shown < SHOWN_TRANSFERS {
+                list.append(&row);
+                shown += 1;
+            } else {
+                more += 1;
+            }
+        };
+        if let Some((job, _)) = imp.moving.borrow().as_ref() {
+            add(self.transfer_row(job, "Moving", "Stop", None));
+        }
+        let queue = imp.queue.borrow();
+        for job in queue.waiting() {
+            add(self.transfer_row(job, "Waiting", "Remove", Some(job.id)));
+        }
+        for (job, failure) in queue.failed() {
+            let row = self.transfer_row(job, &failure.message, "Dismiss", Some(job.id));
+            row.set_tooltip_text(Some(&failure.detail));
+            add(row);
+        }
+        let failed = !queue.failed().is_empty();
+        drop(queue);
+        if more > 0 {
+            let rest = gtk::Label::new(Some(&format!("and {more} more")));
+            rest.add_css_class("dim-label");
+            rest.set_margin_top(6);
+            rest.set_margin_bottom(6);
+            list.append(&rest);
+        }
+        if shown == 0 {
+            let none = gtk::Label::new(Some("No transfers"));
+            none.add_css_class("dim-label");
+            none.set_margin_top(6);
+            none.set_margin_bottom(6);
+            list.append(&none);
+        }
+        if failed {
+            let clear = gtk::Button::with_label("Clear Failed");
+            clear.add_css_class("flat");
+            clear.connect_clicked(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_| {
+                    this.imp().queue.borrow_mut().dismiss();
+                    this.refresh_transfers();
+                }
+            ));
+            list.append(&clear);
+        }
+    }
+
+    /// One line of the transfers list: the file, what is happening to it and
+    /// on which host, and a button. `id` is the job to take off the queue, and
+    /// nothing at all for the one running, which is stopped instead.
+    fn transfer_row(&self, job: &Job, state: &str, action: &str, id: Option<u64>) -> gtk::Box {
+        let name = gtk::Label::builder()
+            .label(job.name())
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+        let way = match job.way {
+            Way::Up => "to",
+            Way::Down => "from",
+        };
+        let said = gtk::Label::builder()
+            .label(format!("{state}, {way} {}", job.alias))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        said.add_css_class("caption");
+        said.add_css_class("dim-label");
+        let words = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        words.set_hexpand(true);
+        words.append(&name);
+        words.append(&said);
+
+        let button = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text(action)
+            .valign(gtk::Align::Center)
+            .build();
+        button.add_css_class("flat");
+        button.connect_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| {
+                match id {
+                    Some(id) => {
+                        this.imp().queue.borrow_mut().remove(id);
+                    }
+                    None => this.stop_moving(),
+                }
+                this.refresh_transfers();
+            }
+        ));
+
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.set_margin_start(6);
+        row.set_margin_end(2);
+        row.set_margin_top(4);
+        row.set_margin_bottom(4);
+        row.append(&words);
+        row.append(&button);
+        row
     }
 
     // --- drawing --------------------------------------------------------------
@@ -1992,22 +2223,8 @@ impl TuniSftp {
     }
 }
 
-/// A failure that took a queue down with it, since what stopped the file being
-/// moved is what the ones behind it would have run into.
-fn stopped(failure: &Failure, waiting: usize) -> Failure {
-    if waiting == 0 {
-        return failure.clone();
-    }
-    let rest = if waiting == 1 {
-        String::from("The one behind it was left where it is.")
-    } else {
-        format!("The {waiting} behind it were left where they are.")
-    };
-    Failure {
-        message: failure.message.clone(),
-        detail: format!("{} {rest}", failure.detail),
-    }
-}
+/// How many rows the transfers list draws before it counts the rest instead.
+const SHOWN_TRANSFERS: usize = 100;
 
 /// The session behind a lock that a panicked thread left poisoned, which is
 /// as gone as a broken pipe.

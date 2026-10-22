@@ -847,9 +847,7 @@ two-second timer, so asking again whenever the same host came round would ring a
 host that cannot be reached every two seconds for as long as the page is open.
 A name in a listing that holds a slash or a NUL, or is empty, is left out: a
 name is one component, and a server sending `../x` is either broken or hoping
-something here joins it onto a path. A change of host stops the transfer that is
-moving, which would otherwise keep a pipe to the old host busy while the new
-host's files wait behind it.
+something here joins it onto a path.
 
 Files move one at a time. Both ways a file is written beside where it is going
 under a dotted name and renamed onto it once it is whole, the discipline the
@@ -889,14 +887,29 @@ so a small file costs what it did. Answers may come back in any order and each
 lands at its own offset. A cancel or a refusal stops asking and still waits for
 what is in flight, so the next request on the session meets its own answer
 rather than a stale one. Files travel on a session of their own, opened by the
-first transfer and kept until the host changes, so the listing goes on
-answering while a large file is under way. Over a shared connection that is one
-more channel on the master; without one it is a second login, as unattended as
-the first. A second transfer waits behind the first in a queue the bar counts
-down, since a request waiting on a busy session is the thing with nothing on
-screen to say so. A failure empties that queue rather than trying the rest: whatever the far end
-refused this file for is what the ones behind it were about to meet, and the
-dialog says how many were left where they are.
+first transfer and kept while the page is on that host or a file waits for it,
+so the listing goes on answering while a large file is under way. Over a shared
+connection that is one more channel on the master; without one it is a second
+login, as unattended as the first.
+
+A second transfer waits behind the first in a queue, since a request waiting on
+a busy session is the thing with nothing on screen to say so. The bar counts it
+down, and the list button beside it opens the queue itself: the file moving with
+a button that stops it, each one waiting with a button that takes it off, and
+each one that failed with why, kept until it is dismissed or "Clear Failed"
+empties the lot. The cross at the end of the bar still cancels everything
+going, and leaves the failures, which are news nobody has read yet. Every job
+names its host, so going to look at another machine no longer stops a file on
+its way to the last one: it finishes on its own host's session, which is let go
+of once nothing more is waiting for that host. A failure goes on the list rather
+than into a dialog, because a dialog for something that broke on a host the page
+has left stands in front of whatever is being done now. It takes the rest of its
+own host's queue with it and says how many: whatever the far end refused this
+file for is what the ones behind it were about to meet. Another host's files are
+on another connection and wait on. With nothing moving and something failed,
+the bar becomes a line saying how many, so a failure while the panel was out of
+sight is still there to find. The queue lives in memory: it does not survive a
+restart, and the list draws its first hundred rows and counts the rest.
 
 Files and folders dragged onto the page go up. They land in the directory being
 shown, or in the one whose row they were dropped on, and they queue like any

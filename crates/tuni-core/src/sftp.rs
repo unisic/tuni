@@ -20,6 +20,7 @@
 //! way it always is: the master gives up on its own `ServerAlive` count, the
 //! pipe closes, and the next read ends short.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::os::fd::AsRawFd;
@@ -353,6 +354,138 @@ pub fn summary(plan: &Plan, report: &Report, verb: &str) -> Option<Failure> {
         ),
         detail,
     ))
+}
+
+/// How many failed transfers are kept on the list. Each one is a few hundred
+/// bytes, and a list longer than this is one nobody reads to the end.
+pub const FAILED_KEPT: usize = 50;
+
+/// One file or folder to move, and the host it moves to or from. The host is
+/// part of it because the queue outlives the page's interest in one host: a
+/// file still going up to the last machine keeps going while the page browses
+/// the next.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Job {
+    /// Handed out by the queue, so a button can name the job it was drawn for
+    /// after the jobs around it have moved.
+    pub id: u64,
+    pub alias: String,
+    pub way: Way,
+    pub remote: String,
+    pub local: PathBuf,
+}
+
+impl Job {
+    /// The name the job is known by, which is the end it starts from.
+    #[must_use]
+    pub fn name(&self) -> String {
+        let path = match self.way {
+            Way::Up => self.local.clone(),
+            Way::Down => PathBuf::from(&self.remote),
+        };
+        path.file_name().map_or_else(
+            || path.to_string_lossy().into_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    }
+}
+
+/// The transfers a page was asked for that are not running: the ones waiting,
+/// in the order they were asked for, and the ones that failed, kept until
+/// somebody dismisses them.
+///
+/// The one running is not in here. It is held by whoever is running it, with
+/// the flag that stops it, and comes back through [`Queue::fail`] if it fails.
+/// ponytail: what waits is bounded only by what was dropped on the page, a
+/// few hundred bytes a job; nothing here reads the disk or the network.
+#[derive(Debug, Default)]
+pub struct Queue {
+    waiting: VecDeque<Job>,
+    failed: VecDeque<(Job, Failure)>,
+    next: u64,
+}
+
+impl Queue {
+    /// Puts a job at the back and returns its id.
+    pub fn push(&mut self, alias: &str, way: Way, remote: String, local: PathBuf) -> u64 {
+        self.next += 1;
+        self.waiting.push_back(Job {
+            id: self.next,
+            alias: alias.to_owned(),
+            way,
+            remote,
+            local,
+        });
+        self.next
+    }
+
+    /// The next job to run, taken off the queue.
+    pub fn pop(&mut self) -> Option<Job> {
+        self.waiting.pop_front()
+    }
+
+    /// Takes a waiting job off the queue, or a failed one off the list.
+    /// Whether there was one by that id.
+    pub fn remove(&mut self, id: u64) -> bool {
+        let before = self.waiting.len() + self.failed.len();
+        self.waiting.retain(|job| job.id != id);
+        self.failed.retain(|(job, _)| job.id != id);
+        self.waiting.len() + self.failed.len() != before
+    }
+
+    /// Forgets everything waiting. The failures stay: they are news nobody has
+    /// read yet, and cancelling the rest is not reading it.
+    pub fn clear(&mut self) {
+        self.waiting.clear();
+    }
+
+    /// Forgets every failure.
+    pub fn dismiss(&mut self) {
+        self.failed.clear();
+    }
+
+    /// Puts a job that did not go on the failed list.
+    ///
+    /// With `give_up`, the jobs waiting for the same host go with it, and the
+    /// failure says how many: whatever the far end refused this one for, or
+    /// the connection that died under it, is what the next ones were about to
+    /// meet, and the same failure once a file is not more information. Jobs
+    /// for other hosts are a different connection and wait on.
+    pub fn fail(&mut self, job: Job, failure: Failure, give_up: bool) {
+        let mut failure = failure;
+        if give_up {
+            let before = self.waiting.len();
+            self.waiting.retain(|waiting| waiting.alias != job.alias);
+            let rest = match before - self.waiting.len() {
+                0 => None,
+                1 => Some(String::from("The one behind it was left where it is.")),
+                more => Some(format!("The {more} behind it were left where they are.")),
+            };
+            if let Some(rest) = rest {
+                failure.detail = format!("{} {rest}", failure.detail);
+            }
+        }
+        if self.failed.len() == FAILED_KEPT {
+            self.failed.pop_front();
+        }
+        self.failed.push_back((job, failure));
+    }
+
+    #[must_use]
+    pub fn waiting(&self) -> &VecDeque<Job> {
+        &self.waiting
+    }
+
+    #[must_use]
+    pub fn failed(&self) -> &VecDeque<(Job, Failure)> {
+        &self.failed
+    }
+
+    /// Whether anything is waiting to go to or from `alias`.
+    #[must_use]
+    pub fn wants(&self, alias: &str) -> bool {
+        self.waiting.iter().any(|job| job.alias == alias)
+    }
 }
 
 /// A connection to one host's sftp subsystem.
@@ -2833,6 +2966,71 @@ mod tests {
         };
         assert_eq!(summary(&one, &report, "send"), Some(refused));
         assert_eq!(one.inside(), None);
+    }
+
+    #[test]
+    fn a_failure_gives_up_on_its_own_host_and_leaves_the_others_waiting() {
+        let mut queue = Queue::default();
+        let push = |queue: &mut Queue, alias: &str, name: &str| {
+            queue.push(alias, Way::Up, format!("/srv/{name}"), PathBuf::from(name))
+        };
+        push(&mut queue, "web", "a");
+        push(&mut queue, "web", "b");
+        push(&mut queue, "db", "c");
+        push(&mut queue, "web", "d");
+
+        let first = queue.pop().unwrap();
+        assert_eq!(first.name(), "a");
+        let refused = Failure::new("Couldn't send a.", "Permission denied.");
+        queue.fail(first, refused, true);
+
+        let left: Vec<String> = queue.waiting().iter().map(Job::name).collect();
+        assert_eq!(left, ["c"]);
+        let (job, said) = &queue.failed()[0];
+        assert_eq!(job.alias, "web");
+        assert_eq!(
+            said.detail,
+            "Permission denied. The 2 behind it were left where they are."
+        );
+
+        // A folder that went partly is news, not a reason to stop the rest.
+        let next = queue.pop().unwrap();
+        push(&mut queue, "db", "e");
+        queue.fail(next, Failure::new("Couldn't send 1 of 3 items.", ""), false);
+        assert_eq!(queue.waiting().len(), 1);
+        assert_eq!(queue.failed().len(), 2);
+    }
+
+    #[test]
+    fn a_job_is_cancelled_by_its_id_after_the_queue_has_moved() {
+        let mut queue = Queue::default();
+        let first = queue.push("web", Way::Down, "/a".into(), "a".into());
+        let second = queue.push("web", Way::Down, "/b".into(), "b".into());
+        assert_eq!(queue.pop().map(|job| job.id), Some(first));
+        assert!(!queue.remove(first), "running is not waiting");
+        assert!(queue.remove(second));
+        assert!(queue.waiting().is_empty());
+        assert!(!queue.wants("web"));
+    }
+
+    #[test]
+    fn the_failed_list_keeps_the_newest_and_cancelling_the_rest_keeps_it() {
+        let mut queue = Queue::default();
+        for name in 0..=FAILED_KEPT {
+            let id = queue.push("web", Way::Up, format!("/{name}"), name.to_string().into());
+            let job = queue.pop().unwrap();
+            assert_eq!(job.id, id);
+            queue.fail(job, Failure::new("No.", ""), false);
+        }
+        assert_eq!(queue.failed().len(), FAILED_KEPT);
+        assert_eq!(queue.failed()[0].0.name(), "1");
+
+        queue.push("web", Way::Up, "/x".into(), "x".into());
+        queue.clear();
+        assert!(queue.waiting().is_empty());
+        assert_eq!(queue.failed().len(), FAILED_KEPT);
+        queue.dismiss();
+        assert!(queue.failed().is_empty());
     }
 
     #[test]
