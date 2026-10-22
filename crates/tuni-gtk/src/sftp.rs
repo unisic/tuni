@@ -567,13 +567,7 @@ impl TuniSftp {
                     let control = crate::hosts::control();
                     let host = tuni_core::ssh::host(&alias);
                     let argv = tuni_core::ssh::sftp_command(&host, &control);
-                    let Some(mut session) = Session::open(&argv) else {
-                        return Err(String::from(
-                            "Nothing here can answer a password or a passphrase, \
-                             so the connection has to be open already. Connect \
-                             the host in a pane first.",
-                        ));
-                    };
+                    let mut session = Session::open(&argv).map_err(|failure| failure.detail)?;
                     let Some(home) = session.realpath(".") else {
                         return Err(reason(&session));
                     };

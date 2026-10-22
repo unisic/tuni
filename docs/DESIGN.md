@@ -814,7 +814,14 @@ a small client speaking version 3 of the SFTP protocol over
 `ssh -s <host> sftp`, which on a live master is one more channel on the
 connection the panes already have, so nothing authenticates twice, and
 `BatchMode=yes` makes sure a file listing is never the thing that asks for a
-password. The rows come from the tree the Files page already has: `Tree` reads
+password. When that refusal is what stops it, the page says so from what `ssh`
+wrote on its way out, read without waiting since a `ProxyCommand` can hold the
+pipe open after ssh has gone: a refused key says to connect in a pane first, an
+unknown host key says the pane is where ssh can ask about it, a server without
+SFTP says that, and anything else is ssh's own last line. Every one of them
+exits 255, so the text is all there is to tell them apart, and `LC_ALL=C` keeps
+it the text. After the handshake the pipe is drained into nothing by a small
+thread, because an ssh writing to a full pipe stops dead. The rows come from the tree the Files page already has: `Tree` reads
 through a `Directory`, which is the disk on one page and, on the other, what has
 so far come back. That indirection is the whole of the rule that nothing remote
 touches the main loop. A directory nobody has asked about yet reads as empty and

@@ -22,8 +22,9 @@
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 
 use crate::editor::temporary_name;
 use crate::files::Failure;
@@ -129,17 +130,32 @@ impl Session {
     /// The argv is built by the caller because it is the same `ssh` invocation
     /// as a pane's, options and all: the point is to land on the machine the
     /// pane is on, over the connection it already opened.
-    pub fn open(argv: &[String]) -> Option<Self> {
-        let (program, args) = argv.split_first()?;
+    ///
+    /// A session that does not start says why, from what `ssh` wrote on its
+    /// way out: a refused key, a host key nobody has accepted and a server
+    /// with no SFTP in it are three different things to do next.
+    pub fn open(argv: &[String]) -> Result<Self, Failure> {
+        let unstarted = |detail: String| Failure::new("Couldn't start a file transfer.", detail);
+        let (program, args) = argv
+            .split_first()
+            .ok_or_else(|| unstarted("There is no command to run.".to_owned()))?;
         let mut child = Command::new(program)
             .args(args)
+            // The environment every background ssh here runs in, for the
+            // reasons `ssh::run` gives: no askpass dialog out of nowhere, and
+            // error text that can be read.
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .env("LC_ALL", "C")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
-            .ok()?;
-        let out = child.stdin.take()?;
-        let input = child.stdout.take()?;
+            .map_err(|error| unstarted(error.to_string()))?;
+        let (Some(out), Some(input), Some(mut errors)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            return Err(unstarted("Its pipes did not open.".to_owned()));
+        };
         let mut session = Self {
             child: Some(child),
             out: Box::new(out),
@@ -148,7 +164,28 @@ impl Session {
             failure: None,
             refusal: None,
         };
-        session.handshake().then_some(session)
+        if session.handshake() {
+            // Read for as long as the pipe is open and thrown away: ssh stops
+            // dead once a pipe nobody reads is full, and a `LogLevel` turned
+            // up in somebody's config fills one. One small thread per
+            // session, gone when the pipe closes.
+            std::thread::spawn(move || std::io::copy(&mut errors, &mut std::io::sink()));
+            return Ok(session);
+        }
+        // Gone before it answered, or answering something else. Reaped, it has
+        // said everything it was going to.
+        if let Some(mut child) = session.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let said = waiting(&mut errors);
+        if said.trim().is_empty() {
+            return Err(session
+                .failure
+                .take()
+                .unwrap_or_else(|| unstarted("The sftp subsystem did not answer.".to_owned())));
+        }
+        Err(explain(&said))
     }
 
     /// Where a path really is, with `~`, `.` and symlinks resolved by the far
@@ -826,6 +863,54 @@ impl Drop for Session {
     }
 }
 
+/// Whatever `ssh` left in its error pipe, up to 4 KiB, without waiting for
+/// more. Non-blocking because the pipe can outlive the ssh that wrote to it: a
+/// `ProxyCommand` inherits it and may hold it open long after.
+fn waiting(errors: &mut ChildStderr) -> String {
+    let fd = errors.as_raw_fd();
+    // Safe: the flags of a descriptor this owns, and the kernel checks both
+    // calls. Failing leaves it blocking, which a reaped ssh still ends.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let mut said = Vec::new();
+    // Ends on `WouldBlock` with what was there kept, which is the point.
+    let _ = errors.take(4096).read_to_end(&mut said);
+    String::from_utf8_lossy(&said).into_owned()
+}
+
+/// What `ssh` said when it gave up, turned into what to do about it.
+///
+/// Matched on the text because ssh has no other way to say it: its exit code
+/// is 255 for every one of these. `LC_ALL=C` keeps the text the text, and a
+/// line nothing here recognizes is shown as it is, since ssh's own sentence
+/// beats a guess. The last line rather than the first, because the warnings
+/// ssh prints on the way in come before the reason it stopped.
+#[must_use]
+pub fn explain(said: &str) -> Failure {
+    let detail = if said.contains("Permission denied") {
+        "Nothing here can answer a password or a passphrase, so the connection \
+         has to be open already. Connect the host in a pane first."
+            .to_owned()
+    } else if said.contains("Host key verification failed") {
+        "This machine does not know the host's key yet, or the key has changed. \
+         Connect in a pane, where ssh can show it and ask."
+            .to_owned()
+    } else if said.contains("subsystem request failed") {
+        "The far end has no SFTP server switched on.".to_owned()
+    } else {
+        said.lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or("The connection ended before the far end answered.")
+            .to_owned()
+    };
+    Failure::new("Couldn't start a file transfer.", detail)
+}
+
 /// Where an unfinished copy of `path` is written: beside it, so it is on the
 /// same filesystem and moves onto it in one rename.
 fn beside(path: &str) -> String {
@@ -1345,6 +1430,53 @@ mod tests {
         let asked = far.join().expect("the far end");
         assert_eq!(asked[1].0, MKDIR);
         assert_eq!(asked[2].0, LSTAT);
+    }
+
+    #[test]
+    fn a_refused_key_says_to_connect_in_a_pane_first() {
+        let said = "Warning: Permanently added 'box' (ED25519) to the list of known hosts.\r\n\
+                    dean@box: Permission denied (publickey,password).\r\n";
+        assert!(
+            explain(said)
+                .detail
+                .contains("Connect the host in a pane first")
+        );
+    }
+
+    #[test]
+    fn a_server_without_sftp_says_so() {
+        let said = "subsystem request failed on channel 0\n";
+        assert_eq!(
+            explain(said).detail,
+            "The far end has no SFTP server switched on."
+        );
+    }
+
+    #[test]
+    fn a_reason_nothing_here_knows_is_shown_as_ssh_said_it() {
+        let said = "** WARNING: connection is not using a post-quantum key exchange algorithm.\n\
+                    ssh: Could not resolve hostname nowhere: Name or service not known\n\n";
+        assert_eq!(
+            explain(said).detail,
+            "ssh: Could not resolve hostname nowhere: Name or service not known"
+        );
+    }
+
+    #[test]
+    fn an_ssh_that_exits_at_once_says_what_it_printed() {
+        let argv: Vec<String> = [
+            "sh",
+            "-c",
+            "echo 'Host key verification failed.' >&2; exit 255",
+        ]
+        .iter()
+        .map(|&part| part.to_owned())
+        .collect();
+        let failure = Session::open(&argv).err().expect("no session");
+        assert!(
+            failure.detail.contains("does not know the host's key"),
+            "{failure:?}"
+        );
     }
 
     #[test]
