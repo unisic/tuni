@@ -183,24 +183,42 @@ pub fn present<F>(
         .sensitive(false)
         .build();
     known.add_css_class("flat");
+    // The row edits the first key. A host with more keeps the rest as they
+    // were, and says so, rather than losing them to a change of user.
+    let others = host.identities.get(1..).unwrap_or_default().to_vec();
+    if !others.is_empty() {
+        let more = gtk::Label::builder()
+            .label(format!("and {} more", others.len()))
+            .tooltip_text(others.join("\n"))
+            .valign(gtk::Align::Center)
+            .build();
+        more.add_css_class("dim-label");
+        more.add_css_class("caption");
+        identity.add_suffix(&more);
+    }
     identity.add_suffix(&known);
     identity.add_suffix(&choose);
     offer_keys(&known, &identity);
-    // Nothing is a real answer here, and it is the first one, so the index of a
-    // chosen alias is one past where it sits in the list.
-    let mut names = vec!["None".to_owned()];
-    names.extend(jumps.iter().filter(|alias| **alias != host.alias).cloned());
-    let jump = adw::ComboRow::builder()
-        .title("Jump host")
-        .subtitle("Reached through this host first")
-        .model(&string_list(&names))
-        .selected(
-            names
-                .iter()
-                .position(|alias| *alias == host.proxy_jump)
-                .unwrap_or(0) as u32,
-        )
+    // Typed rather than picked, because `ProxyJump` is a chain and its links
+    // need not be hosts in this list: a combo of aliases saved `a,b` and
+    // `user@gate:2222` as nothing. The menu adds an alias at the end, which
+    // is the order ssh dials them in.
+    let jump = adw::EntryRow::builder()
+        .title("Jump hosts, in order")
+        .text(&host.proxy_jump)
         .build();
+    let add_jump = gtk::MenuButton::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Add a host to the chain")
+        .valign(gtk::Align::Center)
+        .build();
+    add_jump.add_css_class("flat");
+    jump.add_suffix(&add_jump);
+    offer_jumps(
+        &add_jump,
+        &jump,
+        jumps.into_iter().filter(|alias| *alias != host.alias),
+    );
     // Keyed by the alias rather than by the address, because the alias is what
     // `ssh` is handed and what a changed hostname leaves alone.
     let saved = Rc::new(RefCell::new(meta.password));
@@ -422,12 +440,8 @@ pub fn present<F>(
                 hostname: address.text().trim().to_owned(),
                 port: port.value() as u16,
                 user: user.text().trim().to_owned(),
-                identities: once(identity.text().trim()),
-                proxy_jump: names
-                    .get(jump.selected() as usize)
-                    .filter(|_| jump.selected() != 0)
-                    .cloned()
-                    .unwrap_or_default(),
+                identities: identities(identity.text().trim(), &others),
+                proxy_jump: chain(&jump.text()),
                 forwards: forwards.borrow().clone(),
                 extra: lines(&buffer.text(&buffer.start_iter(), &buffer.end_iter(), false)),
                 source: Source::Tuni,
@@ -789,6 +803,38 @@ fn offer_keys(button: &gtk::MenuButton, row: &adw::EntryRow) {
     ));
 }
 
+/// Hangs the aliases a chain can go through under `button`, each one added to
+/// the end of what `row` holds. A list with none in it leaves the button off.
+fn offer_jumps(
+    button: &gtk::MenuButton,
+    row: &adw::EntryRow,
+    aliases: impl Iterator<Item = String>,
+) {
+    let popover = gtk::Popover::new();
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    for alias in aliases {
+        let item = gtk::Button::builder().label(&alias).build();
+        item.add_css_class("flat");
+        if let Some(label) = item.child().and_downcast::<gtk::Label>() {
+            label.set_xalign(0.0);
+        }
+        item.connect_clicked(glib::clone!(
+            #[weak]
+            row,
+            #[weak]
+            popover,
+            move |_| {
+                row.set_text(&chained(&row.text(), &alias));
+                popover.popdown();
+            }
+        ));
+        list.append(&item);
+    }
+    button.set_sensitive(list.first_child().is_some());
+    popover.set_child(Some(&list));
+    button.set_popover(Some(&popover));
+}
+
 fn pick_key(dialog: &adw::Dialog, row: &adw::EntryRow) {
     let chooser = gtk::FileDialog::builder().title("Choose a Key").build();
     if let Some(home) = std::env::var_os("HOME") {
@@ -839,6 +885,29 @@ fn once(value: &str) -> Vec<String> {
     }
 }
 
+/// The key the row holds, then the ones it did not show.
+fn identities(first: &str, rest: &[String]) -> Vec<String> {
+    once(first)
+        .into_iter()
+        .chain(rest.iter().cloned())
+        .collect()
+}
+
+/// A chain as ssh reads it: links joined by commas and nothing else, since
+/// a space would make the value one quoted word ssh cannot resolve.
+fn chain(text: &str) -> String {
+    text.split(',')
+        .map(str::trim)
+        .filter(|link| !link.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `chain` with one more link at its end.
+fn chained(text: &str, alias: &str) -> String {
+    chain(&format!("{text},{alias}"))
+}
+
 fn lines(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
@@ -866,6 +935,29 @@ fn string_list(items: &[String]) -> gtk::StringList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_the_first_key_keeps_the_others() {
+        let rest = vec!["~/.ssh/work".to_owned(), "~/.ssh/old".to_owned()];
+        assert_eq!(
+            identities("~/.ssh/new", &rest),
+            vec!["~/.ssh/new", "~/.ssh/work", "~/.ssh/old"]
+        );
+        assert_eq!(identities("", &rest), rest);
+    }
+
+    #[test]
+    fn a_jump_is_added_to_the_end_of_the_chain() {
+        assert_eq!(chained("", "gate"), "gate");
+        assert_eq!(chained("gate", "inner"), "gate,inner");
+        assert_eq!(chained("gate, ", "inner"), "gate,inner");
+    }
+
+    #[test]
+    fn a_chain_typed_with_spaces_is_written_without_them() {
+        assert_eq!(chain(" gate , dean@inner:2222 ,"), "gate,dean@inner:2222");
+        assert_eq!(chain("  "), "");
+    }
 
     #[test]
     fn tags_are_read_the_way_somebody_would_type_them() {
