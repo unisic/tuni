@@ -537,8 +537,11 @@ mod imp {
             SIGNALS.get_or_init(|| {
                 vec![
                     // The shell is gone. Whoever placed this widget decides what
-                    // that means — the tab strip closes the tab.
-                    glib::subclass::Signal::builder("exited").build(),
+                    // that means — the tab strip closes the tab. Carries the
+                    // exit code, or -1 for a shell a signal ended.
+                    glib::subclass::Signal::builder("exited")
+                        .param_types([i32::static_type()])
+                        .build(),
                     // The application rang. A tab that is not on screen shows it
                     // as an attention mark rather than as a sound.
                     glib::subclass::Signal::builder("bell").build(),
@@ -1555,9 +1558,12 @@ impl TuniTerminal {
                             // The pty goes and the screen stays, so whatever
                             // the session said on its way out is still there to
                             // read. Scoped, because emitting reaches back in.
-                            if let Some(session) = this.imp().session.borrow_mut().as_mut() {
-                                session.pty = None;
-                            }
+                            let pty = this
+                                .imp()
+                                .session
+                                .borrow_mut()
+                                .as_mut()
+                                .and_then(|session| session.pty.take());
                             // A shell killed mid-spin leaves the agent's last
                             // title on screen, and nothing will ever arrive to
                             // contradict it, so the pane stops reporting work
@@ -1566,7 +1572,26 @@ impl TuniTerminal {
                                 this.notify("working");
                             }
                             this.queue_draw();
-                            this.emit_by_name::<()>("exited", &[]);
+                            // Reaped off this thread, since waiting for a
+                            // process is a wait however short this one usually
+                            // is, and by a future of its own that holds the
+                            // widget weakly: a shell that closed its terminal
+                            // and lives on would otherwise keep a closed pane
+                            // alive for as long as it runs.
+                            let widget = this.downgrade();
+                            glib::spawn_future_local(async move {
+                                let code = match pty {
+                                    Some(pty) => gio::spawn_blocking(move || pty.finish())
+                                        .await
+                                        .ok()
+                                        .flatten(),
+                                    None => None,
+                                };
+                                let code = code.and_then(|code| i32::try_from(code).ok());
+                                if let Some(this) = widget.upgrade() {
+                                    this.emit_by_name::<()>("exited", &[&code.unwrap_or(-1)]);
+                                }
+                            });
                             break;
                         }
                     }

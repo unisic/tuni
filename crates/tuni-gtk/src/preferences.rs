@@ -768,6 +768,21 @@ fn session_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw:
     ));
     connections.add(&dial);
 
+    let reconnect = adw::SwitchRow::builder()
+        .title("Reconnect Dropped Connections")
+        .subtitle("Dial again, for about five minutes, when a connection that was up goes away")
+        .active(settings.ssh_reconnect)
+        .build();
+    reconnect.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.ssh_reconnect = on);
+        }
+    ));
+    connections.add(&reconnect);
+
     // Empty is the default rather than an empty `TERM`, which every program at
     // the far end would read as a terminal that can do nothing.
     let term = adw::EntryRow::builder()

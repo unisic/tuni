@@ -202,17 +202,9 @@ impl Drop for Pty {
     /// the frame that is closing the pane for as long as the shell takes to
     /// die.
     fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
+        let Some(mut child) = self.hang_up() else {
             return;
         };
-        if let Some(pid) = child.process_id() {
-            // Safe: `pid` names a process that has not been waited for — this
-            // is the only place the child is handed away — so the kernel still
-            // holds its slot and the number cannot mean a different process.
-            unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGHUP);
-            }
-        }
         let reaper = std::thread::Builder::new()
             .name("tuni-pty-reaper".to_owned())
             .spawn(move || {
@@ -228,6 +220,52 @@ impl Drop for Pty {
 }
 
 impl Pty {
+    /// Waits for a shell that has hung up its end and says how it went: its
+    /// exit code, or `None` for one a signal ended or that could not be
+    /// waited for.
+    ///
+    /// For a pty whose reader has already seen the end. The shell is gone or
+    /// leaving, which is why it gets a moment to go on its own before the
+    /// hangup: closing the terminal is the last thing `ssh` does before it
+    /// exits with the code that says whether the link dropped, and a SIGHUP
+    /// landing in between would replace that code with a signal. Blocks until
+    /// the shell is reaped, so the caller belongs off the main thread.
+    #[must_use]
+    pub fn finish(mut self) -> Option<u32> {
+        let mut status = None;
+        if let Some(child) = self.child.as_mut() {
+            for _ in 0..20 {
+                status = child.try_wait().ok().flatten();
+                if status.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let status = match status {
+            Some(status) => {
+                self.child = None;
+                status
+            }
+            None => self.hang_up()?.wait().ok()?,
+        };
+        status.signal().is_none().then(|| status.exit_code())
+    }
+
+    /// Sends the hangup and hands over the shell for whoever reaps it.
+    fn hang_up(&mut self) -> Option<Box<dyn Child + Send + Sync>> {
+        let child = self.child.take()?;
+        if let Some(pid) = child.process_id() {
+            // Safe: `pid` names a process that has not been waited for — this
+            // is the only place the child is handed away — so the kernel still
+            // holds its slot and the number cannot mean a different process.
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGHUP);
+            }
+        }
+        Some(child)
+    }
+
     pub fn spawn(config: &PtyConfig) -> Result<Self> {
         let pair = native_pty_system()
             .openpty(PtySize {

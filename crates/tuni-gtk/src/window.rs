@@ -113,6 +113,26 @@ pub struct ClosedTab {
     history: History,
 }
 
+/// A dropped connection being dialled again, for the panes that were on it.
+///
+/// Kept per host rather than per pane because the panes on one shared
+/// connection drop together, and each of them dialling would be as many
+/// logins: one pane leads, and the rest attach to what it brings back.
+#[derive(Default)]
+pub struct Reconnect {
+    /// Tries made so far, which is what the backoff reads.
+    attempt: u32,
+    /// Panes waiting for a connection to attach to, the next leader among them.
+    panes: Vec<Id>,
+    /// The next try, while one is scheduled.
+    timer: Option<glib::SourceId>,
+}
+
+/// How often a reconnect waiting for the network looks again. Each look reads
+/// one property the network monitor already keeps, so it asks nothing of
+/// anyone, and the try it is waiting to make is not counted until it is made.
+const OFFLINE_POLL: Duration = Duration::from_secs(5);
+
 thread_local! {
     /// The tab a drag is carrying between strips: the window and project it
     /// left, and the model's record of it, which no project holds while it is
@@ -342,7 +362,7 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
 
 mod imp {
     use super::{
-        Cell, ClosedTab, HashMap, Id, PathBuf, RefCell, Settings, TuniBrowser, TuniDiff,
+        Cell, ClosedTab, HashMap, Id, PathBuf, Reconnect, RefCell, Settings, TuniBrowser, TuniDiff,
         TuniEditor, TuniFind, TuniGrid, TuniHosts, TuniPanel, TuniRemote, TuniSwitcher,
         TuniTerminal, VecDeque, Workspace, gio, glib,
     };
@@ -368,6 +388,9 @@ mod imp {
         /// a snippet on several hosts, and taken out when the pane starts or
         /// closes, whichever is first.
         pub due: RefCell<HashMap<Id, String>>,
+        /// Dropped connections being dialled again, by host alias. Bounded by
+        /// the hosts the window has panes on, and each entry by its panes.
+        pub reconnects: RefCell<HashMap<String, Reconnect>>,
         /// One host list per pane showing one, by pane id.
         pub hosts: RefCell<HashMap<Id, TuniHosts>>,
         /// One file browser per pane showing a host's files, by pane id.
@@ -2984,6 +3007,7 @@ impl TuniWindow {
         };
         let alias = alias.clone();
         let name = alias.clone();
+        self.leave_reconnect(pane);
         let due = self.imp().due.borrow_mut().remove(&pane);
         let settings = self.settings();
         let term = settings.ssh_term.clone();
@@ -3541,9 +3565,9 @@ impl TuniWindow {
             glib::closure_local!(
                 #[weak(rename_to = this)]
                 self,
-                move |_: TuniTerminal| {
+                move |_: TuniTerminal, code: i32| {
                     if let Some((this, project)) = this.owner(tab) {
-                        this.session_ended(project, tab, pane);
+                        this.session_ended(project, tab, pane, code);
                     }
                 }
             ),
@@ -3556,7 +3580,7 @@ impl TuniWindow {
     /// asks for. A connection that ends does not: a mistyped hostname, a
     /// refused key or a dropped link leaves an explanation on the screen, and
     /// closing the pane throws the explanation away with it.
-    fn session_ended(&self, project: Id, tab: Id, pane: Id) {
+    fn session_ended(&self, project: Id, tab: Id, pane: Id, code: i32) {
         let Some(Content::Ssh { alias }) = self.pane_content(project, tab, pane) else {
             self.close_pane(project, tab, pane);
             return;
@@ -3567,15 +3591,18 @@ impl TuniWindow {
         let disconnected = format!("Disconnected from {alias}");
         // Forty lines is the whole warning with room to spare, and all that is
         // read: what ssh says last is the only part that is about this attempt.
-        let changed = self
+        let text = self
             .imp()
             .terminals
             .borrow()
             .get(&pane)
             .and_then(|terminal| terminal.text(40))
-            .and_then(|text| tuni_core::ssh::changed_key(&text));
-        let Some(key) = changed else {
-            remote.set_idle(&disconnected, "Reconnect");
+            .unwrap_or_default();
+        let Some(key) = tuni_core::ssh::changed_key(&text) else {
+            let ending = tuni_core::ssh::ending(u32::try_from(code).ok(), &text);
+            if !self.retry(&alias, pane, ending) {
+                remote.set_idle(&disconnected, "Reconnect");
+            }
             return;
         };
         remote.set_offer(
@@ -3592,6 +3619,264 @@ impl TuniWindow {
                 }
             ),
         );
+    }
+
+    /// Puts a pane whose connection ended in line for another try, when the
+    /// ending and `ssh-reconnect` both say so. False leaves the bar to the
+    /// caller.
+    ///
+    /// A host that cannot be reached is tried again only as part of bringing
+    /// back a drop. A first attempt that finds no route is an answer, and
+    /// anything else a try ends on, a refused key or a logout, ends the series
+    /// for every pane in it.
+    fn retry(&self, alias: &str, pane: Id, ending: tuni_core::ssh::Ending) -> bool {
+        use tuni_core::ssh::Ending;
+        if !self.settings().ssh_reconnect {
+            return false;
+        }
+        let going = self.imp().reconnects.borrow().contains_key(alias);
+        match ending {
+            Ending::Dropped => {}
+            Ending::Unreachable if going => {}
+            _ => {
+                if going {
+                    self.give_up(alias);
+                }
+                return false;
+            }
+        }
+        let delay = {
+            let mut reconnects = self.imp().reconnects.borrow_mut();
+            let entry = reconnects.entry(alias.to_owned()).or_default();
+            if !entry.panes.contains(&pane) {
+                entry.panes.push(pane);
+            }
+            if entry.timer.is_some() {
+                // Another pane on the same connection got here first and the
+                // try it scheduled covers this one too.
+                None
+            } else {
+                let Some(delay) = tuni_core::ssh::retry_delay(entry.attempt) else {
+                    drop(reconnects);
+                    self.give_up(alias);
+                    return true;
+                };
+                entry.timer = Some(self.redial_after(alias, delay));
+                Some(delay)
+            }
+        };
+        if let Some(delay) = delay {
+            self.reconnect_bar(
+                alias,
+                &format!(
+                    "Lost the connection to {alias}, trying again in {} s",
+                    delay.as_secs()
+                ),
+            );
+        } else if let Some(remote) = self.imp().remotes.borrow().get(&pane) {
+            remote.set_idle(&format!("Lost the connection to {alias}"), "Reconnect");
+        }
+        true
+    }
+
+    fn redial_after(&self, alias: &str, delay: Duration) -> glib::SourceId {
+        let alias = alias.to_owned();
+        glib::timeout_add_local_once(
+            delay,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move || this.redial(&alias)
+            ),
+        )
+    }
+
+    /// The scheduled try: the first pane still waiting dials as if Connect had
+    /// been pressed, prompt and all, and the others wait for its connection.
+    fn redial(&self, alias: &str) {
+        let imp = self.imp();
+        // Switched off while a try was scheduled.
+        if !self.settings().ssh_reconnect {
+            if let Some(entry) = imp.reconnects.borrow_mut().get_mut(alias) {
+                entry.timer = None;
+            }
+            self.give_up(alias);
+            return;
+        }
+        let leader = {
+            let mut reconnects = imp.reconnects.borrow_mut();
+            let Some(entry) = reconnects.get_mut(alias) else {
+                return;
+            };
+            entry.timer = None;
+            if !gio::NetworkMonitor::default().is_network_available() {
+                entry.timer = Some(self.redial_after(alias, OFFLINE_POLL));
+                drop(reconnects);
+                self.reconnect_bar(
+                    alias,
+                    &format!("Waiting for the network to reconnect to {alias}"),
+                );
+                return;
+            }
+            entry.attempt += 1;
+            let terminals = imp.terminals.borrow();
+            entry.panes.retain(|pane| terminals.contains_key(pane));
+            if entry.panes.is_empty() {
+                None
+            } else {
+                Some(entry.panes.remove(0))
+            }
+        };
+        let Some(leader) = leader else {
+            imp.reconnects.borrow_mut().remove(alias);
+            return;
+        };
+        let terminal = imp.terminals.borrow().get(&leader).cloned();
+        if let Some(terminal) = terminal {
+            let content = Content::Ssh {
+                alias: alias.to_owned(),
+            };
+            self.start_session(&terminal, leader, &content, None, true);
+        }
+        self.reconnect_bar(alias, &format!("Reconnecting to {alias}"));
+        self.follow(alias.to_owned());
+    }
+
+    /// Waits for the leader's connection, then attaches the panes waiting on
+    /// it, and closes the series either way.
+    ///
+    /// The control socket is what says the leader is through, the same signal
+    /// `type_on_connect` watches and for the same reason. A host without one
+    /// cannot share, so its panes each dial for themselves straight away, and
+    /// the series ends once the leader has lasted the wait without dropping.
+    /// A leader still at a prompt by then leaves the others with Reconnect,
+    /// which attaches them once somebody has answered it.
+    fn follow(&self, alias: String) {
+        let settings = self.settings();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let persist = settings.ssh_control_persist;
+                let shared = settings.ssh_share_connections;
+                let looked = alias.clone();
+                let socket = gio::spawn_blocking(move || {
+                    let control = tuni_core::ssh::Control::new(persist, shared);
+                    let destination = tuni_core::ssh::host(&looked).target();
+                    control
+                        .socket(&destination)
+                        .map(|(path, _)| (destination, path))
+                })
+                .await
+                .ok()
+                .flatten();
+                if socket.is_none() {
+                    this.attach_waiting(&alias, true);
+                }
+                for _ in 0..CONNECT_TRIES {
+                    glib::timeout_future(CONNECT_INTERVAL).await;
+                    if !this.imp().reconnects.borrow().contains_key(&alias) {
+                        return;
+                    }
+                    let Some((destination, path)) = socket.clone() else {
+                        continue;
+                    };
+                    if !path.exists() {
+                        continue;
+                    }
+                    let live = gio::spawn_blocking(move || {
+                        tuni_core::ssh::Control::new(persist, shared).is_live(&destination)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if live {
+                        this.attach_waiting(&alias, false);
+                        this.imp().reconnects.borrow_mut().remove(&alias);
+                        return;
+                    }
+                }
+                // A leader that dropped again has scheduled the next try, which
+                // carries the series on; one that did not is connected or
+                // waiting on somebody, and either way the series is done.
+                let done = this
+                    .imp()
+                    .reconnects
+                    .borrow()
+                    .get(&alias)
+                    .is_some_and(|entry| entry.timer.is_none());
+                if done {
+                    this.give_up(&alias);
+                }
+            }
+        ));
+    }
+
+    /// Starts every pane waiting on `alias`. Not `requested` when there is a
+    /// connection to attach to, so a master gone again by now leaves the pane
+    /// offering Connect rather than starting a login.
+    fn attach_waiting(&self, alias: &str, requested: bool) {
+        let panes = self
+            .imp()
+            .reconnects
+            .borrow_mut()
+            .get_mut(alias)
+            .map(|entry| std::mem::take(&mut entry.panes))
+            .unwrap_or_default();
+        let content = Content::Ssh {
+            alias: alias.to_owned(),
+        };
+        for pane in panes {
+            let terminal = self.imp().terminals.borrow().get(&pane).cloned();
+            if let Some(terminal) = terminal {
+                self.start_session(&terminal, pane, &content, None, requested);
+            }
+        }
+    }
+
+    /// Ends a series of tries, leaving each pane still waiting with Reconnect.
+    fn give_up(&self, alias: &str) {
+        let entry = self.imp().reconnects.borrow_mut().remove(alias);
+        let Some(entry) = entry else {
+            return;
+        };
+        if let Some(timer) = entry.timer {
+            timer.remove();
+        }
+        let remotes = self.imp().remotes.borrow();
+        for pane in entry.panes {
+            if let Some(remote) = remotes.get(&pane) {
+                remote.set_idle(&format!("Disconnected from {alias}"), "Reconnect");
+            }
+        }
+    }
+
+    /// Takes a pane out of any series it is waiting in, because it is being
+    /// started some other way or is going away. The last pane out of a series
+    /// whose next try is still scheduled takes the try with it.
+    fn leave_reconnect(&self, pane: Id) {
+        self.imp().reconnects.borrow_mut().retain(|_, entry| {
+            entry.panes.retain(|waiting| *waiting != pane);
+            if entry.panes.is_empty()
+                && let Some(timer) = entry.timer.take()
+            {
+                timer.remove();
+                return false;
+            }
+            true
+        });
+    }
+
+    fn reconnect_bar(&self, alias: &str, message: &str) {
+        let reconnects = self.imp().reconnects.borrow();
+        let Some(entry) = reconnects.get(alias) else {
+            return;
+        };
+        let remotes = self.imp().remotes.borrow();
+        for pane in &entry.panes {
+            if let Some(remote) = remotes.get(pane) {
+                remote.set_idle(message, "Reconnect");
+            }
+        }
     }
 
     /// A pane took the keyboard: move the ring, and rename the tab, which is
@@ -3759,6 +4044,7 @@ impl TuniWindow {
         imp.editors.borrow_mut().remove(&pane);
         imp.remotes.borrow_mut().remove(&pane);
         imp.due.borrow_mut().remove(&pane);
+        self.leave_reconnect(pane);
         imp.hosts.borrow_mut().remove(&pane);
         imp.browsers.borrow_mut().remove(&pane);
         // A pane closed mid-turn never sends the notify that would have said it

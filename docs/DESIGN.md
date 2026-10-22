@@ -234,7 +234,23 @@ is also what a man in the middle looks like, so the decision is the person's to
 make with the fingerprint still on the screen beside it; after it the bar goes
 back to Reconnect, and the new key is asked about in the pane like any unknown
 one. Only a screen that ends on the refusal counts, so a warning some remote
-command echoed before the session carried on is not mistaken for one. The panel grows another page while a pane is
+command echoed before the session carried on is not mistaken for one.
+
+With `ssh-reconnect` on, a connection that dropped is dialled again by itself,
+two seconds after, then five, fifteen, thirty and a minute apart, and given up
+after about five minutes. A drop is told from a logout by two things together,
+since ssh prints the same `Shared connection to box closed.` for both: the exit
+code, 255 only when ssh itself failed, and the line ssh wrote last. A host that
+refuses or has no route is tried again only while bringing back a drop, and a
+refused key or a logout ends the series. The panes on one shared connection
+drop together, so one of them dials and the rest attach once its connection is
+up, which is one login however many panes there were; a login that asks for a
+code stops the series by waiting in that pane for somebody to answer it. While
+the machine has no network at all nothing is tried and nothing is counted.
+Off by default, because each try is a login that nobody asked for at the
+moment it starts.
+
+The panel grows another page while a pane is
 on a host: the files at the other end, in the same tree the Files page draws,
 opened over the connection that is already there.
 
@@ -1430,6 +1446,7 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `ssh-share-connections` | `true` | Whether every pane on a host goes through one authenticated connection. Ignored for a host whose own configuration already sets `ControlPath`, which tuni adopts rather than overrides |
 | `ssh-control-persist` | `600` | Seconds a shared connection outlives the last pane using it, up to a day. Zero closes it with the last pane, a second after, since `ControlPersist=0` is forever to ssh |
 | `ssh-reconnect-on-restore` | `false` | Whether a restored ssh pane dials with nothing to attach to. Off, so a window putting eight panes back cannot start eight logins |
+| `ssh-reconnect` | `false` | Whether a pane whose connection dropped dials again by itself, backing off from two seconds to a minute and giving up after about five. Off, because a retry is a login and one that asks for a code should not start while nobody is looking |
 | `check-updates` | `true` | Whether the window asks the GitHub release page for a newer version, once per run. Off leaves the menu's "Check for Updates" to do it by hand |
 | `panel.files`, `panel.git`, `panel.info`, `panel.debug` | `true` | Which pages the panel's switcher offers. The Remote page manages itself: it exists while a pane is on a host |
 | `agent.usage` | `true` | Whether the Info panel reads a coding agent's own session log. Off takes the Agent section away and stops every file below it from being opened |

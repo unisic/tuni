@@ -140,3 +140,18 @@ fn a_shell_that_leaves_on_its_own_is_reaped() {
     }
     assert_ne!(state, "Z", "the shell was left as a zombie");
 }
+
+#[test]
+fn a_shell_that_leaves_says_with_what_code() {
+    // What tells a dropped ssh connection, 255, from a logout that ended with
+    // the far shell's own code: the line ssh prints is the same for both.
+    let mut pty = Pty::spawn(&shell()).expect("spawn a shell on a pty");
+    let events = pty.events();
+    pty.write(b"exit 7\n").expect("write to the pty");
+    while let Ok(event) = events.recv_blocking() {
+        if matches!(event, PtyEvent::Exited) {
+            break;
+        }
+    }
+    assert_eq!(pty.finish(), Some(7));
+}

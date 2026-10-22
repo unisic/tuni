@@ -1927,6 +1927,80 @@ pub fn changed_key(screen: &str) -> Option<ChangedKey> {
     })
 }
 
+/// How an ssh pane's session ended, as far as reconnecting is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    /// Logged out, refused, or anything else a second try would only repeat.
+    Closed,
+    /// A connection that was up went away under the session.
+    Dropped,
+    /// No connection could be made, which is worth another try only while the
+    /// network is coming back after a drop.
+    Unreachable,
+}
+
+/// Reads how a session ended off its exit code and what ssh said last.
+///
+/// Both, because neither is enough alone. ssh exits 255 for every failure of
+/// its own, a refused key and a mistyped name included, and the line a dropped
+/// shared connection prints, `Shared connection to box closed.`, is the same
+/// line a logout prints, there with the far shell's own code. Only the last
+/// line is read, so text a remote shell printed earlier cannot pass for ssh,
+/// and only its end, because ssh writes after whatever was on that line: a
+/// connection that drops at a prompt leaves `$ Shared connection to box
+/// closed.`.
+#[must_use]
+pub fn ending(code: Option<u32>, screen: &str) -> Ending {
+    if code != Some(255) {
+        return Ending::Closed;
+    }
+    let Some(last) = screen.lines().map(str::trim).rfind(|line| !line.is_empty()) else {
+        return Ending::Closed;
+    };
+    let from = |marker: &str| last.rfind(marker).map(|at| &last[at..]);
+    let dropped = from("onnection to ").is_some_and(|rest| {
+        rest.ends_with(" closed.") || rest.ends_with(" closed by remote host.")
+    }) || from("Timeout, server ")
+        .is_some_and(|rest| rest.ends_with(" not responding."))
+        || last.ends_with(": Broken pipe")
+        || last.contains("Connection reset by ");
+    if dropped {
+        return Ending::Dropped;
+    }
+    // Resolution failing for want of a network says so; a name that does not
+    // exist says `Name or service not known`, and trying it again is pointless.
+    let unreachable = from("ssh: connect to host ").is_some()
+        && [
+            ": Network is unreachable",
+            ": No route to host",
+            ": Connection timed out",
+            ": Connection refused",
+        ]
+        .iter()
+        .any(|reason| last.ends_with(reason))
+        || from("ssh: Could not resolve hostname ").is_some()
+            && last.ends_with(": Temporary failure in name resolution");
+    if unreachable {
+        Ending::Unreachable
+    } else {
+        Ending::Closed
+    }
+}
+
+/// How long to wait before the `attempt`th try at a dropped connection, the
+/// first being zero, or `None` once trying has gone on long enough.
+///
+/// Quick at first, because most drops are a wifi handover that is over in
+/// seconds, then a minute apart, and over after about five minutes, since a
+/// host still gone by then is down rather than out of reach.
+#[must_use]
+pub fn retry_delay(attempt: u32) -> Option<std::time::Duration> {
+    const SECONDS: [u64; 8] = [2, 5, 15, 30, 60, 60, 60, 60];
+    SECONDS
+        .get(attempt as usize)
+        .map(|seconds| std::time::Duration::from_secs(*seconds))
+}
+
 /// Whether `text` matches an ssh pattern: `*` for any run of characters, `?`
 /// for exactly one, and everything else literal. What `Host` lines and
 /// `Include` globs are both written in.
@@ -2334,6 +2408,68 @@ Host key verification failed.
         let screen = "No ED25519 host key is known for box and you have requested strict checking.\n\
                       Host key verification failed.\n";
         assert_eq!(changed_key(screen), None);
+    }
+
+    #[test]
+    fn a_shared_connection_dying_under_its_pane_is_a_drop() {
+        let screen = "dean@box:~$ \nShared connection to 127.0.0.1 closed.\n";
+        assert_eq!(ending(Some(255), screen), Ending::Dropped);
+        let plain =
+            "Connection to 127.0.0.1 closed by remote host.\nConnection to 127.0.0.1 closed.\n";
+        assert_eq!(ending(Some(255), plain), Ending::Dropped);
+        let hung = "Timeout, server 127.0.0.1 not responding.\n";
+        assert_eq!(ending(Some(255), hung), Ending::Dropped);
+        let prompt = "~\n\u{276f} Shared connection to 127.0.0.1 closed.";
+        assert_eq!(ending(Some(255), prompt), Ending::Dropped);
+    }
+
+    #[test]
+    fn a_logout_prints_the_same_line_with_the_far_shell_s_code() {
+        let screen = "logout\nShared connection to 127.0.0.1 closed.\n";
+        assert_eq!(ending(Some(0), screen), Ending::Closed);
+        assert_eq!(ending(Some(3), screen), Ending::Closed);
+        assert_eq!(ending(None, screen), Ending::Closed);
+    }
+
+    #[test]
+    fn a_refused_login_is_not_worth_another_try() {
+        assert_eq!(
+            ending(Some(255), "dean@box: Permission denied (publickey).\n"),
+            Ending::Closed
+        );
+        assert_eq!(ending(Some(255), CHANGED), Ending::Closed);
+        assert_eq!(
+            ending(
+                Some(255),
+                "ssh: Could not resolve hostname bxo: Name or service not known\n"
+            ),
+            Ending::Closed
+        );
+    }
+
+    #[test]
+    fn a_network_that_is_not_back_yet_is_unreachable() {
+        for line in [
+            "ssh: connect to host 10.0.0.2 port 22: Network is unreachable",
+            "ssh: connect to host 127.0.0.1 port 22223: Connection refused",
+            "ssh: connect to host 10.255.255.1 port 22: Connection timed out",
+            "ssh: Could not resolve hostname box: Temporary failure in name resolution",
+        ] {
+            assert_eq!(ending(Some(255), line), Ending::Unreachable, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_remote_shell_echoing_ssh_s_words_earlier_does_not_count() {
+        let screen = "Shared connection to box closed.\ndean@box:~$ exit 255\nkilled\n";
+        assert_eq!(ending(Some(255), screen), Ending::Closed);
+    }
+
+    #[test]
+    fn retrying_backs_off_and_then_stops() {
+        assert_eq!(retry_delay(0), Some(std::time::Duration::from_secs(2)));
+        assert_eq!(retry_delay(7), Some(std::time::Duration::from_secs(60)));
+        assert_eq!(retry_delay(8), None);
     }
 
     fn report(lines: &[&str]) -> Vec<(String, String)> {

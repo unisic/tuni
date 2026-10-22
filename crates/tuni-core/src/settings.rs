@@ -257,6 +257,10 @@ pub struct Settings {
     /// off eight logins; on is for people whose every host answers to an agent
     /// and who would rather not press Connect eight times.
     pub ssh_reconnect_on_restore: bool,
+    /// Whether an ssh pane whose connection dropped dials again by itself.
+    /// Off, because a retry is a login, and a login that asks for a code
+    /// should not arrive on its own while nobody is looking.
+    pub ssh_reconnect: bool,
     /// Whether the window asks GitHub for the newest release once at startup.
     ///
     /// On, because no distribution packages Tuni yet and an installed copy would
@@ -306,6 +310,7 @@ impl Default for Settings {
             ssh_share_connections: true,
             ssh_control_persist: crate::ssh::CONTROL_PERSIST,
             ssh_reconnect_on_restore: false,
+            ssh_reconnect: false,
             check_updates: true,
             panel_files: true,
             panel_git: true,
@@ -486,6 +491,9 @@ impl Settings {
         }
         if let Some(on) = table.boolean("ssh-reconnect-on-restore") {
             settings.ssh_reconnect_on_restore = on;
+        }
+        if let Some(on) = table.boolean("ssh-reconnect") {
+            settings.ssh_reconnect = on;
         }
         if let Some(on) = table.boolean("check-updates") {
             settings.check_updates = on;
@@ -702,6 +710,9 @@ impl Settings {
                 "ssh-reconnect-on-restore = {}",
                 self.ssh_reconnect_on_restore
             );
+        }
+        if self.ssh_reconnect != default.ssh_reconnect {
+            let _ = writeln!(out, "ssh-reconnect = {}", self.ssh_reconnect);
         }
         if self.check_updates != default.check_updates {
             let _ = writeln!(out, "check-updates = {}", self.check_updates);
@@ -1136,6 +1147,7 @@ mod tests {
             ssh_share_connections: false,
             ssh_control_persist: 30,
             ssh_reconnect_on_restore: true,
+            ssh_reconnect: true,
             check_updates: false,
             panel_files: true,
             panel_git: true,
@@ -1185,6 +1197,7 @@ mod tests {
         assert!(!read.ssh_share_connections);
         assert_eq!(read.ssh_control_persist, 30);
         assert!(read.ssh_reconnect_on_restore);
+        assert!(read.ssh_reconnect);
         assert!(!read.check_updates);
         assert_eq!(read.info_editor, "zed");
         assert_eq!(read.discord, settings.discord);
