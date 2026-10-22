@@ -922,45 +922,14 @@ impl TuniSftp {
                         moved.total.store(total, Ordering::Relaxed);
                         !moved.stop.load(Ordering::Relaxed)
                     };
-                    match way {
-                        Way::Up => {
-                            let sent = session
-                                .put(&local, &remote, &mut note)
-                                .ok_or_else(|| failed(&session));
-                            // A cancelled upload has left a truncated file
-                            // under the real name at the far end; sweep it so
-                            // nothing over there opens half a file as the
-                            // whole thing.
-                            if sent.is_err() && moved.stop.load(Ordering::Relaxed) {
-                                let _ = session.remove(&remote);
-                            }
-                            sent
-                        }
-                        Way::Down => {
-                            // Written beside where it is going and moved onto
-                            // it when it is whole, which is how the editor
-                            // saves: a transfer that dies leaves nothing under
-                            // a name something else would open.
-                            let part = local.with_file_name(partial(&local));
-                            let got = session
-                                .get(&remote, &part, &mut note)
-                                .ok_or_else(|| failed(&session));
-                            if got.is_err() {
-                                // Dead or cancelled either way, and nothing is
-                                // coming back for the half that landed.
-                                let _ = std::fs::remove_file(&part);
-                                got
-                            } else {
-                                std::fs::rename(&part, &local).map_err(|error| {
-                                    let _ = std::fs::remove_file(&part);
-                                    Failure {
-                                        message: format!("Couldn't finish {}.", local.display()),
-                                        detail: error.to_string(),
-                                    }
-                                })
-                            }
-                        }
-                    }
+                    // Both ways land under a temporary name and are moved on
+                    // when whole, so a cancel or a dead link leaves what was
+                    // there before, at either end.
+                    let done = match way {
+                        Way::Up => session.put(&local, &remote, &mut note),
+                        Way::Down => session.get(&remote, &local, &mut note),
+                    };
+                    done.ok_or_else(|| failed(&session))
                 })
                 .await;
 
@@ -1345,17 +1314,6 @@ impl TuniSftp {
 enum Way {
     Up,
     Down,
-}
-
-/// A name beside the file being written, and the reason it is a dotfile with a
-/// process id in it is the one [`tuni_core::editor::save`] gives: two windows
-/// fetching the same name at once must not share the temporary.
-fn partial(local: &Path) -> String {
-    let name = local
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    format!(".{name}.tuni-{}", std::process::id())
 }
 
 /// A failure that took a queue down with it, since what stopped the file being

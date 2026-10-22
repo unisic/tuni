@@ -25,6 +25,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
+use crate::editor::temporary_name;
 use crate::files::Failure;
 
 /// The protocol version this speaks and the only one it accepts.
@@ -50,6 +51,7 @@ const STAT: u8 = 17;
 const RENAME: u8 = 18;
 const LSTAT: u8 = 7;
 const CLOSE: u8 = 4;
+const FSETSTAT: u8 = 10;
 
 // Replies.
 const REPLY_VERSION: u8 = 2;
@@ -116,6 +118,9 @@ pub struct Session {
     input: BufReader<Box<dyn Read + Send>>,
     next: u32,
     failure: Option<Failure>,
+    /// The status code of the last refusal, for the one caller that acts on
+    /// which code it was rather than only on the sentence.
+    refusal: Option<u32>,
 }
 
 impl Session {
@@ -141,6 +146,7 @@ impl Session {
             input: BufReader::new(Box::new(input)),
             next: 1,
             failure: None,
+            refusal: None,
         };
         session.handshake().then_some(session)
     }
@@ -218,13 +224,12 @@ impl Session {
 
     /// Copies a remote file to `local`, calling `progress` with how much has
     /// arrived and how much there is. `progress` answering `false` stops the
-    /// transfer where it stands: the handle is closed, the half-written local
-    /// file is left for the caller (who named it), and the failure says
-    /// cancelled.
+    /// transfer where it stands, and the failure says cancelled.
     ///
-    /// The caller decides what `local` is named. Nothing here renames anything,
-    /// so a caller that wants a half-written file to be unopenable writes to a
-    /// name nobody looks for and moves it afterwards.
+    /// The bytes land beside `local` under a dotted name and are moved onto it
+    /// once they are whole, which is how the editor saves: a transfer that dies
+    /// leaves nothing under a name something else would open, and a file that
+    /// was already there stays what it was.
     pub fn get(
         &mut self,
         remote: &str,
@@ -233,7 +238,8 @@ impl Session {
     ) -> Option<()> {
         let total = self.stat(remote).map_or(0, |entry| entry.size);
         let handle = self.open_file(remote, READABLE, None)?;
-        let file = match File::create(local) {
+        let part = local.with_file_name(temporary_name(local));
+        let file = match File::create(&part) {
             Ok(file) => file,
             Err(error) => {
                 self.failure = Some(Failure::new(
@@ -246,17 +252,40 @@ impl Session {
         };
         let done = self.download(&handle, file, remote, total, progress);
         self.close(&handle);
-        done
+        let landed = match done.map(|()| std::fs::rename(&part, local)) {
+            Some(Ok(())) => Some(()),
+            Some(Err(error)) => {
+                self.failure = Some(Failure::new(
+                    format!("Couldn't finish {}.", local.display()),
+                    error.to_string(),
+                ));
+                None
+            }
+            None => None,
+        };
+        if landed.is_none() {
+            // Dead, cancelled or refused, and nothing is coming back for the
+            // half that arrived. The failure already says why; a temporary
+            // that will not go is not a second thing worth saying.
+            let _ = std::fs::remove_file(&part);
+        }
+        landed
     }
 
     /// Copies a local file to `remote`, calling `progress` with how much has
     /// gone and how much there is. `progress` answering `false` stops the
-    /// transfer where it stands, leaving a truncated file at the far end for
-    /// the caller to keep or sweep.
+    /// transfer where it stands.
     ///
-    /// The file arrives with the permission bits it has here, which is what the
+    /// The bytes land beside `remote` under a dotted name and replace it only
+    /// once they are whole, so a cancelled or broken upload leaves whatever was
+    /// there exactly as it was rather than cut short under its own name. A new
+    /// file arrives with the permission bits it has here, which is what the
     /// `sftp` program does too: a script that is executable on this machine is
-    /// executable on the other one.
+    /// executable on the other one. A file it replaces keeps the bits it had
+    /// over there, which is what writing into it would have done; its owner
+    /// becomes the account this logged in as, the one thing a rename cannot
+    /// carry across. A symlink is followed to what it points at rather than
+    /// replaced by a file.
     pub fn put(
         &mut self,
         local: &Path,
@@ -275,13 +304,123 @@ impl Session {
         };
         let data = file.metadata().ok();
         let total = data.as_ref().map_or(0, std::fs::Metadata::len);
-        let mode = data.map_or(0o644, |data| {
+        let here = data.map_or(0o644, |data| {
             std::os::unix::fs::PermissionsExt::mode(&data.permissions()) & 0o777
         });
+
+        // Asked with the failure kept, since a name that is not there yet is
+        // the usual answer rather than something that went wrong.
+        let found = self.probe(|session| session.lstat(remote));
+        if found.as_ref().is_some_and(|entry| entry.is_directory) {
+            self.failure = Some(Failure::new(
+                format!("Couldn't write {remote}."),
+                "There is a directory there with that name.",
+            ));
+            return None;
+        }
+        let (target, found) = match found {
+            Some(entry) if entry.is_link => match self.probe(|session| session.realpath(remote)) {
+                Some(real) => {
+                    let found = self.probe(|session| session.stat(&real));
+                    (real, found)
+                }
+                // Somewhere the far end cannot name, so the link is written
+                // through, which is what opening it does.
+                None => return self.overwrite(file, local, remote, total, here, progress),
+            },
+            found => (remote.to_owned(), found),
+        };
+        let kept = found
+            .as_ref()
+            .map(|entry| entry.mode & 0o777)
+            .filter(|mode| *mode != 0);
+
+        let part = beside(&target);
+        self.refusal = None;
+        let Some(handle) = self.open_file(
+            &part,
+            WRITABLE | CREATE | TRUNCATE,
+            Some(kept.unwrap_or(here)),
+        ) else {
+            // A directory this account may not write into can still hold a
+            // file it may write to, so that file is written where it stands.
+            // It costs what the temporary exists to prevent, a cancel there
+            // leaves the file cut short, and it is the only way such a file
+            // can be sent at all.
+            if found.is_some() && self.refusal == Some(PERMISSION_DENIED) {
+                return self.overwrite(file, local, remote, total, here, progress);
+            }
+            // Named as the file that was asked for. The temporary is this
+            // client's business and nobody asked to write it.
+            if let Some(failure) = self.failure.as_mut() {
+                failure.message = format!("Couldn't write {remote}.");
+            }
+            return None;
+        };
+        let done = self.upload(&handle, file, local, remote, total, progress);
+        if done.is_some()
+            && let Some(mode) = kept
+        {
+            // The mode went through the far end's umask on the way in, so a
+            // file that was group-writable would come back without it. Set on
+            // the handle, past the mask, and not fatal when refused: the bytes
+            // are the thing that was asked for, and they are right.
+            let mut request = encode_string_bytes(&handle);
+            request.extend_from_slice(&PERMISSIONS.to_be_bytes());
+            request.extend_from_slice(&mode.to_be_bytes());
+            self.probe(|session| session.settle(FSETSTAT, &request, "write", &part));
+        }
+        self.close(&handle);
+        if done.is_none() {
+            // The one thing to sweep is the temporary. On a connection that
+            // died this cannot reach it either, and a dotted name is what is
+            // left over there rather than half of the real one.
+            self.probe(|session| session.remove(&part));
+            return None;
+        }
+        self.replace(&part, &target, found.is_some())
+    }
+
+    /// Straight into `remote`, cut to nothing first. What [`Self::put`] falls
+    /// back to when there is nowhere beside the file to write.
+    fn overwrite(
+        &mut self,
+        file: File,
+        local: &Path,
+        remote: &str,
+        total: u64,
+        mode: u32,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Option<()> {
         let handle = self.open_file(remote, WRITABLE | CREATE | TRUNCATE, Some(mode))?;
         let done = self.upload(&handle, file, local, remote, total, progress);
         self.close(&handle);
         done
+    }
+
+    /// Moves a finished upload onto the name it was for.
+    ///
+    /// Version 3 leaves a rename onto a taken name to the server and OpenSSH's
+    /// refuses, so a file that is there goes first. Between the two there is a
+    /// moment with nothing under the name. The new bytes are whole by then, so
+    /// when the rename is what fails they stay where they landed and the
+    /// failure says where.
+    fn replace(&mut self, part: &str, target: &str, taken: bool) -> Option<()> {
+        if taken && self.remove(target).is_none() {
+            if let Some(failure) = self.failure.as_mut() {
+                failure.message = format!("Couldn't replace {target}.");
+            }
+            self.probe(|session| session.remove(part));
+            return None;
+        }
+        if self.rename(part, target).is_some() {
+            return Some(());
+        }
+        if let Some(failure) = self.failure.as_mut() {
+            failure.message = format!("Couldn't replace {target}.");
+            failure.detail = format!("The new copy arrived whole and is at {part}.");
+        }
+        None
     }
 
     /// Makes one directory, which the far end refuses if it is already there.
@@ -649,6 +788,7 @@ impl Session {
         }
         let mut reader = Reader::new(body);
         let code = reader.u32().unwrap_or(OK);
+        self.refusal = Some(code);
         let message = reader
             .string()
             .map(|text| String::from_utf8_lossy(&text).into_owned())
@@ -684,6 +824,15 @@ impl Drop for Session {
             let _ = child.wait();
         }
     }
+}
+
+/// Where an unfinished copy of `path` is written: beside it, so it is on the
+/// same filesystem and moves onto it in one rename.
+fn beside(path: &str) -> String {
+    let path = Path::new(path);
+    path.with_file_name(temporary_name(path))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// A string as the protocol writes one: its length and then its bytes, with no
@@ -809,6 +958,7 @@ mod tests {
             input: BufReader::new(Box::new(ours)),
             next: 1,
             failure: None,
+            refusal: None,
         };
         (session, far)
     }
@@ -944,6 +1094,9 @@ mod tests {
 
         let done = session.get("/home/dean/notes.txt", &local, &mut |_, _| false);
         assert_eq!(done, None);
+        // Neither the name asked for nor the one the bytes were landing under.
+        assert!(!local.exists());
+        assert!(!local.with_file_name(temporary_name(&local)).exists());
         assert!(
             session
                 .failure
@@ -966,9 +1119,11 @@ mod tests {
         version.extend_from_slice(&VERSION.to_be_bytes());
         let (mut session, far) = serve(vec![
             (REPLY_VERSION, version),
-            (REPLY_HANDLE, body(1, &encode_string("h"))),
-            (REPLY_STATUS, body(2, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(1, &NO_SUCH_FILE.to_be_bytes())),
+            (REPLY_HANDLE, body(2, &encode_string("h"))),
             (REPLY_STATUS, body(3, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(4, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(5, &OK.to_be_bytes())),
         ]);
         assert!(session.handshake());
         assert_eq!(
@@ -978,14 +1133,111 @@ mod tests {
 
         drop(session);
         let asked = far.join().expect("the far end");
-        assert_eq!(asked[1].0, OPEN);
-        assert_eq!(asked[2].0, WRITE);
+        let kinds: Vec<u8> = asked.iter().map(|(kind, _)| *kind).collect();
+        // Nothing was there, so nothing is removed before the rename.
+        assert_eq!(kinds, vec![INIT, LSTAT, OPEN, WRITE, CLOSE, RENAME]);
 
-        let mut reader = Reader::new(&asked[2].1);
+        let mut reader = Reader::new(&asked[3].1);
         reader.u32().expect("the request id");
         assert_eq!(reader.string().as_deref(), Some(&b"h"[..]));
         assert_eq!(reader.u64(), Some(0));
         assert_eq!(reader.string().as_deref(), Some(&b"hello"[..]));
+        let _ = std::fs::remove_file(&local);
+    }
+
+    /// The paths a request names, in order, read off what the far end was sent.
+    fn paths(asked: &Packet) -> Vec<String> {
+        let mut reader = Reader::new(&asked.1);
+        reader.u32().expect("the request id");
+        std::iter::from_fn(|| reader.string())
+            .map(|path| String::from_utf8_lossy(&path).into_owned())
+            .collect()
+    }
+
+    fn a_regular_file(mode: u32) -> Vec<u8> {
+        let mut attributes = (SIZE | PERMISSIONS).to_be_bytes().to_vec();
+        attributes.extend_from_slice(&3_u64.to_be_bytes());
+        attributes.extend_from_slice(&(0o100_000 | mode).to_be_bytes());
+        attributes
+    }
+
+    #[test]
+    fn an_upload_over_a_file_lands_under_a_temporary_name_and_is_moved_on_at_the_end() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-over-{}", std::process::id()));
+        std::fs::write(&local, b"hello").expect("a file to send");
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_ATTRS, body(1, &a_regular_file(0o664))),
+            (REPLY_HANDLE, body(2, &encode_string("h"))),
+            (REPLY_STATUS, body(3, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(4, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(5, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(6, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(7, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+        assert_eq!(
+            session.put(&local, "/srv/notes.txt", &mut |_, _| true),
+            Some(())
+        );
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        let kinds: Vec<u8> = asked.iter().map(|(kind, _)| *kind).collect();
+        assert_eq!(
+            kinds,
+            vec![INIT, LSTAT, OPEN, WRITE, FSETSTAT, CLOSE, REMOVE, RENAME]
+        );
+        let temporary = format!("/srv/.notes.txt.tuni-{}", std::process::id());
+        assert_eq!(paths(&asked[2])[0], temporary);
+        assert_eq!(paths(&asked[6]), vec!["/srv/notes.txt"]);
+        assert_eq!(
+            paths(&asked[7]),
+            vec![temporary, "/srv/notes.txt".to_owned()]
+        );
+
+        // The bits the file had over there, set past the far end's umask.
+        let mut reader = Reader::new(&asked[4].1);
+        reader.u32().expect("the request id");
+        reader.string().expect("the handle");
+        assert_eq!(reader.u32(), Some(PERMISSIONS));
+        assert_eq!(reader.u32(), Some(0o664));
+        let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn a_cancelled_upload_leaves_the_file_that_was_there() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-keep-{}", std::process::id()));
+        std::fs::write(&local, b"hello").expect("a file to send");
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_ATTRS, body(1, &a_regular_file(0o644))),
+            (REPLY_HANDLE, body(2, &encode_string("h"))),
+            (REPLY_STATUS, body(3, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(4, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+        assert!(
+            session
+                .put(&local, "/srv/notes.txt", &mut |_, _| false)
+                .is_none()
+        );
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        let kinds: Vec<u8> = asked.iter().map(|(kind, _)| *kind).collect();
+        assert_eq!(kinds, vec![INIT, LSTAT, OPEN, CLOSE, REMOVE]);
+        // The only thing deleted is the temporary; the real name was never
+        // opened, so it was never cut short.
+        let temporary = format!("/srv/.notes.txt.tuni-{}", std::process::id());
+        assert_eq!(paths(&asked[2])[0], temporary);
+        assert_eq!(paths(&asked[4]), vec![temporary]);
         let _ = std::fs::remove_file(&local);
     }
 
@@ -998,9 +1250,13 @@ mod tests {
         version.extend_from_slice(&VERSION.to_be_bytes());
         let mut status = PERMISSION_DENIED.to_be_bytes().to_vec();
         status.extend_from_slice(&encode_string("Permission denied"));
-        let (mut session, _far) = serve(vec![
+        // Refused beside the file, since nobody may write into /etc, and then
+        // refused in it, since nobody may write that file either.
+        let (mut session, far) = serve(vec![
             (REPLY_VERSION, version),
-            (REPLY_STATUS, body(1, &status)),
+            (REPLY_ATTRS, body(1, &a_regular_file(0o644))),
+            (REPLY_STATUS, body(2, &status)),
+            (REPLY_STATUS, body(3, &status)),
         ]);
         assert!(session.handshake());
         assert!(
@@ -1015,6 +1271,10 @@ mod tests {
             failure.detail,
             "The account this connection logged in as may not write it."
         );
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        assert_eq!(paths(&asked[3])[0], "/etc/passwd");
         let _ = std::fs::remove_file(&local);
     }
 

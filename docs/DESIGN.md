@@ -831,12 +831,24 @@ header takes a typed path, and the buttons under the thumb walk the history,
 which empties with the session since every path in it names a machine this page
 has left.
 
-Files move one at a time. A download is written beside where it is going under a
-dotted name and renamed onto it once it is whole, the discipline the editor
-already saves with, so an interrupted transfer costs the copy rather than
-leaving half a file under the name something else would open. An upload arrives
-with the permission bits it has here, which is what the `sftp` program does too:
-a script that runs on this machine runs on the other one. How far it has got is
+Files move one at a time. Both ways a file is written beside where it is going
+under a dotted name and renamed onto it once it is whole, the discipline the
+editor already saves with, so an interrupted transfer costs the copy rather than
+leaving half a file under the name something else would open. That matters most
+going up: a cancelled upload over a file that was already there used to leave
+that file truncated and then delete it, and now it leaves it untouched and
+sweeps only the temporary. The price is two more round trips at the end, a
+remove and a rename, since version 3 lets OpenSSH's server refuse a rename onto
+a taken name, and the moment between them has nothing under the name; when the
+rename is what fails, the new copy is whole and the dialog says where it is. A
+replaced file also changes owner to the account that logged in, the one thing a
+rename cannot carry across, and a directory that account may not write into gets
+the old in-place write instead, since a file it may write to is still worth
+sending. A new file arrives with the permission bits it has here, which is what
+the `sftp` program does too: a script that runs on this machine runs on the
+other one. A replaced one keeps the bits it had there, set on the handle past the
+far end's umask, and a symlink is followed to what it points at rather than
+replaced by a file. How far it has got is
 counted rather than guessed, since this drives the loop instead of reading
 another program's output, and the number reaches the progress bar through two
 integers a worker writes and a local timer reads, which is a timer over memory
