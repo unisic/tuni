@@ -845,6 +845,19 @@ whatever was typed into it, and a password is one of the things that gets typed
 into a blank. A snippet with blanks cannot be a host's on-connect snippet,
 since nobody is in front of a pane that is still connecting to fill them in.
 
+The host list's menu runs one snippet on every host it is showing, each in a
+tab of its own. The set is the rows on screen, so the search and the tag picker
+are how it is chosen, and a folded group is left out because it is not showing;
+the dialog names the hosts before anything connects, because this is the one
+click in the window that reaches every machine on the list. Blanks are asked
+for once and the same answers go to every host. The typing waits on the same
+signal an on-connect snippet does and takes its place in those panes, since two
+bodies typed back to back run as one line whenever the first has no newline.
+That also means a host whose configuration shares nothing gets its tab and no
+snippet, which is the same safe way to be wrong. Each host is its own ssh
+process and its own tab: the cost is the length of the list, and the list is
+in front of the person who asked for it.
+
 Keys are read and never held. The list under the launcher's menu is `~/.ssh`
 scanned for `.pub` files, one `ssh-keygen -l` each for the type, the size, the
 comment and the fingerprint, and one `ssh-add -l` for what the agent has, which

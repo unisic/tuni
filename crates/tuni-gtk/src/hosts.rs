@@ -109,6 +109,9 @@ mod imp {
         /// Put a command on the prompt of a local shell. The key commands ask
         /// questions and a list has nowhere to answer them.
         RunLocally(Vec<String>),
+        /// Connect to each of these hosts in a tab of its own and type the
+        /// snippet of this name into every one once it is in.
+        RunSnippet(Vec<String>, String),
     }
 
     #[derive(Default)]
@@ -467,6 +470,7 @@ impl TuniHosts {
             entry("snippets", self, |hosts| {
                 crate::snippets::present(hosts);
             }),
+            entry("run-snippet", self, TuniHosts::run_snippet_on_listed),
             entry("keys", self, |hosts| {
                 crate::keys::present(
                     hosts,
@@ -644,6 +648,81 @@ impl TuniHosts {
                 this.report(written.unwrap_or_else(|_| Err("The write did not finish".to_owned())));
             }
         ));
+    }
+
+    /// Asks which snippet to type into every host the list is showing, each in
+    /// a tab of its own.
+    ///
+    /// The hosts are the rows on screen, so the search and the tag picker are
+    /// how the set is chosen, and a folded group is left out because it is not
+    /// showing. The dialog names them before anything connects: this is one
+    /// click that reaches every machine in the list.
+    fn run_snippet_on_listed(&self) {
+        let aliases: Vec<String> = self
+            .imp()
+            .rows
+            .borrow()
+            .iter()
+            .filter_map(|(_, choice)| match choice {
+                Choice::Host(alias) => Some(alias.clone()),
+                Choice::Local => None,
+            })
+            .collect();
+        if aliases.is_empty() {
+            return;
+        }
+        let snippets: Vec<String> = tuni_core::snippets::Snippets::load()
+            .all()
+            .iter()
+            .map(|snippet| snippet.name.clone())
+            .collect();
+        if snippets.is_empty() {
+            crate::snippets::present(self);
+            return;
+        }
+
+        let names: Vec<&str> = snippets.iter().map(String::as_str).collect();
+        let picker = adw::ComboRow::builder()
+            .title("Snippet")
+            .model(&gtk::StringList::new(&names))
+            .build();
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .build();
+        list.add_css_class("boxed-list");
+        list.append(&picker);
+
+        let dialog = adw::AlertDialog::new(
+            Some("Run a Snippet on Listed Hosts"),
+            Some(&format!(
+                "Each host opens in a tab of its own and the snippet is typed once \
+                 it has connected. {}: {}.",
+                count(aliases.len()),
+                listed(&aliases)
+            )),
+        );
+        dialog.set_extra_child(Some(&list));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("run", "Run");
+        dialog.set_response_appearance("run", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("run"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(
+            None,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_, response| {
+                    if response != "run" {
+                        return;
+                    }
+                    if let Some(name) = snippets.get(picker.selected() as usize) {
+                        this.send(Message::RunSnippet(aliases.clone(), name.clone()));
+                    }
+                }
+            ),
+        );
+        dialog.present(Some(self));
     }
 
     fn confirm_delete(&self) {
@@ -1075,6 +1154,10 @@ fn header_menu() -> gio::Menu {
     menu.append(Some("Local Shell"), Some("hosts.local-shell"));
     menu.append(Some("Keys"), Some("hosts.keys"));
     menu.append(Some("Snippets"), Some("hosts.snippets"));
+    menu.append(
+        Some("Run a Snippet on Listed Hosts…"),
+        Some("hosts.run-snippet"),
+    );
     menu.append(Some("Refresh"), Some("hosts.refresh"));
     menu.append(Some("Open ~/.ssh/config"), Some("hosts.open-config"));
     menu
@@ -1414,6 +1497,17 @@ fn count(hosts: usize) -> String {
     }
 }
 
+/// Hosts by name for a sentence, the first few of them, so a dialog about a
+/// hundred hosts is still a dialog.
+fn listed(aliases: &[String]) -> String {
+    const NAMED: usize = 6;
+    let named = aliases[..aliases.len().min(NAMED)].join(", ");
+    match aliases.len().saturating_sub(NAMED) {
+        0 => named,
+        rest => format!("{named} and {rest} more"),
+    }
+}
+
 /// Scrolls a selected row into view without giving it the keyboard, which
 /// belongs to the search entry for as long as the launcher is up.
 fn reveal(scroller: &gtk::ScrolledWindow, row: &gtk::ListBoxRow) {
@@ -1442,6 +1536,14 @@ mod tests {
         let taken = ["web".to_owned(), "web copy".to_owned()];
         assert_eq!(free_alias("db", &taken), "db copy");
         assert_eq!(free_alias("web", &taken), "web copy 2");
+    }
+
+    #[test]
+    fn a_long_list_of_hosts_names_the_first_few_and_counts_the_rest() {
+        let few: Vec<String> = ["web", "api"].map(str::to_owned).to_vec();
+        assert_eq!(listed(&few), "web, api");
+        let many: Vec<String> = (1..=9).map(|n| format!("h{n}")).collect();
+        assert_eq!(listed(&many), "h1, h2, h3, h4, h5, h6 and 3 more");
     }
 
     #[test]

@@ -363,6 +363,11 @@ mod imp {
         /// terminal underneath is in `terminals` like any other, since it is
         /// one: only what the grid draws differs.
         pub remotes: RefCell<HashMap<Id, TuniRemote>>,
+        /// Text to type into an ssh pane once it has connected, in place of
+        /// the host's own on-connect snippet, by pane id. Put there by running
+        /// a snippet on several hosts, and taken out when the pane starts or
+        /// closes, whichever is first.
+        pub due: RefCell<HashMap<Id, String>>,
         /// One host list per pane showing one, by pane id.
         pub hosts: RefCell<HashMap<Id, TuniHosts>>,
         /// One file browser per pane showing a host's files, by pane id.
@@ -2451,6 +2456,7 @@ impl TuniWindow {
                     Message::Browse(alias) => this.browse_files(&alias),
                     Message::OpenFile(path, line) => this.open_file_at(&path, line),
                     Message::RunLocally(argv) => this.run_locally(&argv),
+                    Message::RunSnippet(aliases, name) => this.run_snippet_on(aliases, &name),
                 }
             }
         ));
@@ -2978,6 +2984,7 @@ impl TuniWindow {
         };
         let alias = alias.clone();
         let name = alias.clone();
+        let due = self.imp().due.borrow_mut().remove(&pane);
         let settings = self.settings();
         let term = settings.ssh_term.clone();
         let dial = requested || settings.ssh_reconnect_on_restore;
@@ -3004,8 +3011,10 @@ impl TuniWindow {
                     }
                     // The snippet and the socket to wait on are read here
                     // because both are files and this is the thread that reads
-                    // files. Nothing is typed unless the host names one.
-                    let waited = greeting(&meta)
+                    // files. Nothing is typed unless the host names one or
+                    // the pane was opened to run one.
+                    let waited = due
+                        .or_else(|| greeting(&meta))
                         .and_then(|body| Some((body, control.socket(&destination)?.0)));
                     // Subprocesses of its own — the keyring and `ssh-keygen -F`
                     // — so it belongs on this thread with the rest of them.
@@ -3722,6 +3731,7 @@ impl TuniWindow {
         }
         imp.editors.borrow_mut().remove(&pane);
         imp.remotes.borrow_mut().remove(&pane);
+        imp.due.borrow_mut().remove(&pane);
         imp.hosts.borrow_mut().remove(&pane);
         imp.browsers.borrow_mut().remove(&pane);
         // A pane closed mid-turn never sends the notify that would have said it
@@ -5043,6 +5053,34 @@ impl TuniWindow {
             self,
             self.palette_entries(),
             "Search commands and terminals",
+        );
+    }
+
+    /// Connects to each host in a tab of its own and types the snippet into
+    /// every one once it is in. Its blanks are asked for once, here, and the
+    /// same answers go to every host.
+    ///
+    /// The typing waits on the same signal a host's own on-connect snippet
+    /// does, and replaces that snippet for these panes: two snippets typed
+    /// back to back would run as one line whenever the first has no newline.
+    fn run_snippet_on(&self, aliases: Vec<String>, name: &str) {
+        let Some(snippet) = tuni_core::snippets::Snippets::load().get(name).cloned() else {
+            return;
+        };
+        crate::snippets::ask(
+            self,
+            &snippet,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |text| {
+                    for alias in &aliases {
+                        let pane = Pane::ssh(alias.clone());
+                        this.imp().due.borrow_mut().insert(pane.id(), text.clone());
+                        this.open_pane(pane);
+                    }
+                }
+            ),
         );
     }
 
