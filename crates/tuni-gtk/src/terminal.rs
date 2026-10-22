@@ -278,6 +278,13 @@ mod imp {
         /// the widget's own chrome — the scrollbar, the empty background before
         /// a shell starts — is painted from the theme rather than from CSS.
         pub(super) theme: RefCell<Theme>,
+        /// What the window last handed down, kept so a pin can be lifted
+        /// without asking the window again.
+        pub(super) given: RefCell<Theme>,
+        /// A host's own colors, which win over what the window hands down. A
+        /// desktop going light is no reason to repaint the pane somebody
+        /// marked as the production machine.
+        pub(super) pinned: RefCell<Option<Theme>>,
         pub(super) font: RefCell<pango::FontDescription>,
         /// Point size in effect, which the zoom shortcuts move away from the
         /// configured one and put back.
@@ -427,6 +434,10 @@ mod imp {
                 theme: RefCell::new(
                     TerminalConfig::default().theme(adw::StyleManager::default().is_dark()),
                 ),
+                given: RefCell::new(
+                    TerminalConfig::default().theme(adw::StyleManager::default().is_dark()),
+                ),
+                pinned: RefCell::new(None),
                 font_size: Cell::new(TerminalConfig::default().font_size),
                 config: RefCell::new(TerminalConfig::default()),
                 font: RefCell::new(pango::FontDescription::new()),
@@ -1341,14 +1352,32 @@ impl TuniTerminal {
     /// the session when one is created. Safe to call repeatedly, which is what
     /// happens when the desktop flips between light and dark.
     pub fn set_theme(&self, theme: &Theme) {
+        self.imp().given.replace(theme.clone());
+        self.repaint();
+    }
+
+    /// Paint in these colors whatever the window says afterwards, or, given
+    /// nothing, go back to the window's.
+    pub fn pin_theme(&self, theme: Option<Theme>) {
+        self.imp().pinned.replace(theme);
+        self.repaint();
+    }
+
+    fn repaint(&self) {
         let imp = self.imp();
-        if *imp.theme.borrow() == *theme {
+        let theme = imp
+            .pinned
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| imp.given.borrow().clone());
+        if *imp.theme.borrow() == theme {
             return;
         }
-        imp.theme.replace(theme.clone());
+        let colors = colors(&theme);
+        imp.theme.replace(theme);
 
         if let Some(session) = imp.session.borrow_mut().as_mut() {
-            let _ = session.term.set_colors(&colors(theme));
+            let _ = session.term.set_colors(&colors);
         }
         self.queue_draw();
     }

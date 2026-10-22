@@ -876,6 +876,12 @@ pub struct Meta {
     /// many: a group is where a host sits, a tag is what it is.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group: String,
+    /// The theme the host's panes are painted in, by its name in the catalog.
+    /// Empty, or a name no bundled theme answers to, leaves the pane in the
+    /// window's colors. One theme rather than a light and dark pair: the point
+    /// is that this machine looks like itself whatever the desktop is doing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub theme: String,
     /// A themed icon name or an emoji, written the way a project's row writes
     /// one. Nothing means the server icon every unmarked host shares, which is
     /// exactly what a launcher of identical rows is not worth marking.

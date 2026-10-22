@@ -785,6 +785,18 @@ only says whether. `SetEnv` is sent by the client, and a server that does not
 `AcceptEnv` the name drops it without a word, which is the server's answer and
 not something the row can check.
 
+A host can have a theme of its own, picked in the editor from the same catalog
+Preferences lists and kept in `meta.json`, so a production machine can be red
+before anybody types into it. It is one theme, not a light and dark pair: a
+desktop going light is the window's business, and a pane that changed with it
+would no longer say which machine it is. The pane holds the host's colors as a
+pin over whatever the window hands down, so Preferences and the desktop still
+repaint every other pane and leave that one alone. The colors are read each
+time the pane connects, which includes a restore that only offers Connect; a
+pane already open when the theme is changed keeps its colors until it
+reconnects. Only the pane changes. The window's chrome is drawn from the
+window's theme, since one window holds panes on several hosts at once.
+
 A forwarded port is two different things under one name. A `LocalForward` in the
 host's own block belongs to ssh, which brings it up with the connection, and
 there is nothing in the window that could start or stop it. One kept in

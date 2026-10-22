@@ -292,12 +292,7 @@ fn theme_row(
         .selected(names.iter().position(|name| *name == current).unwrap_or(0) as u32)
         .enable_search(true)
         .build();
-    // Search needs to be told what part of the model to match against.
-    row.set_expression(Some(gtk::PropertyExpression::new(
-        gtk::StringObject::static_type(),
-        None::<gtk::Expression>,
-        "string",
-    )));
+    searchable(&row);
     row.connect_selected_notify(glib::clone!(
         #[weak]
         window,
@@ -1541,6 +1536,16 @@ fn apply_preview_style(settings: &Settings, theme: &theme::Theme) {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     });
+}
+
+/// Search in a combo row of strings needs to be told what part of the model
+/// to match against.
+pub(crate) fn searchable(row: &adw::ComboRow) {
+    row.set_expression(Some(gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        None::<gtk::Expression>,
+        "string",
+    )));
 }
 
 fn list<'a>(items: impl Iterator<Item = &'a str>) -> gtk::StringList {

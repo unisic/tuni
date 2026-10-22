@@ -143,10 +143,32 @@ pub fn present<F>(
         .title("Group")
         .text(&meta.group)
         .build();
+    // The window's colors first, as nothing is first among the snippets. A
+    // name the catalog has lost stays on the list rather than turning into
+    // the first one, the way a missing font stays in Preferences.
+    let mut themes = vec!["Same as the Window".to_owned()];
+    if !meta.theme.is_empty() && !tuni_core::theme::exists(&meta.theme) {
+        themes.push(meta.theme.clone());
+    }
+    themes.extend(tuni_core::theme::names().map(str::to_owned));
+    let theme = adw::ComboRow::builder()
+        .title("Theme")
+        .subtitle("The colors of this host's panes")
+        .model(&string_list(&themes))
+        .selected(
+            themes
+                .iter()
+                .position(|name| *name == meta.theme)
+                .unwrap_or(0) as u32,
+        )
+        .enable_search(true)
+        .build();
+    crate::preferences::searchable(&theme);
     general.add(&name);
     general.add(&label);
     general.add(&group);
     general.add(&tags);
+    general.add(&theme);
     page.append(&general);
 
     let connection = adw::PreferencesGroup::builder().title("Connection").build();
@@ -488,6 +510,11 @@ pub fn present<F>(
                 label: label.text().trim().to_owned(),
                 tags: split_tags(&tags.text()),
                 group: group.text().trim().to_owned(),
+                theme: themes
+                    .get(theme.selected() as usize)
+                    .filter(|_| theme.selected() != 0)
+                    .cloned()
+                    .unwrap_or_default(),
                 icon: icon.borrow().clone(),
                 on_connect: snippets
                     .get(on_connect.selected() as usize)

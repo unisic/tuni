@@ -2973,7 +2973,12 @@ impl TuniWindow {
             #[weak]
             terminal,
             async move {
-                let Ok(dialled) = gio::spawn_blocking(move || {
+                let Ok((painted, dialled)) = gio::spawn_blocking(move || {
+                    let meta = tuni_core::ssh::Notes::load().get(&alias);
+                    // Looked up whether or not the pane dials, so a pane a
+                    // restore left waiting for Connect is in the host's colors
+                    // already.
+                    let painted = tuni_core::theme::theme(&meta.theme);
                     let control = tuni_core::ssh::Control::new(
                         settings.ssh_control_persist,
                         settings.ssh_share_connections,
@@ -2981,29 +2986,33 @@ impl TuniWindow {
                     let host = tuni_core::ssh::host(&alias);
                     let destination = host.target();
                     if !dial && !control.is_live(&destination) {
-                        return None;
+                        return (painted, None);
                     }
                     // The snippet and the socket to wait on are read here
                     // because both are files and this is the thread that reads
                     // files. Nothing is typed unless the host names one.
-                    let waited = greeting(&alias)
+                    let waited = greeting(&meta)
                         .and_then(|body| Some((body, control.socket(&destination)?.0)));
                     // Subprocesses of its own — the keyring and `ssh-keygen -F`
                     // — so it belongs on this thread with the rest of them.
                     // Empty unless the host has a saved password, which is the
                     // pane asking in the terminal the way it always has.
                     let askpass = tuni_core::secrets::askpass(&destination);
-                    Some((
-                        tuni_core::ssh::command(&host, &control),
-                        destination,
-                        waited,
-                        askpass,
-                    ))
+                    (
+                        painted,
+                        Some((
+                            tuni_core::ssh::command(&host, &control),
+                            destination,
+                            waited,
+                            askpass,
+                        )),
+                    )
                 })
                 .await
                 else {
                     return;
                 };
+                terminal.pin_theme(painted);
                 let remote = this.imp().remotes.borrow().get(&pane).cloned();
                 let Some((argv, destination, waited, askpass)) = dialled else {
                     if let Some(remote) = remote {
@@ -5775,14 +5784,14 @@ impl TuniWindow {
 }
 
 /// What a host asked to have typed once it answers, if it asked for anything
-/// and the snippet it named is still there. Two file reads.
-fn greeting(alias: &str) -> Option<String> {
-    let named = tuni_core::ssh::Notes::load().get(alias).on_connect;
-    if named.is_empty() {
+/// and the snippet it named is still there. One file read: the caller has
+/// the host's notes already.
+fn greeting(meta: &tuni_core::ssh::Meta) -> Option<String> {
+    if meta.on_connect.is_empty() {
         return None;
     }
     tuni_core::snippets::Snippets::load()
-        .get(&named)
+        .get(&meta.on_connect)
         .map(|snippet| snippet.body.clone())
 }
 
