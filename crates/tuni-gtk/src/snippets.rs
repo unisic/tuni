@@ -336,7 +336,10 @@ where
         .selection_mode(gtk::SelectionMode::None)
         .build();
     list.add_css_class("boxed-list");
-    let rows: Rc<Vec<(String, adw::EntryRow)>> = Rc::new(
+    // Weak, because every row's `changed` handler holds `check`, which reads
+    // this list: a strong row here keeps its own handler alive, and the rows
+    // outlive the dialog they were in. The list box is what owns them.
+    let rows: Rc<Vec<(String, glib::WeakRef<adw::EntryRow>)>> = Rc::new(
         blanks
             .into_iter()
             .map(|blank| {
@@ -345,7 +348,7 @@ where
                     .activates_default(true)
                     .build();
                 list.append(&row);
-                (blank.to_owned(), row)
+                (blank.to_owned(), row.downgrade())
             })
             .collect(),
     );
@@ -372,7 +375,7 @@ where
         move || {
             let values: Vec<(String, String)> = rows
                 .iter()
-                .map(|(blank, row)| (blank.clone(), row.text().to_string()))
+                .filter_map(|(blank, row)| Some((blank.clone(), row.upgrade()?.text().to_string())))
                 .collect();
             tuni_core::snippets::fill(&body, &values)
         }
@@ -389,6 +392,9 @@ where
         move || {
             let refused = filled().err();
             for (blank, row) in rows.iter() {
+                let Some(row) = row.upgrade() else {
+                    continue;
+                };
                 if refused.as_ref() == Some(blank) {
                     row.add_css_class("error");
                 } else {
@@ -398,7 +404,7 @@ where
             dialog.set_response_enabled("type", refused.is_none());
         }
     );
-    for (_, row) in rows.iter() {
+    for row in rows.iter().filter_map(|(_, row)| row.upgrade()) {
         row.connect_changed(glib::clone!(
             #[strong]
             check,
@@ -413,7 +419,7 @@ where
         }
     });
     dialog.present(Some(parent));
-    if let Some((_, first)) = rows.first() {
+    if let Some(first) = rows.first().and_then(|(_, row)| row.upgrade()) {
         first.grab_focus();
     }
 }
