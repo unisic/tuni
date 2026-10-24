@@ -62,8 +62,8 @@ pub(crate) fn connected() -> Vec<String> {
 }
 
 /// How many hosts the Recent section holds before the rest of them are just the
-/// list underneath it.
-const RECENT: usize = 5;
+/// list underneath it. The "+" button's menu holds as many.
+pub const RECENT: usize = 5;
 
 /// How many tags a row draws before the rest become a count. Bounded because
 /// the row is as wide as the pane and tags are the part of it nobody limits.
@@ -556,18 +556,19 @@ impl TuniHosts {
         self.send(wher.message(alias));
     }
 
-    /// Puts a host at the top of the list next time. An address typed once is
-    /// not a host, so it gets no history: the file would fill up with lines
-    /// nobody can act on.
+    /// Puts a host at the top of the list next time. The copy here is only
+    /// what the list draws from; the file is written by [`ssh::note_use`],
+    /// which reads it fresh, since this copy is older than whatever the
+    /// palette or the "+" button wrote down since the list was filled.
     fn remember(&self, alias: &str) {
         let imp = self.imp();
         if imp.hosts.borrow().get(alias).is_none() {
             return;
         }
         imp.notes.borrow_mut().used(alias);
-        let notes = imp.notes.borrow().clone();
+        let alias = alias.to_owned();
         glib::spawn_future_local(async move {
-            let _ = gio::spawn_blocking(move || notes.save()).await;
+            let _ = gio::spawn_blocking(move || ssh::note_use(&alias)).await;
         });
     }
 
@@ -965,17 +966,15 @@ impl TuniHosts {
             // Last connected first, and then everything else by group and
             // name. A host in the first is not repeated further down: two
             // rows for one machine is two answers to where to click.
-            let mut recent: Vec<(&Host, u64)> = shown
-                .iter()
-                .filter(|_| tag.is_none())
-                .filter_map(|host| Some((*host, notes.get(&host.alias).last_used?)))
-                .collect();
-            recent.sort_by_key(|(_, when)| std::cmp::Reverse(*when));
-            recent.truncate(RECENT);
+            let recent = if tag.is_none() {
+                notes.recent(shown.iter().copied(), RECENT)
+            } else {
+                Vec::new()
+            };
             if !recent.is_empty() {
                 list.append(&header("Recent"));
             }
-            for (host, _) in &recent {
+            for host in &recent {
                 let row = host_row(host, &notes.get(&host.alias), live.contains(&host.alias));
                 list.append(&row);
                 rows.push((row, Choice::Host(host.alias.clone())));
@@ -984,7 +983,7 @@ impl TuniHosts {
             let rest = shown
                 .iter()
                 .copied()
-                .filter(|host| !recent.iter().any(|(seen, _)| seen.alias == host.alias));
+                .filter(|host| !recent.iter().any(|seen| seen.alias == host.alias));
             let folded = imp.folded.borrow();
             for (group, members) in ssh::grouped(rest, &notes) {
                 if group.is_empty() {

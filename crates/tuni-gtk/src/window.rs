@@ -17,6 +17,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -766,10 +767,24 @@ impl TuniWindow {
             .build();
         status_button.add_css_class("pill");
         status_button.add_css_class("suggested-action");
+        // The other thing a window is opened for. Without it the empty page
+        // knows one way out, and the way to a host is a shortcut to have read
+        // about or a menu to have opened.
+        let status_connect = gtk::Button::builder()
+            .label("New Connection")
+            .tooltip_text("New Connection (Ctrl+Shift+O)")
+            .action_name("win.new-connection")
+            .build();
+        status_connect.add_css_class("pill");
+        status_button.set_halign(gtk::Align::Fill);
+        let status_buttons = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        status_buttons.set_halign(gtk::Align::Center);
+        status_buttons.append(&status_button);
+        status_buttons.append(&status_connect);
         let status = adw::StatusPage::builder()
             .icon_name("utilities-terminal-symbolic")
             .title("No Tabs Open")
-            .child(&status_button)
+            .child(&status_buttons)
             .build();
 
         let content_stack = gtk::Stack::new();
@@ -786,10 +801,28 @@ impl TuniWindow {
         content_overlay.add_overlay(&find);
         content_overlay.add_overlay(&switcher);
 
-        let new_tab = gtk::Button::builder()
+        // Split, so the "+" every tab strip has is also the way to a host: the
+        // arrow holds the hosts connected to last and the whole list under
+        // them, and the button half still does what a "+" does.
+        let recent_hosts = Rc::new(RecentHosts::default());
+        let connections = gio::Menu::new();
+        connections.append_section(None, &recent_hosts.menu);
+        let all_hosts = gio::Menu::new();
+        all_hosts.append(Some("New Connection"), Some("win.new-connection"));
+        connections.append_section(None, &all_hosts);
+        let connections = gtk::PopoverMenu::from_model(Some(&connections));
+        connections.connect_show(glib::clone!(
+            #[strong]
+            recent_hosts,
+            move |_| recent_hosts.refill()
+        ));
+        recent_hosts.refill();
+        let new_tab = adw::SplitButton::builder()
             .icon_name("tab-new-symbolic")
             .tooltip_text("New Tab (Ctrl+Shift+T)")
+            .dropdown_tooltip("Connect to a Host")
             .action_name("win.new-tab")
+            .popover(&connections)
             .build();
         new_tab.add_css_class("flat");
         // Autohide is a setting, and settings arrive after construction; see
@@ -1246,10 +1279,15 @@ impl TuniWindow {
             }),
             // Opens a connection in a tab of its own. The target is the name
             // `ssh` is given, which is either a saved alias or an address
-            // somebody typed.
+            // somebody typed. What the palette and the "+" button's menu run,
+            // so it dates the host the way a pick from the host list does.
             entry("connect", string, |window, target| {
                 if let Some(alias) = target.and_then(glib::Variant::str) {
                     window.open_pane(Pane::ssh(alias.to_owned()));
+                    let alias = alias.to_owned();
+                    glib::spawn_future_local(async move {
+                        let _ = gio::spawn_blocking(move || tuni_core::ssh::note_use(&alias)).await;
+                    });
                 }
             }),
             // A host's files beside the ones here, in a pane next to the one
@@ -6329,6 +6367,65 @@ fn item(label: &str, action: &str, target: &glib::Variant) -> gio::MenuItem {
     item
 }
 
+/// The hosts connected to last, at the top of the "+" button's menu.
+///
+/// Read again each time the menu opens, because the host list is what writes
+/// down a connection and nothing tells the window it did. Two small files and
+/// no subprocess, on the blocking pool. The menu is rebuilt only when the
+/// answer differs from what it shows, since a rebuild under an open menu
+/// takes the keyboard focus off the item it was on.
+#[derive(Default)]
+struct RecentHosts {
+    menu: gio::Menu,
+    asked: Cell<u64>,
+    shown: RefCell<Vec<(String, String)>>,
+}
+
+impl RecentHosts {
+    fn refill(self: &Rc<Self>) {
+        let generation = self.asked.get().wrapping_add(1);
+        self.asked.set(generation);
+        let this = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            let Ok(recent) = gio::spawn_blocking(|| {
+                let hosts = tuni_core::ssh::Hosts::load();
+                let notes = tuni_core::ssh::Notes::load();
+                notes
+                    .recent(hosts.all(), crate::hosts::RECENT)
+                    .into_iter()
+                    .map(|host| {
+                        let meta = notes.get(&host.alias);
+                        let name = if meta.label.is_empty() {
+                            host.alias.clone()
+                        } else {
+                            meta.label
+                        };
+                        (name, host.alias.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            else {
+                return;
+            };
+            if this.asked.get() != generation || *this.shown.borrow() == recent {
+                return;
+            }
+            this.menu.remove_all();
+            for (name, alias) in &recent {
+                // A menu reads its labels for mnemonics, and `db_primary`
+                // would lose its underscore to one.
+                this.menu.append_item(&item(
+                    &name.replace('_', "__"),
+                    "win.connect",
+                    &alias.to_variant(),
+                ));
+            }
+            this.shown.replace(recent);
+        });
+    }
+}
+
 /// The header bar's menu — everything reachable by keyboard that a pointer
 /// should be able to reach too.
 fn main_menu() -> gio::Menu {
@@ -6336,6 +6433,7 @@ fn main_menu() -> gio::Menu {
     opening.append(Some("New Tab"), Some("win.new-tab"));
     opening.append(Some("New Project"), Some("win.new-project"));
     opening.append(Some("New Window"), Some("win.new-window"));
+    opening.append(Some("New Connection"), Some("win.new-connection"));
 
     let panes = gio::Menu::new();
     panes.append(Some("Split Right"), Some("win.split-right"));

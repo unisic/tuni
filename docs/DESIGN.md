@@ -200,7 +200,12 @@ in tuni, in one list, narrowed by the same typing the palette answers to, with
 Enter connecting in this pane, `Ctrl+Enter` in a split beside it, and
 `Shift+Enter` in a tab of its own. A dot says which machines are answering.
 Setting `new-tab` to `hosts` makes that list what `Ctrl+Shift+T` opens, for
-people who connect more often than they start a shell here.
+people who connect more often than they start a shell here. The arrow beside
+the "+" at the end of the tab strip holds the five hosts connected to last and
+New Connection under them, and a window with no tabs offers New Connection
+beside New Terminal, so the way to a host is never only a shortcut. A
+connection from the list, the palette or that arrow dates the host the same
+way, so all three agree on which hosts are recent.
 
 A host can sit in one group and carry any number of tags, both kept in
 `meta.json` beside the label, so a host from `~/.ssh/config` takes them as

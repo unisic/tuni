@@ -1000,6 +1000,25 @@ impl Notes {
         tags
     }
 
+    /// The hosts connected to last, newest first and at most `limit` of them.
+    /// Asked of the hosts on the list, the way [`Notes::tags`] is, since the
+    /// file still dates a host somebody has since deleted by hand, and a
+    /// shortcut to it would dial a name nothing answers to.
+    #[must_use]
+    pub fn recent<'a>(
+        &self,
+        hosts: impl IntoIterator<Item = &'a Host>,
+        limit: usize,
+    ) -> Vec<&'a Host> {
+        let mut dated: Vec<(&Host, u64)> = hosts
+            .into_iter()
+            .filter_map(|host| Some((host, self.0.get(&host.alias)?.last_used?)))
+            .collect();
+        dated.sort_by_key(|(_, when)| std::cmp::Reverse(*when));
+        dated.truncate(limit);
+        dated.into_iter().map(|(host, _)| host).collect()
+    }
+
     /// Records that a connection was opened, which is what puts a host at the
     /// top of the list next time.
     pub fn used(&mut self, alias: &str) {
@@ -1024,6 +1043,29 @@ impl Notes {
         fs::write(&temporary, text)?;
         fs::rename(&temporary, &path)
     }
+}
+
+/// Writes down a connection to `alias`, which is what puts it first in the
+/// Recent section and in the "+" button's menu next time.
+///
+/// Read fresh from the file rather than from a copy somebody holds, because
+/// the host list, the palette and the "+" button all connect, and a copy saved
+/// whole writes back whatever the others wrote since it was read. An address
+/// typed once is not a host, so it gets no history: the file would fill up
+/// with lines nobody can act on.
+///
+/// ponytail: two of these at the same instant can lose one of the dates, since
+/// nothing orders the read against the other write; a lock around `Notes`
+/// writers is the fix if two connections a millisecond apart ever matter.
+///
+/// File reads and a write, so the caller belongs off the main thread.
+pub fn note_use(alias: &str) -> std::io::Result<()> {
+    if Hosts::load().get(alias).is_none() {
+        return Ok(());
+    }
+    let mut notes = Notes::load();
+    notes.used(alias);
+    notes.save()
 }
 
 /// Hosts under the group each is filed in, groups by name and hosts by alias
@@ -3236,6 +3278,31 @@ Host key verification failed.
             "renaming onto the link would detach the user from their dotfiles"
         );
         assert!(fs::read_to_string(&real).expect("read").contains("Include"));
+    }
+
+    #[test]
+    fn the_recent_hosts_are_the_newest_of_the_ones_still_listed() {
+        let dated = |when| Meta {
+            last_used: Some(when),
+            ..Meta::default()
+        };
+        let mut notes = Notes::default();
+        notes.set("old", dated(10));
+        notes.set("newest", dated(30));
+        notes.set("middle", dated(20));
+        notes.set("deleted", dated(40));
+        let hosts: Vec<Host> = ["old", "never", "middle", "newest"]
+            .map(|alias| Host {
+                alias: alias.to_owned(),
+                ..Host::default()
+            })
+            .to_vec();
+        let recent: Vec<&str> = notes
+            .recent(&hosts, 2)
+            .into_iter()
+            .map(|host| host.alias.as_str())
+            .collect();
+        assert_eq!(recent, ["newest", "middle"]);
     }
 
     #[test]
