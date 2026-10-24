@@ -891,6 +891,18 @@ impl TuniTerminal {
             .and_then(|session| session.pty.as_ref()?.shell_pid())
     }
 
+    /// Whether the program in here has the terminal out of line mode. See
+    /// [`tuni_pty::Pty::is_raw`].
+    #[must_use]
+    pub fn is_raw(&self) -> bool {
+        self.imp()
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|session| session.pty.as_ref())
+            .is_some_and(tuni_pty::Pty::is_raw)
+    }
+
     /// Whether anything is running in here. False before the first session
     /// starts and again after one ends, when what is on screen is the last
     /// thing the dead one printed and nothing can be typed at it.

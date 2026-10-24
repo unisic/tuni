@@ -82,8 +82,8 @@ const PANEL_POLL_SECONDS: u32 = 2;
 
 /// How long a host's on-connect snippet waits for the connection, and how often
 /// it looks. Long enough for somebody to find a phone and type a code into it,
-/// and each look is one `stat` of a socket rather than anything that asks ssh a
-/// question.
+/// and each look is one `tcgetattr` on the pane's own terminal rather than
+/// anything that asks ssh a question.
 const CONNECT_INTERVAL: Duration = Duration::from_millis(250);
 const CONNECT_TRIES: u32 = 240;
 
@@ -3033,13 +3033,10 @@ impl TuniWindow {
                     if !dial && !control.is_live(&destination) {
                         return (painted, None);
                     }
-                    // The snippet and the socket to wait on are read here
-                    // because both are files and this is the thread that reads
-                    // files. Nothing is typed unless the host names one or
-                    // the pane was opened to run one.
-                    let waited = due
-                        .or_else(|| greeting(&meta))
-                        .and_then(|body| Some((body, control.socket(&destination)?.0)));
+                    // The snippet is read here because it is a file and this is
+                    // the thread that reads files. Nothing is typed unless the
+                    // host names one or the pane was opened to run one.
+                    let waited = due.or_else(|| greeting(&meta));
                     // Subprocesses of its own — the keyring and `ssh-keygen -F`
                     // — so it belongs on this thread with the rest of them.
                     // Empty unless the host has a saved password, which is the
@@ -3067,8 +3064,8 @@ impl TuniWindow {
                     }
                     return;
                 };
-                if let Some((body, socket)) = waited {
-                    this.type_on_connect(&terminal, destination.clone(), socket, body);
+                if let Some(body) = waited {
+                    this.type_on_connect(&terminal, body);
                 }
                 // Written down before the pane starts, so a connection is on the
                 // list to be hung up from the moment there is one to hang up.
@@ -3095,47 +3092,33 @@ impl TuniWindow {
     /// into.
     ///
     /// Waiting is the whole of this. Sent too early the text goes wherever the
-    /// login went, and a password prompt is one of the places that could be. The
-    /// control socket is the signal: `ssh` binds it after it has authenticated,
-    /// so a socket that exists means the far end is done asking. Watching for it
-    /// is a `stat`, which is why this can look four times a second without
-    /// asking ssh anything; one `-O check` at the end is what tells a live master
-    /// from a socket somebody's kill left behind.
+    /// login went, and a password prompt is one of the places that could be.
+    /// The pane's own terminal is the signal: `ssh` reads a password, a
+    /// passphrase or a host-key answer a line at a time, and takes the terminal
+    /// raw only once the session is up, master and mux client alike.
     ///
-    /// A host whose configuration turns sharing off has no socket, and so no
-    /// moment this can point at. Nothing is typed there, which is the safe way to
-    /// be wrong.
-    fn type_on_connect(
-        &self,
-        terminal: &TuniTerminal,
-        destination: String,
-        socket: PathBuf,
-        body: String,
-    ) {
-        let settings = self.settings();
+    /// The control socket was the signal before, and it cannot be one. With
+    /// sharing on, `%C` names one socket per host, so a second pane dialled
+    /// while the first was still logging in sees that socket appear while it is
+    /// sitting at its own password prompt. With sharing off there is no socket
+    /// at all and the snippet was never typed.
+    ///
+    /// A connection that is not up within the minute gets nothing typed, which
+    /// is the safe way to be wrong.
+    fn type_on_connect(&self, terminal: &TuniTerminal, body: String) {
         glib::spawn_future_local(glib::clone!(
             #[weak]
             terminal,
             async move {
                 for _ in 0..CONNECT_TRIES {
                     glib::timeout_future(CONNECT_INTERVAL).await;
-                    if !socket.exists() {
-                        continue;
-                    }
-                    let destination = destination.clone();
-                    let persist = settings.ssh_control_persist;
-                    let shared = settings.ssh_share_connections;
-                    let live = gio::spawn_blocking(move || {
-                        tuni_core::ssh::Control::new(persist, shared).is_live(&destination)
-                    })
-                    .await;
                     // Into this pane only. `send_text` is what the keyboard
                     // goes through, and in a tab that broadcasts it would type
                     // one host's snippet into every other pane in the tab.
-                    if live.unwrap_or(false) {
+                    if terminal.is_raw() {
                         terminal.send_bytes(body.as_bytes());
+                        return;
                     }
-                    return;
                 }
             }
         ));

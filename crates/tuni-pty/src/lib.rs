@@ -433,6 +433,22 @@ impl Pty {
     pub fn shell_pid(&self) -> Option<u32> {
         self.child.as_ref().and_then(|child| child.process_id())
     }
+
+    /// Whether the program in here has taken the terminal out of line mode,
+    /// which is how `ssh` says a session is up: it reads a password or a
+    /// host-key answer a line at a time, and goes raw only once it has
+    /// logged in. False when the terminal cannot be asked.
+    #[must_use]
+    pub fn is_raw(&self) -> bool {
+        let Some(fd) = self.master.as_raw_fd() else {
+            return false;
+        };
+        // SAFETY: `termios` is plain data that `tcgetattr` fills in whole, and
+        // `fd` is the master this struct owns, open for as long as `self` is.
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        let asked = unsafe { libc::tcgetattr(fd, &mut termios) };
+        asked == 0 && termios.c_lflag & libc::ICANON == 0
+    }
 }
 
 #[cfg(test)]
