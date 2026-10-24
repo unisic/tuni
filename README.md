@@ -49,34 +49,40 @@ source is read as a specification of behavior, not translated.
 
 ## Performance
 
-200 MiB of mixed plain and SGR-colored output, best of two runs, on one
+200 MiB of mixed plain and SGR-colored output, best of five runs, on one
 machine. Time to consume it, so window and shell startup cancel out.
 
 | Terminal | Engine | Consume | Throughput |
 | --- | --- | ---: | ---: |
-| urxvt | X11, CPU | 1.579 s | 126.6 MiB/s |
-| foot | Wayland, CPU | 1.691 s | 118.3 MiB/s |
-| **tuni** | GTK4 + libghostty-vt | 1.723 s | **116.0 MiB/s** |
-| alacritty | GPU (OpenGL) | 1.785 s | 112.0 MiB/s |
-| kitty | GPU (OpenGL) | 1.807 s | 110.6 MiB/s |
-| st | X11, CPU | 2.215 s | 90.2 MiB/s |
-| ghostty | GTK4 + GPU | 2.785 s | 71.8 MiB/s |
-| terminator | VTE 0.84 | 2.829 s | 70.6 MiB/s |
-| ptyxis | VTE 0.84 | 2.835 s | 70.5 MiB/s |
-| gnome-terminal | VTE 0.84 | 2.852 s | 70.1 MiB/s |
-| tilix | VTE 0.84 | 2.884 s | 69.3 MiB/s |
-| sakura | VTE 0.84 | 2.892 s | 69.1 MiB/s |
-| xterm | X11, CPU | 3.726 s | 53.6 MiB/s |
-| qterminal | QTermWidget | 4.276 s | 46.7 MiB/s |
-| konsole | Qt | 4.634 s | 43.1 MiB/s |
-| lxterminal | VTE 0.84 | 9.825 s | 20.3 MiB/s |
-| xfce4-terminal | VTE 0.84 | 10.136 s | 19.7 MiB/s |
+| **tuni** \* | GTK4 + libghostty-vt | 1.182 s | **169.1 MiB/s** |
+| kero \* | Go + libghostty-vt | 1.435 s | 139.4 MiB/s |
+| foot | Wayland, CPU | 1.502 s | 133.1 MiB/s |
+| urxvt | X11, CPU | 1.617 s | 123.6 MiB/s |
+| alacritty | GPU (OpenGL) | 1.790 s | 111.7 MiB/s |
+| kitty | GPU (OpenGL) | 1.908 s | 104.8 MiB/s |
+| st | X11, CPU | 2.210 s | 90.4 MiB/s |
+| ghostty | GTK4 + GPU | 2.524 s | 79.2 MiB/s |
+| sakura | VTE 0.84 | 2.955 s | 67.6 MiB/s |
+| ptyxis | VTE 0.84 | 2.982 s | 67.0 MiB/s |
+| gnome-terminal | VTE 0.84 | 2.995 s | 66.7 MiB/s |
+| terminator | VTE 0.84 | 2.998 s | 66.7 MiB/s |
+| tilix | VTE 0.84 | 3.082 s | 64.9 MiB/s |
+| xterm | X11, CPU | 3.798 s | 52.6 MiB/s |
+| qterminal | QTermWidget | 4.242 s | 47.1 MiB/s |
+| konsole \* | Qt | 4.965 s | 40.2 MiB/s |
+| wezterm | GPU (wgpu) | 6.134 s | 32.6 MiB/s |
+| lxterminal | VTE 0.84 | 10.186 s | 19.6 MiB/s |
+| xfce4-terminal | VTE 0.84 | 10.242 s | 19.5 MiB/s |
 
-Third of seventeen, within 10% of the fastest thing measured and ahead of both
-GPU terminals - with a whole workspace drawn around the terminal.
+\* measured 2026-10-24; the rest on 2026-07-28, on the same machine. Konsole,
+measured on both dates (26.04.3, then 26.08.1), came in 4% slower the second
+time, so nothing says the machine got faster in between.
+
+First of nineteen, a fifth ahead of kero in each of three head-to-head passes,
+with a whole workspace drawn around the terminal.
 
 [docs/BENCHMARK.md](docs/BENCHMARK.md) - method, environment, caveats, and the
-head-to-head with alacritty that the table above is too close to settle.
+head-to-head with kero.
 
 ## Install
 
