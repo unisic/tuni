@@ -3765,7 +3765,28 @@ impl TuniWindow {
     /// the series ends once the leader has lasted the wait without dropping.
     /// A leader still at a prompt by then leaves the others with Reconnect,
     /// which attaches them once somebody has answered it.
+    ///
+    /// Stamped with the attempt it follows, because a leader that drops again
+    /// starts another try, and another `follow`, while this one is still
+    /// waiting. The old one would otherwise read the new try's empty timer at
+    /// the end of its wait and give the series up in the middle of a login.
     fn follow(&self, alias: String) {
+        let Some(attempt) = self
+            .imp()
+            .reconnects
+            .borrow()
+            .get(&alias)
+            .map(|entry| entry.attempt)
+        else {
+            return;
+        };
+        let current = move |this: &Self, alias: &str| {
+            this.imp()
+                .reconnects
+                .borrow()
+                .get(alias)
+                .is_some_and(|entry| entry.attempt == attempt)
+        };
         let settings = self.settings();
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
@@ -3784,12 +3805,15 @@ impl TuniWindow {
                 .await
                 .ok()
                 .flatten();
+                if !current(&this, &alias) {
+                    return;
+                }
                 if socket.is_none() {
                     this.attach_waiting(&alias, true);
                 }
                 for _ in 0..CONNECT_TRIES {
                     glib::timeout_future(CONNECT_INTERVAL).await;
-                    if !this.imp().reconnects.borrow().contains_key(&alias) {
+                    if !current(&this, &alias) {
                         return;
                     }
                     let Some((destination, path)) = socket.clone() else {
@@ -3803,7 +3827,7 @@ impl TuniWindow {
                     })
                     .await
                     .unwrap_or(false);
-                    if live {
+                    if live && current(&this, &alias) {
                         this.attach_waiting(&alias, false);
                         this.imp().reconnects.borrow_mut().remove(&alias);
                         return;
@@ -3817,7 +3841,7 @@ impl TuniWindow {
                     .reconnects
                     .borrow()
                     .get(&alias)
-                    .is_some_and(|entry| entry.timer.is_none());
+                    .is_some_and(|entry| entry.attempt == attempt && entry.timer.is_none());
                 if done {
                     this.give_up(&alias);
                 }
