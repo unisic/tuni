@@ -5,7 +5,8 @@
 //! only ever be touched from the main thread.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::path::PathBuf;
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -165,6 +166,96 @@ fn terminfo_installed(name: &str) -> bool {
     dirs.iter().any(|dir| terminfo_under(dir, name))
 }
 
+fn set_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
+    let fd = fd.as_raw_fd();
+    // SAFETY: flag reads and writes on a descriptor the caller owns.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Parks the calling thread until `fd` is ready for `events`, or has hung up,
+/// which is how a thread drives a non-blocking descriptor without spinning.
+fn wait_for(fd: BorrowedFd<'_>, events: libc::c_short) {
+    let mut ready = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    // SAFETY: one valid `pollfd`, and a count of one. A failure, which is an
+    // interrupt in practice, only sends the caller back to the descriptor,
+    // and that says whatever is really wrong.
+    unsafe { libc::poll(&mut ready, 1, -1) };
+}
+
+/// The reader's wait for output: an epoll set holding the master for the life
+/// of the pane, rather than a `poll` that puts it on the master's wait queue
+/// only while the thread sleeps. Why the registration matters is the line
+/// discipline's business; that it does was measured: 200 MiB of `cat` into a
+/// reader that does nothing else took 1.5 to 1.8 s waiting in `poll` and 1.1
+/// to 1.4 s with the master registered.
+struct Readable(OwnedFd);
+
+impl Readable {
+    fn new(fd: BorrowedFd<'_>) -> std::io::Result<Self> {
+        // SAFETY: no pointers; the result is checked before it is owned.
+        let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epoll < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a fresh descriptor nothing else owns.
+        let epoll = unsafe { OwnedFd::from_raw_fd(epoll) };
+        let mut event = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: 0,
+        };
+        // SAFETY: two open descriptors and one valid event. Hangup and error
+        // are reported whether asked for or not, so the end wakes the reader.
+        if unsafe {
+            libc::epoll_ctl(
+                epoll.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                fd.as_raw_fd(),
+                &mut event,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(epoll))
+    }
+
+    /// Parks the thread until the master has output or has hung up. A failure,
+    /// which is an interrupt in practice, only sends the reader back to the
+    /// descriptor, and that says whatever is really wrong.
+    fn wait(&self) {
+        let mut event = libc::epoll_event { events: 0, u64: 0 };
+        // SAFETY: room for one event, and a count of one.
+        unsafe { libc::epoll_wait(self.0.as_raw_fd(), &mut event, 1, -1) };
+    }
+}
+
+/// `write_all` for the non-blocking master: a full input queue means the shell
+/// has not read yet, which is a reason to wait rather than to give up.
+fn write_through(
+    writer: &mut dyn Write,
+    fd: BorrowedFd<'_>,
+    mut bytes: &[u8],
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => wait_for(fd, libc::POLLOUT),
+            Err(e) => return Err(e),
+        }
+    }
+    writer.flush()
+}
+
 /// One directory's answer: entries live at `<dir>/<first letter>/<name>`.
 fn terminfo_under(dir: &std::path::Path, name: &str) -> bool {
     let Some(first) = name.chars().next() else {
@@ -189,7 +280,7 @@ impl Drop for Pty {
     /// Hangs up the way closing a terminal window does.
     ///
     /// Dropping the master alone does not: the reader thread holds a duplicate
-    /// of it and is parked in `read()`, so the kernel still sees an open master
+    /// of it and is parked waiting on it, so the kernel still sees an open master
     /// and sends nobody a hangup. A shell sitting at a prompt does leave —
     /// `portable-pty`'s writer sends it an EOF as it goes — but a shell with a
     /// foreground job never reads that EOF, so the shell, the job, the reader
@@ -318,10 +409,30 @@ impl Pty {
             .master
             .take_writer()
             .map_err(|e| Error::Spawn(e.to_string()))?;
-        let mut reader = pair
+        // The reader's own duplicate rather than `try_clone_reader`, because it
+        // has to wait on the descriptor as well as read it, and that reader
+        // hides it.
+        let master = pair
             .master
-            .try_clone_reader()
-            .map_err(|e| Error::Spawn(e.to_string()))?;
+            .as_raw_fd()
+            .ok_or_else(|| Error::Spawn("the pty has no descriptor".to_owned()))?;
+        // SAFETY: `master` belongs to `pair.master`, which is open past this
+        // line; each duplicate is owned by whoever it goes to from here on.
+        let master = unsafe { BorrowedFd::borrow_raw(master) };
+        let reader = master.try_clone_to_owned().map_err(Error::Io)?;
+        let writable = master.try_clone_to_owned().map_err(Error::Io)?;
+        // Non-blocking, so the reader can tell "nothing more for now" from
+        // "wait", drain the master until the kernel has nothing left and hand
+        // the whole burst over as one buffer. A blocking read returns whatever
+        // the line discipline pushed since the last wakeup, which under a
+        // firehose is a couple of hundred bytes: 200 MiB of `cat` woke the
+        // main loop and fed the VT about a million times, and drained it is
+        // about five thousand, 40 KiB each.
+        //
+        // The flag belongs to the open file, which every duplicate shares, so
+        // the writer below has to wait for room instead of blocking in `write`.
+        set_nonblocking(&reader).map_err(Error::Io)?;
+        let readable = Readable::new(reader.as_fd()).map_err(Error::Io)?;
 
         // Bounded so a firehose applies backpressure to the reader instead of
         // growing an unbounded queue the UI can never drain.
@@ -329,18 +440,37 @@ impl Pty {
         std::thread::Builder::new()
             .name("tuni-pty-reader".to_owned())
             .spawn(move || {
+                let mut reader = std::fs::File::from(reader);
                 let mut buf = vec![0u8; READ_BUF];
+                let mut filled = 0;
                 loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
+                    // EIO is how the master says the last slave closed.
+                    let (ended, drained) = match reader.read(&mut buf[filled..]) {
+                        Ok(0) => (true, true),
                         Ok(n) => {
-                            if tx
-                                .send_blocking(PtyEvent::Output(buf[..n].to_vec()))
-                                .is_err()
-                            {
-                                break;
+                            filled += n;
+                            if filled < buf.len() {
+                                continue;
                             }
+                            (false, false)
                         }
+                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => (false, true),
+                        Err(_) => (true, true),
+                    };
+                    if filled > 0
+                        && tx
+                            .send_blocking(PtyEvent::Output(buf[..filled].to_vec()))
+                            .is_err()
+                    {
+                        break;
+                    }
+                    filled = 0;
+                    if ended {
+                        break;
+                    }
+                    if drained {
+                        readable.wait();
                     }
                 }
                 let _ = tx.send_blocking(PtyEvent::Exited);
@@ -371,11 +501,7 @@ impl Pty {
             .name("tuni-pty-writer".to_owned())
             .spawn(move || {
                 while let Ok(chunk) = pending.recv_blocking() {
-                    if writer
-                        .write_all(&chunk)
-                        .and_then(|()| writer.flush())
-                        .is_err()
-                    {
+                    if write_through(&mut writer, writable.as_fd(), &chunk).is_err() {
                         break;
                     }
                 }
@@ -512,6 +638,23 @@ mod tests {
         })
         .expect("echo starts");
         assert!(drain(&pty).contains("tuni"));
+    }
+
+    #[test]
+    fn input_larger_than_the_queue_waits_for_the_shell_instead_of_failing() {
+        // Far past what the line discipline holds, so the writer meets a full
+        // queue and has to wait on the non-blocking master. Whole lines, because
+        // until `stty` runs the queue is canonical and drops an overlong one.
+        let line = format!("{}\n", "x".repeat(99));
+        let mut pty = Pty::spawn(&PtyConfig {
+            argv: ["sh", "-c", "stty -echo; head -c 1000000 | wc -c"]
+                .map(str::to_owned)
+                .to_vec(),
+            ..PtyConfig::default()
+        })
+        .expect("sh starts");
+        pty.write(line.repeat(10_000).as_bytes()).expect("queued");
+        assert!(drain(&pty).contains("1000000"));
     }
 
     #[test]
