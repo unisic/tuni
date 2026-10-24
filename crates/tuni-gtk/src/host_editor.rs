@@ -306,10 +306,11 @@ pub fn present<F>(
     // Two options with rows of their own. They are taken out of the extra
     // lines below, so the text there cannot say something else about them.
     // A value other than yes or no names a socket, which on keeps, since the
-    // switch only says whether.
+    // switch only says whether. `false` is ssh's other spelling of no, and kept
+    // as a socket it would leave a switch turned on still meaning off.
     let agent_was = host
         .option("ForwardAgent")
-        .filter(|value| !value.eq_ignore_ascii_case("no"));
+        .filter(|value| !value.eq_ignore_ascii_case("no") && !value.eq_ignore_ascii_case("false"));
     let agent = adw::SwitchRow::builder()
         .title("Forward the agent")
         .subtitle("Root on the host can sign with your keys while you are connected")
