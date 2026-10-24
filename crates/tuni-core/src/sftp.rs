@@ -673,7 +673,10 @@ impl Session {
     /// The bytes land beside `local` under a dotted name and are moved onto it
     /// once they are whole, which is how the editor saves: a transfer that dies
     /// leaves nothing under a name something else would open, and a file that
-    /// was already there stays what it was.
+    /// was already there stays what it was. The rest of the editor's rules come
+    /// with the rename: a symlink is resolved first so the link stays a link,
+    /// and a file that was already there keeps its permissions, so a script
+    /// fetched over itself stays executable.
     pub fn get(
         &mut self,
         remote: &str,
@@ -687,7 +690,8 @@ impl Session {
             .filter(|entry| entry.mtime != 0)
             .map(|entry| UNIX_EPOCH + std::time::Duration::from_secs(entry.mtime));
         let handle = self.open_file(remote, READABLE, None)?;
-        let part = local.with_file_name(temporary_name(local));
+        let target = std::fs::canonicalize(local).unwrap_or_else(|_| local.to_path_buf());
+        let part = target.with_file_name(temporary_name(&target));
         let file = match File::create(&part) {
             Ok(file) => file,
             Err(error) => {
@@ -709,7 +713,16 @@ impl Session {
             // what was asked for, and they are right.
             let _ = file.set_modified(changed);
         }
-        let landed = match done.map(|()| std::fs::rename(&part, local)) {
+        let finish = || -> std::io::Result<()> {
+            // Before the rename, so a machine that loses power just after it
+            // has the bytes to go with the name.
+            file.sync_all()?;
+            if let Ok(metadata) = std::fs::metadata(&target) {
+                std::fs::set_permissions(&part, metadata.permissions())?;
+            }
+            std::fs::rename(&part, &target)
+        };
+        let landed = match done.map(|()| finish()) {
             Some(Ok(())) => Some(()),
             Some(Err(error)) => {
                 self.failure = Some(Failure::new(
@@ -2419,6 +2432,54 @@ mod tests {
         assert_eq!(asked[2].0, OPEN);
         assert_eq!(asked[3].0, READ);
         let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn a_download_over_a_link_writes_through_it_and_keeps_the_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = std::env::temp_dir().join(format!("tuni-sftp-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a directory");
+        let real = directory.join("deploy.sh");
+        std::fs::write(&real, b"old").expect("the old file");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let link = directory.join("current");
+        std::os::unix::fs::symlink(&real, &link).expect("a link");
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let mut attributes = (SIZE | PERMISSIONS).to_be_bytes().to_vec();
+        attributes.extend_from_slice(&5_u64.to_be_bytes());
+        attributes.extend_from_slice(&0o100_644_u32.to_be_bytes());
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_ATTRS, body(1, &attributes)),
+            (REPLY_HANDLE, body(2, &encode_string("h"))),
+            (REPLY_DATA, body(3, &encode_string("hello"))),
+            (REPLY_STATUS, body(4, &EOF.to_be_bytes())),
+            (REPLY_STATUS, body(5, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+
+        let done = session.get("/srv/deploy.sh", &link, &mut |_, _| true);
+        assert_eq!(done, Some(()));
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("the link")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&real).expect("the file"), b"hello");
+        let mode = std::fs::metadata(&real)
+            .expect("the file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+
+        drop(session);
+        far.join().expect("the far end");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
