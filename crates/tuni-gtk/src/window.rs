@@ -363,8 +363,8 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
 
 mod imp {
     use super::{
-        Cell, ClosedTab, HashMap, Id, PathBuf, Reconnect, RefCell, Settings, TuniBrowser, TuniDiff,
-        TuniEditor, TuniFind, TuniGrid, TuniHosts, TuniPanel, TuniRemote, TuniSwitcher,
+        Cell, ClosedTab, HashMap, HashSet, Id, PathBuf, Reconnect, RefCell, Settings, TuniBrowser,
+        TuniDiff, TuniEditor, TuniFind, TuniGrid, TuniHosts, TuniPanel, TuniRemote, TuniSwitcher,
         TuniTerminal, VecDeque, Workspace, gio, glib,
     };
     use adw::subclass::prelude::*;
@@ -418,6 +418,11 @@ mod imp {
         /// one was, which sends again once it is there. Two sends of one file
         /// at once would race to the rename.
         pub uploading: RefCell<HashMap<PathBuf, bool>>,
+        /// The copies saved here and not yet taken by the far end: refused as
+        /// changed there, or lost on the way. Opening one again shows the copy
+        /// rather than fetching over it, which would throw the edit away
+        /// after the dialog said it was kept. Bounded like `remote_seen`.
+        pub unsent: RefCell<HashSet<PathBuf>>,
         /// The "Move to Project" part of every tab's context menu, filled in
         /// as the menu opens. One `GMenu` shared by every strip in the window,
         /// because `AdwTabBox` builds its popover from the model once and
@@ -2650,13 +2655,17 @@ impl TuniWindow {
         editor
     }
 
-    /// Whether a pane in any project already has `path` open.
+    /// Whether a pane in any project already has `path` open, or it holds a
+    /// save the far end has not taken yet. Either way, fetching over it would
+    /// lose something.
     pub fn is_editing(&self, path: &Path) -> bool {
-        self.imp()
-            .editors
-            .borrow()
-            .values()
-            .any(|editor| editor.path() == path)
+        self.imp().unsent.borrow().contains(path)
+            || self
+                .imp()
+                .editors
+                .borrow()
+                .values()
+                .any(|editor| editor.path() == path)
     }
 
     /// Opens a copy of a remote file that has just been fetched, remembering
@@ -2682,6 +2691,7 @@ impl TuniWindow {
         let Some((alias, remote)) = tuni_core::sftp::origin(&local) else {
             return;
         };
+        imp.unsent.borrow_mut().insert(local.clone());
         if let Some(again) = imp.uploading.borrow_mut().get_mut(&local) {
             *again = true;
             return;
@@ -2724,6 +2734,7 @@ impl TuniWindow {
                     .cloned();
                 match sent {
                     Ok(Ok(SaveBack::Sent(now))) => {
+                        this.imp().unsent.borrow_mut().remove(&local);
                         this.imp()
                             .remote_seen
                             .borrow_mut()

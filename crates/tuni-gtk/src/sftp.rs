@@ -1051,7 +1051,8 @@ impl TuniSftp {
     /// browsing session; saving the pane sends the copy back.
     ///
     /// A copy some pane already has open is shown rather than fetched again,
-    /// since fetching would write the far end's text under an unsaved buffer.
+    /// since fetching would write the far end's text under an unsaved buffer,
+    /// and so is one whose last save never reached the far end.
     fn edit(&self, item: &Item) {
         let imp = self.imp();
         let Some(window) = self.root().and_downcast::<crate::window::TuniWindow>() else {
