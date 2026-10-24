@@ -461,10 +461,10 @@ impl TuniHosts {
                 let Some(alias) = hosts.imp().target.borrow().clone() else {
                     return;
                 };
-                // The bare command a person would have typed, not the one tuni
-                // runs: the options it adds are its own business, and pasting
-                // them into a shell would be noise.
-                hosts.clipboard().set_text(&format!("ssh {alias}"));
+                let host = hosts.imp().hosts.borrow().get(&alias).cloned();
+                if let Some(host) = host.or_else(|| Host::adhoc(&alias)) {
+                    hosts.clipboard().set_text(&host.typed());
+                }
             }),
             entry("local-shell", self, |hosts| hosts.send(Message::LocalShell)),
             entry("snippets", self, |hosts| {
@@ -1042,7 +1042,10 @@ impl TuniHosts {
             {
                 let row = adhoc_row(&host);
                 list.append(&row);
-                rows.push((row, Choice::Host(host.target())));
+                // The address as typed rather than `target()`, which leaves the
+                // port to `-p`: the pane looks its host up again by this name,
+                // and `deploy@box` would come back on port 22.
+                rows.push((row, Choice::Host(host.alias.clone())));
             }
         }
 
@@ -1275,7 +1278,7 @@ fn host_row(host: &Host, meta: &Meta, live: bool) -> gtk::ListBoxRow {
 fn adhoc_row(host: &Host) -> gtk::ListBoxRow {
     row(
         &crate::icon_picker::image(None, crate::host_editor::ICON, false),
-        &format!("Connect to {}", host.target()),
+        &format!("Connect to {}", host.alias),
         &host.address(),
         &[],
         "not saved",

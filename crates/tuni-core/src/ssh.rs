@@ -447,11 +447,9 @@ pub fn command(host: &Host, control: &Control) -> Vec<String> {
         argv.push("-o".to_owned());
         argv.push(option);
     }
-    // A saved host's port is already in the configuration `ssh` is about to
-    // read for itself. One typed by hand has nowhere else to carry it.
-    if host.source == Source::Adhoc && host.port != 0 {
+    if let Some(port) = host.port_flag() {
         argv.push("-p".to_owned());
-        argv.push(host.port.to_string());
+        argv.push(port.to_string());
     }
     // `--`, because a destination may begin with a dash.
     argv.push("--".to_owned());
@@ -694,16 +692,51 @@ impl Host {
     /// The destination for an `ssh` command line. The alias, because
     /// everything the configuration says about the host is filed under that
     /// name; an address typed by hand has no name to be filed under and so
-    /// carries itself. The port is not in here: it is `-p`.
+    /// carries itself.
+    ///
+    /// A port typed by hand travels in here as `ssh://user@host:port`, because
+    /// the destination is all that `ssh -G` and `ssh -O check` are given: with
+    /// the port on `-p` instead they would work out the socket of port 22, and
+    /// a connection that is up would read as one that is not. OpenSSH 10.2
+    /// takes no IPv6 address inside such a URI, so that one alone keeps `-p`;
+    /// see [`Host::port_flag`].
     #[must_use]
     pub fn target(&self) -> String {
-        match self.source {
-            Source::Adhoc if !self.user.is_empty() => {
-                format!("{}@{}", self.user, self.hostname)
-            }
-            Source::Adhoc => self.hostname.clone(),
-            _ => self.alias.clone(),
+        if self.source != Source::Adhoc {
+            return self.alias.clone();
         }
+        let login = if self.user.is_empty() {
+            self.hostname.clone()
+        } else {
+            format!("{}@{}", self.user, self.hostname)
+        };
+        if self.port != 0 && self.port_flag().is_none() {
+            format!("ssh://{login}:{}", self.port)
+        } else {
+            login
+        }
+    }
+
+    /// The port that has to go on `-p`, when [`Host::target`] could not carry
+    /// it: a typed IPv6 address. A saved host's port is in the configuration
+    /// `ssh` reads for itself.
+    // ponytail: the socket of a typed IPv6 address with a port is still looked
+    // up on port 22; passing `-p` to every `ssh -G` is the fix if it matters.
+    fn port_flag(&self) -> Option<u16> {
+        (self.source == Source::Adhoc && self.port != 0 && self.hostname.contains(':'))
+            .then_some(self.port)
+    }
+
+    /// The bare command a person would have typed for this host, not the one
+    /// tuni runs: the options it adds are its own business.
+    #[must_use]
+    pub fn typed(&self) -> String {
+        let mut argv = vec!["ssh".to_owned()];
+        if let Some(port) = self.port_flag() {
+            argv.extend(["-p".to_owned(), port.to_string()]);
+        }
+        argv.push(self.target());
+        shell_line(&argv)
     }
 
     /// What the extra lines give `keyword`, found the way ssh finds it: in any
@@ -2877,9 +2910,21 @@ Host key verification failed.
         assert_eq!(host.user, "deploy");
         assert_eq!(host.hostname, "10.0.0.1");
         assert_eq!(host.port, 2222);
-        assert_eq!(host.target(), "deploy@10.0.0.1");
+        assert_eq!(host.target(), "ssh://deploy@10.0.0.1:2222");
         assert_eq!(Host::adhoc("[::1]:22").expect("host").hostname, "::1");
         assert_eq!(Host::adhoc("box").expect("host").target(), "box");
+        assert_eq!(
+            Host::adhoc("deploy@box").expect("host").target(),
+            "deploy@box"
+        );
+        // The alias is what a pane is opened with, and what brings the port
+        // back when the pane looks its host up again.
+        assert_eq!(Host::adhoc(&host.alias).expect("host").port, 2222);
+        assert_eq!(host.typed(), "ssh ssh://deploy@10.0.0.1:2222");
+        assert_eq!(
+            Host::adhoc("[::1]:2222").expect("host").typed(),
+            "ssh -p 2222 ::1"
+        );
         assert!(Host::adhoc("two words here").is_none());
         assert!(Host::adhoc("").is_none());
     }
@@ -2923,11 +2968,15 @@ Host key verification failed.
         assert!(!argv.iter().any(|arg| arg.starts_with("ControlPath")));
 
         // A port the configuration has never heard of has to travel on the
-        // command line.
+        // command line, inside the destination where `ssh -G` sees it too.
         let typed = Host::adhoc("deploy@10.0.0.1:2222").expect("host");
         let argv = command(&typed, &control);
+        assert!(!argv.iter().any(|arg| arg == "-p"));
+        assert_eq!(argv[argv.len() - 1], "ssh://deploy@10.0.0.1:2222");
+        let typed = Host::adhoc("[::1]:2222").expect("host");
+        let argv = command(&typed, &control);
         assert!(argv.windows(2).any(|pair| pair == ["-p", "2222"]));
-        assert_eq!(argv[argv.len() - 1], "deploy@10.0.0.1");
+        assert_eq!(argv[argv.len() - 1], "::1");
     }
 
     #[test]
