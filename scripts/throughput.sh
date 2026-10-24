@@ -63,6 +63,11 @@ run_once() { # $1 = terminal, $2 = shell command
     # timer would stop before the window has read a byte.
     gnome-terminal) gnome-terminal --wait -- sh -c "$2" >/dev/null 2>&1 & ;;
     ptyxis) ptyxis --standalone -- sh -c "$2" >/dev/null 2>&1 & ;;
+    # kerod owns the PTY and the open app draws it, so the session goes to the
+    # app already running with -f. A directory outside every project would
+    # leave a new project behind in the sidebar; home lands in the one kero
+    # starts with.
+    kero) kero new -f -w -d "$HOME" -- sh -c "$2" >"$WORK/kero.id" 2>/dev/null & ;;
     *) "$1" -e sh -c "$2" >/dev/null 2>&1 & ;;
   esac
   pid=$!
@@ -75,6 +80,9 @@ run_once() { # $1 = terminal, $2 = shell command
   end=$(date +%s.%N)
   kill "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
+  # The session outlives its command in a shell, so without this every run
+  # would leave one more session in the app.
+  [ "$1" = kero ] && kero close "$(cat "$WORK/kero.id")" >/dev/null 2>&1
   [ -e "$MARKER" ] || return 1
   echo "$end - $start" | bc
 }
