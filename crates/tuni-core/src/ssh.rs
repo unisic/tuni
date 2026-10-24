@@ -1915,6 +1915,29 @@ impl ChangedKey {
             self.file.to_string_lossy().into_owned(),
         ]
     }
+
+    /// Whether this is the key of the host `report` describes, under the name
+    /// and in a file `ssh` would look it up in.
+    ///
+    /// The warning is read off a screen a far shell can print anything on, so
+    /// what it names is checked against what `ssh -G` says before a button is
+    /// offered for it. Against the raw lists rather than [`known_files`], whose
+    /// split comes apart at a space that a real path may hold.
+    #[must_use]
+    pub fn belongs_to(&self, report: &[(String, String)]) -> bool {
+        let file = self.file.to_string_lossy();
+        let listed = |files: &str| {
+            files == file
+                || files.starts_with(&format!("{file} "))
+                || files.ends_with(&format!(" {file}"))
+                || files.contains(&format!(" {file} "))
+        };
+        known_name(report).as_deref() == Some(self.name.as_str())
+            && report
+                .iter()
+                .filter(|(key, _)| key == "userknownhostsfile" || key == "globalknownhostsfile")
+                .any(|(_, files)| listed(files))
+    }
 }
 
 /// The changed key ssh is complaining about, read off what it left on screen.
@@ -1975,34 +1998,57 @@ pub enum Ending {
 /// Reads how a session ended off its exit code and what ssh said last.
 ///
 /// Both, because neither is enough alone. ssh exits 255 for every failure of
-/// its own, a refused key and a mistyped name included, and the line a dropped
-/// shared connection prints, `Shared connection to box closed.`, is the same
-/// line a logout prints, there with the far shell's own code. Only the last
-/// line is read, so text a remote shell printed earlier cannot pass for ssh,
-/// and only its end, because ssh writes after whatever was on that line: a
-/// connection that drops at a prompt leaves `$ Shared connection to box
-/// closed.`.
+/// its own, a refused key and a mistyped name included, and a far shell that
+/// runs `exit 255` hands on the same code. Only the end of the screen is read,
+/// so text a remote shell printed earlier cannot pass for ssh, and only the
+/// end of a line, because ssh writes after whatever was on it: a connection
+/// that drops at a prompt leaves `$ Connection to box closed.`.
+///
+/// `Connection to box closed.` alone is what a pane with a terminal prints
+/// whenever ssh leaves, `exit 255` included. A drop puts its reason on the line
+/// above, `closed by remote host.` or `Read from remote host`, and that line
+/// is what decides. `Shared connection to box closed.` has no line above it in
+/// either case, so `master_up` is asked instead, and only then: a master still
+/// answering means the far shell left and the connection did not. Read off
+/// what OpenSSH 10.2 prints against a real `sshd`.
 #[must_use]
-pub fn ending(code: Option<u32>, screen: &str) -> Ending {
+pub fn ending(code: Option<u32>, screen: &str, master_up: impl FnOnce() -> bool) -> Ending {
     if code != Some(255) {
         return Ending::Closed;
     }
-    let Some(last) = screen.lines().map(str::trim).rfind(|line| !line.is_empty()) else {
+    let mut lines = screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(last) = lines.next_back() else {
         return Ending::Closed;
     };
-    let from = |marker: &str| last.rfind(marker).map(|at| &last[at..]);
-    let dropped = from("onnection to ").is_some_and(|rest| {
-        rest.ends_with(" closed.") || rest.ends_with(" closed by remote host.")
-    }) || from("Timeout, server ")
-        .is_some_and(|rest| rest.ends_with(" not responding."))
-        || last.ends_with(": Broken pipe")
-        || last.contains("Connection reset by ");
+    let above = lines.next_back().unwrap_or_default();
+    fn from<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+        line.rfind(marker).map(|at| &line[at..])
+    }
+    let closed =
+        |line: &str| from(line, "onnection to ").is_some_and(|rest| rest.ends_with(" closed."));
+    let lost = |line: &str| {
+        from(line, "onnection to ").is_some_and(|rest| rest.ends_with(" closed by remote host."))
+            || from(line, "Read from remote host ").is_some()
+    };
+    let dropped = if from(last, "Shared connection to ").is_some() && closed(last) {
+        !master_up()
+    } else if closed(last) {
+        lost(above)
+    } else {
+        lost(last)
+            || from(last, "Timeout, server ").is_some_and(|rest| rest.ends_with(" not responding."))
+            || last.ends_with(": Broken pipe")
+            || last.contains("Connection reset by ")
+    };
     if dropped {
         return Ending::Dropped;
     }
     // Resolution failing for want of a network says so; a name that does not
     // exist says `Name or service not known`, and trying it again is pointless.
-    let unreachable = from("ssh: connect to host ").is_some()
+    let unreachable = from(last, "ssh: connect to host ").is_some()
         && [
             ": Network is unreachable",
             ": No route to host",
@@ -2011,7 +2057,7 @@ pub fn ending(code: Option<u32>, screen: &str) -> Ending {
         ]
         .iter()
         .any(|reason| last.ends_with(reason))
-        || from("ssh: Could not resolve hostname ").is_some()
+        || from(last, "ssh: Could not resolve hostname ").is_some()
             && last.ends_with(": Temporary failure in name resolution");
     if unreachable {
         Ending::Unreachable
@@ -2453,6 +2499,29 @@ Host key verification failed.
     }
 
     #[test]
+    fn a_changed_key_counts_only_for_the_host_the_pane_is_on() {
+        let key = changed_key(CHANGED).unwrap();
+        let own = report(&[
+            "hostname 127.0.0.1",
+            "port 22222",
+            "userknownhostsfile /home/dean/.ssh/known hosts /home/dean/.ssh/known_hosts2",
+        ]);
+        assert!(key.belongs_to(&own));
+        // A warning a far shell printed about some other machine's key.
+        let other = report(&[
+            "hostname 10.0.0.9",
+            "userknownhostsfile /home/dean/.ssh/known hosts",
+        ]);
+        assert!(!key.belongs_to(&other));
+        let elsewhere = report(&[
+            "hostname 127.0.0.1",
+            "port 22222",
+            "userknownhostsfile /home/dean/.ssh/known",
+        ]);
+        assert!(!key.belongs_to(&elsewhere));
+    }
+
+    #[test]
     fn a_warning_the_session_printed_before_carrying_on_is_not_a_changed_key() {
         let echoed = format!("{CHANGED}dean@box:~$ exit\nConnection to box closed.\n");
         assert_eq!(changed_key(&echoed), None);
@@ -2468,35 +2537,43 @@ Host key verification failed.
     #[test]
     fn a_shared_connection_dying_under_its_pane_is_a_drop() {
         let screen = "dean@box:~$ \nShared connection to 127.0.0.1 closed.\n";
-        assert_eq!(ending(Some(255), screen), Ending::Dropped);
+        assert_eq!(ending(Some(255), screen, || false), Ending::Dropped);
         let plain =
             "Connection to 127.0.0.1 closed by remote host.\nConnection to 127.0.0.1 closed.\n";
-        assert_eq!(ending(Some(255), plain), Ending::Dropped);
+        assert_eq!(ending(Some(255), plain, || true), Ending::Dropped);
         let hung = "Timeout, server 127.0.0.1 not responding.\n";
-        assert_eq!(ending(Some(255), hung), Ending::Dropped);
+        assert_eq!(ending(Some(255), hung, || true), Ending::Dropped);
         let prompt = "~\n\u{276f} Shared connection to 127.0.0.1 closed.";
-        assert_eq!(ending(Some(255), prompt), Ending::Dropped);
+        assert_eq!(ending(Some(255), prompt, || false), Ending::Dropped);
+        let read = "Read from remote host box: Connection reset by peer\n\
+                    Connection to box closed.\n";
+        assert_eq!(ending(Some(255), read, || true), Ending::Dropped);
     }
 
     #[test]
     fn a_logout_prints_the_same_line_with_the_far_shell_s_code() {
         let screen = "logout\nShared connection to 127.0.0.1 closed.\n";
-        assert_eq!(ending(Some(0), screen), Ending::Closed);
-        assert_eq!(ending(Some(3), screen), Ending::Closed);
-        assert_eq!(ending(None, screen), Ending::Closed);
+        assert_eq!(ending(Some(0), screen, || true), Ending::Closed);
+        assert_eq!(ending(Some(3), screen, || true), Ending::Closed);
+        assert_eq!(ending(None, screen, || true), Ending::Closed);
     }
 
     #[test]
     fn a_refused_login_is_not_worth_another_try() {
         assert_eq!(
-            ending(Some(255), "dean@box: Permission denied (publickey).\n"),
+            ending(
+                Some(255),
+                "dean@box: Permission denied (publickey).\n",
+                || true
+            ),
             Ending::Closed
         );
-        assert_eq!(ending(Some(255), CHANGED), Ending::Closed);
+        assert_eq!(ending(Some(255), CHANGED, || true), Ending::Closed);
         assert_eq!(
             ending(
                 Some(255),
-                "ssh: Could not resolve hostname bxo: Name or service not known\n"
+                "ssh: Could not resolve hostname bxo: Name or service not known\n",
+                || true
             ),
             Ending::Closed
         );
@@ -2510,14 +2587,41 @@ Host key verification failed.
             "ssh: connect to host 10.255.255.1 port 22: Connection timed out",
             "ssh: Could not resolve hostname box: Temporary failure in name resolution",
         ] {
-            assert_eq!(ending(Some(255), line), Ending::Unreachable, "{line}");
+            assert_eq!(
+                ending(Some(255), line, || true),
+                Ending::Unreachable,
+                "{line}"
+            );
         }
+    }
+
+    #[test]
+    fn a_far_shell_exiting_255_is_not_a_drop() {
+        // What a pane with a terminal shows after `ssh -tt box 'exit 255'`.
+        let plain = "dean@box:~$ exit 255\nConnection to box closed.\n";
+        assert_eq!(ending(Some(255), plain, || false), Ending::Closed);
+        // The same through a shared connection, whose master is still up
+        // because only the session on it ended.
+        let shared = "dean@box:~$ exit 255\nShared connection to box closed.\n";
+        assert_eq!(ending(Some(255), shared, || true), Ending::Closed);
+    }
+
+    #[test]
+    fn the_master_is_asked_only_about_a_shared_line() {
+        let asked = std::cell::Cell::new(false);
+        let ask = || {
+            asked.set(true);
+            false
+        };
+        let plain = "Connection to box closed by remote host.\nConnection to box closed.\n";
+        assert_eq!(ending(Some(255), plain, ask), Ending::Dropped);
+        assert!(!asked.get());
     }
 
     #[test]
     fn a_remote_shell_echoing_ssh_s_words_earlier_does_not_count() {
         let screen = "Shared connection to box closed.\ndean@box:~$ exit 255\nkilled\n";
-        assert_eq!(ending(Some(255), screen), Ending::Closed);
+        assert_eq!(ending(Some(255), screen, || true), Ending::Closed);
     }
 
     #[test]

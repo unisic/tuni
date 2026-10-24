@@ -3588,37 +3588,68 @@ impl TuniWindow {
         let Some(remote) = self.imp().remotes.borrow().get(&pane).cloned() else {
             return;
         };
-        let disconnected = format!("Disconnected from {alias}");
-        // Forty lines is the whole warning with room to spare, and all that is
-        // read: what ssh says last is the only part that is about this attempt.
-        let text = self
-            .imp()
-            .terminals
-            .borrow()
-            .get(&pane)
-            .and_then(|terminal| terminal.text(40))
-            .unwrap_or_default();
-        let Some(key) = tuni_core::ssh::changed_key(&text) else {
-            let ending = tuni_core::ssh::ending(u32::try_from(code).ok(), &text);
-            if !self.retry(&alias, pane, ending) {
-                remote.set_idle(&disconnected, "Reconnect");
-            }
+        let Some(terminal) = self.imp().terminals.borrow().get(&pane).cloned() else {
             return;
         };
-        remote.set_offer(
-            &format!("The host key of {alias} has changed"),
-            "Forget Old Key",
-            glib::clone!(
-                #[weak(rename_to = this)]
-                self,
-                #[weak]
-                remote,
-                move || {
-                    this.run_locally(&key.forget());
-                    remote.set_idle(&disconnected, "Reconnect");
+        // Forty lines is the whole warning with room to spare, and all that is
+        // read: what ssh says last is the only part that is about this attempt.
+        let text = terminal.text(40).unwrap_or_default();
+        let code = u32::try_from(code).ok();
+        let settings = self.settings();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            remote,
+            #[weak]
+            terminal,
+            async move {
+                let looked = alias.clone();
+                // `ssh -G` for the key, `ssh -O check` for a shared line: both
+                // subprocesses, and asked only when the screen calls for them.
+                let read = gio::spawn_blocking(move || {
+                    let destination = tuni_core::ssh::host(&looked).target();
+                    match tuni_core::ssh::changed_key(&text) {
+                        Some(key) if key.belongs_to(&tuni_core::ssh::describe(&destination)) => {
+                            Err(key)
+                        }
+                        _ => Ok(tuni_core::ssh::ending(code, &text, || {
+                            tuni_core::ssh::Control::new(
+                                settings.ssh_control_persist,
+                                settings.ssh_share_connections,
+                            )
+                            .is_live(&destination)
+                        })),
+                    }
+                })
+                .await;
+                // Closed, or started again, while ssh was being asked, which
+                // makes the answer about a session that is no longer on screen.
+                let current = this.imp().remotes.borrow().get(&pane) == Some(&remote);
+                if !current || terminal.is_running() {
+                    return;
                 }
-            ),
-        );
+                let disconnected = format!("Disconnected from {alias}");
+                match read {
+                    Ok(Err(key)) => remote.set_offer(
+                        &format!("The host key of {alias} has changed"),
+                        "Forget Old Key",
+                        glib::clone!(
+                            #[weak]
+                            this,
+                            #[weak]
+                            remote,
+                            move || {
+                                this.run_locally(&key.forget());
+                                remote.set_idle(&disconnected, "Reconnect");
+                            }
+                        ),
+                    ),
+                    Ok(Ok(ending)) if this.retry(&alias, pane, ending) => {}
+                    _ => remote.set_idle(&disconnected, "Reconnect"),
+                }
+            }
+        ));
     }
 
     /// Puts a pane whose connection ended in line for another try, when the
