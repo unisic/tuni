@@ -107,9 +107,8 @@ appstream-util validate-relax --nonet \
 - The shell starts about 5 ms after launch instead of 660, before GTK is loaded,
   and the window is up in a third of the time. A flood of output is read nearly
   a third faster, and PSS is a fifth lower than 1.6.0's.
-- Fedora can take Tuni from COPR and Arch from the AUR, as tuni-bin or built
-  from source as tuni. An AUR copy leaves updates to the helper, and the update
-  dialog says so.
+- Fedora can take Tuni from COPR, and updates then arrive with the rest of the
+  system.
 
 * Sat Oct 10 2026 Unisic <contact@unisic.app> - 1.6.0-1
 - A host can keep its password, in the desktop keyring through secret-tool. ssh

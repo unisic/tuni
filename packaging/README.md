@@ -136,18 +136,20 @@ packaging/aur/sync.sh --version 1.7.0 --check   # retarget, .SRCINFO, build both
 ```
 
 `sync.sh` takes the checksums from the published release, so it runs after
-one. `--push` publishes, which `.github/workflows/aur.yml` does after every
-release with the `AUR_SSH_KEY` secret: a private key registered on the AUR
-account, base64'd onto one line.
+one. `--push` publishes, which `.github/workflows/aur.yml` does after a release
+once the repository variable `AUR` is `on`, with the `AUR_SSH_KEY` secret: a
+private key registered on the AUR account, base64'd onto one line. Neither is
+set yet, so releases skip the AUR.
 
 ```sh
 base64 -w0 < ~/.ssh/aur | gh secret set AUR_SSH_KEY --repo unisic/tuni
+gh variable set AUR --body on --repo unisic/tuni
 ```
 
 ## Releases
 
 `.github/workflows/release.yml` builds all three on a `v*` tag and attaches
-them to the GitHub release, then pushes both AUR recipes; Packit sees the same
+them to the GitHub release, then, with `AUR` on, pushes both AUR recipes; Packit sees the same
 release and builds it into COPR. Every job installs what it built before
 uploading it. Five files carry the version — `Cargo.toml`, the spec, the PKGBUILD, the
 Debian changelog, and the AppStream metadata — and the first job in the

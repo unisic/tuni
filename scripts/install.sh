@@ -12,7 +12,7 @@
 #
 #     scripts/install.sh
 #
-# Outside COPR and the AUR, Tuni is in no package repository, so a release
+# Outside COPR, Tuni is in no package repository, so a release
 # does not arrive through the system's own updates. This script is what stands
 # in for that: it asks the GitHub release page what the newest version
 # is, and installs the package built for this distribution with the machine's

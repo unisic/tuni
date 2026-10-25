@@ -123,17 +123,12 @@ sudo apt install ./tuni_*_amd64.deb      # Ubuntu 26.04+
 sudo pacman -U ./tuni-*-x86_64.pkg.tar.zst
 ```
 
-Fedora and Arch can take it from a package manager instead, which then updates
-it along with everything else:
+Fedora can take it from COPR instead, which then updates it along with
+everything else:
 
 ```sh
-sudo dnf copr enable debondor/Tuni && sudo dnf install tuni   # Fedora
-paru -S tuni-bin    # Arch, the release's own package
-paru -S tuni        # Arch, built from source
+sudo dnf copr enable debondor/Tuni && sudo dnf install tuni
 ```
-
-An AUR build leaves updates to the helper, and its update dialog says so
-instead of offering the installer.
 
 Or from source, which is what all three do:
 

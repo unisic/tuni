@@ -1361,7 +1361,7 @@ which is why both are commits rather than branches; releases are built from the
 
 ### Updating
 
-No package repository carries Tuni yet: no COPR, no AUR, no PPA. A release
+Outside COPR no package repository carries Tuni: no AUR, no PPA. A release
 therefore does not arrive with the rest of a system's updates, and an installed
 copy would stay the version it was installed at forever. `scripts/install.sh`
 stands in for the package repository that does not exist:

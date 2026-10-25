@@ -214,7 +214,10 @@ jobs:
     name: AUR
     # After the release, because sync.sh hashes the published Arch package,
     # which does not exist until `release` has created it. A separate workflow
-    # so a failed push can be run again on its own.
+    # so a failed push can be run again on its own. Off until the repository
+    # variable AUR is "on": without an AUR account there is no key to push
+    # with, and a job that can only fail would turn every release red.
+    if: vars.AUR == 'on'
     needs: [version, release]
     uses: ./.github/workflows/aur.yml
     with:

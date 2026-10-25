@@ -94,11 +94,8 @@
         and the window holds a fifth less memory. Beside eighteen other
         terminals measured in one run, Tuni came first in throughput and first
         to start a shell.</p>
-        <p>Fedora can take Tuni from COPR and Arch from the AUR, as
-        <code>tuni-bin</code> or built from source as <code>tuni</code>, and
-        updates then arrive with the rest of the system. An AUR copy leaves
-        its updates to the AUR helper, and the update dialog says so instead
-        of offering the installer.</p>
+        <p>Fedora can take Tuni from COPR, and updates then arrive with the
+        rest of the system.</p>
       </description>
     </release>
     <release version="1.6.0" date="2026-10-10">
