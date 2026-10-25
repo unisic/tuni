@@ -1,21 +1,26 @@
-# Throughput benchmark
+# Benchmark
 
-How fast does a terminal consume PTY output? `scripts/throughput.sh` times each
-terminal twice: once running only the marker `touch`, once running `cat` over
-the payload first. The difference is time spent consuming output, so window and
-shell startup cancel out. Each phase runs five times and the best time is kept.
-A third run leaves the shell sleeping and reads what the terminal costs while
-it waits: memory, and CPU over five idle seconds.
+How fast does a terminal start, consume PTY output, and what does it cost
+while it waits? `scripts/throughput.sh` times each terminal twice: once
+running only the marker `touch`, once running `cat` over the payload first.
+The difference is time spent consuming output, so window and shell startup
+cancel out. Each phase runs five times and the best time is kept. A third run
+leaves the shell sleeping and reads what the terminal costs while it waits:
+memory, and CPU over five idle seconds.
 
 Payload: 200 MiB (209 715 216 bytes) of mixed plain and SGR-colored lines, so
 the parser does real work rather than `memcpy`. Every terminal runs `/bin/sh`,
 not an interactive shell.
 
 ```sh
-scripts/throughput.sh 200 alacritty ghostty kitty foot konsole ptyxis \
-  gnome-terminal xfce4-terminal tilix terminator qterminal sakura \
-  lxterminal st urxvt xterm wezterm kero
+RUNS=5 nice -n 19 scripts/throughput.sh 200 tuni foot alacritty kitty \
+  konsole ptyxis gnome-terminal xfce4-terminal tilix terminator qterminal \
+  sakura lxterminal st urxvt xterm wezterm ghostty kero
 ```
+
+`TUNI=/usr/bin/tuni` in front of it times an installed tuni in place of this
+tree's release build, which is how a release and the build after it go
+through the same script.
 
 ## Environment
 
@@ -24,123 +29,98 @@ scripts/throughput.sh 200 alacritty ghostty kitty foot konsole ptyxis \
 | CPU | Intel Core i7-13700F (24 threads) |
 | RAM | 32 GiB |
 | GPU | AMD Radeon RX 9070 XT (Navi 48) |
-| Kernel | 7.1.5-200.fc44.x86_64, Fedora 44; 7.2.11-200.fc44.x86_64 for the October run |
-| Session | KDE Plasma on Wayland (KWin); the X11 terminals run through Xwayland; the 2026-10-25 run in a headless KWin |
-| Date | 2026-07-28; tuni, kero and konsole again on 2026-10-24; tuni, foot, alacritty, kitty and konsole side by side on 2026-10-25 |
+| Kernel | 7.2.11-200.fc44.x86_64, Fedora 44 |
+| Session | A headless KWin (`kwin_wayland --virtual --xwayland`, 1280x800) on a session bus of its own; the X11 terminals through its Xwayland |
+| Load | `nice -n 19` beside a running game, load average 1.4 to 4.8 |
+| Date | 2026-10-25, all nineteen in one invocation |
+
+Every window opened in the headless compositor, so nothing on the desktop lost
+focus to the run. The terminals that were not installed ran out of their
+Fedora 44 packages unpacked into a directory, with `LD_LIBRARY_PATH` at the
+libraries that came with them.
 
 ## Results
 
-200 MiB payload, best of five runs (`RUNS=5`), sorted by throughput. Rows
-marked \* are from 2026-10-24, when only tuni, kero and konsole were still
-installed; the rest are from 2026-07-28.
+200 MiB payload, best of five runs (`RUNS=5`), sorted by throughput. tuni is
+900cde5, the tree released as 1.7.0.
 
-| Terminal | Version | Engine | Startup | Consume | Throughput |
-| --- | --- | --- | ---: | ---: | ---: |
-| **tuni** \* | 1.6.0 (7872d5e) | GTK4 + libghostty-vt | 1.095 s | 1.182 s | **169.1 MiB/s** |
-| kero \* | 2.1.17 | Go + libghostty-vt | 0.024 s | 1.435 s | **139.4 MiB/s** |
-| foot | 1.27.0 | Wayland, CPU | 0.016 s | 1.502 s | **133.1 MiB/s** |
-| urxvt | 9.31 | X11, CPU | 0.022 s | 1.617 s | **123.6 MiB/s** |
-| alacritty | 0.17.0 | GPU (OpenGL) | 0.044 s | 1.790 s | **111.7 MiB/s** |
-| kitty | 0.47.1 | GPU (OpenGL) | 0.108 s | 1.908 s | **104.8 MiB/s** |
-| st | 0.9.2 | X11, CPU | 0.019 s | 2.210 s | **90.4 MiB/s** |
-| ghostty | 1.3.1 | GTK4 + GPU | 0.202 s | 2.524 s | **79.2 MiB/s** |
-| sakura | 3.8.9 | VTE 0.84 | 0.068 s | 2.955 s | **67.6 MiB/s** |
-| ptyxis | 50.1 | VTE 0.84 | 0.224 s | 2.982 s | **67.0 MiB/s** |
-| gnome-terminal | 3.60.0 | VTE 0.84 | 0.170 s | 2.995 s | **66.7 MiB/s** |
-| terminator | 2.1.5 | VTE 0.84 | 0.189 s | 2.998 s | **66.7 MiB/s** |
-| tilix | 1.9.6 | VTE 0.84 | 0.073 s | 3.082 s | **64.9 MiB/s** |
-| xterm | 406 | X11, CPU | 0.017 s | 3.798 s | **52.6 MiB/s** |
-| qterminal | 2.4.0 | QTermWidget | 0.073 s | 4.242 s | **47.1 MiB/s** |
-| konsole \* | 26.08.1 | Qt | 0.137 s | 4.965 s | **40.2 MiB/s** |
-| wezterm | 20260716-nightly | GPU (wgpu) | 0.034 s | 6.134 s | **32.6 MiB/s** |
-| lxterminal | 0.4.1 | VTE 0.84 | 0.046 s | 10.186 s | **19.6 MiB/s** |
-| xfce4-terminal | 1.2.0 | VTE 0.84 | 0.084 s | 10.242 s | **19.5 MiB/s** |
+| Terminal | Version | Engine | Startup | First frame | Consume | Throughput | RSS | PSS | Idle |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **tuni** | 1.7.0 | GTK4 + libghostty-vt | **0.005 s** | 233 ms | 1.320 s | **151.4 MiB/s** | 112.3 MiB | 47.5 MiB | 0 ms |
+| foot | 1.27.0 | Wayland, CPU | 0.016 s | 21 ms | 1.512 s | 132.2 MiB/s | 16.9 MiB | 7.3 MiB | 0 ms |
+| alacritty | 0.17.0 | GPU (OpenGL) | 0.045 s | 57 ms | 1.695 s | 118.0 MiB/s | 85.9 MiB | 30.3 MiB | 0 ms |
+| kitty | 0.47.1 | GPU (OpenGL) | 0.113 s | 94 ms | 1.712 s | 116.8 MiB/s | 113.3 MiB | 47.8 MiB | 0 ms |
+| urxvt | 9.31 | X11, CPU | 0.011 s | n/a | 1.874 s | 106.7 MiB/s | 14.2 MiB | 4.7 MiB | 0 ms |
+| st | 0.9.2 | X11, CPU | 0.018 s | n/a | 2.437 s | 82.0 MiB/s | 11.5 MiB | 2.8 MiB | 0 ms |
+| ptyxis | 50.1 | VTE 0.84 | 0.520 s | 525 ms | 3.022 s | 66.1 MiB/s | 115.0 MiB | 48.2 MiB | 10 ms |
+| gnome-terminal \* | 3.60.0 | VTE 0.84 | 0.171 s | n/a | 3.058 s | 65.3 MiB/s | 55.5 MiB | 20.4 MiB | 0 ms |
+| terminator | 2.1.5 | VTE 0.84 | 0.206 s | 211 ms | 3.110 s | 64.3 MiB/s | 86.3 MiB | 43.0 MiB | 10 ms |
+| sakura | 3.8.9 | VTE 0.84 | 0.051 s | 67 ms | 3.177 s | 62.9 MiB/s | 39.1 MiB | 11.6 MiB | 0 ms |
+| tilix | 1.9.6 | VTE 0.84 | 0.069 s | 165 ms | 3.300 s | 60.6 MiB/s | 76.1 MiB | 40.8 MiB | 0 ms |
+| ghostty | 1.3.1 | GTK4 + GPU | 0.531 s | 471 ms | 3.521 s | 56.7 MiB/s | 164.6 MiB | 83.5 MiB | 0 ms |
+| xterm | 411 | X11, CPU | 0.017 s | n/a | 4.347 s | 46.0 MiB/s | 9.2 MiB | 3.4 MiB | 0 ms |
+| konsole | 26.08.1 | Qt | 0.125 s | 127 ms | 4.696 s | 42.5 MiB/s | 94.8 MiB | 31.1 MiB | 0 ms |
+| qterminal | 2.4.0 | QTermWidget | 0.079 s | 86 ms | 4.701 s | 42.5 MiB/s | 72.5 MiB | 18.6 MiB | 0 ms |
+| kero \* | 2.1.17 | Go + libghostty-vt | 0.025 s | n/a | 4.739 s | 42.2 MiB/s | 167.0 MiB | 74.8 MiB | 90 ms |
+| wezterm | 20261019-nightly | GPU (wgpu) | 0.034 s | 69 ms | 7.829 s | 25.5 MiB/s | 115.8 MiB | 61.5 MiB | 0 ms |
+| lxterminal | 0.4.1 | VTE 0.84 | 0.045 s | 90 ms | 9.681 s | 20.6 MiB/s | 48.7 MiB | 15.2 MiB | 0 ms |
+| xfce4-terminal | 1.2.0 | VTE 0.84 | 0.086 s | 106 ms | 10.091 s | 19.8 MiB/s | 52.5 MiB | 17.6 MiB | 0 ms |
 
-Reading it:
-
-- tuni sits first. In July, at 1.2.0, it was third at 117.2 MiB/s, inside 12%
-  of foot. What moved it is the PTY reader: it used to do one blocking read
-  per wakeup, a couple of hundred bytes under a flood, and now drains the
-  master until the kernel has nothing left, waiting in an epoll set that holds
-  the master for the life of the pane. Waiting in epoll rather than `poll`
-  alone took the PTY, with nothing drawing, from 1.5-1.8 s to 1.1-1.4 s for
-  the payload.
-- The rows come from two dates, so the order between them is not a race run
-  side by side. Konsole is the one terminal measured on both, at 41.7 MiB/s
-  (26.04.3) and then 40.2 (26.08.1): 4% slower, so nothing says the machine
-  got faster in between.
-- The five stock VTE frontends land within 4% of each other at ~66 MiB/s,
-  which is the reassuring part — they share an engine, and the benchmark says
-  so. lxterminal and xfce4-terminal use the same VTE and are 3.4× slower than
-  their siblings, so that gap is configuration (scrollback, rewrap), not the
-  engine.
-- ghostty measures at 79 MiB/s while tuni and kero, which both use ghostty's
-  VT parser through `libghostty-vt`, measure at 169 and 139. The parser is not
-  what separates them; the difference is in what is built around the same
-  library.
-- wezterm is the surprise at the bottom: a GPU renderer consuming at 33 MiB/s,
-  behind every VTE frontend that isn't misconfigured. A GPU pipeline says
-  nothing about how fast the reader thread drains the PTY. (Nightly build,
-  since that is what the wezterm repo ships for Fedora 44.)
-- tuni's startup in this table is not comparable: the script used to type the
-  command into a restored session through the capture harness. It now starts
-  tuni the way the others start, with the command as the shell, and the
-  side-by-side run below has the number that compares.
-
-## Startup, memory and idle
-
-On 2026-10-25 five terminals ran side by side in one invocation, with tuni at
-the commit after b32b8ab, the one that splits it into a launcher and the
-application:
-
-```sh
-RUNS=5 nice -n 19 scripts/throughput.sh 200 foot alacritty kitty konsole
-```
-
-foot, alacritty and kitty were no longer installed, so they ran out of their
-Fedora 44 packages unpacked into a directory, with `LD_LIBRARY_PATH` at the
-libraries that came with them. Every window opened in a headless KWin
-(`kwin_wayland --virtual`) on a session bus of its own, so nothing on the
-desktop lost focus. A game was running beside it, which is why the run was
-niced and why the load average was 4.4 to 4.8; every throughput here is below
-its row in the table above for that reason.
-
-| Terminal | Version | Startup | First frame | Consume | Throughput | RSS | PSS | Idle |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **tuni** | 1.6.0 | **0.006 s** | 261 ms | 1.739 s | **115.0 MiB/s** | 111.5 MiB | 47.4 MiB | 0 ms |
-| foot | 1.27.0 | 0.017 s | 23 ms | 1.963 s | 101.8 MiB/s | 16.8 MiB | 7.4 MiB | 0 ms |
-| alacritty | 0.17.0 | 0.053 s | 60 ms | 2.232 s | 89.6 MiB/s | 85.8 MiB | 30.6 MiB | 0 ms |
-| kitty | 0.47.1 | 0.128 s | 101 ms | 2.332 s | 85.7 MiB/s | 113.2 MiB | 48.3 MiB | 0 ms |
-| konsole | 26.08.1 | 0.146 s | 137 ms | 5.290 s | 37.8 MiB/s | 95.2 MiB | 30.0 MiB | 0 ms |
+\* The process the script starts is a client that hands the terminal to a
+server, so the script reads n/a for its memory and idle. These were measured
+separately, three times each, from the server with one terminal open:
+`gnome-terminal-server`, and for kero the app plus `kerod` (60.4 + 14.4 MiB
+PSS, 141.0 + 26.0 MiB RSS), the app freshly started for each sample. A kero
+app that has been open longer idles at 0 to 10 ms.
 
 Startup is the empty run: launch until the shell has run `touch`. First frame
 is launch until the first `wl_surface.attach` of a buffer that
-`WAYLAND_DEBUG=client` prints, median of five, measured straight after the run
-in the same session, at a load average of 2.7 to 3.1; tuni's is the median of
-nine, because its launches spread wider than the others' (254 to 299 ms).
-Memory is read from `/proc/<pid>/smaps_rollup` three
-seconds after `touch`, once a GTK window has stopped painting its first
-frames. PSS divides each shared page among the processes mapping it, so it is
-the fairer column; RSS counts all of Mesa's `libLLVM` (25 MiB) against every
-GPU terminal. Idle is the CPU the process spends in the five seconds after the
-memory read, counted in 10 ms clock ticks, so 10 ms is one tick and 0 is less
-than one.
+`WAYLAND_DEBUG=client` prints, median of five, measured straight after the
+run in the same session; tuni's is the median of nine, because its launches
+spread wider than the others'. It is n/a for the X11 terminals, which draw
+through Xwayland and not as Wayland clients, and for gnome-terminal and kero,
+whose window belongs to the server. Memory is read from
+`/proc/<pid>/smaps_rollup` three seconds after `touch`, once a GTK window has
+stopped painting its first frames. PSS divides each shared page among the
+processes mapping it, so it is the fairer column; RSS counts all of Mesa's
+`libLLVM` (25 MiB) against every GPU terminal. Idle is the CPU the process
+spends in the five seconds after the memory read, counted in 10 ms clock
+ticks, so 10 ms is one tick and 0 is less than one.
 
 Reading it:
 
-- tuni consumes first, 13% ahead of foot. Its idle is under one clock tick
-  here and has been one in other runs: over 20 seconds, three launches each,
-  it spends 0 or 1 tick and wakes
-  66 to 68 times both before ab2d619 and after it. In steady state its only
-  periodic work is two `/proc` reads every two seconds per pane, the
-  foreground process and the working directory, about 0.06 ms each.
-- Startup and first frame are one moment for the other four and two for tuni.
-  `tuni` starts the first shell before it loads GTK at all, so the shell runs
-  `touch` 6 ms after launch, ahead of foot's 17, while the window is still
-  being built; the others start their shell after their window. The column
-  that compares what a person sees is first frame, and there tuni is last.
-- On memory it is just under kitty, 47.4 against 48.3 MiB, and above the
-  other three. The next section is what both of those are made of.
+- tuni consumes first, 14.5% ahead of foot, and its shell starts first:
+  `tuni` is a launcher linked against GLib and GIO alone that starts the shell
+  before GTK is loaded, so `touch` runs 4.9 ms after launch, ahead of urxvt's
+  10.8 and foot's 16.4, while the window is still being built.
+- First frame is where tuni is behind: 233 ms, twelfth of the fourteen with a
+  number, ahead of ghostty and ptyxis. The section below is what that is made
+  of. For the others startup and first frame are one moment, because they
+  start their shell after their window.
+- On memory it is fourteenth of nineteen by PSS, 47.5 MiB, level with kitty and
+  ptyxis and below ghostty, kero and wezterm. Every GTK terminal pays for GTK
+  before it holds a cell; see below.
+- Idle: no terminal does real work while it waits. ptyxis and terminator spend
+  one tick in five seconds, and kero, freshly started, nine.
+- The five stock VTE frontends land within 9% of each other at 60.6 to
+  66.1 MiB/s: they share an engine, and the benchmark says so. lxterminal and
+  xfce4-terminal use the same VTE and are three times slower than their
+  siblings, so that gap is configuration (scrollback, rewrap), not the engine.
+- ghostty measures at 56.7 MiB/s while tuni, which uses ghostty's VT parser
+  through `libghostty-vt`, measures at 151.4. The parser is not what separates
+  them; the difference is what is built around the same library.
+
+### Headless against the desktop
+
+Sixteen of the nineteen land within 14% of what it measured on
+the KDE desktop in July (October for tuni, kero and konsole), in both
+directions: foot 133.1 to 132.2, alacritty 111.7 to 118.0, konsole 40.2 to
+42.5, tuni 169.1 to 151.4. Three do not, and the cause is not known for any of
+them: ghostty (79.2 to 56.7, -28%), wezterm (32.6 to 25.5, -22%, a different
+nightly) and kero (139.4 to 42.2, -70%, and 49.8 in a second pass with a
+freshly started app). kero draws on the GPU through Mesa in both sessions. Its
+desktop head-to-head with tuni is below, and its row here says what kero does
+in a headless compositor, not on a desktop.
 
 ### What GTK costs before tuni does anything
 
@@ -156,19 +136,20 @@ hides Papirus-Dark, the icon theme on this machine.
 
 - With Papirus-Dark, tuni draws its first frame 26 ms before the empty window
   does: it creates the renderer while the theme loads, which floor does not.
-  All four other terminals are ahead of that floor, so no change inside tuni
-  can bring its first frame below theirs while it is a GTK program. With the
-  stock theme the floor is 103 ms, still behind foot, alacritty and kitty,
-  and tuni's 117 ms is ahead of konsole's 128 measured with the desktop's
-  theme.
+  Every terminal in the table with a first frame is ahead of that floor
+  except ghostty and ptyxis, which link libadwaita too, so no change inside
+  tuni can bring its first frame below theirs while it is a libadwaita
+  program. With the stock theme the floor is 103 ms, still behind seven of
+  them, and tuni's 117 ms is ahead of konsole's 127, tilix's 165 and
+  terminator's 211 measured with the desktop's theme.
 - Most of the gap between the two columns is GTK loading the icon theme. GTK
   does that on a thread and the first icon the window draws waits for it; with
   Papirus-Dark that is about 180 ms of CPU building hash tables out of the
   theme's cache, the same in floor as in tuni, and 13.1 MiB of tuni's PSS is
   those tables, still allocated in the loader thread's arena.
-- PSS has the same shape. The empty window is above foot, alacritty and
-  konsole before any terminal exists in it, and kitty is 7.3 MiB above it.
-  tuni is 7.0 MiB above it, and the largest single part of that is tuni's own
+- PSS has the same shape. The empty window, 41.1 MiB, is above twelve of the
+  eighteen other terminals before any terminal exists in it, and kitty is
+  6.7 MiB above it. tuni is 7.0 MiB above it, and the largest single part of that is tuni's own
   binary: 5.8 MiB of PSS, 4.6 MiB of it code.
 - Linking alone has a price. From exec to `main`, median of fifteen: 0.4 ms
   for a program linked only against GLib, 13.4 ms against GTK 4 (114
@@ -211,28 +192,48 @@ hides Papirus-Dark, the icon theme on this machine.
   about 281 ms instead of 209, because the settings GDK reads from the desktop
   portal name Papirus-Dark while `gtk::init` opens the display, before tuni
   can set anything, so the load has already started and switching adds a
-  second one. It would also replace the
-  icons the desktop asked for.
+  second one. It would also replace the icons the desktop asked for.
+
+### 1.6.0 against 1.7.0
+
+The release before this round, installed as `/usr/bin/tuni`, against this
+tree's build, in the same headless session and interleaved: two throughput
+passes of five runs each, nine first frames each, five PSS readings each.
+
+| | 1.6.0 | 1.7.0 | |
+| --- | --- | --- | --- |
+| Startup | 663 to 734 ms | 5.2 to 5.6 ms | shell 130 times sooner |
+| First frame, median of 9 | 671.4 ms | 234.1 ms | 65% less |
+| Throughput, best pass | 112.0 MiB/s | 146.4 MiB/s | 31% more |
+| RSS, median of 5 | 129.0 MiB | 112.2 MiB | 13% less |
+| PSS, median of 5 | 59.8 MiB | 47.1 MiB | 21% less |
+| Idle | 0 to 10 ms/5s | 0 to 10 ms/5s | unchanged |
+
+Throughput moves between passes in both (1.6.0 100.9 to 112.0, 1.7.0 122.6
+to 146.4) because the run shared the machine with a game; the 151.4 in the
+table above is the same build's best in the nineteen-terminal run.
 
 ## tuni against kero
 
 kero runs its terminals in a daemon, `kerod`, and the app draws them, so the
 script starts each run as a session in the app already open (`kero new -f -w`)
-and closes it afterwards. The pair was run three times on 2026-10-24 with
-`RUNS=5 scripts/throughput.sh 200 kero`:
+and closes it afterwards. The pair was run three times on 2026-10-24, on the
+KDE desktop rather than headless, with `RUNS=5 scripts/throughput.sh 200 kero`:
 
 | Pass | tuni | kero | Winner |
 | --- | ---: | ---: | --- |
 | head-to-head, best of 5 | 156.2 MiB/s | 130.0 MiB/s | tuni, +20.2% |
 | head-to-head, best of 5 | 164.5 MiB/s | 133.6 MiB/s | tuni, +23.1% |
-| table above, best of 5 | 169.1 MiB/s | 139.4 MiB/s | tuni, +21.3% |
+| full run, best of 5 | 169.1 MiB/s | 139.4 MiB/s | tuni, +21.3% |
 
 Before the reader change the same pairing went to kero, 112.7 and 121.2 MiB/s
-against 138.9 and 129.4.
+against 138.9 and 129.4. Headless, kero does not reach those numbers (42.2
+and 49.8 MiB/s), so the pairing is read from the desktop passes; see
+"Headless against the desktop".
 
 In July, at 1.2.0, the pair to settle was tuni and alacritty, and three passes
-called it a dead heat between 106 and 117 MiB/s. alacritty was not installed
-for the October run, so that pairing has not been repeated.
+called it a dead heat between 106 and 117 MiB/s. In the headless run above it
+is tuni by 28%, 151.4 against 118.0.
 
 Caveats worth keeping in mind:
 
@@ -254,14 +255,14 @@ Caveats worth keeping in mind:
 
 ## Not measured
 
-- **Rio** — installed as a Flatpak (`com.rioterm.Rio`), which cannot be driven:
+- **Rio**: installed as a Flatpak (`com.rioterm.Rio`), which cannot be driven:
   that build ignores `-e` and any configured `shell`, and always spawns the
   user's login shell on the host through `flatpak-spawn --host`, so no command
   reaches it. (`RIO_CONFIG_HOME` does make it honor a config `shell`, but then
   it spawns inside the sandbox and never produced output here.) Measuring Rio
   means `cargo install rioterm` and adding it to the list; the default
   `rio -e sh -c …` case in the script already fits its CLI.
-- **blackbox-terminal**, **guake**, **tilda**, **deepin-terminal** — VTE
+- **blackbox-terminal**, **guake**, **tilda**, **deepin-terminal**: VTE
   frontends again, and the five already in the table say what VTE does.
 
 The script drives kitty, foot and wezterm with trailing arguments, `-x` for

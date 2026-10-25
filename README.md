@@ -49,50 +49,46 @@ source is read as a specification of behavior, not translated.
 
 ## Performance
 
-200 MiB of mixed plain and SGR-colored output, best of five runs, on one
-machine. Time to consume it, so window and shell startup cancel out.
+Nineteen terminals in one run on one machine, 2026-10-25: 200 MiB of mixed
+plain and SGR-colored output, best of five runs. Startup is launch until the
+shell ran, throughput is the time to consume the output with startup taken
+out, memory three seconds after the shell started, idle the CPU over the five
+seconds after that.
 
-| Terminal | Engine | Consume | Throughput |
-| --- | --- | ---: | ---: |
-| **tuni** \* | GTK4 + libghostty-vt | 1.182 s | **169.1 MiB/s** |
-| kero \* | Go + libghostty-vt | 1.435 s | 139.4 MiB/s |
-| foot | Wayland, CPU | 1.502 s | 133.1 MiB/s |
-| urxvt | X11, CPU | 1.617 s | 123.6 MiB/s |
-| alacritty | GPU (OpenGL) | 1.790 s | 111.7 MiB/s |
-| kitty | GPU (OpenGL) | 1.908 s | 104.8 MiB/s |
-| st | X11, CPU | 2.210 s | 90.4 MiB/s |
-| ghostty | GTK4 + GPU | 2.524 s | 79.2 MiB/s |
-| sakura | VTE 0.84 | 2.955 s | 67.6 MiB/s |
-| ptyxis | VTE 0.84 | 2.982 s | 67.0 MiB/s |
-| gnome-terminal | VTE 0.84 | 2.995 s | 66.7 MiB/s |
-| terminator | VTE 0.84 | 2.998 s | 66.7 MiB/s |
-| tilix | VTE 0.84 | 3.082 s | 64.9 MiB/s |
-| xterm | X11, CPU | 3.798 s | 52.6 MiB/s |
-| qterminal | QTermWidget | 4.242 s | 47.1 MiB/s |
-| konsole \* | Qt | 4.965 s | 40.2 MiB/s |
-| wezterm | GPU (wgpu) | 6.134 s | 32.6 MiB/s |
-| lxterminal | VTE 0.84 | 10.186 s | 19.6 MiB/s |
-| xfce4-terminal | VTE 0.84 | 10.242 s | 19.5 MiB/s |
+| Terminal | Engine | Startup | First frame | PSS | Idle | Throughput |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| **tuni** | GTK4 + libghostty-vt | **0.005 s** | 233 ms | 47.5 MiB | 0 ms | **151.4 MiB/s** |
+| foot | Wayland, CPU | 0.016 s | 21 ms | 7.3 MiB | 0 ms | 132.2 MiB/s |
+| alacritty | GPU (OpenGL) | 0.045 s | 57 ms | 30.3 MiB | 0 ms | 118.0 MiB/s |
+| kitty | GPU (OpenGL) | 0.113 s | 94 ms | 47.8 MiB | 0 ms | 116.8 MiB/s |
+| urxvt | X11, CPU | 0.011 s | n/a | 4.7 MiB | 0 ms | 106.7 MiB/s |
+| st | X11, CPU | 0.018 s | n/a | 2.8 MiB | 0 ms | 82.0 MiB/s |
+| ptyxis | VTE 0.84 | 0.520 s | 525 ms | 48.2 MiB | 10 ms | 66.1 MiB/s |
+| gnome-terminal | VTE 0.84 | 0.171 s | n/a | 20.4 MiB \* | 0 ms \* | 65.3 MiB/s |
+| terminator | VTE 0.84 | 0.206 s | 211 ms | 43.0 MiB | 10 ms | 64.3 MiB/s |
+| sakura | VTE 0.84 | 0.051 s | 67 ms | 11.6 MiB | 0 ms | 62.9 MiB/s |
+| tilix | VTE 0.84 | 0.069 s | 165 ms | 40.8 MiB | 0 ms | 60.6 MiB/s |
+| ghostty | GTK4 + GPU | 0.531 s | 471 ms | 83.5 MiB | 0 ms | 56.7 MiB/s |
+| xterm | X11, CPU | 0.017 s | n/a | 3.4 MiB | 0 ms | 46.0 MiB/s |
+| konsole | Qt | 0.125 s | 127 ms | 31.1 MiB | 0 ms | 42.5 MiB/s |
+| qterminal | QTermWidget | 0.079 s | 86 ms | 18.6 MiB | 0 ms | 42.5 MiB/s |
+| kero | Go + libghostty-vt | 0.025 s | n/a | 74.8 MiB \* | 90 ms \* | 42.2 MiB/s |
+| wezterm | GPU (wgpu) | 0.034 s | 69 ms | 61.5 MiB | 0 ms | 25.5 MiB/s |
+| lxterminal | VTE 0.84 | 0.045 s | 90 ms | 15.2 MiB | 0 ms | 20.6 MiB/s |
+| xfce4-terminal | VTE 0.84 | 0.086 s | 106 ms | 17.6 MiB | 0 ms | 19.8 MiB/s |
 
-\* measured 2026-10-24; the rest on 2026-07-28, on the same machine. Konsole,
-measured on both dates (26.04.3, then 26.08.1), came in 4% slower the second
-time, so nothing says the machine got faster in between.
+\* read from the server that draws the window, gnome-terminal-server, and
+kero's app with kerod, because what the launch started is a client that waits.
 
-First of nineteen, a fifth ahead of kero in each of three head-to-head passes,
-with a whole workspace drawn around the terminal.
+First in throughput, 14.5% ahead of foot, and first to start a shell, because
+`tuni` starts it before GTK is loaded. The run was headless, in a KWin of its
+own; kero, which reaches 139.4 MiB/s on the desktop and loses to tuni by a
+fifth there in each of three passes, does not reach that headless.
 
-Side by side on 2026-10-25, under load, with memory three seconds after the
-shell started and CPU over the five idle seconds after that:
+Against 1.6.0 in the same session: the shell 5 ms after launch instead of
+660, the first frame at 234 ms instead of 671, PSS 47.1 MiB instead of 59.8,
+and 146.4 MiB/s instead of 112.0.
 
-| Terminal | Startup | First frame | PSS | Idle | Throughput |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| **tuni** | **0.006 s** | 261 ms | 47.4 MiB | 0 ms | **115.0 MiB/s** |
-| foot | 0.017 s | 23 ms | 7.4 MiB | 0 ms | 101.8 MiB/s |
-| alacritty | 0.053 s | 60 ms | 30.6 MiB | 0 ms | 89.6 MiB/s |
-| kitty | 0.128 s | 101 ms | 48.3 MiB | 0 ms | 85.7 MiB/s |
-| konsole | 0.146 s | 137 ms | 30.0 MiB | 0 ms | 37.8 MiB/s |
-
-Startup is when the shell ran, and tuni starts its shell before it loads GTK.
 First frame and memory are mostly GTK: an empty libadwaita window on the same
 machine takes 259 ms to its first frame and 41 MiB PSS with the icon theme
 there, Papirus-Dark, and 103 ms and 26 MiB with the stock one.

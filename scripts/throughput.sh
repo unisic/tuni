@@ -9,12 +9,16 @@
 # seconds after that.
 #
 # Usage: scripts/throughput.sh [payload-megabytes] [terminal...]
+#
+# TUNI names another tuni to time in place of this tree's release build, so a
+# release and the build after it run through the same script:
+# TUNI=/usr/bin/tuni scripts/throughput.sh 200
 set -u
 export LC_ALL=C
 
 MB=${1:-200}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-TUNI=$ROOT/target/release/tuni
+TUNI=${TUNI:-$ROOT/target/release/tuni}
 WORK=${TMPDIR:-/tmp}/tuni-throughput
 PAYLOAD=$WORK/payload.txt
 MARKER=$WORK/done
@@ -112,8 +116,10 @@ ticks() { awk '{print $14 + $15}' "/proc/$1/stat" 2>/dev/null; }
 
 # RSS and PSS in MiB, then CPU milliseconds over five idle seconds. Only the
 # process that was started is read, so a terminal that hands its window to a
-# server (kero, gnome-terminal, ptyxis) reads n/a rather than the client.
+# server (kero, gnome-terminal) reads n/a: what it started is a client that
+# waits, and its 20 or 30 MiB would read as the terminal's.
 footprint() { # $1 = terminal
+  case "$1" in kero|gnome-terminal) echo "n/a n/a n/a"; return ;; esac
   rm -f "$MARKER"
   local pid mem before after hz
   launch "$1" "touch $MARKER; exec sleep 30"
