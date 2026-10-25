@@ -35,6 +35,10 @@ BuildRequires:  pkgconfig(gtksourceview-5)
 BuildRequires:  pkgconfig(sqlite3)
 BuildRequires:  desktop-file-utils
 BuildRequires:  libappstream-glib
+# libghostty-vt's build script clones the pinned Ghostty commit with the git
+# command rather than cargo's own fetcher, and COPR's buildroot has no git:
+# 1.7.0 failed there on "failed to execute git clone ghostty".
+BuildRequires:  git-core
 
 # Everything the panels shell out to. curl fetches the plan bars the Info
 # page shows next to a running Claude Code, and the host list is read with the
