@@ -4,6 +4,8 @@ How fast does a terminal consume PTY output? `scripts/throughput.sh` times each
 terminal twice: once running only the marker `touch`, once running `cat` over
 the payload first. The difference is time spent consuming output, so window and
 shell startup cancel out. Each phase runs five times and the best time is kept.
+A third run leaves the shell sleeping and reads what the terminal costs while
+it waits: memory, and CPU over five idle seconds.
 
 Payload: 200 MiB (209 715 216 bytes) of mixed plain and SGR-colored lines, so
 the parser does real work rather than `memcpy`. Every terminal runs `/bin/sh`,
@@ -24,7 +26,7 @@ scripts/throughput.sh 200 alacritty ghostty kitty foot konsole ptyxis \
 | GPU | AMD Radeon RX 9070 XT (Navi 48) |
 | Kernel | 7.1.5-200.fc44.x86_64, Fedora 44; 7.2.11-200.fc44.x86_64 for the October run |
 | Session | KDE Plasma on Wayland (KWin); the X11 terminals run through Xwayland |
-| Date | 2026-07-28; tuni, kero and konsole again on 2026-10-24 |
+| Date | 2026-07-28; tuni, kero and konsole again on 2026-10-24; tuni, foot, alacritty, kitty and konsole side by side on 2026-10-25 |
 
 ## Results
 
@@ -80,8 +82,60 @@ Reading it:
   behind every VTE frontend that isn't misconfigured. A GPU pipeline says
   nothing about how fast the reader thread drains the PTY. (Nightly build,
   since that is what the wezterm repo ships for Fedora 44.)
-- tuni's startup number is not comparable: it is a GTK4 window plus the capture
-  harness, and the payload run subtracts it anyway.
+- tuni's startup in this table is not comparable: the script used to type the
+  command into a restored session through the capture harness. It now starts
+  tuni the way the others start, with the command as the shell, and the
+  side-by-side run below has the number that compares.
+
+## Startup, memory and idle
+
+On 2026-10-25 five terminals ran side by side in one invocation:
+
+```sh
+RUNS=5 scripts/throughput.sh 200 foot alacritty kitty konsole
+```
+
+foot, alacritty and kitty were no longer installed, so they ran out of their
+Fedora 44 packages unpacked into a directory, with `LD_LIBRARY_PATH` at the
+libraries that came with them. The load average was 3.6 to 4.7 throughout,
+from other work on the machine, which is why every throughput here is below
+its row in the table above.
+
+| Terminal | Version | Startup | Consume | Throughput | RSS | PSS | Idle |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **tuni** | 1.6.0 (8cc3679) | 0.259 s | 1.339 s | **149.4 MiB/s** | 120.3 MiB | 56.9 MiB | 0 ms |
+| foot | 1.27.0 | 0.017 s | 1.517 s | 131.8 MiB/s | 17.0 MiB | 7.5 MiB | 0 ms |
+| alacritty | 0.17.0 | 0.051 s | 2.024 s | 98.7 MiB/s | 85.7 MiB | 31.1 MiB | 10 ms |
+| kitty | 0.47.1 | 0.128 s | 2.113 s | 94.6 MiB/s | 113.1 MiB | 49.1 MiB | 10 ms |
+| konsole | 26.08.1 | 0.124 s | 4.692 s | 42.6 MiB/s | 93.9 MiB | 29.3 MiB | 0 ms |
+
+Startup is the empty run: launch until the shell has run `touch`. Memory is
+read from `/proc/<pid>/smaps_rollup` three seconds after that, once a GTK
+window has stopped painting its first frames. PSS divides each shared page
+among the processes mapping it, so it is the fairer column; RSS counts all of
+Mesa's `libLLVM` (25 MiB) against every GPU terminal. Idle is the CPU the
+process spends in the five seconds after the memory read, counted in 10 ms
+clock ticks, so 10 ms is one tick and 0 is less than one.
+
+Reading it:
+
+- tuni consumes first, 13% ahead of foot, and idles at zero. In steady state
+  its only periodic work is two `/proc` reads every two seconds per pane, the
+  foreground process and the working directory, about 0.06 ms each.
+- It is last on startup and on memory, and most of both is GTK loading the
+  icon theme. GTK does that on a thread and the first icon the window draws
+  waits for it; with Papirus-Dark, the theme on this machine, the load is
+  about 180 ms of CPU building hash tables out of the theme's cache, the same
+  in a bare GTK program with nothing of tuni in it. With the stock theme (an
+  empty `XDG_DATA_HOME`) the same build starts in 168 ms with 40.1 MiB PSS,
+  against 302 ms and 55.0 MiB with Papirus, median of seven each.
+- Before this run tuni loaded that theme several times over: every search
+  path added after GTK starts the load throws it away. Loading it once took
+  the median startup from 728 to 310 ms and PSS from 65 to 56 MiB, and
+  creating the renderer while the theme loads took startup to 278 ms (seven
+  launches each, interleaved, load average 4 to 7).
+- foot's 17 ms and 7.5 MiB are a Wayland client with no toolkit and no GPU
+  context; every other row has at least one of the two.
 
 ## tuni against kero
 

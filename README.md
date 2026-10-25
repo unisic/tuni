@@ -81,8 +81,22 @@ time, so nothing says the machine got faster in between.
 First of nineteen, a fifth ahead of kero in each of three head-to-head passes,
 with a whole workspace drawn around the terminal.
 
-[docs/BENCHMARK.md](docs/BENCHMARK.md) - method, environment, caveats, and the
-head-to-head with kero.
+Side by side on 2026-10-25, under load, with memory three seconds after the
+shell started and CPU over the five idle seconds after that:
+
+| Terminal | Startup | PSS | Idle | Throughput |
+| --- | ---: | ---: | ---: | ---: |
+| **tuni** | 0.259 s | 56.9 MiB | 0 ms | **149.4 MiB/s** |
+| foot | 0.017 s | 7.5 MiB | 0 ms | 131.8 MiB/s |
+| alacritty | 0.051 s | 31.1 MiB | 10 ms | 98.7 MiB/s |
+| kitty | 0.128 s | 49.1 MiB | 10 ms | 94.6 MiB/s |
+| konsole | 0.124 s | 29.3 MiB | 0 ms | 42.6 MiB/s |
+
+Startup and memory are mostly GTK loading the icon theme: with the stock one
+instead of Papirus, tuni starts in 168 ms with 40 MiB PSS.
+
+[docs/BENCHMARK.md](docs/BENCHMARK.md) - method, environment, caveats, where
+the startup and memory go, and the head-to-head with kero.
 
 ## Install
 

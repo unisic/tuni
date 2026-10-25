@@ -3,9 +3,12 @@
 #
 # Each terminal is timed twice: once running only the marker touch, once
 # running cat over the payload first. The difference is the time spent
-# consuming output, which cancels out window and shell startup.
+# consuming output, which cancels out window and shell startup. A third run
+# leaves the shell sleeping and reads what the terminal costs while it waits:
+# its memory three seconds after the marker, and the CPU it spends in the five
+# seconds after that.
 #
-# Usage: scripts/throughput.sh [payload-megabytes]
+# Usage: scripts/throughput.sh [payload-megabytes] [terminal...]
 set -u
 export LC_ALL=C
 
@@ -19,6 +22,12 @@ RUNS=${RUNS:-2}
 
 [ -x "$TUNI" ] || { echo "build first: cargo build --release"; exit 1; }
 mkdir -p "$WORK"
+
+# tuni has no -e. Its pane runs $SHELL, so the command rides in as a shell
+# that hands it straight to sh -c, which is what -e does for the others.
+SHIM=$WORK/shell
+printf '#!/bin/sh\nexec /bin/sh -c "$TUNI_BENCH_COMMAND"\n' >"$SHIM"
+chmod +x "$SHIM"
 
 if [ ! -e "$PAYLOAD" ] || [ "$(stat -c%s "$PAYLOAD")" -lt $((MB * 1048576)) ]; then
   echo "generating ${MB}MiB payload…"
@@ -42,16 +51,13 @@ with open(path, 'w') as f:
 PY
 fi
 
-run_once() { # $1 = terminal, $2 = shell command
-  rm -f "$MARKER"
-  local start end pid
-  start=$(date +%s.%N)
+launch() { # $1 = terminal, $2 = shell command; leaves the pid in $!
   case "$1" in
-    # A plain sh keeps a slow interactive rc file out of the measurement.
+    # TUNI_SESSION=0 keeps a restored session out of the run, and a process of
+    # its own keeps it off a tuni that is already open.
     tuni)
-      SHELL=/bin/sh TUNI_CAPTURE_PNG=$WORK/frame.png \
-        TUNI_CAPTURE_INPUT="$2"$'\n' TUNI_CAPTURE_DELAY_MS=120000 \
-        "$TUNI" >/dev/null 2>&1 &
+      TUNI_SESSION=0 TUNI_SINGLE_INSTANCE=0 TUNI_BENCH_COMMAND="$2" \
+        SHELL=$SHIM "$TUNI" >/dev/null 2>&1 &
       ;;
     # kitty and foot spell the command as trailing arguments; -e is either
     # ignored or an error depending on the version.
@@ -70,21 +76,64 @@ run_once() { # $1 = terminal, $2 = shell command
     kero) kero new -f -w -d "$HOME" -- sh -c "$2" >"$WORK/kero.id" 2>/dev/null & ;;
     *) "$1" -e sh -c "$2" >/dev/null 2>&1 & ;;
   esac
-  pid=$!
+}
+
+finish() { # $1 = terminal, $2 = pid
+  kill "$2" 2>/dev/null
+  wait "$2" 2>/dev/null
+  # The session outlives its command in a shell, so without this every run
+  # would leave one more session in the app.
+  [ "$1" = kero ] && kero close "$(cat "$WORK/kero.id")" >/dev/null 2>&1
+  [ -e "$MARKER" ]
+}
+
+await_marker() {
   # 5ms, because the poll interval is the resolution of the whole benchmark:
   # at 50ms the fast terminals all landed in one bucket and read as a tie.
   for _ in $(seq 1 24000); do
     [ -e "$MARKER" ] && break
     sleep 0.005
   done
+}
+
+run_once() { # $1 = terminal, $2 = shell command
+  rm -f "$MARKER"
+  local start end pid
+  start=$(date +%s.%N)
+  launch "$1" "$2"
+  pid=$!
+  await_marker
   end=$(date +%s.%N)
-  kill "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null
-  # The session outlives its command in a shell, so without this every run
-  # would leave one more session in the app.
-  [ "$1" = kero ] && kero close "$(cat "$WORK/kero.id")" >/dev/null 2>&1
-  [ -e "$MARKER" ] || return 1
+  finish "$1" "$pid" || return 1
   echo "$end - $start" | bc
+}
+
+ticks() { awk '{print $14 + $15}' "/proc/$1/stat" 2>/dev/null; }
+
+# RSS and PSS in MiB, then CPU milliseconds over five idle seconds. Only the
+# process that was started is read, so a terminal that hands its window to a
+# server (kero, gnome-terminal, ptyxis) reads n/a rather than the client.
+footprint() { # $1 = terminal
+  rm -f "$MARKER"
+  local pid mem before after hz
+  launch "$1" "touch $MARKER; exec sleep 30"
+  pid=$!
+  await_marker
+  # The marker says the shell started, not that the window is done: a GTK
+  # window still paints its first frames and answers the compositor's
+  # configure for a second or two after that. Read sooner, and the idle
+  # column measures the end of startup rather than a terminal waiting.
+  sleep 3
+  mem=$(awk '/^Rss:/ {r = $2} /^Pss:/ {p = $2}
+    END {if (r) printf "%.1f %.1f", r / 1024, p / 1024}' \
+    "/proc/$pid/smaps_rollup" 2>/dev/null)
+  before=$(ticks "$pid")
+  sleep 5
+  after=$(ticks "$pid")
+  hz=$(getconf CLK_TCK)
+  finish "$1" "$pid" || return 1
+  [ -n "$mem" ] && [ -n "$before" ] && [ -n "$after" ] || { echo "n/a n/a n/a"; return; }
+  echo "$mem $(( (after - before) * 1000 / hz ))"
 }
 
 best() { # $1 = terminal, $2 = command
@@ -107,6 +156,7 @@ for term in tuni "$@"; do
   full=$(best "$term" "cat $PAYLOAD; touch $MARKER") || { echo "$term: failed"; continue; }
   delta=$(echo "$full - $base" | bc)
   rate=$(echo "scale=1; $bytes / 1048576 / $delta" | bc -l)
-  printf '%-10s startup %ss  total %ss  consume %ss  %s MiB/s\n' \
-    "$term" "$base" "$full" "$delta" "$rate"
+  read -r rss pss idle < <(footprint "$term" || echo "n/a n/a n/a")
+  printf '%-10s startup %ss  total %ss  consume %ss  %s MiB/s  rss %s MiB  pss %s MiB  idle %s ms/5s\n' \
+    "$term" "$base" "$full" "$delta" "$rate" "$rss" "$pss" "$idle"
 done
