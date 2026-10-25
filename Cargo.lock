@@ -1405,6 +1405,7 @@ dependencies = [
  "gdk4-x11",
  "gtk4",
  "libadwaita",
+ "libc",
  "sourceview5",
  "tuni-core",
  "tuni-pty",

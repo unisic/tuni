@@ -559,6 +559,7 @@ fn build_window(app: &adw::Application, directory: Option<&Path>) {
                 debug::mark("content");
                 window.present();
                 debug::mark("presented");
+                trim_after_first_frame(&window);
                 // A window restored onto a file or a diff has no terminal in
                 // the pane that is focused, and a capture of it is still a
                 // capture.
@@ -567,6 +568,34 @@ fn build_window(app: &adw::Application, directory: Option<&Path>) {
             }
         ),
     );
+}
+
+/// Hands back to the system what starting the window freed.
+///
+/// Startup allocates a great deal it lets go of at once: the icon theme's
+/// loader thread, the parse of every stylesheet, the renderer compiling its
+/// shaders for the first frame. glibc keeps freed memory in its arenas and
+/// only returns what sits at the very top of one, so without this those pages
+/// stay counted against the window for as long as it is open, about 1.4 MiB.
+/// The second tick is the first one after a frame has been painted, which is
+/// when the renderer's share has been freed too. One walk of the arenas, once
+/// per window, well under a millisecond.
+fn trim_after_first_frame(window: &TuniWindow) {
+    #[cfg(target_env = "gnu")]
+    {
+        let painted = std::cell::Cell::new(false);
+        window.add_tick_callback(move |_, _| {
+            if !painted.replace(true) {
+                return glib::ControlFlow::Continue;
+            }
+            // SAFETY: takes no pointer and only touches allocator state,
+            // which it locks itself.
+            unsafe { libc::malloc_trim(0) };
+            glib::ControlFlow::Break
+        });
+    }
+    #[cfg(not(target_env = "gnu"))]
+    let _ = window;
 }
 
 /// The settings for this run: the file, then the environment on top of it.

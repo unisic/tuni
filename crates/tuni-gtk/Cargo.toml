@@ -24,6 +24,8 @@ adw = { package = "libadwaita", version = "0.9", features = ["v1_6", "gtk_v4_10"
 # The same bridge tuni-pty crosses: a language server's reader thread feeds the
 # main loop through one of these.
 async-channel = "2"
+# `malloc_trim`, once the first frame is up.
+libc = "0.2"
 # 4.14 for the path API the box drawing characters are stroked with. No floor
 # is raised by it: libadwaita 1.6 already asks for a newer GTK than that.
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
