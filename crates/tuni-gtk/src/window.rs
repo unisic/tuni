@@ -638,8 +638,8 @@ impl TuniWindow {
             }
         });
         window.connect_unrealize(crate::blur::forget);
-        // Nothing on the machine notices a release while no distribution
-        // packages tuni, so the window asks once itself. It is the last thing
+        // Outside COPR and the AUR nothing on the machine notices a release,
+        // so the window asks once itself. It is the last thing
         // `new` does and it answers on another thread, so a slow network
         // delays no part of the first frame.
         if window.imp().settings.borrow().check_updates {
@@ -1575,14 +1575,21 @@ impl TuniWindow {
     /// terminal is the one program that can offer it a place to ask. A Flatpak
     /// is told rather than offered a button that could not work: the sandbox
     /// cannot install packages on the host, and pretending otherwise would
-    /// leave somebody watching a command fail.
+    /// leave somebody watching a command fail. An AUR build is told too,
+    /// because its helper is what updates it.
     fn offer_update(&self, latest: &str) {
         let current = env!("CARGO_PKG_VERSION");
         let sandboxed = tuni_core::updates::in_flatpak();
+        let from_aur = !sandboxed && tuni_core::updates::from_aur();
         let body = if sandboxed {
             format!(
                 "You are running {current}. This copy is a Flatpak, and a sandboxed app cannot \
                  install packages on the host; rebuild it from the manifest to move to {latest}."
+            )
+        } else if from_aur {
+            format!(
+                "You are running {current}. This copy came from the AUR, so the AUR helper that \
+                 installed it, such as paru or yay, moves it to {latest} on its next upgrade."
             )
         } else {
             format!(
@@ -1592,7 +1599,7 @@ impl TuniWindow {
         };
         let heading = format!("Tuni {latest} Is Available");
         let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
-        if sandboxed {
+        if sandboxed || from_aur {
             dialog.add_response("close", "Close");
             dialog.set_close_response("close");
         } else {

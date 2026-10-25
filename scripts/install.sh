@@ -12,9 +12,9 @@
 #
 #     scripts/install.sh
 #
-# Tuni is not in COPR, the AUR, or any other package repository yet, so a
-# release does not arrive through the system's own updates. This script is what
-# stands in for that: it asks the GitHub release page what the newest version
+# Outside COPR and the AUR, Tuni is in no package repository, so a release
+# does not arrive through the system's own updates. This script is what stands
+# in for that: it asks the GitHub release page what the newest version
 # is, and installs the package built for this distribution with the machine's
 # own package manager, the RPM on Fedora, the deb on Debian and Ubuntu, the
 # pkg.tar.zst on Arch. Installing over an older copy is what an update is, so

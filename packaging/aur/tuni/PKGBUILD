@@ -1,0 +1,58 @@
+# Maintainer: Unisic <contact@unisic.app>
+#
+# AUR source package. The same build as ../../arch/PKGBUILD, which the release
+# workflow runs, pointed at the tag archive on GitHub instead of a local
+# `make dist`. Regenerate with ../sync.sh rather than editing pkgver and
+# sha256sums by hand.
+#
+# libghostty-vt is Zig source compiled during the build, so Zig comes down in
+# source(), pinned by URL and checksum: Arch's own zig is 0.16 and the Ghostty
+# commit libghostty-rs pins does not build with it. build() also needs the
+# network, because cargo fetches the registry and the libghostty-vt-sys build
+# script fetches the pinned Ghostty source.
+
+pkgname=tuni
+pkgver=1.6.0
+pkgrel=1
+pkgdesc='Terminals, projects, files, and Git in one window'
+arch=('x86_64' 'aarch64')
+url='https://github.com/unisic/tuni'
+license=('GPL-3.0-or-later')
+# sqlite: the Info page reads OpenCode's session database. git and curl are
+# shelled out to by the Git panel and the plan bars on the Info page.
+depends=('gtk4' 'libadwaita' 'gtksourceview5' 'sqlite' 'git' 'curl'
+         'hicolor-icon-theme')
+# Panes say TERM=xterm-ghostty; without the terminfo tuni falls back to
+# xterm-256color, which is why this is optional rather than hard.
+optdepends=('ghostty-terminfo: terminfo for the TERM tuni panes advertise')
+makedepends=('rust' 'cargo' 'make' 'gcc' 'pkgconf')
+conflicts=('tuni-bin')
+# !lto: the tree-sitter grammars are C compiled inside the cargo build, and
+# makepkg's default lto option turns their objects into GCC bitcode that the
+# linker rust brings cannot read, leaving every ts_ symbol undefined.
+options=('!debug' '!lto')
+# The tag archive rather than a release asset: the tree has no submodules, so
+# GitHub's archive is the whole source, and it unpacks to tuni-<version>/.
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('3ad1f5fec4c35adaae3a536a4a85bb7da73987147e85643ac082fde1e5d1f9bb')
+_zigver=0.15.2
+source_x86_64=("https://ziglang.org/download/${_zigver}/zig-x86_64-linux-${_zigver}.tar.xz")
+sha256sums_x86_64=('02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239')
+source_aarch64=("https://ziglang.org/download/${_zigver}/zig-aarch64-linux-${_zigver}.tar.xz")
+sha256sums_aarch64=('958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f')
+
+build() {
+    export PATH="${srcdir}/zig-${CARCH}-linux-${_zigver}:${PATH}"
+    make -C "${pkgname}-${pkgver}" build
+}
+
+package() {
+    # The pinned zig again: `make install` depends on `build`, which re-runs
+    # cargo, a no-op here but only if it can still find the toolchain.
+    export PATH="${srcdir}/zig-${CARCH}-linux-${_zigver}:${PATH}"
+    make -C "${pkgname}-${pkgver}" install PREFIX=/usr DESTDIR="${pkgdir}"
+    # Tells the running app that the AUR helper owns its updates. Without it
+    # the update dialog offers scripts/install.sh, which would pacman -U the
+    # release package over this one behind the helper's back.
+    install -Dm644 /dev/stdin "${pkgdir}/usr/share/tuni/install-channel" <<< 'aur'
+}

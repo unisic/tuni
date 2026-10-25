@@ -1,0 +1,24 @@
+pkgbase = tuni-bin
+	pkgdesc = Terminals, projects, files, and Git in one window (binary release)
+	pkgver = 1.6.0
+	pkgrel = 1
+	url = https://github.com/unisic/tuni
+	arch = x86_64
+	license = GPL-3.0-or-later
+	depends = gtk4
+	depends = libadwaita
+	depends = gtksourceview5
+	depends = sqlite
+	depends = git
+	depends = curl
+	depends = hicolor-icon-theme
+	optdepends = ghostty-terminfo: terminfo for the TERM tuni panes advertise
+	provides = tuni=1.6.0
+	conflicts = tuni
+	noextract = tuni-1.6.0-1-x86_64.pkg.tar.zst
+	options = !strip
+	options = !debug
+	source = tuni-1.6.0-1-x86_64.pkg.tar.zst::https://github.com/unisic/tuni/releases/download/v1.6.0/tuni-1.6.0-1-x86_64.pkg.tar.zst
+	sha256sums = ee4d96d6a0511187fd7864d6d736a7ce40e71a2dfdf33102528717aa584161fb
+
+pkgname = tuni-bin

@@ -115,11 +115,41 @@ what makes a terminal fast, is unaffected and still used.
 and refuses one that went out compiled for its build machine. CI runs it, and
 so does every package job, on the binary it just installed.
 
+## COPR (`../.packit.yaml`)
+
+Packit builds each GitHub release from `tuni.spec` into the COPR project
+`deandark/Tuni`. The project is set up once, by hand: internet access during
+builds turned on, since the spec fetches cargo crates, the Ghostty source and
+Zig; the Fedora chroots ticked, which is the list Packit builds for; and
+`github.com/unisic/tuni` under "Packit allowed forge projects". The Packit
+GitHub App has to be enabled for this repository too.
+
+## AUR (`aur/`)
+
+`aur/tuni` builds the tag archive from source, the way `arch/PKGBUILD` builds a
+local one, and `aur/tuni-bin` repacks the release's Arch package. Both leave
+`/usr/share/tuni/install-channel` behind, which is how the update dialog knows
+to leave updating to the helper.
+
+```sh
+packaging/aur/sync.sh --version 1.7.0 --check   # retarget, .SRCINFO, build both
+```
+
+`sync.sh` takes the checksums from the published release, so it runs after
+one. `--push` publishes, which `.github/workflows/aur.yml` does after every
+release with the `AUR_SSH_KEY` secret: a private key registered on the AUR
+account, base64'd onto one line.
+
+```sh
+base64 -w0 < ~/.ssh/aur | gh secret set AUR_SSH_KEY --repo unisic/tuni
+```
+
 ## Releases
 
 `.github/workflows/release.yml` builds all three on a `v*` tag and attaches
-them to the GitHub release. Every job installs what it built before uploading
-it. Five files carry the version — `Cargo.toml`, the spec, the PKGBUILD, the
+them to the GitHub release, then pushes both AUR recipes; Packit sees the same
+release and builds it into COPR. Every job installs what it built before
+uploading it. Five files carry the version — `Cargo.toml`, the spec, the PKGBUILD, the
 Debian changelog, and the AppStream metadata — and the first job in the
 workflow refuses to release if they disagree with each other or with the tag.
 

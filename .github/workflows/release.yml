@@ -209,3 +209,14 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "Tuni ${VERSION}" \
             --generate-notes
+
+  aur:
+    name: AUR
+    # After the release, because sync.sh hashes the published Arch package,
+    # which does not exist until `release` has created it. A separate workflow
+    # so a failed push can be run again on its own.
+    needs: [version, release]
+    uses: ./.github/workflows/aur.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+    secrets: inherit
