@@ -86,11 +86,11 @@ shell started and CPU over the five idle seconds after that:
 
 | Terminal | Startup | First frame | PSS | Idle | Throughput |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| **tuni** | 0.028 s | 234 ms | 53.1 MiB | 0 ms | **131.1 MiB/s** |
-| foot | 0.017 s | 22 ms | 7.4 MiB | 0 ms | 109.8 MiB/s |
-| alacritty | 0.051 s | 56 ms | 30.7 MiB | 0 ms | 99.9 MiB/s |
-| kitty | 0.120 s | 94 ms | 48.4 MiB | 0 ms | 101.6 MiB/s |
-| konsole | 0.127 s | 127 ms | 30.4 MiB | 0 ms | 39.0 MiB/s |
+| **tuni** | 0.024 s | 233 ms | 48.1 MiB | 10 ms | **156.7 MiB/s** |
+| foot | 0.017 s | 22 ms | 7.4 MiB | 0 ms | 127.8 MiB/s |
+| alacritty | 0.046 s | 55 ms | 30.8 MiB | 0 ms | 112.2 MiB/s |
+| kitty | 0.120 s | 90 ms | 48.4 MiB | 0 ms | 111.5 MiB/s |
+| konsole | 0.124 s | 128 ms | 30.4 MiB | 0 ms | 40.4 MiB/s |
 
 Startup is when the shell ran, and tuni starts its shell before its window.
 First frame and memory are mostly GTK: an empty libadwaita window on the same
