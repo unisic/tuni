@@ -264,10 +264,13 @@ fn terminfo_under(dir: &std::path::Path, name: &str) -> bool {
     dir.join(first.to_string()).join(name).is_file()
 }
 
+/// A shell's command line, directory and environment, not yet started.
+pub struct Command(CommandBuilder);
+
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     /// Bytes on their way to the shell. A queue rather than the writer itself
-    /// because writing is what blocks — see the thread in `spawn`.
+    /// because writing is what blocks — see the thread in `spawn_command`.
     writes: async_channel::Sender<Vec<u8>>,
     /// The shell. Held in an `Option` so the hangup can hand it to whoever
     /// reaps it, and held on this side until then so its pid cannot be recycled
@@ -358,15 +361,14 @@ impl Pty {
     }
 
     pub fn spawn(config: &PtyConfig) -> Result<Self> {
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: config.rows.max(1),
-                cols: config.cols.max(1),
-                pixel_width: config.cell_width_px.saturating_mul(config.cols),
-                pixel_height: config.cell_height_px.saturating_mul(config.rows),
-            })
-            .map_err(|e| Error::Spawn(e.to_string()))?;
+        Self::spawn_command(config, Self::command(config))
+    }
 
+    /// What `spawn` would run, with this process's environment read into it
+    /// now. Starting it is `spawn_command`, which reads the environment no
+    /// further, so the two halves can sit on either side of a thread that
+    /// must not touch it.
+    pub fn command(config: &PtyConfig) -> Command {
         // The two branches cannot be merged: `arg` panics on a default-prog
         // builder, so a command has to be built from `new` instead.
         let mut cmd = match config.argv.as_slice() {
@@ -393,10 +395,27 @@ impl Pty {
         if let Some(cwd) = &config.cwd {
             cmd.cwd(cwd);
         }
+        // The activation token belongs to the window the launch opens, and GTK
+        // takes both spellings of it out of the environment as it starts, so
+        // nothing started later presents itself with a token already spent. A
+        // shell started before GTK was would still find it there.
+        cmd.env_remove("XDG_ACTIVATION_TOKEN");
+        cmd.env_remove("DESKTOP_STARTUP_ID");
         for (key, value) in &config.env {
             cmd.env(key, value);
         }
+        Command(cmd)
+    }
 
+    pub fn spawn_command(config: &PtyConfig, Command(cmd): Command) -> Result<Self> {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: config.rows.max(1),
+                cols: config.cols.max(1),
+                pixel_width: config.cell_width_px.saturating_mul(config.cols),
+                pixel_height: config.cell_height_px.saturating_mul(config.rows),
+            })
+            .map_err(|e| Error::Spawn(e.to_string()))?;
         let child = pair
             .slave
             .spawn_command(cmd)

@@ -585,6 +585,22 @@ glib::wrapper! {
 impl TuniWindow {
     #[must_use]
     pub fn new(app: &adw::Application, settings: Settings) -> Self {
+        let window = Self::without_content(app, settings);
+        window.attach_content();
+        window
+    }
+
+    /// The window [`Self::new`] builds, with its content not in it yet.
+    ///
+    /// The content is what waits for the icon theme. Putting it in the window
+    /// roots the header bar, whose window buttons look up the application's
+    /// icon, and that lookup waits for the theme GTK began loading on a thread
+    /// in `adw::init`: with a big theme, some 165 ms on the main thread with
+    /// nothing else allowed to happen. Projects and their shells can be opened
+    /// on a window without it, so the first window opens them first and
+    /// attaches the content after.
+    #[must_use]
+    pub fn without_content(app: &adw::Application, settings: Settings) -> Self {
         let window: Self = glib::Object::builder()
             .property("application", app)
             .property("default-width", 1100)
@@ -622,18 +638,6 @@ impl TuniWindow {
             }
         });
         window.connect_unrealize(crate::blur::forget);
-        // Realizing is what creates the renderer, which on Vulkan opens every
-        // installed driver in turn, some 35 ms. The first icon the content
-        // looks up waits for the icon theme GTK began loading on a thread in
-        // `adw::init`, so realizing first runs the two side by side instead of
-        // leaving the renderer to `present`. It waits until here because GTK
-        // gives the surface its app id, the thing a desktop matches to the
-        // .desktop entry, only to a window that has its application when it is
-        // realized, and that property is set after `constructed`.
-        WidgetExt::realize(&window);
-        let toasts = window.imp().toasts.borrow().clone();
-        window.set_content(toasts.as_ref());
-        crate::debug::mark("   set_content");
         // Nothing on the machine notices a release while no distribution
         // packages tuni, so the window asks once itself. It is the last thing
         // `new` does and it answers on another thread, so a slow network
@@ -642,6 +646,23 @@ impl TuniWindow {
             window.check_updates(false);
         }
         window
+    }
+
+    /// Puts the content in the window, and the keyboard on the focused pane: a
+    /// shell started before there was content to root it had nowhere to take
+    /// the focus.
+    pub fn attach_content(&self) {
+        // Realizing is what creates the renderer, which on Vulkan opens every
+        // installed driver in turn, some 35 ms. The content waits for the icon
+        // theme, so realizing first runs the two side by side instead of
+        // leaving the renderer to `present`. It waits until here because GTK
+        // gives the surface its app id, the thing a desktop matches to the
+        // .desktop entry, only to a window that has its application when it is
+        // realized, and that property is set after `constructed`.
+        WidgetExt::realize(self);
+        let toasts = self.imp().toasts.borrow().clone();
+        self.set_content(toasts.as_ref());
+        self.focus_pane();
     }
 
     /// Says this window owns the saved session: it is the one restored at
@@ -3187,7 +3208,9 @@ impl TuniWindow {
     /// Starts a shell once its widget has been allocated.
     ///
     /// The shell learns its window size from that first allocation, so starting
-    /// it any earlier opens it at 80x24 and corrects it under its own feet.
+    /// it any earlier opens it at 80x24 and corrects it under its own feet. The
+    /// first window starts its shells before it has been laid out at all, on
+    /// purpose; see `build_window`.
     ///
     /// A restored pane replays what it had printed once the shell is up, so the
     /// old output sits above the new prompt rather than racing it.

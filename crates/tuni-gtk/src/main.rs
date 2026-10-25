@@ -36,10 +36,12 @@ mod terminal;
 mod tiles;
 mod window;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use adw::prelude::*;
 use gtk::glib;
+use tuni_pty::{Pty, PtyConfig};
 
 use terminal::TuniTerminal;
 use window::TuniWindow;
@@ -152,6 +154,10 @@ pub(crate) const ACCELS: &[(&str, &[&str])] = &[
 fn main() -> glib::ExitCode {
     debug::mark("main");
     quieten();
+    if let Some(shell) = early_shell() {
+        terminal::expect_early_shell(shell);
+    }
+    init_adwaita();
     debug::mark("gtk::init");
 
     // One instance, and every later launch is forwarded to it as a command
@@ -224,7 +230,11 @@ fn main() -> glib::ExitCode {
     // line, so both jobs are here: the first launch builds the window, and
     // every launch after it is a project in the window that exists.
     app.connect_command_line(|app, cmdline| {
-        let directory = launch_directory(cmdline);
+        let directory = launch_directory(
+            cmdline.cwd(),
+            &cmdline.arguments(),
+            cmdline.getenv("HOME").map(PathBuf::from),
+        );
         // The focused window, else any of them: a window that has never been
         // focused is still a window to open the project in, and building a
         // second one would be the thing this is here to avoid.
@@ -321,11 +331,13 @@ fn separate_process() -> gtk::gio::ApplicationFlags {
 /// it, because that is where an application menu launches everything from and a
 /// session restored with a project per checkout does not want a tenth project
 /// for the home directory on top.
-fn launch_directory(cmdline: &gtk::gio::ApplicationCommandLine) -> Option<PathBuf> {
-    let cwd = cmdline.cwd();
-    let named = cmdline
-        .arguments()
-        .into_iter()
+fn launch_directory(
+    cwd: Option<PathBuf>,
+    arguments: &[OsString],
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let named = arguments
+        .iter()
         .skip(1)
         .find(|argument| !argument.to_string_lossy().starts_with('-'));
     if let Some(named) = named {
@@ -338,8 +350,87 @@ fn launch_directory(cmdline: &gtk::gio::ApplicationCommandLine) -> Option<PathBu
     }
 
     let cwd = cwd?;
-    let home = cmdline.getenv("HOME").map(PathBuf::from);
     (Some(&cwd) != home.as_ref() && cwd.is_dir()).then_some(cwd)
+}
+
+/// The first window's shell, started on a thread before GTK is.
+///
+/// Starting GTK is 35 to 60 ms of opening the display and parsing the theme,
+/// and a shell needs none of it, so the one the first window is about to ask
+/// for loads its own configuration in that time rather than after it. It is a
+/// guess at what that window will ask for, and `TuniTerminal::start` adopts it
+/// only when the shell it would have started is this one. A wrong guess is a
+/// shell that read its startup files and was hung up, so there is no guess
+/// where the answer is not cheap to know here: a session about to be
+/// restored, whose panes are wherever they were left, or a launch about to
+/// hand itself to the Tuni already running, which opens no window of its own.
+/// Two launches racing for the bus can both get past that, and the one that
+/// loses hangs up a shell nobody saw.
+fn early_shell() -> Option<std::thread::JoinHandle<Option<(PtyConfig, Pty)>>> {
+    if separate_process().is_empty() && primary_running() {
+        return None;
+    }
+    let settings = tuni_core::settings::Settings::load();
+    if window::session_enabled()
+        && settings.restore_session
+        && tuni_core::session::Snapshot::path().exists()
+    {
+        return None;
+    }
+    // Where `build_window` opens its project without a session, and so where
+    // `directory_for_new_shell` starts the first shell: the directory the
+    // launch named, else the process's own. Each is read the way that path
+    // reads it, `g_get_current_dir` for the one and `getcwd` for the other,
+    // since they differ under a symlink.
+    let arguments: Vec<OsString> = std::env::args_os().collect();
+    let cwd = launch_directory(
+        Some(glib::current_dir()),
+        &arguments,
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+    .or_else(|| std::env::current_dir().ok());
+    let config = PtyConfig {
+        shell: tuni_pty::resolve_shell(&settings.terminal.command),
+        cwd,
+        ..PtyConfig::default()
+    };
+    // Everything that reads the environment happens above, on this thread.
+    // GTK takes the activation token out of it as it starts, and glibc's
+    // `unsetenv` shifts the entries after it in place, so a read running
+    // alongside can step over one: a shell without `PATH`.
+    let command = Pty::command(&config);
+    std::thread::Builder::new()
+        .name("tuni-early-shell".to_owned())
+        .spawn(move || {
+            let pty = Pty::spawn_command(&config, command).ok()?;
+            Some((config, pty))
+        })
+        .ok()
+}
+
+/// Whether the application id is already on the session bus, which is the
+/// question `GApplication` is about to ask it before handing this launch over.
+/// No answer counts as yes, since the cost of a wrong yes is only a shell
+/// started at the usual time.
+fn primary_running() -> bool {
+    let Ok(bus) = gtk::gio::bus_get_sync(gtk::gio::BusType::Session, gtk::gio::Cancellable::NONE)
+    else {
+        return true;
+    };
+    bus.call_sync(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "NameHasOwner",
+        Some(&(APP_ID,).to_variant()),
+        None,
+        gtk::gio::DBusCallFlags::NONE,
+        -1,
+        gtk::gio::Cancellable::NONE,
+    )
+    .ok()
+    .and_then(|reply| reply.get::<(bool,)>())
+    .is_none_or(|(owned,)| owned)
 }
 
 /// The two lines a terminal on this desktop prints before it has drawn
@@ -362,7 +453,8 @@ fn launch_directory(cmdline: &gtk::gio::ApplicationCommandLine) -> Option<PathBu
 fn quieten() {
     if std::env::var_os("MESA_VK_IGNORE_CONFORMANCE_WARNING").is_none() {
         // SAFETY: nothing else has started yet — this is the first statement
-        // of `main`, before GTK, its renderer, or a thread of ours exists.
+        // of `main`, before GTK, its renderer, or a thread of ours exists;
+        // the early shell's thread starts after this returns.
         unsafe { std::env::set_var("MESA_VK_IGNORE_CONFORMANCE_WARNING", "1") };
     }
 
@@ -385,7 +477,11 @@ fn quieten() {
         // SAFETY: as above — still before GTK, its renderer, or any thread.
         unsafe { std::env::set_var("GSK_DEBUG", "full-redraw") };
     }
+}
 
+/// GTK, then libadwaita, with the dark-theme warning `quieten` describes
+/// dropped on the way.
+fn init_adwaita() {
     // libadwaita before anything reads a GtkSettings, because the first read
     // loads the theme's CSS, the CSS creates the icon theme, and creating it
     // starts loading the whole theme on a thread under the theme's lock.
@@ -425,45 +521,52 @@ fn build_window(app: &adw::Application, directory: Option<&Path>) {
     debug::mark("activate");
     let settings = settings();
     window::apply_appearance(settings.appearance);
-    let window = TuniWindow::new(app, settings);
+    let window = TuniWindow::without_content(app, settings);
     debug::mark("window built");
     // The window the application opens with is the one the saved session
     // belongs to. Windows opened beside it neither restore it nor write it.
     window.own_session();
-    window.present();
-    debug::mark("presented");
-    // The first frame is what the person is waiting for, and `present` only
-    // asks for it. The frame clock says when it arrived.
-    window.connect_map(|window| {
-        if let Some(clock) = window.frame_clock() {
-            clock.connect_after_paint(|_| debug::mark("first frame"));
-        }
-    });
-
-    // The first project's shell learns its size from the first allocation, so
-    // it opens after the window is on screen rather than before.
-    let directory = directory.map(Path::to_path_buf);
-    glib::idle_add_local_once(glib::clone!(
-        #[weak]
-        window,
-        move || {
-            // A saved session opens as it was left; anything else opens as a
-            // first run does.
-            let restored = window::session_enabled() && window.restore_session();
-            // A launch that named a directory gets a project for it either way:
-            // the session is what was there before, and the directory is what
-            // was asked for now.
-            if let Some(directory) = directory {
-                window.open_project_in(Some(&directory));
-            } else if !restored {
-                window.open_project();
+    // A saved session opens as it was left; anything else opens as a first
+    // run does.
+    let restored = window::session_enabled() && window.restore_session();
+    // A launch that named a directory gets a project for it either way: the
+    // session is what was there before, and the directory is what was asked
+    // for now.
+    if let Some(directory) = directory {
+        window.open_project_in(Some(directory));
+    } else if !restored {
+        window.open_project();
+    }
+    debug::mark("project open");
+    // The shells start before the window has its content, not after. The
+    // content waits for the icon theme (see `TuniWindow::without_content`),
+    // which with a big theme is most of the wait before the first frame, and
+    // a shell started first loads its own configuration in the same time, so
+    // the prompt is there when the window is. The price is the size: nothing
+    // has been laid out, so the shell opens at the 80x24 fallback and the
+    // first allocation corrects it, the way a shell in a tab behind the
+    // selected one always has. Each start waits in an idle; this one is
+    // lower, so they all run before it.
+    glib::idle_add_local_full(
+        glib::Priority::LOW,
+        glib::clone!(
+            #[weak]
+            window,
+            #[upgrade_or]
+            glib::ControlFlow::Break,
+            move || {
+                window.attach_content();
+                debug::mark("content");
+                window.present();
+                debug::mark("presented");
+                // A window restored onto a file or a diff has no terminal in
+                // the pane that is focused, and a capture of it is still a
+                // capture.
+                maybe_capture(&window, window.active_terminal().as_ref());
+                glib::ControlFlow::Break
             }
-            debug::mark("project open");
-            // A window restored onto a file or a diff has no terminal in the
-            // pane that is focused, and a capture of it is still a capture.
-            maybe_capture(&window, window.active_terminal().as_ref());
-        }
-    ));
+        ),
+    );
 }
 
 /// The settings for this run: the file, then the environment on top of it.

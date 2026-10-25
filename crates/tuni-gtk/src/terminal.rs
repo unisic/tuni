@@ -64,6 +64,31 @@ const CWD_POLL: Duration = Duration::from_secs(2);
 /// anything shorter than the poll above cannot be measured anyway.
 const LONG_COMMAND_SECONDS: u64 = 10;
 
+/// A shell started before GTK was, with what it was started with.
+type EarlyShell = std::thread::JoinHandle<Option<(PtyConfig, Pty)>>;
+
+thread_local! {
+    /// The first window's shell, on its way (see `early_shell` in main.rs).
+    static EARLY_SHELL: RefCell<Option<EarlyShell>> = const { RefCell::new(None) };
+}
+
+pub fn expect_early_shell(shell: EarlyShell) {
+    EARLY_SHELL.replace(Some(shell));
+}
+
+/// The shell started early, when it runs what `config` asks for, wherever it
+/// asks for it. Only the first terminal to start asks: a guess that turned out
+/// wrong is dropped there, which hangs it up, rather than kept for a pane that
+/// may never come.
+fn early_shell(config: &PtyConfig) -> Option<Pty> {
+    let (early, pty) = EARLY_SHELL.take()?.join().ok()??;
+    (early.shell == config.shell
+        && early.argv == config.argv
+        && early.cwd == config.cwd
+        && early.env == config.env)
+        .then_some(pty)
+}
+
 /// What a pane's session runs. `Launch::default()` is the configured shell in
 /// no particular directory, which is what every pane was before a pane could
 /// run anything else.
@@ -1508,7 +1533,15 @@ impl TuniTerminal {
             ..PtyConfig::default()
         };
         config.env.extend(launch.env.iter().cloned());
-        let pty = Pty::spawn(&config).map_err(|e| e.to_string())?;
+        let pty = match early_shell(&config) {
+            Some(pty) => {
+                // Started before there were metrics to give it pixels; a size
+                // it already has costs the kernel a comparison.
+                let _ = pty.resize(cols, rows, config.cell_width_px, config.cell_height_px);
+                pty
+            }
+            None => Pty::spawn(&config).map_err(|e| e.to_string())?,
+        };
 
         let events = pty.events();
         imp.session.replace(Some(Session {
