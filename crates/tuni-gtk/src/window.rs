@@ -622,6 +622,18 @@ impl TuniWindow {
             }
         });
         window.connect_unrealize(crate::blur::forget);
+        // Realizing is what creates the renderer, which on Vulkan opens every
+        // installed driver in turn, some 35 ms. The first icon the content
+        // looks up waits for the icon theme GTK began loading on a thread in
+        // `adw::init`, so realizing first runs the two side by side instead of
+        // leaving the renderer to `present`. It waits until here because GTK
+        // gives the surface its app id, the thing a desktop matches to the
+        // .desktop entry, only to a window that has its application when it is
+        // realized, and that property is set after `constructed`.
+        WidgetExt::realize(&window);
+        let toasts = window.imp().toasts.borrow().clone();
+        window.set_content(toasts.as_ref());
+        crate::debug::mark("   set_content");
         // Nothing on the machine notices a release while no distribution
         // packages tuni, so the window asks once itself. It is the last thing
         // `new` does and it answers on another thread, so a slow network
@@ -986,9 +998,8 @@ impl TuniWindow {
 
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&split));
-        self.imp().toasts.replace(Some(toasts.clone()));
-        self.set_content(Some(&toasts));
-        crate::debug::mark("   set_content");
+        // Put in by `new`, once the window is realized.
+        self.imp().toasts.replace(Some(toasts));
 
         // What being given the window back is worth: a host list re-reads files
         // the user edits somewhere else, since coming back is when they would
