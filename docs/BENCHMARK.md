@@ -25,7 +25,7 @@ scripts/throughput.sh 200 alacritty ghostty kitty foot konsole ptyxis \
 | RAM | 32 GiB |
 | GPU | AMD Radeon RX 9070 XT (Navi 48) |
 | Kernel | 7.1.5-200.fc44.x86_64, Fedora 44; 7.2.11-200.fc44.x86_64 for the October run |
-| Session | KDE Plasma on Wayland (KWin); the X11 terminals run through Xwayland |
+| Session | KDE Plasma on Wayland (KWin); the X11 terminals run through Xwayland; the 2026-10-25 run in a headless KWin |
 | Date | 2026-07-28; tuni, kero and konsole again on 2026-10-24; tuni, foot, alacritty, kitty and konsole side by side on 2026-10-25 |
 
 ## Results
@@ -89,53 +89,111 @@ Reading it:
 
 ## Startup, memory and idle
 
-On 2026-10-25 five terminals ran side by side in one invocation:
+On 2026-10-25 five terminals ran side by side in one invocation, with tuni at
+e69fa8c:
 
 ```sh
-RUNS=5 scripts/throughput.sh 200 foot alacritty kitty konsole
+RUNS=5 nice -n 19 scripts/throughput.sh 200 foot alacritty kitty konsole
 ```
 
 foot, alacritty and kitty were no longer installed, so they ran out of their
 Fedora 44 packages unpacked into a directory, with `LD_LIBRARY_PATH` at the
-libraries that came with them. The load average was 3.6 to 4.7 throughout,
-from other work on the machine, which is why every throughput here is below
-its row in the table above.
+libraries that came with them. Every window opened in a headless KWin
+(`kwin_wayland --virtual`) on a session bus of its own, so nothing on the
+desktop lost focus. A game was running beside it, which is why the run was
+niced and why the load average was 3.3 to 4.2; every throughput here is below
+its row in the table above for that reason.
 
-| Terminal | Version | Startup | Consume | Throughput | RSS | PSS | Idle |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **tuni** | 1.6.0 (8cc3679) | 0.259 s | 1.339 s | **149.4 MiB/s** | 120.3 MiB | 56.9 MiB | 0 ms |
-| foot | 1.27.0 | 0.017 s | 1.517 s | 131.8 MiB/s | 17.0 MiB | 7.5 MiB | 0 ms |
-| alacritty | 0.17.0 | 0.051 s | 2.024 s | 98.7 MiB/s | 85.7 MiB | 31.1 MiB | 10 ms |
-| kitty | 0.47.1 | 0.128 s | 2.113 s | 94.6 MiB/s | 113.1 MiB | 49.1 MiB | 10 ms |
-| konsole | 26.08.1 | 0.124 s | 4.692 s | 42.6 MiB/s | 93.9 MiB | 29.3 MiB | 0 ms |
+| Terminal | Version | Startup | First frame | Consume | Throughput | RSS | PSS | Idle |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **tuni** | 1.6.0 (e69fa8c) | 0.028 s | 234 ms | 1.525 s | **131.1 MiB/s** | 117.9 MiB | 53.1 MiB | 0 ms |
+| foot | 1.27.0 | 0.017 s | 22 ms | 1.821 s | 109.8 MiB/s | 17.0 MiB | 7.4 MiB | 0 ms |
+| alacritty | 0.17.0 | 0.051 s | 56 ms | 2.002 s | 99.9 MiB/s | 85.8 MiB | 30.7 MiB | 0 ms |
+| kitty | 0.47.1 | 0.120 s | 94 ms | 1.968 s | 101.6 MiB/s | 113.0 MiB | 48.4 MiB | 0 ms |
+| konsole | 26.08.1 | 0.127 s | 127 ms | 5.127 s | 39.0 MiB/s | 94.9 MiB | 30.4 MiB | 0 ms |
 
-Startup is the empty run: launch until the shell has run `touch`. Memory is
-read from `/proc/<pid>/smaps_rollup` three seconds after that, once a GTK
-window has stopped painting its first frames. PSS divides each shared page
-among the processes mapping it, so it is the fairer column; RSS counts all of
-Mesa's `libLLVM` (25 MiB) against every GPU terminal. Idle is the CPU the
-process spends in the five seconds after the memory read, counted in 10 ms
-clock ticks, so 10 ms is one tick and 0 is less than one.
+Startup is the empty run: launch until the shell has run `touch`. First frame
+is launch until the first `wl_surface.attach` of a buffer that
+`WAYLAND_DEBUG=client` prints, median of five, measured straight after the run
+in the same session. Memory is read from `/proc/<pid>/smaps_rollup` three
+seconds after `touch`, once a GTK window has stopped painting its first
+frames. PSS divides each shared page among the processes mapping it, so it is
+the fairer column; RSS counts all of Mesa's `libLLVM` (25 MiB) against every
+GPU terminal. Idle is the CPU the process spends in the five seconds after the
+memory read, counted in 10 ms clock ticks, so 10 ms is one tick and 0 is less
+than one.
 
 Reading it:
 
-- tuni consumes first, 13% ahead of foot, and idles at zero. In steady state
+- tuni consumes first, 19% ahead of foot, and idles at zero. In steady state
   its only periodic work is two `/proc` reads every two seconds per pane, the
   foreground process and the working directory, about 0.06 ms each.
-- It is last on startup and on memory, and most of both is GTK loading the
-  icon theme. GTK does that on a thread and the first icon the window draws
-  waits for it; with Papirus-Dark, the theme on this machine, the load is
-  about 180 ms of CPU building hash tables out of the theme's cache, the same
-  in a bare GTK program with nothing of tuni in it. With the stock theme (an
-  empty `XDG_DATA_HOME`) the same build starts in 168 ms with 40.1 MiB PSS,
-  against 302 ms and 55.0 MiB with Papirus, median of seven each.
-- Before this run tuni loaded that theme several times over: every search
-  path added after GTK starts the load throws it away. Loading it once took
-  the median startup from 728 to 310 ms and PSS from 65 to 56 MiB, and
+- Startup and first frame are one moment for the other four and two for tuni.
+  Since dce2a1b the first shell is spawned on a thread before GTK starts, so
+  it runs `touch` 28 ms after launch while the window is still being built;
+  the others start their shell after their window. The column that compares
+  what a person sees is first frame, and there tuni is last.
+- It is last on memory too. The next section is what both of those are made
+  of.
+
+### What GTK costs before tuni does anything
+
+`floor` is a C program holding nothing but an `AdwApplicationWindow`, a header
+bar and a label, linked against the same GTK 4.22.5 and libadwaita 1.9.4 and
+measured the same way. The stock theme is an empty `XDG_DATA_HOME`, which
+hides Papirus-Dark, the icon theme on this machine.
+
+| | First frame, Papirus-Dark | First frame, stock | PSS, Papirus-Dark | PSS, stock |
+| --- | ---: | ---: | ---: | ---: |
+| tuni | 234 ms | 127 ms | 53.1 MiB | 38.6 MiB |
+| floor | 259 ms | 103 ms | 41.1 MiB | 25.9 MiB |
+
+- With Papirus-Dark, tuni draws its first frame 25 ms before the empty window
+  does: it creates the renderer while the theme loads, which floor does not.
+  All four other terminals are ahead of that floor, so no change inside tuni
+  can bring its first frame below theirs while it is a GTK program. With the
+  stock theme the floor is 103 ms, still behind foot, alacritty and kitty.
+- Most of the gap between the two columns is GTK loading the icon theme. GTK
+  does that on a thread and the first icon the window draws waits for it; with
+  Papirus-Dark that is about 180 ms of CPU building hash tables out of the
+  theme's cache, the same in floor as in tuni, and 13.1 MiB of tuni's PSS is
+  those tables, still allocated in the loader thread's arena.
+- PSS has the same shape. The empty window is above foot, alacritty and
+  konsole before any terminal exists in it, and kitty is 7.3 MiB above it.
+  tuni is 12 MiB above it, 4.7 MiB above kitty, and the largest single part of
+  that is tuni's own binary: 6.4 MiB mapped, 4.9 MiB of it code, measured
+  before the relocations were packed.
+- Linking alone has a price. From exec to `main`, median of fifteen: 0.4 ms
+  for a program linked only against GLib, 13.4 ms against GTK 4 (114
+  libraries), 17.7 ms against libadwaita (134). The early shell cannot start
+  before `main`, so 17.7 ms is the floor under tuni's startup column, and
+  foot's whole startup is 17 ms. Under it would take a launcher without GTK
+  that starts the shell and then loads the rest, and the window would appear
+  no sooner for it, so it has not been built.
+
+### What moved it
+
+- Before this round tuni loaded the icon theme several times over: every
+  search path added after GTK starts the load throws it away. Loading it once
+  took the median startup from 728 to 310 ms and PSS from 65 to 56 MiB, and
   creating the renderer while the theme loads took startup to 278 ms (seven
   launches each, interleaved, load average 4 to 7).
-- foot's 17 ms and 7.5 MiB are a Wayland client with no toolkit and no GPU
-  context; every other row has at least one of the two.
+- Starting the shell before GTK (dce2a1b) took the startup column from 259 to
+  28 ms. It moves the shell, not the window.
+- A `malloc_trim` on the tick after the first frame hands back what startup
+  freed: median PSS 55.0 to 53.6 MiB over two interleaved series of three,
+  first frame unchanged within noise. Every `madvise` of a whole run together
+  took 0.42 ms.
+- Linking with `-z pack-relative-relocs` writes the binary's 22 837 relative
+  relocations as DT_RELR, 33 KiB instead of 574: PSS 53.4 to 52.95 MiB, the
+  file 528 KiB smaller, first frame unchanged within noise.
+- Tried and kept out: setting `gtk-icon-theme-name` to Adwaita before
+  `adw::init`. PSS fell from 55.0 to 47.2 MiB, but the window was presented at
+  about 281 ms instead of 209, because the settings GDK reads from the desktop
+  portal name Papirus-Dark while `gtk::init` opens the display, before tuni
+  can set anything, so the load has already started and switching adds a
+  second one. It would also replace the
+  icons the desktop asked for.
 
 ## tuni against kero
 

@@ -84,16 +84,18 @@ with a whole workspace drawn around the terminal.
 Side by side on 2026-10-25, under load, with memory three seconds after the
 shell started and CPU over the five idle seconds after that:
 
-| Terminal | Startup | PSS | Idle | Throughput |
-| --- | ---: | ---: | ---: | ---: |
-| **tuni** | 0.259 s | 56.9 MiB | 0 ms | **149.4 MiB/s** |
-| foot | 0.017 s | 7.5 MiB | 0 ms | 131.8 MiB/s |
-| alacritty | 0.051 s | 31.1 MiB | 10 ms | 98.7 MiB/s |
-| kitty | 0.128 s | 49.1 MiB | 10 ms | 94.6 MiB/s |
-| konsole | 0.124 s | 29.3 MiB | 0 ms | 42.6 MiB/s |
+| Terminal | Startup | First frame | PSS | Idle | Throughput |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **tuni** | 0.028 s | 234 ms | 53.1 MiB | 0 ms | **131.1 MiB/s** |
+| foot | 0.017 s | 22 ms | 7.4 MiB | 0 ms | 109.8 MiB/s |
+| alacritty | 0.051 s | 56 ms | 30.7 MiB | 0 ms | 99.9 MiB/s |
+| kitty | 0.120 s | 94 ms | 48.4 MiB | 0 ms | 101.6 MiB/s |
+| konsole | 0.127 s | 127 ms | 30.4 MiB | 0 ms | 39.0 MiB/s |
 
-Startup and memory are mostly GTK loading the icon theme: with the stock one
-instead of Papirus, tuni starts in 168 ms with 40 MiB PSS.
+Startup is when the shell ran, and tuni starts its shell before its window.
+First frame and memory are mostly GTK: an empty libadwaita window on the same
+machine takes 259 ms to its first frame and 41 MiB PSS with the icon theme
+there, Papirus-Dark, and 103 ms and 26 MiB with the stock one.
 
 [docs/BENCHMARK.md](docs/BENCHMARK.md) - method, environment, caveats, where
 the startup and memory go, and the head-to-head with kero.
