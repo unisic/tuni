@@ -64,15 +64,13 @@ const CWD_POLL: Duration = Duration::from_secs(2);
 /// anything shorter than the poll above cannot be measured anyway.
 const LONG_COMMAND_SECONDS: u64 = 10;
 
-/// A shell started before GTK was, with what it was started with.
-type EarlyShell = std::thread::JoinHandle<Option<(PtyConfig, Pty)>>;
-
 thread_local! {
-    /// The first window's shell, on its way (see `early_shell` in main.rs).
-    static EARLY_SHELL: RefCell<Option<EarlyShell>> = const { RefCell::new(None) };
+    /// The first window's shell and what it was started with, by the `tuni`
+    /// launcher before this program was (see `src/bin/tuni.rs`).
+    static EARLY_SHELL: RefCell<Option<(PtyConfig, Pty)>> = const { RefCell::new(None) };
 }
 
-pub fn expect_early_shell(shell: EarlyShell) {
+pub fn expect_early_shell(shell: (PtyConfig, Pty)) {
     EARLY_SHELL.replace(Some(shell));
 }
 
@@ -81,7 +79,7 @@ pub fn expect_early_shell(shell: EarlyShell) {
 /// wrong is dropped there, which hangs it up, rather than kept for a pane that
 /// may never come.
 fn early_shell(config: &PtyConfig) -> Option<Pty> {
-    let (early, pty) = EARLY_SHELL.take()?.join().ok()??;
+    let (early, pty) = EARLY_SHELL.take()?;
     (early.shell == config.shell
         && early.argv == config.argv
         && early.cwd == config.cwd

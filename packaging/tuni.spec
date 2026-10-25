@@ -79,6 +79,7 @@ appstream-util validate-relax --nonet \
 %license LICENSE
 %doc README.md
 %{_bindir}/%{name}
+%{_bindir}/%{name}-gtk
 %{_datadir}/applications/%{app_id}.desktop
 %{_datadir}/metainfo/%{app_id}.metainfo.xml
 # Globbed rather than listed: the icons come from `make install-data`, which is

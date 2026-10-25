@@ -87,10 +87,10 @@ jobs:
           mkdir -p dist && cp "rpmbuild/RPMS/x86_64/tuni-${VERSION}-"*.rpm dist/
 
       - name: Install what was built
-        run: dnf install -y ./dist/*.rpm && test -x /usr/bin/tuni
+        run: dnf install -y ./dist/*.rpm && test -x /usr/bin/tuni && test -x /usr/bin/tuni-gtk
 
       - name: Check the binary against the baseline CPU
-        run: scripts/check-baseline.sh /usr/bin/tuni
+        run: scripts/check-baseline.sh /usr/bin/tuni-gtk
 
       - uses: actions/upload-artifact@v7
         with:
@@ -133,10 +133,10 @@ jobs:
           mkdir -p dist && mv ../*.deb dist/
 
       - name: Install what was built
-        run: apt-get install -y ./dist/*.deb && test -x /usr/bin/tuni
+        run: apt-get install -y ./dist/*.deb && test -x /usr/bin/tuni && test -x /usr/bin/tuni-gtk
 
       - name: Check the binary against the baseline CPU
-        run: scripts/check-baseline.sh /usr/bin/tuni
+        run: scripts/check-baseline.sh /usr/bin/tuni-gtk
 
       - uses: actions/upload-artifact@v7
         with:
@@ -174,10 +174,10 @@ jobs:
           mkdir -p dist && cp packaging/arch/*.pkg.tar.zst dist/
 
       - name: Install what was built
-        run: pacman -U --noconfirm ./dist/*.pkg.tar.zst && test -x /usr/bin/tuni
+        run: pacman -U --noconfirm ./dist/*.pkg.tar.zst && test -x /usr/bin/tuni && test -x /usr/bin/tuni-gtk
 
       - name: Check the binary against the baseline CPU
-        run: scripts/check-baseline.sh /usr/bin/tuni
+        run: scripts/check-baseline.sh /usr/bin/tuni-gtk
 
       - uses: actions/upload-artifact@v7
         with:

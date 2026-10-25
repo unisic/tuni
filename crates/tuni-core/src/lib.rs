@@ -13,6 +13,7 @@ pub mod files;
 pub mod fuzzy;
 pub mod git;
 pub mod info;
+pub mod launch;
 pub mod links;
 pub mod lsp;
 pub mod panes;

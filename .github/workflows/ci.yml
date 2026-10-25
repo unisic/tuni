@@ -69,7 +69,7 @@ jobs:
         run: make build
 
       - name: Check the binary against the baseline CPU
-        run: scripts/check-baseline.sh target/release/tuni
+        run: scripts/check-baseline.sh target/release/tuni-gtk
 
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings

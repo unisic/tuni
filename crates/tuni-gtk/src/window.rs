@@ -1837,7 +1837,7 @@ impl TuniWindow {
     /// Runs while the window is closing, so it does the least it can: a
     /// snapshot of the model, one pass over the live terminals, two files.
     fn save_session(&self) {
-        if !session_enabled() || !self.imp().session_owner.get() {
+        if !tuni_core::session::enabled() || !self.imp().session_owner.get() {
             return;
         }
         let imp = self.imp();
@@ -6944,18 +6944,6 @@ fn load_css() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     });
-}
-
-/// Whether this run reads and writes the saved session at all.
-///
-/// `TUNI_SESSION=off` opens an empty window and leaves the saved one exactly
-/// as it was, which is what the smoke captures want: a capture that restored
-/// yesterday's window would be a picture of yesterday, and one that saved its
-/// own would throw away a real session.
-#[must_use]
-pub fn session_enabled() -> bool {
-    !std::env::var("TUNI_SESSION")
-        .is_ok_and(|value| matches!(value.trim(), "0" | "off" | "no" | "false"))
 }
 
 /// Tell libadwaita which appearance was asked for.

@@ -90,7 +90,8 @@ Reading it:
 ## Startup, memory and idle
 
 On 2026-10-25 five terminals ran side by side in one invocation, with tuni at
-ab2d619:
+the commit after b32b8ab, the one that splits it into a launcher and the
+application:
 
 ```sh
 RUNS=5 nice -n 19 scripts/throughput.sh 200 foot alacritty kitty konsole
@@ -101,23 +102,23 @@ Fedora 44 packages unpacked into a directory, with `LD_LIBRARY_PATH` at the
 libraries that came with them. Every window opened in a headless KWin
 (`kwin_wayland --virtual`) on a session bus of its own, so nothing on the
 desktop lost focus. A game was running beside it, which is why the run was
-niced and why the load average was 2.8 to 3.1; every throughput here is below
+niced and why the load average was 4.4 to 4.8; every throughput here is below
 its row in the table above for that reason.
 
 | Terminal | Version | Startup | First frame | Consume | Throughput | RSS | PSS | Idle |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **tuni** | 1.6.0 (ab2d619) | 0.024 s | 233 ms | 1.276 s | **156.7 MiB/s** | 112.1 MiB | 48.1 MiB | 10 ms |
-| foot | 1.27.0 | 0.017 s | 22 ms | 1.565 s | 127.8 MiB/s | 17.0 MiB | 7.4 MiB | 0 ms |
-| alacritty | 0.17.0 | 0.046 s | 55 ms | 1.782 s | 112.2 MiB/s | 86.0 MiB | 30.8 MiB | 0 ms |
-| kitty | 0.47.1 | 0.120 s | 90 ms | 1.793 s | 111.5 MiB/s | 113.1 MiB | 48.4 MiB | 0 ms |
-| konsole | 26.08.1 | 0.124 s | 128 ms | 4.942 s | 40.4 MiB/s | 94.9 MiB | 30.4 MiB | 0 ms |
+| **tuni** | 1.6.0 | **0.006 s** | 261 ms | 1.739 s | **115.0 MiB/s** | 111.5 MiB | 47.4 MiB | 0 ms |
+| foot | 1.27.0 | 0.017 s | 23 ms | 1.963 s | 101.8 MiB/s | 16.8 MiB | 7.4 MiB | 0 ms |
+| alacritty | 0.17.0 | 0.053 s | 60 ms | 2.232 s | 89.6 MiB/s | 85.8 MiB | 30.6 MiB | 0 ms |
+| kitty | 0.47.1 | 0.128 s | 101 ms | 2.332 s | 85.7 MiB/s | 113.2 MiB | 48.3 MiB | 0 ms |
+| konsole | 26.08.1 | 0.146 s | 137 ms | 5.290 s | 37.8 MiB/s | 95.2 MiB | 30.0 MiB | 0 ms |
 
 Startup is the empty run: launch until the shell has run `touch`. First frame
 is launch until the first `wl_surface.attach` of a buffer that
 `WAYLAND_DEBUG=client` prints, median of five, measured straight after the run
-in the same session; tuni's is the median of nine launches interleaved with
-the build before ab2d619, because its first series of five spread from 253 to
-326 ms. Memory is read from `/proc/<pid>/smaps_rollup` three
+in the same session, at a load average of 2.7 to 3.1; tuni's is the median of
+nine, because its launches spread wider than the others' (254 to 299 ms).
+Memory is read from `/proc/<pid>/smaps_rollup` three
 seconds after `touch`, once a GTK window has stopped painting its first
 frames. PSS divides each shared page among the processes mapping it, so it is
 the fairer column; RSS counts all of Mesa's `libLLVM` (25 MiB) against every
@@ -127,18 +128,18 @@ than one.
 
 Reading it:
 
-- tuni consumes first, 23% ahead of foot. Its 10 ms of idle is one clock
-  tick: over 20 seconds, three launches each, it spends 0 or 1 tick and wakes
+- tuni consumes first, 13% ahead of foot. Its idle is under one clock tick
+  here and has been one in other runs: over 20 seconds, three launches each,
+  it spends 0 or 1 tick and wakes
   66 to 68 times both before ab2d619 and after it. In steady state its only
   periodic work is two `/proc` reads every two seconds per pane, the
   foreground process and the working directory, about 0.06 ms each.
 - Startup and first frame are one moment for the other four and two for tuni.
-  Since dce2a1b the first shell is spawned on a thread before GTK starts, so
-  it runs `touch` 24 ms after launch while the window is still being built;
-  the others start their shell after their window. The column that compares
-  what a person sees is first frame, and there tuni is last.
-- On memory it is just under kitty, 47.9 against 48.4 MiB as the median of
-  five launches each with nothing else measured in between, and above the
+  `tuni` starts the first shell before it loads GTK at all, so the shell runs
+  `touch` 6 ms after launch, ahead of foot's 17, while the window is still
+  being built; the others start their shell after their window. The column
+  that compares what a person sees is first frame, and there tuni is last.
+- On memory it is just under kitty, 47.4 against 48.3 MiB, and above the
   other three. The next section is what both of those are made of.
 
 ### What GTK costs before tuni does anything
@@ -150,7 +151,7 @@ hides Papirus-Dark, the icon theme on this machine.
 
 | | First frame, Papirus-Dark | First frame, stock | PSS, Papirus-Dark | PSS, stock |
 | --- | ---: | ---: | ---: | ---: |
-| tuni | 233 ms | 117 ms | 48.1 MiB | 33.6 MiB |
+| tuni (ab2d619) | 233 ms | 117 ms | 48.1 MiB | 33.6 MiB |
 | floor | 259 ms | 103 ms | 41.1 MiB | 25.9 MiB |
 
 - With Papirus-Dark, tuni draws its first frame 26 ms before the empty window
@@ -171,11 +172,11 @@ hides Papirus-Dark, the icon theme on this machine.
   binary: 5.8 MiB of PSS, 4.6 MiB of it code.
 - Linking alone has a price. From exec to `main`, median of fifteen: 0.4 ms
   for a program linked only against GLib, 13.4 ms against GTK 4 (114
-  libraries), 17.7 ms against libadwaita (134). The early shell cannot start
-  before `main`, so 17.7 ms is the floor under tuni's startup column, and
-  foot's whole startup is 17 ms. Under it would take a launcher without GTK
-  that starts the shell and then loads the rest, and the window would appear
-  no sooner for it, so it has not been built.
+  libraries), 17.7 ms against libadwaita (134). A shell started in `main`
+  starts no sooner than that, which is why `tuni` is now a launcher linked
+  against GLib and GIO alone: it starts the shell and then `exec`s
+  `tuni-gtk`, which adopts it. The window appears no sooner for it; see
+  below.
 
 ### What moved it
 
@@ -198,6 +199,13 @@ hides Papirus-Dark, the icon theme on this machine.
   52.9 to 47.9 MiB over five launches each, the panel about 4 MiB of it, and
   the first frame from 239.1 to 233.4 ms over nine interleaved launches. The
   panel's first opening pays 6 to 8 ms for it.
+- Splitting `tuni` into a launcher that starts the shell and `exec`s
+  `tuni-gtk` took startup from 26.3 to 5.6 ms, median of nine launches each
+  interleaved with b32b8ab; foot is 17.8 ms measured the same way. The exec
+  and the D-Bus question of whether a Tuni is already running are inside
+  those 5.6 ms. First frame, 277.9 against 282.5 ms over fifteen launches
+  each, and PSS, 47.6 against 47.4 MiB, did not move beyond noise: like
+  dce2a1b, it moves the shell and not the window.
 - Tried and kept out: setting `gtk-icon-theme-name` to Adwaita before
   `adw::init`. PSS fell from 55.0 to 47.2 MiB, but the window was presented at
   about 281 ms instead of 209, because the settings GDK reads from the desktop

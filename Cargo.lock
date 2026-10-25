@@ -1403,6 +1403,7 @@ dependencies = [
  "async-channel",
  "gdk4-wayland",
  "gdk4-x11",
+ "gio",
  "gtk4",
  "libadwaita",
  "libc",

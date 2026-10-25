@@ -86,13 +86,13 @@ shell started and CPU over the five idle seconds after that:
 
 | Terminal | Startup | First frame | PSS | Idle | Throughput |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| **tuni** | 0.024 s | 233 ms | 48.1 MiB | 10 ms | **156.7 MiB/s** |
-| foot | 0.017 s | 22 ms | 7.4 MiB | 0 ms | 127.8 MiB/s |
-| alacritty | 0.046 s | 55 ms | 30.8 MiB | 0 ms | 112.2 MiB/s |
-| kitty | 0.120 s | 90 ms | 48.4 MiB | 0 ms | 111.5 MiB/s |
-| konsole | 0.124 s | 128 ms | 30.4 MiB | 0 ms | 40.4 MiB/s |
+| **tuni** | **0.006 s** | 261 ms | 47.4 MiB | 0 ms | **115.0 MiB/s** |
+| foot | 0.017 s | 23 ms | 7.4 MiB | 0 ms | 101.8 MiB/s |
+| alacritty | 0.053 s | 60 ms | 30.6 MiB | 0 ms | 89.6 MiB/s |
+| kitty | 0.128 s | 101 ms | 48.3 MiB | 0 ms | 85.7 MiB/s |
+| konsole | 0.146 s | 137 ms | 30.0 MiB | 0 ms | 37.8 MiB/s |
 
-Startup is when the shell ran, and tuni starts its shell before its window.
+Startup is when the shell ran, and tuni starts its shell before it loads GTK.
 First frame and memory are mostly GTK: an empty libadwaita window on the same
 machine takes 259 ms to its first frame and 41 MiB PSS with the icon theme
 there, Papirus-Dark, and 103 ms and 26 MiB with the stock one.

@@ -196,6 +196,18 @@ pub struct Restored {
     pub panel_width: Option<f64>,
 }
 
+/// Whether this run reads and writes the saved session at all.
+///
+/// `TUNI_SESSION=off` opens an empty window and leaves the saved one exactly
+/// as it was, which is what the smoke captures want: a capture that restored
+/// yesterday's window would be a picture of yesterday, and one that saved its
+/// own would throw away a real session.
+#[must_use]
+pub fn enabled() -> bool {
+    !std::env::var("TUNI_SESSION")
+        .is_ok_and(|value| matches!(value.trim(), "0" | "off" | "no" | "false"))
+}
+
 impl Snapshot {
     /// The workspace as it stands. `state` is asked, per pane, for the key its
     /// scrollback was saved under — `None` for panes whose output was not

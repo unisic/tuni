@@ -36,17 +36,15 @@ mod terminal;
 mod tiles;
 mod window;
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use adw::prelude::*;
 use gtk::glib;
-use tuni_pty::{Pty, PtyConfig};
+use tuni_core::launch::{APP_ID, launch_directory};
+use tuni_pty::Pty;
 
 use terminal::TuniTerminal;
 use window::TuniWindow;
-
-const APP_ID: &str = "dev.unisic.Tuni";
 
 /// What the keyboard does, as data rather than as scattered constants, so a
 /// configurable keymap has one table to read instead of a scattered set.
@@ -153,10 +151,24 @@ pub(crate) const ACCELS: &[(&str, &[&str])] = &[
 
 fn main() -> glib::ExitCode {
     debug::mark("main");
-    quieten();
-    if let Some(shell) = early_shell() {
+    // SAFETY: the first statements of `main`, before GTK, its renderer, or a
+    // thread of ours exists.
+    let inherited = unsafe { Pty::inherited() };
+    unsafe {
+        tuni_core::launch::quieten(
+            tuni_core::settings::Settings::load()
+                .terminal
+                .background_opacity,
+        );
+    }
+    if let Some(shell) = inherited {
         terminal::expect_early_shell(shell);
     }
+    // The launcher's own name, so the process reads as `tuni` in `top` and to
+    // `pkill` whichever of the two programs it was started as. The threads
+    // started after this take it too, as they did before there were two.
+    // SAFETY: a fixed, NUL-terminated name, read by the kernel and kept.
+    unsafe { libc::prctl(libc::PR_SET_NAME, c"tuni".as_ptr()) };
     init_adwaita();
     debug::mark("gtk::init");
 
@@ -305,136 +317,18 @@ fn checkout_icons(display: &gtk::gdk::Display) {
     }
 }
 
-/// `NON_UNIQUE` when this run must not join the one already going.
-///
-/// A capture renders a window and quits, and forwarded to a running instance it
-/// would render nothing and quit anyway. A build being worked on is the same
-/// problem the other way around: `cargo run` while an installed Tuni is up
-/// would open a window in the installed one and test nothing.
+/// `NON_UNIQUE` when this run must not join the one already going, for the
+/// reasons `tuni_core::launch::separate_process` gives.
 fn separate_process() -> gtk::gio::ApplicationFlags {
-    let separate = std::env::var_os("TUNI_CAPTURE_PNG").is_some()
-        || std::env::var("TUNI_SINGLE_INSTANCE").is_ok_and(|value| value == "0");
-    if separate {
+    if tuni_core::launch::separate_process() {
         gtk::gio::ApplicationFlags::NON_UNIQUE
     } else {
         gtk::gio::ApplicationFlags::empty()
     }
 }
 
-/// The directory a launch was about, if it was about one.
-///
-/// An argument names it outright, which is what a shell alias or a `.desktop`
-/// file with a path in it would use. Otherwise it is the working directory the
-/// launch was made from, which is how a file manager says it: KDE's launcher
-/// sets the child process's directory rather than passing a flag, since only
-/// konsole takes one. A launch from the home directory is not read as naming
-/// it, because that is where an application menu launches everything from and a
-/// session restored with a project per checkout does not want a tenth project
-/// for the home directory on top.
-fn launch_directory(
-    cwd: Option<PathBuf>,
-    arguments: &[OsString],
-    home: Option<PathBuf>,
-) -> Option<PathBuf> {
-    let named = arguments
-        .iter()
-        .skip(1)
-        .find(|argument| !argument.to_string_lossy().starts_with('-'));
-    if let Some(named) = named {
-        let path = PathBuf::from(named);
-        let path = match path.is_absolute() {
-            true => path,
-            false => cwd?.join(path),
-        };
-        return path.is_dir().then_some(path);
-    }
-
-    let cwd = cwd?;
-    (Some(&cwd) != home.as_ref() && cwd.is_dir()).then_some(cwd)
-}
-
-/// The first window's shell, started on a thread before GTK is.
-///
-/// Starting GTK is 35 to 60 ms of opening the display and parsing the theme,
-/// and a shell needs none of it, so the one the first window is about to ask
-/// for loads its own configuration in that time rather than after it. It is a
-/// guess at what that window will ask for, and `TuniTerminal::start` adopts it
-/// only when the shell it would have started is this one. A wrong guess is a
-/// shell that read its startup files and was hung up, so there is no guess
-/// where the answer is not cheap to know here: a session about to be
-/// restored, whose panes are wherever they were left, or a launch about to
-/// hand itself to the Tuni already running, which opens no window of its own.
-/// Two launches racing for the bus can both get past that, and the one that
-/// loses hangs up a shell nobody saw.
-fn early_shell() -> Option<std::thread::JoinHandle<Option<(PtyConfig, Pty)>>> {
-    if separate_process().is_empty() && primary_running() {
-        return None;
-    }
-    let settings = tuni_core::settings::Settings::load();
-    if window::session_enabled()
-        && settings.restore_session
-        && tuni_core::session::Snapshot::path().exists()
-    {
-        return None;
-    }
-    // Where `build_window` opens its project without a session, and so where
-    // `directory_for_new_shell` starts the first shell: the directory the
-    // launch named, else the process's own. Each is read the way that path
-    // reads it, `g_get_current_dir` for the one and `getcwd` for the other,
-    // since they differ under a symlink.
-    let arguments: Vec<OsString> = std::env::args_os().collect();
-    let cwd = launch_directory(
-        Some(glib::current_dir()),
-        &arguments,
-        std::env::var_os("HOME").map(PathBuf::from),
-    )
-    .or_else(|| std::env::current_dir().ok());
-    let config = PtyConfig {
-        shell: tuni_pty::resolve_shell(&settings.terminal.command),
-        cwd,
-        ..PtyConfig::default()
-    };
-    // Everything that reads the environment happens above, on this thread.
-    // GTK takes the activation token out of it as it starts, and glibc's
-    // `unsetenv` shifts the entries after it in place, so a read running
-    // alongside can step over one: a shell without `PATH`.
-    let command = Pty::command(&config);
-    std::thread::Builder::new()
-        .name("tuni-early-shell".to_owned())
-        .spawn(move || {
-            let pty = Pty::spawn_command(&config, command).ok()?;
-            Some((config, pty))
-        })
-        .ok()
-}
-
-/// Whether the application id is already on the session bus, which is the
-/// question `GApplication` is about to ask it before handing this launch over.
-/// No answer counts as yes, since the cost of a wrong yes is only a shell
-/// started at the usual time.
-fn primary_running() -> bool {
-    let Ok(bus) = gtk::gio::bus_get_sync(gtk::gio::BusType::Session, gtk::gio::Cancellable::NONE)
-    else {
-        return true;
-    };
-    bus.call_sync(
-        Some("org.freedesktop.DBus"),
-        "/org/freedesktop/DBus",
-        "org.freedesktop.DBus",
-        "NameHasOwner",
-        Some(&(APP_ID,).to_variant()),
-        None,
-        gtk::gio::DBusCallFlags::NONE,
-        -1,
-        gtk::gio::Cancellable::NONE,
-    )
-    .ok()
-    .and_then(|reply| reply.get::<(bool,)>())
-    .is_none_or(|(owned,)| owned)
-}
-
-/// The two lines a terminal on this desktop prints before it has drawn
-/// anything, neither of which is a fault of the program that lands in.
+/// GTK, then libadwaita, with a warning that is no fault of this program
+/// dropped on the way.
 ///
 /// A desktop that dresses GTK3 in a dark theme writes
 /// `gtk-application-prefer-dark-theme` into `settings.ini` for GTK4 as well,
@@ -444,43 +338,6 @@ fn primary_running() -> bool {
 /// dropped for the one call that prints it, since libadwaita then overwrites
 /// the setting itself. Nothing on screen moves: the property is the one
 /// libadwaita ignores.
-///
-/// Mesa's RADV prints a conformance notice for every Vulkan context, which is
-/// what GTK renders with. It is a statement about the driver's certification,
-/// not about this machine or this program, and Mesa has an environment
-/// variable for saying so once and not again. A value already in the
-/// environment is left alone: somebody who asked for the notice can have it.
-fn quieten() {
-    if std::env::var_os("MESA_VK_IGNORE_CONFORMANCE_WARNING").is_none() {
-        // SAFETY: nothing else has started yet — this is the first statement
-        // of `main`, before GTK, its renderer, or a thread of ours exists;
-        // the early shell's thread starts after this returns.
-        unsafe { std::env::set_var("MESA_VK_IGNORE_CONFORMANCE_WARNING", "1") };
-    }
-
-    // A translucent window has no opaque chrome: every bar's background is
-    // `transparent` and the only paint under a label is the window's own
-    // color, so a pixel GSK's damage tracking leaves out is never covered
-    // again and a sliver of text that has since changed stays on screen. Full
-    // redraws are the one lever GSK offers against that, and the window is
-    // already repainting whole for every terminal frame, so the added work is
-    // the chrome around it. An opaque window paints its own backgrounds and is
-    // left with damage tracking on, because it does not have the problem.
-    // `TUNI_PARTIAL_REDRAW=1` puts it back either way.
-    if std::env::var_os("GSK_DEBUG").is_none()
-        && std::env::var_os("TUNI_PARTIAL_REDRAW").is_none()
-        && tuni_core::settings::Settings::load()
-            .terminal
-            .background_opacity
-            < 1.0
-    {
-        // SAFETY: as above — still before GTK, its renderer, or any thread.
-        unsafe { std::env::set_var("GSK_DEBUG", "full-redraw") };
-    }
-}
-
-/// GTK, then libadwaita, with the dark-theme warning `quieten` describes
-/// dropped on the way.
 fn init_adwaita() {
     // libadwaita before anything reads a GtkSettings, because the first read
     // loads the theme's CSS, the CSS creates the icon theme, and creating it
@@ -528,7 +385,7 @@ fn build_window(app: &adw::Application, directory: Option<&Path>) {
     window.own_session();
     // A saved session opens as it was left; anything else opens as a first
     // run does.
-    let restored = window::session_enabled() && window.restore_session();
+    let restored = tuni_core::session::enabled() && window.restore_session();
     // A launch that named a directory gets a project for it either way: the
     // session is what was there before, and the directory is what was asked
     // for now.
