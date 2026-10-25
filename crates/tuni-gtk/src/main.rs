@@ -170,19 +170,28 @@ fn main() -> glib::ExitCode {
                 | separate_process(),
         )
         .build();
+    // GTK loads the icon theme on a thread as soon as anything asks for it,
+    // and any change to where icons are looked up after that throws the load
+    // away and does it again, on the main thread, at the next lookup. With a
+    // large theme (Papirus is 44 000 files) one load is 170 ms. GtkApplication
+    // adds the resource path `/dev/unisic/Tuni/icons/` during startup whether
+    // or not a resource is there, and this program has no resources at all,
+    // so the base path goes and the load GTK started is the one that is used.
+    app.set_resource_base_path(None);
+    // Names the installed icon rather than carrying one: the desktop looks
+    // it up in the icon theme, which is also where the notification daemon
+    // and the window switcher look for it. Before `run` rather than in
+    // `startup`, because GtkApplication sets one itself when there is none,
+    // and finding out whether the theme has the icon waits for the whole
+    // theme to load before the window has been built.
+    if gtk::is_initialized_main_thread() {
+        gtk::Window::set_default_icon_name(APP_ID);
+    }
 
     app.connect_startup(|app| {
         debug::mark("startup begin");
-        // Names the installed icon rather than carrying one: the desktop looks
-        // it up in the icon theme, which is also where the notification daemon
-        // and the window switcher look for it.
-        gtk::Window::set_default_icon_name(APP_ID);
-        // The icons Adwaita does not have, like the Git page's commit graph.
-        // An installed build finds them in hicolor beside the app icon; this
-        // path is for a checkout run, and points at nothing anywhere else.
         if let Some(display) = gtk::gdk::Display::default() {
-            gtk::IconTheme::for_display(&display)
-                .add_search_path(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/icons"));
+            checkout_icons(&display);
         }
         // The table with the config file's overrides on top; a change made in
         // the settings window later reapplies the same way.
@@ -258,6 +267,34 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
+/// The icons Adwaita does not have, like the Git page's commit graph, out of
+/// the checkout when this build's own have not been installed.
+///
+/// An installed build finds them in hicolor beside the app icon, and adding a
+/// search path anyway is not free: it reloads the whole icon theme on the main
+/// thread before the first frame (see `set_resource_base_path` in `main`). So
+/// the path is added only when one of the checkout's icons is missing from
+/// every hicolor the theme already searches, which is a run out of a checkout
+/// that was never installed, or one that added an icon since.
+fn checkout_icons(display: &gtk::gdk::Display) {
+    let checkout = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/icons"));
+    let Ok(icons) = std::fs::read_dir(checkout.join("hicolor/scalable/actions")) else {
+        return;
+    };
+    let installed: Vec<PathBuf> = std::iter::once(glib::user_data_dir())
+        .chain(glib::system_data_dirs())
+        .map(|dir| dir.join("icons/hicolor/scalable/actions"))
+        .collect();
+    let missing = icons.flatten().any(|icon| {
+        !installed
+            .iter()
+            .any(|dir| dir.join(icon.file_name()).exists())
+    });
+    if missing {
+        gtk::IconTheme::for_display(display).add_search_path(checkout);
+    }
+}
+
 /// `NON_UNIQUE` when this run must not join the one already going.
 ///
 /// A capture renders a window and quits, and forwarded to a running instance it
@@ -312,10 +349,10 @@ fn launch_directory(cmdline: &gtk::gio::ApplicationCommandLine) -> Option<PathBu
 /// `gtk-application-prefer-dark-theme` into `settings.ini` for GTK4 as well,
 /// and libadwaita — which decides light and dark for itself, out of
 /// `AdwStyleManager` and the desktop's own color scheme, and is doing that here
-/// too — warns once that the setting means nothing to it. It is answered by
-/// clearing the setting for this process before libadwaita ever looks at it,
-/// which is what the empty value would have been anyway. Nothing on screen
-/// moves: the property is the one libadwaita ignores.
+/// too — warns once that the setting means nothing to it. The warning is
+/// dropped for the one call that prints it, since libadwaita then overwrites
+/// the setting itself. Nothing on screen moves: the property is the one
+/// libadwaita ignores.
 ///
 /// Mesa's RADV prints a conformance notice for every Vulkan context, which is
 /// what GTK renders with. It is a statement about the driver's certification,
@@ -349,15 +386,39 @@ fn quieten() {
         unsafe { std::env::set_var("GSK_DEBUG", "full-redraw") };
     }
 
-    // Before the application rather than inside its startup: libadwaita reads
-    // the setting while GtkApplication starts up, and a warning is only avoided
-    // by having answered it first. `gtk::init` is what opens the display the
-    // settings come from, and running it twice is a no-op.
-    if gtk::init().is_ok()
-        && let Some(settings) = gtk::Settings::default()
-    {
-        settings.set_gtk_application_prefer_dark_theme(false);
+    // libadwaita before anything reads a GtkSettings, because the first read
+    // loads the theme's CSS, the CSS creates the icon theme, and creating it
+    // starts loading the whole theme on a thread under the theme's lock.
+    // libadwaita's own initialisation then adds its icons to that theme, which
+    // waits for the lock and throws the finished load away, so the next lookup
+    // does it again on the main thread: 170 ms each with Papirus, both before
+    // the first frame. Initialised first, it adds its path before the thread
+    // has the lock, and the one load there is uses it. Running it again inside
+    // the application's startup is a no-op. Clearing the dark setting before
+    // libadwaita looked at it, which is how the warning used to be avoided, is
+    // a GtkSettings read, so it would put the double load back.
+    //
+    // GLib aborts on a warning under `G_DEBUG=fatal-warnings` after whichever
+    // handler took it, so that mode is lifted for the one call too, and only
+    // that call: `gtk::init` opens the display outside it.
+    if gtk::init().is_err() {
+        return;
     }
+    let fatal = glib::log_set_always_fatal(glib::LogLevels::empty());
+    let quiet = glib::log_set_handler(
+        Some("Adwaita"),
+        glib::LogLevels::LEVEL_WARNING,
+        false,
+        false,
+        |domain, level, message| {
+            if !message.starts_with("Using GtkSettings:gtk-application-prefer-dark-theme") {
+                glib::log_default_handler(domain, level, Some(message));
+            }
+        },
+    );
+    let _ = adw::init();
+    glib::log_remove_handler(Some("Adwaita"), quiet);
+    glib::log_set_always_fatal(fatal);
 }
 
 fn build_window(app: &adw::Application, directory: Option<&Path>) {
