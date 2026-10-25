@@ -149,11 +149,13 @@ gh variable set AUR --body on --repo unisic/tuni
 ## Releases
 
 `.github/workflows/release.yml` builds all three on a `v*` tag and attaches
-them to the GitHub release, then, with `AUR` on, pushes both AUR recipes; Packit sees the same
-release and builds it into COPR. Every job installs what it built before
-uploading it. Five files carry the version — `Cargo.toml`, the spec, the PKGBUILD, the
-Debian changelog, and the AppStream metadata — and the first job in the
-workflow refuses to release if they disagree with each other or with the tag.
+them to the GitHub release, whose notes are that version's section of
+`CHANGELOG.md`. Packit sees the same release and builds it into COPR, and with
+`AUR` on the workflow pushes both AUR recipes too. Every job installs what it
+built before uploading it. Six files carry the version: `Cargo.toml`, the spec,
+the PKGBUILD, the Debian changelog, the AppStream metadata and `CHANGELOG.md`.
+The first job in the workflow refuses to release if they disagree with each
+other or with the tag.
 
 ## Not here
 

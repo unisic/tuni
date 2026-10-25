@@ -51,6 +51,8 @@ jobs:
           check data/dev.unisic.Tuni.metainfo.xml \
             "$(sed -n '0,/<release /s/.*<release version="\([^"]*\)".*/\1/p' \
               data/dev.unisic.Tuni.metainfo.xml)"
+          # The newest section is what the release publishes as its notes.
+          check CHANGELOG.md "$(sed -n '0,/^## /s/^## //p' CHANGELOG.md)"
 
           # workflow_dispatch has no tag to disagree with.
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
@@ -205,9 +207,14 @@ jobs:
       - name: Publish
         run: |
           ls -la dist
+          # This version's section of CHANGELOG.md, which gh puts above the
+          # generated notes; with no pull requests those are only the link to
+          # the full comparison, which is why the section is written by hand.
+          notes=$(awk -v h="## ${VERSION}" '$0 == h {f = 1; next} /^## / {f = 0} f' CHANGELOG.md)
           gh release create "v${VERSION}" dist/* \
             --target "$GITHUB_SHA" \
             --title "Tuni ${VERSION}" \
+            --notes "$notes" \
             --generate-notes
 
   aur:
