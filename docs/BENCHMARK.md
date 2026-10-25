@@ -193,6 +193,11 @@ hides Papirus-Dark, the icon theme on this machine.
   portal name Papirus-Dark while `gtk::init` opens the display, before tuni
   can set anything, so the load has already started and switching adds a
   second one. It would also replace the icons the desktop asked for.
+- Arming each pane's two `/proc` polls as GLib seconds timers, which fire
+  together across the process, instead of millisecond timers that each land
+  on a moment of their own: context switches over 20 idle seconds at 16 panes
+  from 92 and 97 to 22 and 21, at 4 panes from 44 to 24 and 22, a single pane
+  unchanged at 12 to 13. A poll may now run up to a second late.
 
 ### 1.6.0 against 1.7.0
 
@@ -212,6 +217,36 @@ passes of five runs each, nine first frames each, five PSS readings each.
 Throughput moves between passes in both (1.6.0 100.9 to 112.0, 1.7.0 122.6
 to 146.4) because the run shared the machine with a game; the 151.4 in the
 table above is the same build's best in the nineteen-terminal run.
+
+### Panes, a flood, and closing them
+
+One window driven by `TUNI_CAPTURE_ACTIONS` in the same headless session,
+every pane running `exec sleep 300`, read once the actions settle and again
+32 seconds later; the two readings matched to 0.3 MiB. Two launches each,
+which agreed to 0.6 MiB. Memory is from the build before the polls moved to
+seconds timers, which touches no allocation; the context switches of the
+pane rows are from after it.
+
+| | PSS | RSS | Threads | fds | Context switches, 20 s idle |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 pane | 48.7 MiB | 112.0 MiB | 14 | 32 | 12 to 13 |
+| 4 panes | 50.1 MiB | 113.2 MiB | 20 | 44 | 22 to 24 |
+| 16 panes | 55.0 MiB | 118.1 MiB | 44 | 92 | 21 to 22 |
+| 16 tabs | 53.9 MiB | 117.3 MiB | 44 | 92 | 92 to 100, before |
+| 16 panes, 15 closed | 53.6 MiB | 117.0 MiB | 14 | 32 | 12, before |
+| 1 pane after 200 MiB | 66.3 MiB | 129.9 MiB | 14 | 32 | 13 to 14, before |
+
+- A pane costs about 0.4 MiB of PSS, two threads (the PTY reader and writer)
+  and four descriptors, and nothing in CPU while it waits: no row spent more
+  than one tick in 20 seconds.
+- Closing returns every thread and descriptor, and `TUNI_DEBUG_LIFETIME`
+  reports all fifteen terminals released and none still alive. What PSS
+  keeps, about 5 MiB over a single pane, is allocator and GTK state rather
+  than a leak: a `malloc_trim(0)` called from gdb hands 1.9 MiB of it back,
+  and the rest is caches grown while sixteen panes were drawn.
+- Output is bounded by the scrollback budget of 50 000 lines: 200 MiB through
+  one pane adds 16 to 18 MiB, and 400 MiB adds nothing more (64.9 against
+  65.3 MiB in a separate pair of launches).
 
 ## tuni against kero
 

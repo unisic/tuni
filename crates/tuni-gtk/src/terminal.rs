@@ -56,7 +56,14 @@ const FEED_BUDGET: Duration = Duration::from_millis(8);
 /// same couple of seconds the panel polls its own reads at, for the same
 /// reason: the answer is wanted by the time somebody looks, and one `readlink`
 /// is not worth a tighter loop than that.
-const CWD_POLL: Duration = Duration::from_secs(2);
+///
+/// Whole seconds, and armed with `timeout_add_seconds_local`, because GLib
+/// fires every seconds timer in a process on the same tick: sixteen panes
+/// polling twice each were 92 context switches in 20 idle seconds as
+/// millisecond timers, each pane's pair landing on a moment of its own, and
+/// are 22 this way, against 13 for a single pane. The price is up to a second
+/// of slack on when a poll runs, which a two-second poll absorbs.
+const CWD_POLL_SECONDS: u32 = 2;
 
 /// How long a command has to run before its ending is worth a notification.
 /// Long enough that nothing typed and answered at the prompt qualifies, short
@@ -822,8 +829,8 @@ impl TuniTerminal {
     /// prompt is the last thing printed, and a poll that rides on output would
     /// have nothing left to ride on at the moment the answer changed.
     fn follow_directory(&self) {
-        glib::timeout_add_local(
-            CWD_POLL,
+        glib::timeout_add_seconds_local(
+            CWD_POLL_SECONDS,
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
@@ -864,8 +871,8 @@ impl TuniTerminal {
     /// is alive, two while something is running under it. It ends with the
     /// session or with the widget.
     fn watch_commands(&self) {
-        glib::timeout_add_local(
-            CWD_POLL,
+        glib::timeout_add_seconds_local(
+            CWD_POLL_SECONDS,
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
