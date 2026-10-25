@@ -118,7 +118,7 @@ so does every package job, on the binary it just installed.
 ## COPR (`../.packit.yaml`)
 
 Packit builds each GitHub release from `tuni.spec` into the COPR project
-`deandark/Tuni`. The project is set up once, by hand: internet access during
+`debondor/Tuni`. The project is set up once, by hand: internet access during
 builds turned on, since the spec fetches cargo crates, the Ghostty source and
 Zig; the Fedora chroots ticked, which is the list Packit builds for; and
 `github.com/unisic/tuni` under "Packit allowed forge projects". The Packit

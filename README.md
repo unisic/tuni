@@ -127,7 +127,7 @@ Fedora and Arch can take it from a package manager instead, which then updates
 it along with everything else:
 
 ```sh
-sudo dnf copr enable deandark/Tuni && sudo dnf install tuni   # Fedora
+sudo dnf copr enable debondor/Tuni && sudo dnf install tuni   # Fedora
 paru -S tuni-bin    # Arch, the release's own package
 paru -S tuni        # Arch, built from source
 ```

@@ -1,5 +1,5 @@
-# Packit builds each GitHub release into the COPR project deandark/Tuni, so a
-# machine with `dnf copr enable deandark/Tuni` gets new versions from
+# Packit builds each GitHub release into the COPR project debondor/Tuni, so a
+# machine with `dnf copr enable debondor/Tuni` gets new versions from
 # `dnf upgrade`. It needs the Packit GitHub App on unisic/tuni, and
 # github.com/unisic/tuni in the project's "Packit allowed forge projects".
 specfile_path: packaging/tuni.spec
@@ -11,7 +11,7 @@ upstream_tag_template: "v{version}"
 jobs:
   - job: copr_build
     trigger: release
-    owner: deandark
+    owner: debondor
     project: Tuni
     # The build fetches cargo crates, the Ghostty source libghostty-vt-sys pins
     # and Zig 0.15.2, as the spec's header says, so it needs the network. No
