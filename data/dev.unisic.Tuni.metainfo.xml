@@ -91,9 +91,10 @@
         <p>A launch starts the shell in about 5 ms instead of 660, before GTK
         is loaded, and the window is up in a third of the time it took. A
         flood of output is read in bursts, nearly a third faster than 1.6.0,
-        and the window holds a fifth less memory. Beside eighteen other
-        terminals measured in one run, Tuni came first in throughput and first
-        to start a shell.</p>
+        and the window holds a fifth less memory. Idle panes wake the window
+        together, so sixteen of them cost a quarter of the wakeups they did.
+        Beside eighteen other terminals measured in one run, Tuni came first
+        in throughput and first to start a shell.</p>
         <p>Fedora can take Tuni from COPR, and updates then arrive with the
         rest of the system.</p>
       </description>

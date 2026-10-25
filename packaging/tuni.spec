@@ -106,7 +106,8 @@ appstream-util validate-relax --nonet \
   security key, and the "+" in the tab strip offers the last five hosts.
 - The shell starts about 5 ms after launch instead of 660, before GTK is loaded,
   and the window is up in a third of the time. A flood of output is read nearly
-  a third faster, and PSS is a fifth lower than 1.6.0's.
+  a third faster, and PSS is a fifth lower than 1.6.0's. Idle panes wake the
+  window together, so sixteen of them cost a quarter of the wakeups they did.
 - Fedora can take Tuni from COPR, and updates then arrive with the rest of the
   system.
 
