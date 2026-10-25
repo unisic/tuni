@@ -783,9 +783,17 @@ impl TuniWindow {
         let menu = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
             .tooltip_text("Main Menu")
-            .menu_model(&main_menu())
             .primary(true)
             .build();
+        // Built as it first opens, F10 included, since GTK calls this before
+        // any popup: a popover menu that may never be opened is half a MiB of
+        // a window's PSS. The button stays sensitive and announces its popup
+        // with no model yet, which is GTK's own rule for a button given this.
+        menu.set_create_popup_func(|menu| {
+            if menu.menu_model().is_none() {
+                menu.set_menu_model(Some(&main_menu()));
+            }
+        });
         header.pack_end(&menu);
 
         let show_files = gtk::ToggleButton::builder()
@@ -798,46 +806,17 @@ impl TuniWindow {
         stack.set_hexpand(true);
         stack.set_vexpand(true);
 
-        let status_button = gtk::Button::builder()
-            .label("New Terminal")
-            .action_name("win.new-tab")
-            .halign(gtk::Align::Center)
-            .build();
-        status_button.add_css_class("pill");
-        status_button.add_css_class("suggested-action");
-        // The other thing a window is opened for. Without it the empty page
-        // knows one way out, and the way to a host is a shortcut to have read
-        // about or a menu to have opened.
-        let status_connect = gtk::Button::builder()
-            .label("New Connection")
-            .tooltip_text("New Connection (Ctrl+Shift+O)")
-            .action_name("win.new-connection")
-            .build();
-        status_connect.add_css_class("pill");
-        status_button.set_halign(gtk::Align::Fill);
-        let status_buttons = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        status_buttons.set_halign(gtk::Align::Center);
-        status_buttons.append(&status_button);
-        status_buttons.append(&status_connect);
-        let status = adw::StatusPage::builder()
-            .icon_name("utilities-terminal-symbolic")
-            .title("No Tabs Open")
-            .child(&status_buttons)
-            .build();
-
+        // The empty state joins it the first time there is nothing to show:
+        // see `empty_state`.
         let content_stack = gtk::Stack::new();
         content_stack.add_named(&stack, Some("tabs"));
-        content_stack.add_named(&status, Some("empty"));
 
         // The find bar floats over whichever pane is showing rather than living
         // inside one: a pane's widgets are rebuilt whenever the layout changes
-        // shape, and a bar parented there would go with them.
-        let find = TuniFind::new();
-        let switcher = TuniSwitcher::new();
+        // shape, and a bar parented there would go with them. It and the tab
+        // switcher join the overlay when first wanted: see `find_bar`.
         let content_overlay = gtk::Overlay::new();
         content_overlay.set_child(Some(&content_stack));
-        content_overlay.add_overlay(&find);
-        content_overlay.add_overlay(&switcher);
 
         // Split, so the "+" every tab strip has is also the way to a host: the
         // arrow holds the hosts connected to last and the whole list under
@@ -907,23 +886,8 @@ impl TuniWindow {
 
         // --- the Files and Git panel, on the far side of the terminals
 
-        crate::debug::mark("   panel begin");
+        // Empty until it first opens: see `build_panel`.
         let panel_view = TuniPanel::new();
-        crate::debug::mark("   panel end");
-        if let Some(files) = panel_view.files() {
-            files.connect_message(glib::clone!(
-                #[weak(rename_to = this)]
-                self,
-                move |message| this.files_message(&message)
-            ));
-        }
-        if let Some(git) = panel_view.git() {
-            git.connect_open(glib::clone!(
-                #[weak(rename_to = this)]
-                self,
-                move |path, staged| this.open_diff(&path, staged)
-            ));
-        }
         // The tab strip belongs to the terminals, so it stops where they do:
         // stretched over the panel it would name tabs for a column that shows
         // the same three pages whichever tab is in front.
@@ -967,6 +931,9 @@ impl TuniWindow {
             #[weak(rename_to = this)]
             self,
             move |panel| {
+                if panel.shows_sidebar() {
+                    this.build_panel();
+                }
                 this.sync_files();
                 let mut timer = this.imp().panel_timer.borrow_mut();
                 if panel.shows_sidebar() {
@@ -1061,10 +1028,6 @@ impl TuniWindow {
         imp.row_menu.replace(Some(row_menu));
         imp.stack.replace(Some(stack));
         imp.content.replace(Some(content_stack));
-        imp.find.replace(Some(find));
-        imp.switcher.replace(Some(switcher));
-        imp.status.replace(Some(status));
-        imp.status_button.replace(Some(status_button));
         imp.tab_bar.replace(Some(tab_bar));
         imp.banner.replace(Some(banner));
         imp.title.replace(Some(title));
@@ -5134,6 +5097,31 @@ impl TuniWindow {
         self.imp().terminals.borrow().get(&pane).cloned()
     }
 
+    /// Builds the panel's pages the first time it opens, and hooks the window
+    /// to the two of them that ask it for something.
+    fn build_panel(&self) {
+        let Some(panel) = self.imp().panel_view.borrow().clone() else {
+            return;
+        };
+        if !panel.ensure_built() {
+            return;
+        }
+        if let Some(files) = panel.files() {
+            files.connect_message(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |message| this.files_message(&message)
+            ));
+        }
+        if let Some(git) = panel.git() {
+            git.connect_open(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |path, staged| this.open_diff(&path, staged)
+            ));
+        }
+    }
+
     /// Opens the panel on a page, or closes it if that page is already the one
     /// showing.
     fn show_panel(&self, page: &str) {
@@ -5172,8 +5160,8 @@ impl TuniWindow {
         if let Some(editor) = self.active_editor() {
             return Some(Search::Editor(editor));
         }
-        let find = self.imp().find.borrow().clone()?;
-        Some(Search::Terminal(find, self.active_terminal()?))
+        let terminal = self.active_terminal()?;
+        Some(Search::Terminal(self.find_bar(), terminal))
     }
 
     /// Walks to the next match in the focused pane, or the previous one.
@@ -5257,12 +5245,19 @@ impl TuniWindow {
     }
 
     fn switcher_key(&self, key: gdk::Key, state: gdk::ModifierType) -> glib::Propagation {
-        let Some(switcher) = self.imp().switcher.borrow().clone() else {
-            return glib::Propagation::Proceed;
-        };
+        // Every key in the window comes through here, and only one that opens
+        // the switcher makes one.
+        let open = self
+            .imp()
+            .switcher
+            .borrow()
+            .clone()
+            .filter(TuniSwitcher::is_open);
         // Escape is only the switcher's while it is up; the rest of the time it
         // belongs to whatever is in the pane.
-        if switcher.is_open() && key == gdk::Key::Escape {
+        if let Some(switcher) = &open
+            && key == gdk::Key::Escape
+        {
             switcher.close();
             return glib::Propagation::Stop;
         }
@@ -5280,7 +5275,7 @@ impl TuniWindow {
         }
         let forward = !state.contains(gdk::ModifierType::SHIFT_MASK);
 
-        if switcher.is_open() {
+        if let Some(switcher) = open {
             switcher.step(forward);
             return glib::Propagation::Stop;
         }
@@ -5288,6 +5283,15 @@ impl TuniWindow {
         if cards.len() < 2 {
             return glib::Propagation::Proceed;
         }
+        let made = self.imp().switcher.borrow().clone();
+        let switcher = made.unwrap_or_else(|| {
+            let switcher = TuniSwitcher::new();
+            if let Some(overlay) = self.overlay() {
+                overlay.add_overlay(&switcher);
+            }
+            self.imp().switcher.replace(Some(switcher.clone()));
+            switcher
+        });
         // Opening lands on the tab before this one, which is what one press and
         // release is for: the way back to where the work just was.
         let start = if forward { 1 } else { cards.len() - 1 };
@@ -5638,10 +5642,36 @@ impl TuniWindow {
         entries
     }
 
-    /// The find bar, for the smoke captures.
+    /// The find bar, made the first time a search asks for it.
+    ///
+    /// Not with the window: the bar and the tab switcher are about a third of
+    /// a MiB of a window's PSS, measured, for two widgets a session may never
+    /// show.
     #[must_use]
-    pub(crate) fn find_bar(&self) -> Option<TuniFind> {
-        self.imp().find.borrow().clone()
+    pub(crate) fn find_bar(&self) -> TuniFind {
+        if let Some(find) = self.imp().find.borrow().clone() {
+            return find;
+        }
+        let find = TuniFind::new();
+        // Under the switcher if that came first, which is how the two were
+        // stacked when both were built with the window. `add_overlay` is this
+        // same call with no sibling.
+        let switcher = self.imp().switcher.borrow().clone();
+        if let Some(overlay) = self.overlay() {
+            find.insert_before(&overlay, switcher.as_ref());
+        }
+        self.imp().find.replace(Some(find.clone()));
+        find
+    }
+
+    /// What floats over the panes: the find bar and the tab switcher.
+    fn overlay(&self) -> Option<gtk::Overlay> {
+        self.imp()
+            .content
+            .borrow()
+            .as_ref()?
+            .parent()
+            .and_downcast()
     }
 
     pub(crate) fn active_editor(&self) -> Option<TuniEditor> {
@@ -5669,6 +5699,56 @@ impl TuniWindow {
 
     // --- rendering the model -----------------------------------------------
 
+    /// Puts the page shown in place of the tabs into the content stack, the
+    /// first time there are none. Not built with the window, because a window
+    /// opens with a tab: the page is half a MiB of PSS that would sit behind
+    /// the terminals until the last one closes, if it ever does. `refresh`
+    /// fills in its words.
+    ///
+    /// Asked for from an idle rather than from `refresh` itself, since a new
+    /// project is refreshed once before its first tab exists, and that empty
+    /// moment is never drawn. The idle runs above the redraw priority, so a
+    /// window that really has nothing to show gets the page before the frame
+    /// that shows it.
+    fn empty_state(&self) {
+        let imp = self.imp();
+        if imp.status.borrow().is_some() {
+            return;
+        }
+        let Some(content) = imp.content.borrow().clone() else {
+            return;
+        };
+        let status_button = gtk::Button::builder()
+            .label("New Terminal")
+            .action_name("win.new-tab")
+            .halign(gtk::Align::Center)
+            .build();
+        status_button.add_css_class("pill");
+        status_button.add_css_class("suggested-action");
+        // The other thing a window is opened for. Without it the empty page
+        // knows one way out, and the way to a host is a shortcut to have read
+        // about or a menu to have opened.
+        let status_connect = gtk::Button::builder()
+            .label("New Connection")
+            .tooltip_text("New Connection (Ctrl+Shift+O)")
+            .action_name("win.new-connection")
+            .build();
+        status_connect.add_css_class("pill");
+        status_button.set_halign(gtk::Align::Fill);
+        let status_buttons = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        status_buttons.set_halign(gtk::Align::Center);
+        status_buttons.append(&status_button);
+        status_buttons.append(&status_connect);
+        let status = adw::StatusPage::builder()
+            .icon_name("utilities-terminal-symbolic")
+            .title("No Tabs Open")
+            .child(&status_buttons)
+            .build();
+        content.add_named(&status, Some("empty"));
+        imp.status.replace(Some(status));
+        imp.status_button.replace(Some(status_button));
+    }
+
     /// Titles, names, and which of the two empty states is showing. Cheap
     /// enough to call on every change.
     fn refresh(&self) {
@@ -5691,7 +5771,34 @@ impl TuniWindow {
             title.set_subtitle(&subtitle.unwrap_or_default());
         }
         if let Some(content) = imp.content.borrow().as_ref() {
-            content.set_visible_child_name(if tabs { "tabs" } else { "empty" });
+            if tabs {
+                content.set_visible_child_name("tabs");
+            } else if imp.status.borrow().is_some() {
+                content.set_visible_child_name("empty");
+            } else {
+                glib::idle_add_local_full(
+                    glib::Priority::HIGH_IDLE,
+                    glib::clone!(
+                        #[weak(rename_to = this)]
+                        self,
+                        #[upgrade_or]
+                        glib::ControlFlow::Break,
+                        move || {
+                            let empty = this
+                                .imp()
+                                .workspace
+                                .borrow()
+                                .selected_project()
+                                .is_none_or(|project| project.is_empty());
+                            if empty {
+                                this.empty_state();
+                                this.refresh();
+                            }
+                            glib::ControlFlow::Break
+                        }
+                    ),
+                );
+            }
         }
         if let (Some(status), Some(button)) = (
             imp.status.borrow().as_ref(),

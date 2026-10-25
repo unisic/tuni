@@ -862,12 +862,11 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                 #[weak]
                 window,
                 move || {
-                    let (Some(find), Some(terminal)) =
-                        (window.find_bar(), window.active_terminal())
-                    else {
+                    let Some(terminal) = window.active_terminal() else {
                         eprintln!("TUNI_CAPTURE_SEARCH: no terminal is open");
                         return;
                     };
+                    let find = window.find_bar();
                     find.open(&terminal);
                     find.search_text(&needle);
                     // The entry waits a moment before it searches, the way it
