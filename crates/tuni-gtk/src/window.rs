@@ -1279,6 +1279,27 @@ impl TuniWindow {
                     }
                 },
             ),
+            entry("open-folder", string, |window, target| {
+                if let Some(path) = target.and_then(glib::Variant::str) {
+                    gtk::FileLauncher::new(Some(&gio::File::for_path(path))).launch(
+                        Some(window),
+                        gio::Cancellable::NONE,
+                        |_| (),
+                    );
+                }
+            }),
+            // The editor's command and the directory to open it on.
+            entry(
+                "open-in-editor",
+                glib::VariantTy::new("(ss)").ok(),
+                |window, target| {
+                    if let Some((command, path)) =
+                        target.and_then(glib::Variant::get::<(String, String)>)
+                    {
+                        window.open_in_editor(&command, Path::new(&path));
+                    }
+                },
+            ),
             entry("open-url", string, |window, target| {
                 if let Some(url) = target.and_then(glib::Variant::str) {
                     gtk::UriLauncher::new(url).launch(Some(window), gio::Cancellable::NONE, |_| ());
@@ -1694,6 +1715,28 @@ impl TuniWindow {
         };
         terminal.send_text(&snippet.body);
         terminal.grab_focus();
+    }
+
+    /// Opens an editor on a directory, as the Info page's editor button does.
+    ///
+    /// Only an editor from the table: a window's actions can be activated by
+    /// anything on the session bus, and a command taken from the target as it
+    /// came would run whatever that wrote.
+    fn open_in_editor(&self, command: &str, root: &Path) {
+        let Some(editor) = tuni_core::editors::installed()
+            .into_iter()
+            .find(|editor| editor.command == command)
+        else {
+            return;
+        };
+        let line = format!(
+            "{} {}",
+            editor.command,
+            glib::shell_quote(root).to_string_lossy()
+        );
+        if let Err(error) = glib::spawn_command_line_async(line) {
+            self.toast(&format!("Couldn't start {}: {error}", editor.name));
+        }
     }
 
     /// Runs a task in a shell of its own beside the pane on screen, started
@@ -4991,6 +5034,41 @@ impl TuniWindow {
             });
         }
 
+        // The checkout on screen, opened somewhere else: the folder, and every
+        // editor the Info page offers, on the root its other pages anchor to.
+        let root = self
+            .imp()
+            .workspace
+            .borrow()
+            .selected_project()
+            .zip(directory.as_deref())
+            .map(|(project, cwd)| project.panel_root(cwd).0);
+        if let Some(root) = root.as_deref().and_then(Path::to_str) {
+            let place = shorten(root);
+            entries.push(palette::Entry {
+                search: format!("Open in Files folder file manager {place}"),
+                title: "Open in Files".to_owned(),
+                subtitle: Some(place.clone()),
+                icon: "folder-open-symbolic",
+                shortcut: None,
+                action: "win.open-folder",
+                target: Some(root.to_variant()),
+                terminal: false,
+            });
+            for editor in tuni_core::editors::installed() {
+                entries.push(palette::Entry {
+                    search: format!("Open in {} editor {place}", editor.name),
+                    title: format!("Open in {}", editor.name),
+                    subtitle: Some(place.clone()),
+                    icon: "text-editor-symbolic",
+                    shortcut: None,
+                    action: "win.open-in-editor",
+                    target: Some((editor.command, root).to_variant()),
+                    terminal: false,
+                });
+            }
+        }
+
         // Whatever a shell in the window is serving, so a dev server is a query
         // away from a browser without opening the Info page on its pane.
         let shells: Vec<u32> = self
@@ -5002,7 +5080,7 @@ impl TuniWindow {
             .collect();
         for port in tuni_core::info::served(&shells) {
             entries.push(palette::Entry {
-                search: format!("{} {} open browser localhost port", port.port, port.process),
+                search: format!("Open localhost:{} {} browser port", port.port, port.process),
                 title: format!("Open localhost:{}", port.port),
                 subtitle: Some(port.process.clone()),
                 icon: "web-browser-symbolic",

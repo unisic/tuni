@@ -18,7 +18,8 @@ A native terminal workspace for Linux.
   the shells
 - Session inspector: what is running, what is listening, what a connection
   forwards; a dev server's port opens in the browser from the palette
-- Command palette, tab switcher, find in whichever pane has the keyboard
+- Command palette, tab switcher, find in whichever pane has the keyboard; the
+  checkout on screen opens in Files or in an installed editor from the palette
 - The checkout's own tasks in the palette: `package.json` scripts, `just`,
   `make`, Taskfile and `mise`, each run in a pane beside the one on screen
 - The hosts `~/.ssh/config` already declares, one shared connection per machine,

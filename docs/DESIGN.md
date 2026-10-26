@@ -119,7 +119,12 @@ the page is showing and no more often than that. The command palette offers
 the same ports for every shell in the window, "Open localhost:5173" by number
 or by the process holding it, so the browser is a query away without the page
 open. That is one walk of `/proc` each time the palette opens, however many
-shells there are, and one row a port however many workers hold it.
+shells there are, and one row a port however many workers hold it. The
+palette opens the checkout itself the same way: "Open in Files", and "Open in"
+each editor the page's editor button finds, on the directory the other two
+pages anchor to. The editor is looked up by its command in that same table
+before anything is spawned, because a window's actions can be activated from
+outside it, and a command taken as it came would run whatever sent it.
 
 When a coding agent is running under that shell, the page grows an Agent section
 for it. Claude Code, Codex, OpenCode and Pi each keep a record of their own turns
