@@ -137,9 +137,11 @@ ghostty-next:
 # Under the installed one's ID it would be handed to the Tuni already running,
 # which opens a window of the old version; under its own it is an application
 # of its own, with its own taskbar entry. The saved session is left alone, so
-# closing it cannot overwrite the real one.
+# closing it cannot overwrite the real one. Not single either: a second
+# `make dev` with the first still open would otherwise hand its window to the
+# first, which is the build from before.
 dev: build
-	TUNI_APP_ID=$(APP_ID).Devel TUNI_SESSION=off $(CARGO_TARGET_DIR)/release/tuni
+	TUNI_APP_ID=$(APP_ID).Devel TUNI_SESSION=off TUNI_SINGLE_INSTANCE=0 $(CARGO_TARGET_DIR)/release/tuni
 
 install: build install-data
 	install -Dm755 $(CARGO_TARGET_DIR)/release/tuni $(bindir)/tuni
