@@ -64,7 +64,7 @@ GHOSTTY_NEXT_COMMIT := 2de5e7d38e1354759211722a8687c0815d2cf02c
 GHOSTTY_NEXT_DIR ?= $(ZIG_PREFIX)/opt/ghostty-$(GHOSTTY_NEXT_COMMIT)
 
 .PHONY: all build build-next test-next install install-data uninstall check \
-	dist clean zig zig-next ghostty-next
+	dist clean zig zig-next ghostty-next dev
 
 all: build
 
@@ -133,6 +133,14 @@ ghostty-next:
 
 # Themes are baked into the binary at build time, so an installed Tuni needs
 # nothing beside the executable but its desktop integration.
+# The build being worked on, beside the installed Tuni rather than inside it.
+# Under the installed one's ID it would be handed to the Tuni already running,
+# which opens a window of the old version; under its own it is an application
+# of its own, with its own taskbar entry. The saved session is left alone, so
+# closing it cannot overwrite the real one.
+dev: build
+	TUNI_APP_ID=$(APP_ID).Devel TUNI_SESSION=off $(CARGO_TARGET_DIR)/release/tuni
+
 install: build install-data
 	install -Dm755 $(CARGO_TARGET_DIR)/release/tuni $(bindir)/tuni
 

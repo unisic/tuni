@@ -138,6 +138,10 @@ make zig
 cargo run --release
 ```
 
+With Tuni installed and running, `make dev` instead: `cargo run` hands its
+window to the Tuni already up, which is the old version. `make dev` runs the
+build as an application of its own, and leaves the saved session alone.
+
 That is the list CI installs, so a machine with it builds what the release
 builds. Fedora's own `rust` is new enough; on a distribution whose is not,
 `rustup` puts a current toolchain beside it.

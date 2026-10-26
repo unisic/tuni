@@ -160,7 +160,7 @@ fn main() -> glib::ExitCode {
     // environment as well - `cwd()` is in the message either way, and
     // `XDG_ACTIVATION_TOKEN` is what lets the window come to the front.
     let app = adw::Application::builder()
-        .application_id(APP_ID)
+        .application_id(app_id())
         .flags(
             gtk::gio::ApplicationFlags::HANDLES_COMMAND_LINE
                 | gtk::gio::ApplicationFlags::SEND_ENVIRONMENT
@@ -172,8 +172,12 @@ fn main() -> glib::ExitCode {
         debug::mark("startup begin");
         // Names the installed icon rather than carrying one: the desktop looks
         // it up in the icon theme, which is also where the notification daemon
-        // and the window switcher look for it.
-        gtk::Window::set_default_icon_name(APP_ID);
+        // and the window switcher look for it. A build under its own ID names
+        // its own icon when one is installed, the grey development one.
+        let id = app_id();
+        let themed = gtk::gdk::Display::default()
+            .is_some_and(|display| gtk::IconTheme::for_display(&display).has_icon(&id));
+        gtk::Window::set_default_icon_name(if themed { &id } else { APP_ID });
         // The icons Adwaita does not have, like the Git page's commit graph.
         // An installed build finds them in hicolor beside the app icon; this
         // path is for a checkout run, and points at nothing anywhere else.
@@ -253,6 +257,17 @@ fn main() -> glib::ExitCode {
         glib::ExitCode::SUCCESS
     });
     app.run()
+}
+
+/// The application ID, which `TUNI_APP_ID` replaces for a build being worked
+/// on: `dev.unisic.Tuni.Devel` gets a taskbar entry and a single instance of
+/// its own, where `TUNI_SINGLE_INSTANCE=0` alone would still file its windows
+/// under the installed Tuni's `.desktop`.
+fn app_id() -> String {
+    std::env::var("TUNI_APP_ID")
+        .ok()
+        .filter(|id| gtk::gio::Application::id_is_valid(id))
+        .unwrap_or_else(|| APP_ID.to_owned())
 }
 
 /// `NON_UNIQUE` when this run must not join the one already going.

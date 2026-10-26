@@ -1338,7 +1338,10 @@ Debugging aids, all off unless set, and none of them written back to the
 configuration file: `TUNI_THEME` names one of the bundled themes for the run
 and `TUNI_FONT` a font the way Pango writes one (`"JetBrains Mono 13"`), with
 `TUNI_LIGATURES=1` to let them fire; `TUNI_SESSION=0` neither restores the
-saved session nor overwrites it; `TUNI_SINGLE_INSTANCE=0` runs a window of its
+saved session nor overwrites it; `TUNI_APP_ID=dev.unisic.Tuni.Devel` makes a
+build its own application, with its own taskbar entry and its own single
+instance, which is how `make dev` runs one, with `TUNI_SESSION=off` beside it;
+`TUNI_SINGLE_INSTANCE=0` runs a window of its
 own rather than opening a project in the tuni already running, which is what a
 build being worked on wants; `TUNI_DEBUG_FRAME_TIME` prints draw-time
 percentiles; `TUNI_DEBUG_STARTUP` prints how many milliseconds each phase
