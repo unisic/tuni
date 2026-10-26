@@ -176,6 +176,7 @@ const KEYWORDS: &[(&str, &str)] = &[
     ("win.find", "search"),
     ("win.keys", "ssh-keygen public copy-id"),
     ("win.check-updates", "upgrade version"),
+    ("win.new-worktree-tab", "git branch agent checkout"),
 ];
 
 /// The settings pages, for the palette to open on the one a word lives on:
@@ -255,6 +256,12 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "win.new-project",
     ),
     ("New Window", "window-new-symbolic", None, "win.new-window"),
+    (
+        "New Tab in Worktree",
+        "tuni-git-symbolic",
+        None,
+        "win.new-worktree-tab",
+    ),
     (
         "Split Right",
         "view-right-pane-symbolic",
@@ -1117,6 +1124,7 @@ impl TuniWindow {
                 }
             }),
             entry("reopen-tab", None, |window, _| window.reopen_tab()),
+            entry("new-worktree-tab", None, |window, _| window.ask_worktree()),
             entry("broadcast", None, |window, _| window.toggle_broadcast()),
             entry("close-pane", None, |window, _| window.close_focused_pane()),
             entry("split-right", None, |window, _| window.split(Edge::Right)),
@@ -1843,6 +1851,61 @@ impl TuniWindow {
         if let Err(error) = glib::spawn_command_line_async(line) {
             self.toast(&format!("Couldn't start {}: {error}", editor.name));
         }
+    }
+
+    /// Asks a branch's name, then opens a tab on it in a worktree of its own,
+    /// off the checkout the shell on screen is in: kero's way of letting two
+    /// agents work in one repository without editing each other's files.
+    fn ask_worktree(&self) {
+        let Some((project, _)) = self.selected_tab() else {
+            return;
+        };
+        let Some(directory) = self.directory_for_new_shell(project) else {
+            return;
+        };
+        let entry = gtk::Entry::builder().activates_default(true).build();
+        let dialog = adw::AlertDialog::new(
+            Some("New Tab in Worktree"),
+            Some("A new branch off the current one, checked out in a folder of its own"),
+        );
+        dialog.set_extra_child(Some(&entry));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("create", "Create");
+        dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("create"));
+        dialog.set_close_response("cancel");
+        // The name is typed straight away, as in the rename dialog.
+        dialog.set_focus(Some(&entry));
+        dialog.connect_response(
+            None,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_, response| {
+                    if response != "create" {
+                        return;
+                    }
+                    let branch = entry.text().to_string();
+                    let directory = directory.clone();
+                    glib::spawn_future_local(async move {
+                        let added = gio::spawn_blocking(move || {
+                            tuni_core::git::add_worktree(&directory, &branch)
+                        })
+                        .await;
+                        match added {
+                            Ok(Ok(path)) => {
+                                let mut pane = Pane::new();
+                                pane.directory = path.to_str().map(str::to_owned);
+                                this.add_tab(project, Tab::with_pane(pane));
+                            }
+                            Ok(Err(message)) => this.toast(&message),
+                            Err(_) => {}
+                        }
+                    });
+                }
+            ),
+        );
+        dialog.present(Some(self));
     }
 
     /// Runs a task in a shell of its own beside the pane on screen, started

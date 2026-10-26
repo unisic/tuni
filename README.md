@@ -34,6 +34,8 @@ A native terminal workspace for Linux.
   typed with `Ctrl+Shift+Backspace` whatever the shell
 - A project's row takes an icon from the desktop's theme, or an emoji; a folder
   dropped on the sidebar opens as a project
+- A tab in a git worktree of its own, on a new branch, so agents working side
+  by side never edit the same files
 - A coding agent thinking in a pane spins on its tab and on its project, and
   leaves an exclamation there when it finishes into a tab you are not watching;
   `Ctrl+Shift+J` goes to the next tab that wants you

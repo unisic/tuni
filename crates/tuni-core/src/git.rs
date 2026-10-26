@@ -936,6 +936,73 @@ pub fn create_branch(name: &str) -> Result<Task, String> {
     })
 }
 
+/// Checks out a new branch, off the one `directory` is on, in a worktree of its
+/// own, and says where: the main checkout's `.tuni/worktrees`, hidden by the
+/// repository's `info/exclude`, which is where kero keeps its. One checkout
+/// per agent, so two of them never edit the same files. Waits for git, which
+/// writes out every file of the branch.
+pub fn add_worktree(directory: &Path, branch: &str) -> Result<PathBuf, String> {
+    let branch = branch.trim();
+    if branch.is_empty() || branch.starts_with('-') {
+        return Err("Enter a branch name.".to_owned());
+    }
+    if !run(&["check-ref-format", "--branch", branch], directory).is_ok() {
+        return Err(format!("“{branch}” can't name a branch."));
+    }
+    let common = run(
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        directory,
+    );
+    if !common.is_ok() {
+        return Err(common.message("Not in a git repository."));
+    }
+    let common = PathBuf::from(common.stdout.trim());
+    let Some(main) = common
+        .parent()
+        .filter(|_| common.file_name() == Some(OsStr::new(".git")))
+    else {
+        return Err("A bare repository has no checkout to put a worktree in.".to_owned());
+    };
+    let path = main.join(".tuni/worktrees").join(branch.replace('/', "-"));
+    if path.exists() {
+        return Err(format!("“{branch}” has a worktree already."));
+    }
+    exclude(&common, "/.tuni/").map_err(|error| error.to_string())?;
+    let added = run(
+        &[
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("-b"),
+            OsStr::new(branch),
+            OsStr::new("--"),
+            path.as_os_str(),
+            OsStr::new("HEAD"),
+        ],
+        directory,
+    );
+    if !added.is_ok() {
+        return Err(added.message("The worktree was not added."));
+    }
+    Ok(path)
+}
+
+/// Adds `pattern` to the repository's `info/exclude`, which ignores it the way
+/// `.gitignore` does without a change to any file the repository tracks.
+fn exclude(common: &Path, pattern: &str) -> std::io::Result<()> {
+    let path = common.join("info/exclude");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if text.lines().any(|line| line.trim() == pattern) {
+        return Ok(());
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(pattern);
+    text.push('\n');
+    std::fs::create_dir_all(common.join("info"))?;
+    std::fs::write(path, text)
+}
+
 #[must_use]
 pub fn init() -> Task {
     Task::new("Start a repository here", vec![vec!["init"]])
@@ -1083,6 +1150,29 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn a_worktree_gets_a_branch_of_its_own_inside_the_checkout_and_out_of_its_status() {
+        let sandbox = Sandbox::new("worktree");
+        sandbox.write("a.txt", "a\n");
+        sandbox.git(&["add", "a.txt"]);
+        sandbox.git(&["commit", "-qm", "first"]);
+
+        let path = add_worktree(&sandbox.path, "feature/x").expect("worktree");
+        assert!(
+            path.ends_with(".tuni/worktrees/feature-x"),
+            "{}",
+            path.display()
+        );
+        assert!(path.join("a.txt").is_file());
+        assert_eq!(
+            run(&["branch", "--show-current"], &path).stdout.trim(),
+            "feature/x"
+        );
+        assert!(sandbox.status().is_clean());
+        assert!(add_worktree(&sandbox.path, "feature/x").is_err());
+        assert!(add_worktree(&sandbox.path, " ").is_err());
     }
 
     #[test]

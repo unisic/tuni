@@ -847,6 +847,9 @@ impl TuniGit {
         dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("create"));
         dialog.set_close_response("cancel");
+        // Otherwise the keyboard starts on Create, and the name is typed after
+        // a click on the entry nobody should need.
+        dialog.set_focus(Some(&entry));
         dialog.connect_response(
             None,
             glib::clone!(

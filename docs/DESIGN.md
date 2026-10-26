@@ -111,7 +111,13 @@ in the state the command line would have left it in — including the reflog ent
 to undo it by. Discarding asks first, and what git would delete outright goes to
 the desktop's trash instead. The state of a file is spelled out, never carried
 by color alone: the two porcelain letters are on the row, and what they mean is
-in its tooltip.
+in its tooltip. "New Tab in Worktree" in the palette asks a branch's name and
+opens a tab on it in a checkout of its own, off the branch the shell on screen
+is on: two agents in one repository, each in its own worktree, never edit the
+same files. The worktree goes where kero puts its, inside the main checkout
+under `.tuni/worktrees`, and the repository's `info/exclude` keeps that folder
+out of its status without a change to any file it tracks. Removing one is
+`git worktree remove`, as it was before.
 
 Its Info page, under `Ctrl+Shift+I`, is the session itself: the shell and its
 process id, the directory it is working in, the directory the other two pages
