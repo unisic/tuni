@@ -713,10 +713,44 @@ impl TuniWindow {
         imp.attention
             .replace(Some((attention.clone(), attention_label)));
 
+        // The sidebar's empty foot moves the window, as the header above it
+        // does: on a tall window it is most of the sidebar, and the nearest
+        // thing to grab.
+        let foot = gtk::WindowHandle::builder()
+            .vexpand(true)
+            .child(&attention)
+            .build();
+
         let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         column.append(&scroller);
         column.append(&new_project);
-        column.append(&attention);
+        column.append(&foot);
+        // A folder dropped anywhere on the sidebar opens as a project, the
+        // way `tuni <folder>` does; a file in the same drop is passed over.
+        column.add_css_class("tuni-sidebar-drop");
+        let folders = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        folders.connect_drop(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            false,
+            move |_, value, _, _| {
+                let Ok(files) = value.get::<gdk::FileList>() else {
+                    return false;
+                };
+                let folders: Vec<PathBuf> = files
+                    .files()
+                    .iter()
+                    .filter_map(gio::File::path)
+                    .filter(|path| path.is_dir())
+                    .collect();
+                for folder in &folders {
+                    this.open_project_in(Some(folder));
+                }
+                !folders.is_empty()
+            }
+        ));
+        column.add_controller(folders);
 
         let sidebar_header = adw::HeaderBar::builder()
             .show_end_title_buttons(false)
@@ -1107,6 +1141,19 @@ impl TuniWindow {
             entry("close-project", uint64, |window, target| {
                 if let Some(id) = project_target(target) {
                     window.close_project(id);
+                }
+            }),
+            // Kero's Close All Sessions: every shell in the project ends and
+            // the project stays, with its name, icon and directory, for the
+            // next tab. Each tab is closed the way its own button closes it,
+            // so one holding unsaved edits still asks.
+            entry("close-project-tabs", uint64, |window, target| {
+                let view = project_target(target)
+                    .and_then(|id| window.imp().views.borrow().get(&id).cloned());
+                if let Some(view) = view {
+                    for position in (0..view.n_pages()).rev() {
+                        view.close_page(&view.nth_page(position));
+                    }
                 }
             }),
             entry("rename-project", uint64, |window, target| {
@@ -5676,7 +5723,7 @@ impl TuniWindow {
     fn popup_row_menu(&self, row: &gtk::ListBoxRow, x: f64, y: f64) {
         let imp = self.imp();
         let index = row.index().max(0) as usize;
-        let Some((id, named, pinned, follows, iconed)) =
+        let Some((id, named, pinned, follows, iconed, tabs)) =
             imp.workspace.borrow().projects().get(index).map(|p| {
                 (
                     p.id(),
@@ -5684,6 +5731,7 @@ impl TuniWindow {
                     p.custom_directory.is_some(),
                     p.inherit_directory,
                     p.icon.is_some(),
+                    !p.is_empty(),
                 )
             })
         else {
@@ -5693,7 +5741,9 @@ impl TuniWindow {
             return;
         };
 
-        menu.set_menu_model(Some(&project_menu(id, named, pinned, follows, iconed)));
+        menu.set_menu_model(Some(&project_menu(
+            id, named, pinned, follows, iconed, tabs,
+        )));
         // The gesture reports the click in the row's coordinates; the popover
         // is parented to the list, which is where it has to point.
         let point = row
@@ -5888,7 +5938,14 @@ fn project_target(target: Option<&glib::Variant>) -> Option<Id> {
 /// Title" only belongs there when there is a custom one to drop, and because
 /// the directory rule reads as one label per state rather than a checkbox that
 /// says what is off.
-fn project_menu(id: Id, named: bool, pinned: bool, follows: bool, iconed: bool) -> gio::Menu {
+fn project_menu(
+    id: Id,
+    named: bool,
+    pinned: bool,
+    follows: bool,
+    iconed: bool,
+    tabs: bool,
+) -> gio::Menu {
     let target = id.raw().to_variant();
 
     let naming = gio::Menu::new();
@@ -5940,6 +5997,9 @@ fn project_menu(id: Id, named: bool, pinned: bool, follows: bool, iconed: bool) 
     ));
 
     let closing = gio::Menu::new();
+    if tabs {
+        closing.append_item(&item("Close All Tabs", "win.close-project-tabs", &target));
+    }
     closing.append_item(&item("Close Project", "win.close-project", &target));
 
     let menu = gio::Menu::new();
@@ -6261,6 +6321,9 @@ fn load_css() {
                 drawn over it would only say the same thing twice. */\n\
              .tuni-sidebar-grip:hover { background-color: alpha(@accent_color, 0.5); }\n\
              .tuni-drop { background-color: alpha(@accent_color, 0.28); border-radius: 6px; }\n\
+             .tuni-sidebar-drop { transition: box-shadow 120ms ease-out; }\n\
+             .tuni-sidebar-drop:drop(active) { \
+              box-shadow: inset 0 0 0 2px alpha(@accent_color, 0.7); }\n\
              /* A tab held over a project row, and the same row for a moment\n\
                 after it has been let go of. The two are one colour on purpose:\n\
                 what lights up under the pointer is what keeps the tab, and the\n\

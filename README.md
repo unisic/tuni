@@ -32,7 +32,8 @@ A native terminal workspace for Linux.
   without restarting the shells in it
 - Type one command into every pane of a tab at once, and wipe the one being
   typed with `Ctrl+Shift+Backspace` whatever the shell
-- A project's row takes an icon from the desktop's theme, or an emoji
+- A project's row takes an icon from the desktop's theme, or an emoji; a folder
+  dropped on the sidebar opens as a project
 - A coding agent thinking in a pane spins on its tab and on its project, and
   leaves an exclamation there when it finishes into a tab you are not watching;
   `Ctrl+Shift+J` goes to the next tab that wants you

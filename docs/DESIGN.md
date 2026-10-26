@@ -53,13 +53,19 @@ is drawn in the row's own foreground color like every other symbolic icon in the
 window; an emoji is text the font colors. A project whose tabs are all closed
 stays in the sidebar until it is closed on purpose: by its own button, by its
 menu, or by a middle click anywhere on the row, which is how a tab closes
-everywhere else. Dragged off the sidebar entirely it becomes a window of its own
+everywhere else. "Close All Tabs" in that menu gets a project there in one go,
+as kero's Close All Sessions does: each tab closes the way its own button closes
+it, so one holding unsaved edits still asks. Dragged off the sidebar entirely it becomes a window of its own
 instead, tabs, panes, shells and all: the tab strip does this for one tab and
 hears it from `AdwTabView`, and a list row, which has no such signal, reads a
 drag that ended on nothing as the same request. The sidebar and
 the panel are both dragged to a width by their inner edge, and one dragged to a
 width keeps it. Until then each is a fraction of the window, which is what a
-split view sizes by and what an undragged one should go on doing.
+split view sizes by and what an undragged one should go on doing. A folder
+dropped on the sidebar opens as a project, one per folder, the way `tuni <folder>`
+does; files in the same drop are passed over. The sidebar's empty space under
+its rows moves the window, as the header above it does: on a tall window it is
+most of the sidebar, and the nearest thing to grab.
 
 One tuni runs at a time, and a launch made while it is running is a project
 rather than a second window. "Open Terminal Here" in a file manager says where
