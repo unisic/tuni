@@ -363,6 +363,27 @@ fn selection_is_marked_on_the_grid_and_can_be_cleared() {
     terminal.clear_selection().expect("clear");
     assert!(!terminal.has_selection());
     assert_eq!(terminal.selection_text().expect("text"), None);
+
+    // The row was copied while selected and nothing has written to it since,
+    // so only the library's own record of the selection can repaint it.
+    let grid = terminal.snapshot().expect("snapshot");
+    assert_eq!(grid.cell(0, 0).expect("cell").bg, None);
+}
+
+#[test]
+fn a_snapshot_after_a_write_shows_the_new_row_and_keeps_the_rest() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    terminal.feed(b"first\r\nsecond");
+    assert_eq!(row_text(&mut terminal, 0), "first");
+
+    terminal.feed(b"\x1b[1;1Hthird");
+    assert_eq!(row_text(&mut terminal, 0), "third");
+    assert_eq!(row_text(&mut terminal, 1), "second");
+
+    // Scrolling moves every row, and every row has to follow it.
+    terminal.feed(b"\x1b[5;1H\r\n");
+    assert_eq!(row_text(&mut terminal, 0), "second");
+    assert_eq!(row_text(&mut terminal, 1), "");
 }
 
 #[test]
@@ -571,6 +592,38 @@ fn a_theme_recolors_the_selection_instead_of_inverting_it() {
     let cell = grid.cell(0, 0).expect("cell");
     assert_eq!(cell.bg, colors.selection_background);
     assert_eq!(cell.fg, colors.selection_foreground.expect("set above"));
+}
+
+#[test]
+fn a_theme_arriving_after_a_snapshot_recolors_a_selection_already_drawn() {
+    let mut terminal = Terminal::new(20, 5, 100).expect("terminal");
+    let colors = test_colors();
+    let inverting = Colors {
+        selection_background: None,
+        selection_foreground: None,
+        ..colors
+    };
+    terminal.set_colors(&inverting).expect("set colors");
+    terminal.feed(b"hello");
+
+    let geometry = geometry(20, 5);
+    let (x, y) = at(0, 0);
+    terminal
+        .select_press(x, y, geometry, Duration::from_millis(0), false)
+        .expect("press");
+    let (x, y) = at(2, 0);
+    terminal.select_drag(x, y, geometry, false).expect("drag");
+    let grid = terminal.snapshot().expect("snapshot");
+    assert_eq!(grid.cell(0, 0).expect("cell").bg, Some(grid.fg));
+
+    // The same theme with selection colors added. Those are this crate's, so
+    // the library has no reason to call the row dirty; the theme has to.
+    terminal.set_colors(&colors).expect("set colors");
+    let grid = terminal.snapshot().expect("snapshot");
+    assert_eq!(
+        grid.cell(0, 0).expect("cell").bg,
+        colors.selection_background
+    );
 }
 
 #[test]

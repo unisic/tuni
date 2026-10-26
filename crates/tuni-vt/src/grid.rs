@@ -135,6 +135,17 @@ impl Grid {
         }
     }
 
+    /// Blank one row, ahead of copying it again.
+    pub(crate) fn clear_row(&mut self, row: u16) {
+        let start = usize::from(row) * usize::from(self.cols);
+        let end = start + usize::from(self.cols);
+        if let Some(cells) = self.cells.get_mut(start..end) {
+            for cell in cells {
+                cell.reset();
+            }
+        }
+    }
+
     pub(crate) fn cell_mut(&mut self, col: u16, row: u16) -> Option<&mut Cell> {
         if col >= self.cols || row >= self.rows {
             return None;

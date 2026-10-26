@@ -27,7 +27,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use libghostty_vt::fmt::Format;
-use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
+use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIterator};
 use libghostty_vt::screen::RowSemanticPrompt;
 use libghostty_vt::selection::gesture::{
     Autoscroll, AutoscrollTickEvent, Behavior, Behaviors, DragEvent, Geometry as GestureGeometry,
@@ -1320,6 +1320,16 @@ impl Terminal {
     /// cell iteration) whose lifetimes cannot leave this method, so the frame
     /// is copied out. Buffers are reused, so a steady-state redraw does not
     /// allocate.
+    ///
+    /// Only the rows the library marks dirty are copied again. Reading a cell
+    /// is half a dozen calls across the FFI, and a cursor blink or a spinner
+    /// asks for a whole viewport of them to learn that one row, or none,
+    /// changed. Anything that touches every row arrives as a full redraw: a
+    /// scroll, a resize, a selection, reverse video, and any color, the
+    /// defaults `set_colors` hands over included. So a theme repaints the
+    /// selection colors kept here too. That is how Ghostty's own renderer
+    /// reads the same flags. Both layers are cleared here because the library
+    /// never clears them itself.
     pub fn snapshot(&mut self) -> Result<&Grid> {
         let snapshot = self.render.update(&self.inner)?;
         let colors = snapshot.colors()?;
@@ -1344,14 +1354,29 @@ impl Terminal {
             None
         };
 
-        self.grid.resize_and_clear(cols, rows);
+        let dirty = snapshot.dirty()?;
+        let full = dirty == Dirty::Full || (self.grid.cols, self.grid.rows) != (cols, rows);
+        if full {
+            self.grid.resize_and_clear(cols, rows);
+        }
         self.grid.fg = colors.foreground.into();
         self.grid.bg = colors.background.into();
         self.grid.cursor = cursor;
+        if !full && dirty == Dirty::Clean {
+            return Ok(&self.grid);
+        }
 
         let mut row_it = self.rows.update(&snapshot)?;
         let mut y: u16 = 0;
         while let Some(row) = row_it.next() {
+            if !full {
+                if !row.dirty()? {
+                    y += 1;
+                    continue;
+                }
+                self.grid.clear_row(y);
+            }
+            row.set_dirty(false)?;
             // A row-level flag, tolerant of false positives, that saves an FFI
             // call per cell on the overwhelming majority of rows, which carry
             // no hyperlink at all.
@@ -1432,6 +1457,7 @@ impl Terminal {
             y += 1;
         }
 
+        snapshot.set_dirty(Dirty::Clean)?;
         Ok(&self.grid)
     }
 }
