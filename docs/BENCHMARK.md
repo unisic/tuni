@@ -242,11 +242,19 @@ pane rows are from after it.
 - Closing returns every thread and descriptor, and `TUNI_DEBUG_LIFETIME`
   reports all fifteen terminals released and none still alive. What PSS
   keeps, about 5 MiB over a single pane, is allocator and GTK state rather
-  than a leak: a `malloc_trim(0)` called from gdb hands 1.9 MiB of it back,
+  than a leak: a `malloc_trim(0)` called from gdb handed 1.9 MiB of it back,
   and the rest is caches grown while sixteen panes were drawn.
 - Output is bounded by the scrollback budget of 50 000 lines: 200 MiB through
   one pane adds 16 to 18 MiB, and 400 MiB adds nothing more (64.9 against
   65.3 MiB in a separate pair of launches).
+- Since then a closed pane, and every MiB a pane reads, asks for one
+  `malloc_trim(0)` once two seconds pass without another ask. On 2026-10-26,
+  two interleaved pairs, the closed-panes row went from 52.8 and 53.7 MiB to
+  50.7 and 51.6, and the row after 200 MiB from 65.1 and 66.7 to 64.0 and
+  63.9. A trim from gdb afterwards found nothing left to hand back on either
+  row. On a C heap of 64 MiB with 62 freed in page-sized runs one trim took
+  2.7 ms, and 0.24 ms once there was nothing to return; it runs on the main
+  thread, once per burst, and never during one.
 
 ## tuni against kero
 

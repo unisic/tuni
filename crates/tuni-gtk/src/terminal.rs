@@ -52,6 +52,11 @@ const PROGRESS_STALE: Duration = Duration::from_secs(15);
 /// it costs throughput rather than the window's ability to answer.
 const FEED_BUDGET: Duration = Duration::from_millis(8);
 
+/// How much output a pane reads before it asks for `trim_soon`. A flood asks
+/// many times over and is trimmed once at its end; what a prompt prints takes
+/// hours to add up to one ask.
+const TRIM_AFTER_BYTES: usize = 1 << 20;
+
 /// How often a shell that has never sent OSC 7 is looked up in `/proc`. The
 /// same couple of seconds the panel polls its own reads at, for the same
 /// reason: the answer is wanted by the time somebody looks, and one `readlink`
@@ -668,6 +673,7 @@ mod imp {
             // Drop the session before the widget so the reader thread's channel
             // closes and the shell gets its SIGHUP.
             self.session.replace(None);
+            crate::trim_soon();
         }
     }
 
@@ -1575,10 +1581,16 @@ impl TuniTerminal {
                 // chunk keeps the main loop answering within a frame without
                 // paying a round trip through the loop for each 64 KiB.
                 let mut served = Instant::now();
+                let mut unasked = 0;
                 while let Ok(event) = events.recv().await {
                     match event {
                         PtyEvent::Output(bytes) => {
                             this.feed(&bytes);
+                            unasked += bytes.len();
+                            if unasked >= TRIM_AFTER_BYTES {
+                                unasked = 0;
+                                crate::trim_soon();
+                            }
                             // A closed pane's session is gone, but a shell
                             // that ignored its SIGHUP can keep printing, and
                             // every chunk it prints would keep this future —

@@ -455,6 +455,54 @@ fn trim_after_first_frame(window: &TuniWindow) {
     let _ = window;
 }
 
+/// How long `trim_soon` waits without being asked again before it trims.
+#[cfg(target_env = "gnu")]
+const TRIM_QUIET_SECONDS: u32 = 2;
+
+#[cfg(target_env = "gnu")]
+thread_local! {
+    /// When `trim_soon` was last asked, for as long as its timer is armed.
+    static TRIM_ASKED: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Hands back to the system, once the freeing stops, what a closed pane or a
+/// flood of output let go of.
+///
+/// The same glibc behaviour `trim_after_first_frame` is for, after the fact:
+/// a closed pane's grid and what it had cached for drawing, and the buffers a
+/// flood was read through, stay counted against the window otherwise. A trim
+/// from gdb took 1.8 to 1.9 MiB off a window with fifteen of sixteen panes
+/// closed and 1.9 to 2.3 MiB off one that had shown 200 MiB of output. The
+/// trim waits for two seconds without another ask, so a flood gets one at its
+/// end rather than one per chunk, each of which the next read would fault
+/// straight back in. While armed it is one seconds timer, on the tick every
+/// other one in the process shares; idle, it is nothing.
+pub fn trim_soon() {
+    #[cfg(target_env = "gnu")]
+    TRIM_ASKED.with(|asked| {
+        if asked.replace(Some(std::time::Instant::now())).is_some() {
+            return;
+        }
+        glib::timeout_add_seconds_local(TRIM_QUIET_SECONDS, || {
+            let quiet = std::time::Duration::from_secs(TRIM_QUIET_SECONDS.into());
+            let asked_since = TRIM_ASKED.with(|asked| match asked.get() {
+                Some(at) if at.elapsed() < quiet => true,
+                _ => {
+                    asked.set(None);
+                    false
+                }
+            });
+            if asked_since {
+                return glib::ControlFlow::Continue;
+            }
+            // SAFETY: as in `trim_after_first_frame`.
+            unsafe { libc::malloc_trim(0) };
+            glib::ControlFlow::Break
+        });
+    });
+}
+
 /// The settings for this run: the file, then the environment on top of it.
 ///
 /// `TUNI_THEME` names one of the bundled themes for both appearances,
