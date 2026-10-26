@@ -123,8 +123,8 @@ pub struct Agents {
     /// Whether UsageFleet is asked how much of this device's group budget is
     /// spent, and whether it is refusing new prompts for it.
     ///
-    /// One request to usagefleet.com at most once a minute while Claude Code or
-    /// Pi is in the pane, with the device token UsageFleet's collector keeps.
+    /// One request to usagefleet.com at most once a minute while Claude Code,
+    /// Pi or rokartur's agent is in the pane, with the device token UsageFleet's collector keeps.
     /// Where it is not installed there is no token and nothing is sent.
     pub usagefleet: bool,
     /// Whether a tab whose agent is thinking draws a spinner.

@@ -333,9 +333,10 @@ impl Reader {
         if !fleet {
             self.fleet = None;
         }
-        // UsageFleet meters these two agents' logs, and its guard sits in
-        // front of their prompts.
-        if fleet && matches!(agent, Agent::Claude | Agent::Pi) {
+        // UsageFleet meters these three agents' logs, `~/.agents/sessions`
+        // among them as of 1.2.177, and its guard sits in front of Claude
+        // Code's and Pi's prompts.
+        if fleet && matches!(agent, Agent::Claude | Agent::Pi | Agent::Rokartur) {
             snapshot.fleet = self.fleet_budget();
         }
         snapshot

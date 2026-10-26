@@ -981,8 +981,8 @@ fn agents_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw::
     let fleet = adw::SwitchRow::builder()
         .title("UsageFleet")
         .subtitle(
-            "The group's 5 hour and weekly budget beside Claude Code and Pi, asked of its \
-             server once a minute",
+            "The group's 5 hour and weekly budget beside Claude Code, Pi and rokartur's \
+             agent, asked of its server once a minute",
         )
         .active(settings.agents.usagefleet)
         .build();
