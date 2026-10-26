@@ -114,6 +114,45 @@ fn appearance_page(
     ));
     window_group.add(&tab_bar);
 
+    let unfocused = adw::SpinRow::builder()
+        .title("Unfocused Panes")
+        .subtitle("Percent shown while another pane has the keyboard")
+        .adjustment(&gtk::Adjustment::new(
+            settings.unfocused_split_opacity * 100.0,
+            tuni_core::settings::UNFOCUSED_SPLIT_OPACITY_MIN * 100.0,
+            100.0,
+            5.0,
+            10.0,
+            0.0,
+        ))
+        .build();
+    unfocused.connect_value_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let percent = row.value() / 100.0;
+            edit(&window, |settings| {
+                settings.unfocused_split_opacity = percent
+            });
+        }
+    ));
+    window_group.add(&unfocused);
+
+    let follows = adw::SwitchRow::builder()
+        .title("Focus Follows Mouse")
+        .subtitle("Moving the pointer into a split pane gives it the keyboard")
+        .active(settings.focus_follows_mouse)
+        .build();
+    follows.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.focus_follows_mouse = on);
+        }
+    ));
+    window_group.add(&follows);
+
     let panel_group = adw::PreferencesGroup::builder()
         .title("Panel Pages")
         // Verified rather than implied: a hidden page is one GtkStack refuses to

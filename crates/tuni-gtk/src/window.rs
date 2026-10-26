@@ -566,6 +566,7 @@ impl TuniWindow {
         // change the desktop happens to send.
         let opacity = imp.settings.borrow().terminal.background_opacity;
         apply_chrome(&window.theme(), opacity);
+        crate::grid::apply_veil(imp.settings.borrow().unfocused_split_opacity);
         // There is no surface to ask about until the window is realized, and
         // the setting was read before there was a window at all. The blurred
         // region is the window's own rectangle, so it is asked for again every
@@ -1421,6 +1422,7 @@ impl TuniWindow {
         crate::editor::apply_font(&settings.terminal);
         crate::diff::apply_colors(&theme);
         apply_chrome(&theme, settings.terminal.background_opacity);
+        crate::grid::apply_veil(settings.unfocused_split_opacity);
         crate::blur::apply(self, settings.background_blur);
 
         if let Some(panel) = imp.panel_view.borrow().as_ref() {
@@ -3006,6 +3008,16 @@ impl TuniWindow {
 
     fn grid_message(&self, project: Id, tab: Id, message: Message) {
         let imp = self.imp();
+        // The pointer moving over a pane. Handing it the keyboard is all this
+        // does, and the pane taking the keyboard moves the ring and the model
+        // the way a click does. Only in the window being typed into: a pointer
+        // crossing a window in the background is on its way somewhere else.
+        if let Message::Focus(pane) = message {
+            if imp.settings.borrow().focus_follows_mouse && self.is_active() {
+                self.give_keyboard(pane);
+            }
+            return;
+        }
         let mut reshaped = false;
         {
             let mut workspace = imp.workspace.borrow_mut();
@@ -3017,7 +3029,7 @@ impl TuniWindow {
                 return;
             };
             match message {
-                Message::Focus(pane) => layout.focus(pane),
+                Message::Focus(_) => {}
                 Message::Move(dragged, edge, target) => {
                     layout.move_pane(dragged, edge, target);
                     reshaped = true;
@@ -4560,9 +4572,12 @@ impl TuniWindow {
 
     /// Hands the keyboard to whatever the focused pane holds.
     fn focus_pane(&self) {
-        let Some(pane) = self.focused_pane() else {
-            return;
-        };
+        if let Some(pane) = self.focused_pane() {
+            self.give_keyboard(pane);
+        }
+    }
+
+    fn give_keyboard(&self, pane: Id) {
         let imp = self.imp();
         if let Some(editor) = imp.editors.borrow().get(&pane) {
             editor.focus_text();

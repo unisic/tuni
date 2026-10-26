@@ -236,6 +236,15 @@ pub struct Settings {
     /// bar that appears when a second tab opens moves the terminal under the
     /// pointer, and the row it costs is the row it is worth.
     pub auto_hide_tab_bar: bool,
+    /// How much of a split pane without the keyboard shows through the veil
+    /// drawn over it, Ghostty's `unfocused-split-opacity` and Ghostty's 0.7.
+    /// The ring alone says which pane takes the typing; the veil says it from
+    /// across the room. 1 draws no veil.
+    pub unfocused_split_opacity: f64,
+    /// Whether the pointer moving in a split pane hands it the keyboard,
+    /// Ghostty's `focus-follows-mouse`. Off, as there: a mouse nudged on its
+    /// way somewhere else would otherwise move where the typing goes.
+    pub focus_follows_mouse: bool,
     /// Whether the compositor is asked to blur what shows through a translucent
     /// window. KWin is the one that offers this; on a desktop without the
     /// protocol the request is dropped and the background stays clear.
@@ -301,6 +310,8 @@ impl Default for Settings {
             restore_history: false,
             wrap_lines: false,
             auto_hide_tab_bar: false,
+            unfocused_split_opacity: 0.7,
+            focus_follows_mouse: false,
             background_blur: false,
             ssh_term: crate::ssh::REMOTE_TERM.to_owned(),
             ssh_share_connections: true,
@@ -318,6 +329,10 @@ impl Default for Settings {
         }
     }
 }
+
+/// The dimmest an unfocused split pane may be, Ghostty's floor: below it the
+/// pane is a dark rectangle rather than something to glance at.
+pub const UNFOCUSED_SPLIT_OPACITY_MIN: f64 = 0.15;
 
 /// How many lines of a pane's scrollback are kept for the replay. kero's own
 /// cap, and for the same reason: it bounds a file that would otherwise grow
@@ -462,6 +477,15 @@ impl Settings {
         }
         if let Some(on) = table.boolean("window.auto-hide-tab-bar") {
             settings.auto_hide_tab_bar = on;
+        }
+        if let Some(opacity) = table
+            .number("unfocused-split-opacity")
+            .filter(|opacity| (UNFOCUSED_SPLIT_OPACITY_MIN..=1.0).contains(opacity))
+        {
+            settings.unfocused_split_opacity = opacity;
+        }
+        if let Some(on) = table.boolean("focus-follows-mouse") {
+            settings.focus_follows_mouse = on;
         }
         if let Some(opens) = table.string("new-tab").and_then(NewTab::parse) {
             settings.new_tab = opens;
@@ -672,6 +696,16 @@ impl Settings {
         }
         if self.auto_hide_tab_bar != default.auto_hide_tab_bar {
             let _ = writeln!(out, "window.auto-hide-tab-bar = {}", self.auto_hide_tab_bar);
+        }
+        if self.unfocused_split_opacity != default.unfocused_split_opacity {
+            let _ = writeln!(
+                out,
+                "unfocused-split-opacity = {}",
+                toml::number(self.unfocused_split_opacity)
+            );
+        }
+        if self.focus_follows_mouse != default.focus_follows_mouse {
+            let _ = writeln!(out, "focus-follows-mouse = {}", self.focus_follows_mouse);
         }
         if self.new_tab != default.new_tab {
             let _ = writeln!(out, "new-tab = {}", toml::quote(self.new_tab.name()));
@@ -1138,6 +1172,8 @@ mod tests {
             restore_history: true,
             wrap_lines: true,
             auto_hide_tab_bar: true,
+            unfocused_split_opacity: 0.5,
+            focus_follows_mouse: true,
             background_blur: true,
             ssh_term: "xterm-ghostty".to_owned(),
             ssh_share_connections: false,
@@ -1186,6 +1222,8 @@ mod tests {
         assert!(!read.restore_directory);
         assert!(read.wrap_lines);
         assert!(read.auto_hide_tab_bar);
+        assert!((read.unfocused_split_opacity - 0.5).abs() < f64::EPSILON);
+        assert!(read.focus_follows_mouse);
         assert_eq!(read.new_tab, NewTab::Hosts);
         assert!(!read.new_tab_inherits_directory);
         assert_eq!(read.ssh_term, "xterm-ghostty");

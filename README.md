@@ -12,7 +12,8 @@ A native terminal workspace for Linux.
 
 ## Features
 
-- Split panes in a niri-style layout, grouped into projects and tabs
+- Split panes in a niri-style layout, grouped into projects and tabs; the
+  ones without the keyboard dim, and the keyboard can follow the mouse
 - File tree, git panel with hunk staging, and a source editor, in panes beside
   the shells
 - Session inspector: what is running, what is listening, what a connection

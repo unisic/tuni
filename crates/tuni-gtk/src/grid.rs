@@ -220,6 +220,16 @@ impl TuniGrid {
         if let Some(widget) = panes.get(&id) {
             overlay.set_child(Some(widget));
         }
+        if ring {
+            // Drawn over every split pane and clear on the focused one, so
+            // the ring moving is a fade in the stylesheet rather than a widget
+            // coming and going. Under the drop preview, which is about the
+            // pane being dropped on and has to read whichever pane that is.
+            let veil = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            veil.add_css_class("tuni-veil");
+            veil.set_can_target(false);
+            overlay.add_overlay(&veil);
+        }
         overlay.add_overlay(&preview);
 
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -236,6 +246,9 @@ impl TuniGrid {
         if movable {
             self.watch_drops(id, &container, &preview);
         }
+        if ring {
+            self.watch_pointer(id, &container);
+        }
 
         self.imp().panes.borrow_mut().push(PaneWidgets {
             id,
@@ -243,6 +256,30 @@ impl TuniGrid {
             overlay,
         });
         container
+    }
+
+    /// Tells the window the pointer is moving over a pane that does not have
+    /// the keyboard, which `focus-follows-mouse` turns into handing it over.
+    /// Motion rather than entering: a split or a close rebuilds the tiles
+    /// under a pointer that never moved, and that must not take the keyboard
+    /// from the pane the split just made. Nothing is said while a button is
+    /// held, which is a selection being dragged out of the pane that has it.
+    fn watch_pointer(&self, id: Id, pane: &gtk::Box) {
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_motion(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |motion, _, _| {
+                let held = gdk::ModifierType::BUTTON1_MASK
+                    | gdk::ModifierType::BUTTON2_MASK
+                    | gdk::ModifierType::BUTTON3_MASK;
+                let focused = *this.imp().focused.borrow();
+                if focused != Some(id) && !motion.current_event_state().intersects(held) {
+                    this.send(Message::Focus(id));
+                }
+            }
+        ));
+        pane.add_controller(motion);
     }
 
     /// The strip along the top of a pane that carries it onto another one.
@@ -313,6 +350,32 @@ impl TuniGrid {
         ));
         pane.add_controller(target);
     }
+}
+
+/// How much of a split pane without the keyboard shows through its veil,
+/// `unfocused-split-opacity`. The veil is the window's own background, which
+/// is the terminal's, so a dimmed pane fades toward the color it already sits
+/// on rather than toward grey.
+pub fn apply_veil(opacity: f64) {
+    thread_local! {
+        static PROVIDER: gtk::CssProvider = gtk::CssProvider::new();
+    }
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
+    let veil = (1.0 - opacity).clamp(0.0, 1.0);
+    PROVIDER.with(|provider| {
+        provider.load_from_string(&format!(
+            ".tuni-veil {{ background-color: @window_bg_color; border-radius: 7px; \
+             opacity: 0; transition: opacity 160ms ease-out; }}\n\
+             .tuni-pane.ringed:not(.focused) .tuni-veil {{ opacity: {veil:.3}; }}\n"
+        ));
+        gtk::style_context_add_provider_for_display(
+            &display,
+            provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
 }
 
 /// Which edge of a pane a point is nearest: the tile is cut into four triangles

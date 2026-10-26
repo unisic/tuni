@@ -561,6 +561,18 @@ were nowhere near the pointer. Sizes are weights rather than pixels, and the
 arithmetic that turns weights into a row of tiles lives in the model beside its
 tests, not in a widget where nothing can reach it.
 
+In a split tab the panes without the keyboard sit behind a veil of the window's
+own background, Ghostty's `unfocused-split-opacity` at Ghostty's 0.7. The ring
+says which pane takes the typing to someone reading the edges; the veil says it
+to someone glancing at the window. The veil is a widget over every split pane,
+clear on the focused one, so the ring moving is a 160 ms fade in the stylesheet
+rather than a widget coming and going, and it costs one rectangle of one color
+per pane. `focus-follows-mouse` hands a pane the keyboard when the pointer
+moves in it. Moving rather than entering, because a split rebuilds the tiles
+under a pointer that never moved, and that must not take the keyboard from the
+pane the split just made; never while a button is held, which is a selection
+being dragged; and only in the window being typed into, as in Ghostty.
+
 The saved session is two files rather than one. `session.json` is the shape of
 the window — projects, tabs, columns, panes, weights, focus, names — and it is
 small, cheap to write, and safe to keep: a directory path and a title are what
@@ -1204,6 +1216,8 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `terminal.restore-history` | `false` | Whether a restored pane replays what it had printed |
 | `editor.wrap-lines` | `false` | Whether a file pane folds a long line rather than scrolling sideways |
 | `window.auto-hide-tab-bar` | `false` | Whether the tab bar goes away while a window has one tab |
+| `unfocused-split-opacity` | `0.7` | How much of a split pane without the keyboard shows through, from 0.15 to 1. 1 dims nothing |
+| `focus-follows-mouse` | `false` | Whether the pointer moving in a split pane gives it the keyboard |
 | `new-tab` | `"shell"` | `shell` or `hosts`: what Ctrl+Shift+T opens. Ctrl+Shift+O opens the host list either way |
 | `new-tab-inherit-directory` | `true` | Whether a new tab or split starts where the visible shell is. Off opens every one where a shell started outside the window would; one project is taken out of it from its own menu instead |
 | `ssh-term` | `"xterm-256color"` | What an ssh pane calls itself at the far end. Tuni's own `TERM` describes terminfo that is on this machine and not necessarily on the other one |
