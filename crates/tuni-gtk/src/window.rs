@@ -3820,7 +3820,9 @@ impl TuniWindow {
     fn close_pane(&self, project: Id, tab: Id, pane: Id) {
         let imp = self.imp();
         self.forget_pane(pane);
-        let alive = {
+        // The last pane leaves the layout before the strip closes the tab, so
+        // the tab that goes is empty and this is what asks about a worktree.
+        let (alive, closed) = {
             let mut workspace = imp.workspace.borrow_mut();
             let Some(layout) = workspace
                 .project_mut(project)
@@ -3829,7 +3831,8 @@ impl TuniWindow {
             else {
                 return;
             };
-            layout.remove(pane)
+            let closed = layout.panes().find(|each| each.id() == pane).cloned();
+            (layout.remove(pane), closed)
         };
 
         if !alive {
@@ -3842,6 +3845,7 @@ impl TuniWindow {
             if let (Some(view), Some(page)) = (view, page) {
                 view.close_page(&page);
             }
+            self.offer_worktree_removal(closed.as_ref());
             return;
         }
         self.rebuild_grid(project, tab);
@@ -4037,6 +4041,76 @@ impl TuniWindow {
         // every walk.
         imp.recent.borrow_mut().retain(|id| *id != tab.id());
         self.refresh();
+        self.offer_worktree_removal(tab.layout().panes());
+    }
+
+    /// A tab closed in a worktree [`Self::ask_worktree`] made asks whether the
+    /// worktree goes with it, as a kero session does; unasked while a tab in
+    /// any window is still working in it.
+    fn offer_worktree_removal<'a>(&self, panes: impl IntoIterator<Item = &'a Pane>) {
+        let Some(worktree) = panes
+            .into_iter()
+            .filter_map(|pane| pane.directory.as_deref())
+            .find_map(|directory| tuni_core::git::worktree_of(Path::new(directory)))
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let in_use = self
+            .application()
+            .into_iter()
+            .flat_map(|app| app.windows())
+            .filter_map(|window| window.downcast::<TuniWindow>().ok())
+            .any(|window| {
+                let workspace = window.imp().workspace.borrow();
+                workspace
+                    .projects()
+                    .iter()
+                    .flat_map(tuni_core::workspace::Project::tabs)
+                    .flat_map(|tab| tab.layout().panes())
+                    .filter_map(|pane| pane.directory.as_deref())
+                    .any(|directory| Path::new(directory).starts_with(&worktree))
+            });
+        if in_use {
+            return;
+        }
+        let name = worktree
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let dialog = adw::AlertDialog::new(
+            Some(&format!("Remove the Worktree “{name}”?")),
+            Some(
+                "Its folder goes, and its branch with it once the checkout has every \
+                 commit of it. A worktree with changes in it stays.",
+            ),
+        );
+        dialog.add_response("keep", "Keep");
+        dialog.add_response("remove", "Remove");
+        // Suggested rather than destructive: git refuses whatever would lose
+        // work.
+        dialog.set_response_appearance("remove", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("remove"));
+        dialog.set_close_response("keep");
+        dialog.connect_response(
+            Some("remove"),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_, _| {
+                    let worktree = worktree.clone();
+                    glib::spawn_future_local(async move {
+                        let removed =
+                            gio::spawn_blocking(move || tuni_core::git::remove_worktree(&worktree))
+                                .await;
+                        if let Ok(Err(message)) = removed {
+                            this.toast(&message);
+                        }
+                    });
+                }
+            ),
+        );
+        dialog.present(Some(self));
     }
 
     /// A page has arrived in a strip. A tab in flight is the only kind this

@@ -116,8 +116,13 @@ opens a tab on it in a checkout of its own, off the branch the shell on screen
 is on: two agents in one repository, each in its own worktree, never edit the
 same files. The worktree goes where kero puts its, inside the main checkout
 under `.tuni/worktrees`, and the repository's `info/exclude` keeps that folder
-out of its status without a change to any file it tracks. Removing one is
-`git worktree remove`, as it was before.
+out of its status without a change to any file it tracks. Closing the last tab
+working in one asks whether the worktree goes with it, and its branch once
+the checkout has every commit of it, as kero's sessions do. Never by force:
+git refuses a worktree with changes in it and `branch -d` an unmerged branch,
+so the answer that loses nothing is the default and Enter gives it. Which
+tab is in a worktree is told by the path alone, a shell that has gone deeper
+into it included, so nothing about it has to be saved with the session.
 
 Its Info page, under `Ctrl+Shift+I`, is the session itself: the shell and its
 process id, the directory it is working in, the directory the other two pages

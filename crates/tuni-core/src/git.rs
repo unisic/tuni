@@ -986,6 +986,49 @@ pub fn add_worktree(directory: &Path, branch: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// The worktree [`add_worktree`] made that `directory` is somewhere inside, if
+/// it is in one. Told by the path alone, which nothing but tuni puts there, so
+/// a shell that has moved deeper into the checkout still counts.
+#[must_use]
+pub fn worktree_of(directory: &Path) -> Option<&Path> {
+    directory.ancestors().find(|path| {
+        path.parent()
+            .is_some_and(|parent| parent.ends_with(".tuni/worktrees"))
+    })
+}
+
+/// Removes a worktree [`add_worktree`] made, and its branch with it once the
+/// main checkout has every commit of it, as kero does. Never by force: a
+/// worktree with changes in it, or a branch with commits nothing else has, is
+/// left where it is and git's reason comes back.
+pub fn remove_worktree(worktree: &Path) -> Result<(), String> {
+    let Some(main) = worktree.ancestors().nth(3) else {
+        return Err("Not a worktree tuni made.".to_owned());
+    };
+    let branch = run(&["branch", "--show-current"], worktree).stdout;
+    let removed = run(
+        &[
+            OsStr::new("worktree"),
+            OsStr::new("remove"),
+            OsStr::new("--"),
+            worktree.as_os_str(),
+        ],
+        main,
+    );
+    if removed.stderr.contains("modified or untracked files") {
+        return Err("The worktree has changes in it, so it stays.".to_owned());
+    }
+    if !removed.is_ok() {
+        return Err(removed.message("The worktree was not removed."));
+    }
+    let branch = branch.trim();
+    if !branch.is_empty() {
+        // `-d` refuses an unmerged branch, which is the point: it stays.
+        run(&["branch", "-d", "--", branch], main);
+    }
+    Ok(())
+}
+
 /// Adds `pattern` to the repository's `info/exclude`, which ignores it the way
 /// `.gitignore` does without a change to any file the repository tracks.
 fn exclude(common: &Path, pattern: &str) -> std::io::Result<()> {
@@ -1173,6 +1216,33 @@ mod tests {
         assert!(sandbox.status().is_clean());
         assert!(add_worktree(&sandbox.path, "feature/x").is_err());
         assert!(add_worktree(&sandbox.path, " ").is_err());
+    }
+
+    #[test]
+    fn a_worktree_goes_with_its_merged_branch_and_stays_while_it_has_changes() {
+        let sandbox = Sandbox::new("worktree-remove");
+        sandbox.write("a.txt", "a\n");
+        sandbox.git(&["add", "a.txt"]);
+        sandbox.git(&["commit", "-qm", "first"]);
+        let path = add_worktree(&sandbox.path, "done").expect("worktree");
+        assert_eq!(worktree_of(&path.join("src/deep")), Some(path.as_path()));
+        assert_eq!(worktree_of(&sandbox.path), None);
+
+        std::fs::write(path.join("b.txt"), "b\n").unwrap();
+        assert!(remove_worktree(&path).is_err());
+        assert!(path.join("b.txt").is_file());
+
+        std::fs::remove_file(path.join("b.txt")).unwrap();
+        remove_worktree(&path).expect("removed");
+        assert!(!path.exists());
+        assert!(!run(&["rev-parse", "--verify", "refs/heads/done"], &sandbox.path).is_ok());
+
+        let path = add_worktree(&sandbox.path, "work").expect("worktree");
+        std::fs::write(path.join("c.txt"), "c\n").unwrap();
+        run(&["add", "c.txt"], &path);
+        assert!(run(&["commit", "-qm", "c"], &path).is_ok());
+        remove_worktree(&path).expect("removed");
+        assert!(run(&["rev-parse", "--verify", "refs/heads/work"], &sandbox.path).is_ok());
     }
 
     #[test]
