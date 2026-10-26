@@ -38,7 +38,8 @@ A native terminal workspace for Linux.
   by side never edit the same files; closing it offers to remove the worktree
 - A coding agent thinking in a pane spins on its tab and on its project, and
   leaves an exclamation there when it finishes into a tab you are not watching;
-  `Ctrl+Shift+J` goes to the next tab that wants you
+  `Ctrl+Shift+J` goes to the next tab that wants you. Any agent that spins its
+  title or reports its progress counts, with no list to add it to
 - The checkout's recent Claude Code conversations in the palette, each picked
   up again in a tab of its own
 - Paste a screenshot and the agent gets it: an image on the clipboard pastes

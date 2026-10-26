@@ -310,9 +310,12 @@ mod imp {
         /// signal is worth raising.
         pub(super) broadcast: Cell<bool>,
         pub(super) title: RefCell<Option<String>>,
-        /// Whether the last title said a coding agent in this pane is working
-        /// on a turn. See `tuni_core::usage::thinking`.
+        /// Whether a coding agent in this pane is working on a turn, by
+        /// either of the two ways agents say so: `spinning`, or a progress
+        /// report that cannot say how far along it is. See `update_working`.
         pub(super) working: Cell<bool>,
+        /// Whether the last title spun. See `tuni_core::usage::thinking`.
+        pub(super) spinning: Cell<bool>,
         /// Whether the window draws that state as a spinner on the tab, which
         /// is also what decides whether the agent's own glyph comes off the
         /// title: the glyph is taken away because the spinner replaces it, so
@@ -443,6 +446,7 @@ mod imp {
                 broadcast: Cell::new(false),
                 title: RefCell::new(None),
                 working: Cell::new(false),
+                spinning: Cell::new(false),
                 agent_spinner: Cell::new(Agents::default().spinner),
                 cwd: RefCell::new(None),
                 cwd_reported: Cell::new(false),
@@ -1529,13 +1533,12 @@ impl TuniTerminal {
                             if let Some(session) = this.imp().session.borrow_mut().as_mut() {
                                 session.pty = None;
                             }
-                            // A shell killed mid-spin leaves the agent's last
-                            // title on screen, and nothing will ever arrive to
-                            // contradict it, so the pane stops reporting work
+                            // A shell killed mid-turn leaves the agent's last
+                            // title, or its last progress report, standing, and
+                            // nothing will ever arrive to contradict it, so the pane stops reporting work
                             // here rather than pulsing the bar forever.
-                            if this.imp().working.replace(false) {
-                                this.notify("working");
-                            }
+                            this.imp().spinning.set(false);
+                            this.apply_progress(Progress::Remove);
                             this.queue_draw();
                             this.emit_by_name::<()>("exited", &[]);
                             break;
@@ -1675,10 +1678,8 @@ impl TuniTerminal {
         // second is four frames that change the state and not the name, and
         // comparing raw titles would run that refresh for every one of them.
         if let Some(title) = title {
-            let working = tuni_core::usage::thinking(&title);
-            if imp.working.replace(working) != working {
-                self.notify("working");
-            }
+            imp.spinning.set(tuni_core::usage::thinking(&title));
+            self.update_working();
             let name = if imp.agent_spinner.get() {
                 tuni_core::usage::strip_spinner(&title)
             } else {
@@ -3801,6 +3802,7 @@ impl TuniTerminal {
         }
         if progress == Progress::Remove {
             imp.progress.set(None);
+            self.update_working();
             self.queue_draw();
             return;
         }
@@ -3824,12 +3826,27 @@ impl TuniTerminal {
                 move || {
                     this.imp().progress_stale.replace(None);
                     this.imp().progress.set(None);
+                    this.update_working();
                     this.queue_draw();
                 }
             ),
         );
         imp.progress_stale.replace(Some(source));
+        self.update_working();
         self.queue_draw();
+    }
+
+    /// Whether an agent here is on a turn. Claude Code spins its title; Pi,
+    /// with its terminal progress on, and whatever else reports progress
+    /// without a percentage, keeps an indeterminate bar alive until the turn
+    /// ends. Neither says whose turn it is, so an agent nobody taught tuni
+    /// about gets the tab's spinner, its mark and its banner all the same.
+    fn update_working(&self) {
+        let imp = self.imp();
+        let working = imp.spinning.get() || imp.progress.get() == Some(Progress::Indeterminate);
+        if imp.working.replace(working) != working {
+            self.notify("working");
+        }
     }
 
     /// The progress bar: a hairline along the bottom edge, in the theme's own

@@ -529,15 +529,21 @@ at all while nothing wants a look. Kero has the same foot and the same key:
 it is the one place that answers "is anything waiting on me" without reading
 every row.
 
-What it reads is the title, and nothing else. Claude Code writes its own state
-there — `✳ Claude Code` between turns, a braille spinner frame in place of the
+What it reads is what the agent says about itself, and nothing else. Claude
+Code writes its own state in the title — `✳ Claude Code` between turns, a braille spinner frame in place of the
 star while it works — so a pane reports for itself over an escape sequence the
 terminal parses anyway. No process is polled for it and no screen is scraped;
 the CPU an agent burns was measured first and cannot tell thinking from waiting,
 which is the reason this is read rather than sampled. Braille is the whole test:
 a spinner is drawn out of that block and no prompt, path or command line starts
-with one. An agent that says nothing in its title simply never reports, the same
-as every pane that is not running one.
+with one. Pi says it with the progress report instead, once its
+`terminal.showTerminalProgress` is on: OSC 9;4 in the state that only knows it
+is busy, sent again every second of a turn and cleared when the turn ends.
+Either one is a turn, and neither names the agent, so an agent tuni has never
+heard of is recognised the same way, with no list to add it to. The price is
+that anything else reporting progress without a percentage counts as well, and
+its end marks the tab as an agent's would. An agent that says nothing in either
+place simply never reports, the same as every pane that is not running one.
 
 The glyph then comes off the name. Having turned it into a spinner on the tab,
 leaving it in the label would say the same thing twice and animate a frame under

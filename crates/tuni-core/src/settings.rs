@@ -103,8 +103,8 @@ pub struct Agents {
     pub usage: bool,
     /// Which agents count as one. An agent that is not recognised is a pane
     /// like any other: no section, no logs read, no request made. The turn
-    /// marks are not filtered by these, because the title's spinner says a turn
-    /// is running without saying whose.
+    /// marks are not filtered by these, because neither the title's spinner
+    /// nor a progress report says whose turn is running.
     pub claude: bool,
     pub codex: bool,
     pub opencode: bool,
