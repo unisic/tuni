@@ -256,6 +256,62 @@ pane rows are from after it.
   2.7 ms, and 0.24 ms once there was nothing to return; it runs on the main
   thread, once per burst, and never during one.
 
+### CPU while one line changes
+
+Throughput says how fast a flood is swallowed. Most of a working day is the
+opposite: a screen that stays put while one line changes, a spinner under a
+build log or a progress bar. The workload prints 40 000 bytes of the colored
+payload, then rewrites one line 30 times a second, a bold green spinner
+glyph and a counter. The figure is the CPU every thread of the terminal
+spent over 10 seconds of it, read from `/proc/<pid>/task/*/schedstat` after
+3 seconds to settle. Then each terminal sat at a `bash --norc` prompt for
+20 seconds, with its own default cursor blink, read with `perf stat -e
+task-clock` after 4 seconds. Same headless session on 2026-10-26, nice 19,
+three rounds with the terminals interleaved, median and range of the three.
+
+| | Spinner, ms per 10 s | Range | At a prompt, ms per 20 s | Range |
+| --- | ---: | ---: | ---: | ---: |
+| kitty | 75.9 | 69.8 to 84.7 | 5.1 | 5.0 to 10.1 |
+| alacritty | 79.0 | 72.8 to 82.3 | 0 | 0 |
+| foot | 80.0 | 78.9 to 84.2 | 0 | 0 |
+| konsole | 126.4 | 120.1 to 134.4 | 0.1 | 0.1 |
+| ghostty | 159.5 | 155.5 to 172.3 | 19.6 | 18.9 to 22.9 |
+| tuni, this tree | 170.5 | 166.0 to 187.2 | 5.9 | 5.9 to 6.3 |
+| tuni 1.7.0 | 303.6 | 274.3 to 309.5 | 7.0 | 6.7 to 7.1 |
+
+- The zeros are perf reporting the counter as never scheduled: foot and
+  alacritty did not run once in the 20 seconds. tuni follows the desktop's
+  blink settings, so it blinks from the moment it is focused until
+  `gtk-cursor-blink-timeout` after that and then stops its timer; most of
+  its 5.9 ms is that blink.
+- Against 1.7.0 the spinner costs 44% less and the prompt 16% less. Two
+  changes did it. Ghostty's render state marks which rows changed, and the
+  snapshot now copies only those, where it used to read every cell of the
+  viewport across the FFI each frame. Timed outside the app on a 120 by 40
+  screen, feeding a spinner line and taking the snapshot is 3.6 µs, and a
+  resize followed by the full snapshot it forces is 111 µs. And each row's
+  text is recorded once into a render node and drawn again from it until
+  the row's content changes, so Pango lays out the one row that moved
+  rather than all of them. The cache holds one viewport of nodes, which GTK
+  shares with the frame it draws, so it costs no memory of its own beyond
+  the map; a font, size, scale or ligature change empties it.
+- The same session's throughput pair, best of five through 200 MiB: 158.0
+  MiB/s, RSS 111.4 MiB, PSS 48.4 MiB for this tree, and 153.8 MiB/s, 111.3
+  MiB and 48.1 MiB for 1.7.0. The row cache costs a flood nothing, and
+  memory is unchanged.
+- Where the remaining 170 ms goes, from a `perf record -e task-clock` of
+  the spinner with call graphs, 2 071 samples: about 37% under tuni's draw,
+  13 points of it Pango shaping the changed row and 10 GTK building text
+  nodes, and 34% in GTK's renderer. Reading the terminal is under 1%.
+- 7 of those points are GTK reloading a font. `gsk_text_node_new2` measures
+  every text node with an unhinted copy of its font, and remembers only the
+  last font it copied, so a row that switches between bold and regular, as
+  the spinner does, reloads it through fontconfig at every switch. With
+  fontconfig's slight hinting and RGB subpixel order, which this desktop
+  has, the shortcut that skips the copy never applies. Drawing unhinted
+  would skip it, but that changes how every glyph looks, so it is left to
+  the desktop.
+
 ## tuni against kero
 
 kero runs its terminals in a daemon, `kerod`, and the app draws them, so the
