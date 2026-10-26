@@ -46,6 +46,26 @@ pub fn score(candidate: &str, pattern: &str) -> Option<i32> {
     Some(score)
 }
 
+/// How well `query` finds `words`, a list of other names for an entry: each of
+/// the query's terms has to start one of them. Letters in order would be too
+/// loose here, since a dozen synonyms hold most of the alphabet and any query
+/// would match; kero scores its keywords the same way.
+#[must_use]
+pub fn keywords(words: &str, query: &str) -> Option<i32> {
+    let words = words.to_lowercase();
+    let query = query.to_lowercase();
+    let mut terms = query.split_whitespace().peekable();
+    terms.peek()?;
+    terms.try_fold(0, |total, term| {
+        words
+            .split_whitespace()
+            .filter(|word| word.starts_with(term))
+            .filter_map(|word| score(word, term))
+            .max()
+            .map(|best| total + best)
+    })
+}
+
 /// Whether a character ends a word, so the next one starts one. kero only
 /// counts spaces; a palette entry here can carry a path or a hyphenated name,
 /// and the first letter after either reads as the start of a word too.
@@ -94,6 +114,19 @@ mod tests {
         let boundary = score("~/src/upstream", "up").expect("boundary match");
         let inner = score("~/src/cupboard", "up").expect("inner match");
         assert!(boundary > inner, "{boundary} should beat {inner}");
+    }
+
+    #[test]
+    fn a_keyword_has_to_start_with_the_term_not_merely_contain_its_letters() {
+        assert!(keywords("projects hide show", "pro").is_some());
+        assert_eq!(keywords("projects hide show", "ssh"), None);
+    }
+
+    #[test]
+    fn every_term_of_the_query_has_to_find_a_keyword() {
+        assert!(keywords("theme dark light", "dark theme").is_some());
+        assert_eq!(keywords("theme dark light", "dark font"), None);
+        assert_eq!(keywords("theme dark light", "  "), None);
     }
 
     #[test]

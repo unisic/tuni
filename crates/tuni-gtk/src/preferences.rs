@@ -54,14 +54,23 @@ thread_local! {
     static PREVIEW: RefCell<Option<Paint>> = const { RefCell::new(None) };
 }
 
-pub fn present(window: &crate::window::TuniWindow, settings: &Settings) {
+/// Opens the settings, on `page` when one is named: the palette's way to the
+/// page a word belongs on.
+pub fn present(window: &crate::window::TuniWindow, settings: &Settings, page: Option<&str>) {
     let dialog = adw::PreferencesDialog::new();
     dialog.set_title("Preferences");
+    // libadwaita's own search over every row's title and subtitle, under the
+    // header's magnifier and on typing: five pages of rows are a lot to read
+    // through for the one that says "Scrollback".
+    dialog.set_search_enabled(true);
     dialog.add(&appearance_page(window, settings));
     dialog.add(&terminal_page(window, settings));
     dialog.add(&session_page(window, settings));
     dialog.add(&shortcuts_page(window, settings));
     dialog.add(&agents_page(window, settings));
+    if let Some(page) = page {
+        dialog.set_visible_page_name(page);
+    }
     dialog.connect_closed(|_| PREVIEW.with_borrow_mut(|slot| *slot = None));
     dialog.present(Some(window));
 }
@@ -71,6 +80,7 @@ fn appearance_page(
     settings: &Settings,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
+        .name("appearance")
         .title("Appearance")
         .icon_name("applications-graphics-symbolic")
         .build();
@@ -352,6 +362,7 @@ fn theme_row(
 
 fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
+        .name("terminal")
         .title("Terminal")
         .icon_name("utilities-terminal-symbolic")
         .build();
@@ -610,6 +621,7 @@ fn terminal_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw
 /// through twice is where a setting goes to be missed.
 fn session_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
+        .name("session")
         .title("Session")
         .icon_name("document-open-recent-symbolic")
         .build();
@@ -853,6 +865,7 @@ fn session_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw:
 /// before there was a page to turn it off from.
 fn agents_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
+        .name("agents")
         .title("AI Agents")
         .icon_name("applications-engineering-symbolic")
         .build();
@@ -1089,6 +1102,7 @@ fn agents_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw::
 /// refuses.
 fn shortcuts_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
+        .name("shortcuts")
         .title("Shortcuts")
         .icon_name("input-keyboard-symbolic")
         .build();

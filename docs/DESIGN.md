@@ -253,7 +253,12 @@ machine, and a dev server is a thing to watch next to the shell being worked
 in. Only what runs by its name alone is offered: a recipe that wants an
 argument, or a rule that builds a file rather than doing a job, is left out.
 The files are read again on every opening, at most 256 KiB each, so a script
-added a moment ago is there. Zentty lists them the same way. Holding `Ctrl` and
+added a moment ago is there. Zentty lists them the same way. A command also
+answers to the word a person reaches for before its name, as kero's do: "ssh"
+finds New Connection, "maximize" Zoom Pane, and "font" or "dark" the settings
+page that holds them, which the palette opens on. Those words count only from
+their start; letters picked out of a dozen synonyms in order would match any
+query at all. Holding `Ctrl` and
 pressing `Tab` brings up the tab switcher: a card per tab with a picture of what
 is in it, in the order they were last worked in, so one press and release goes
 back to where you just were.
@@ -361,7 +366,9 @@ writing each change to `~/.config/tuni/config.toml` as it is made. It is four
 pages, Appearance, Terminal, Session and Shortcuts, and each row is a title and
 one short line saying what it does: a page long enough to scroll through twice
 is where a setting goes to be missed, and a subtitle that argues its own design
-is a setting nobody reads. There is no
+is a setting nobody reads. Typing in it, or the magnifier in its header,
+searches every row's title and subtitle across the pages, so "scroll" is one
+row rather than a page to read. There is no
 OK button; a line of terminal beside the font rows is drawn in whatever has
 just been chosen, since that is the only way a font or a palette is actually
 picked. The family is chosen from what this machine has, asked of the font map

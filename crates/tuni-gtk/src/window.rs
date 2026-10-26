@@ -157,6 +157,62 @@ enum Search {
     Editor(TuniEditor),
 }
 
+/// Words a command is also found by, past its name: the one a person reaches
+/// for first is not always the one the menu uses, and kero's palette answers
+/// to both.
+const KEYWORDS: &[(&str, &str)] = &[
+    ("win.settings", "settings options configuration"),
+    ("win.new-connection", "ssh host remote server"),
+    ("win.broadcast", "synchronize input all panes"),
+    ("win.split-right", "vertical pane"),
+    ("win.split-down", "horizontal pane"),
+    ("win.zoom-pane", "maximize fullscreen"),
+    ("win.equalize-panes", "balance even resize"),
+    ("win.clear-terminal", "reset cls"),
+    ("win.reopen-tab", "undo restore"),
+    ("win.jump-attention", "notification agent unread done"),
+    ("win.toggle-sidebar", "projects hide show"),
+    ("win.toggle-panel", "files git info hide show"),
+    ("win.find", "search"),
+    ("win.keys", "ssh-keygen public copy-id"),
+    ("win.check-updates", "upgrade version"),
+];
+
+/// The settings pages, for the palette to open on the one a word lives on:
+/// its title, the page's name in the dialog, its icon, and what is on it.
+const SETTINGS_PAGES: &[(&str, &str, &str, &str)] = &[
+    (
+        "Appearance Preferences",
+        "appearance",
+        "applications-graphics-symbolic",
+        "settings theme dark light colors tab bar unfocused panes dim focus follows mouse padding background opacity blur",
+    ),
+    (
+        "Terminal Preferences",
+        "terminal",
+        "utilities-terminal-symbolic",
+        "settings font family size ligatures line spacing cursor blink copy on select mouse reporting bell scrollback wrap",
+    ),
+    (
+        "Session Preferences",
+        "session",
+        "document-open-recent-symbolic",
+        "settings shell command new tabs directory restore last session working directories output updates discord",
+    ),
+    (
+        "Shortcut Preferences",
+        "shortcuts",
+        "input-keyboard-symbolic",
+        "settings keys keybindings keyboard accelerators hotkeys",
+    ),
+    (
+        "AI Agent Preferences",
+        "agents",
+        "applications-engineering-symbolic",
+        "settings claude codex opencode pi usage plan limits spin mark notification bell",
+    ),
+];
+
 /// What the palette lists before the projects and terminals: the window's own
 /// actions, by the name a person would search for, with the keys that do the
 /// same thing so the palette teaches them. The shortcuts repeat `ACCELS` in
@@ -1365,7 +1421,10 @@ impl TuniWindow {
                     ),
                 );
             }),
-            entry("settings", None, |window, _| window.show_preferences()),
+            entry("settings", None, |window, _| window.show_preferences(None)),
+            entry("settings-page", string, |window, target| {
+                window.show_preferences(target.and_then(glib::Variant::str));
+            }),
             entry("check-updates", None, |window, _| {
                 window.check_updates(true);
             }),
@@ -1533,8 +1592,8 @@ impl TuniWindow {
         }
     }
 
-    fn show_preferences(&self) {
-        preferences::present(self, &self.imp().settings.borrow().clone());
+    fn show_preferences(&self, page: Option<&str>) {
+        preferences::present(self, &self.imp().settings.borrow().clone(), page);
     }
 
     /// What this is, who wrote it, and where to report it. `AdwAboutDialog`
@@ -5012,8 +5071,20 @@ impl TuniWindow {
 
         let mut entries: Vec<Entry> = COMMANDS
             .iter()
-            .map(|(title, icon, shortcut, action)| Entry::command(title, icon, *shortcut, action))
+            .map(|(title, icon, shortcut, action)| {
+                let mut entry = Entry::command(title, icon, *shortcut, action);
+                if let Some((_, words)) = KEYWORDS.iter().find(|(name, _)| name == action) {
+                    entry.words = words;
+                }
+                entry
+            })
             .collect();
+        for (title, page, icon, words) in SETTINGS_PAGES {
+            let mut entry = Entry::command(title, icon, None, "win.settings-page")
+                .with_target(page.to_variant());
+            entry.words = words;
+            entries.push(entry);
+        }
 
         // Reading the configuration is files and no subprocess, and the
         // palette opens on a keystroke rather than on a timer, so this stays
@@ -5022,7 +5093,8 @@ impl TuniWindow {
             entries.push(palette::Entry {
                 // Widened so that typing the address finds the alias, and so
                 // that "ssh" alone lists everything connectable.
-                search: format!("{} {} ssh connect", host.alias, host.address()),
+                search: format!("{} {}", host.alias, host.address()),
+                words: "ssh connect",
                 title: host.alias.clone(),
                 subtitle: Some(host.address()),
                 icon: "network-server-symbolic",
@@ -5035,7 +5107,8 @@ impl TuniWindow {
 
         for snippet in tuni_core::snippets::Snippets::load().all() {
             entries.push(palette::Entry {
-                search: format!("{} snippet run", snippet.name),
+                search: snippet.name.clone(),
+                words: "snippet run",
                 title: snippet.name.clone(),
                 subtitle: Some(crate::snippets::summary(&snippet.body)),
                 icon: "text-x-generic-symbolic",
@@ -5070,7 +5143,8 @@ impl TuniWindow {
                 _ => task.command.clone(),
             };
             entries.push(palette::Entry {
-                search: format!("{} {} task run", task.name, task.command),
+                search: format!("{} {}", task.name, task.command),
+                words: "task run",
                 title: task.name,
                 subtitle: Some(subtitle),
                 icon: "media-playback-start-symbolic",
@@ -5093,7 +5167,8 @@ impl TuniWindow {
         if let Some(root) = root.as_deref().and_then(Path::to_str) {
             let place = shorten(root);
             entries.push(palette::Entry {
-                search: format!("Open in Files folder file manager {place}"),
+                search: format!("Open in Files {place}"),
+                words: "folder file manager",
                 title: "Open in Files".to_owned(),
                 subtitle: Some(place.clone()),
                 icon: "folder-open-symbolic",
@@ -5104,7 +5179,8 @@ impl TuniWindow {
             });
             for editor in tuni_core::editors::installed() {
                 entries.push(palette::Entry {
-                    search: format!("Open in {} editor {place}", editor.name),
+                    search: format!("Open in {} {place}", editor.name),
+                    words: "editor",
                     title: format!("Open in {}", editor.name),
                     subtitle: Some(place.clone()),
                     icon: "text-editor-symbolic",
@@ -5127,7 +5203,8 @@ impl TuniWindow {
             .collect();
         for port in tuni_core::info::served(&shells) {
             entries.push(palette::Entry {
-                search: format!("Open localhost:{} {} browser port", port.port, port.process),
+                search: format!("Open localhost:{} {}", port.port, port.process),
+                words: "browser port",
                 title: format!("Open localhost:{}", port.port),
                 subtitle: Some(port.process.clone()),
                 icon: "web-browser-symbolic",
@@ -5198,6 +5275,7 @@ impl TuniWindow {
                         action: "win.reveal-pane",
                         target: Some(pane.id().raw().to_variant()),
                         terminal: true,
+                        words: "",
                     });
                 }
             }

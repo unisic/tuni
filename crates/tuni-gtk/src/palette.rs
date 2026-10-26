@@ -39,6 +39,10 @@ pub struct Entry {
     /// take in its project and directory as well, so typing a repository name
     /// finds the shells working in it.
     pub search: String,
+    /// Other names the entry answers to, each matched from its start rather
+    /// than letter by letter: "ssh" finds the hosts without also finding
+    /// "Toggle Sidebar" by the s, s and h in "Sidebar projects hide".
+    pub words: &'static str,
 }
 
 impl Entry {
@@ -58,6 +62,7 @@ impl Entry {
             target: None,
             terminal: false,
             search: title.to_owned(),
+            words: "",
         }
     }
 
@@ -338,7 +343,9 @@ fn fill_list(list: &gtk::ListBox, entries: &[Entry], query: &str) -> Rows {
             if query.is_empty() {
                 Some((index, 0))
             } else {
-                fuzzy::score(&entry.search, query).map(|score| (index, score))
+                fuzzy::score(&entry.search, query)
+                    .max(fuzzy::keywords(entry.words, query))
+                    .map(|score| (index, score))
             }
         })
         .collect();
