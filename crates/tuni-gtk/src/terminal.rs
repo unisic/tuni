@@ -7,6 +7,7 @@
 //! this keeps up under a firehose is exactly what the Etap 0 benchmark decides.
 
 use std::cell::{Cell, RefCell};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -218,6 +219,30 @@ const TEXTURE_CACHE_BYTES: usize = 64 << 20;
 /// as text moving with the pointer and few enough that a shell has time to
 /// answer each one; kitty's own debounce is in the same range.
 const RESIZE_SETTLE: Duration = Duration::from_millis(50);
+
+/// The text of the rows the last frame drew, as render nodes, keyed by a hash
+/// of what each row held.
+///
+/// Laying text out through Pango is most of what a frame costs, and most rows
+/// are the same from one frame to the next: a spinner rewrites one line, a
+/// cursor blink none, a line of output moves every other row up by one. Keyed
+/// by content rather than by position, a row that scrolled is found again
+/// wherever it landed and only the new line is laid out. A row the frame did
+/// not draw is dropped at the end of it, so the map never outgrows a viewport,
+/// and the nodes kept are the ones GTK holds for the frame on screen anyway.
+///
+/// The hash stands in for the row. Two different rows meeting on the same 64
+/// bits would draw the older one until either changed, odds too small to
+/// spend a copy of every cell on ruling out.
+#[derive(Default)]
+struct RowNodes {
+    /// What every row of a frame shares and that changes how text is drawn:
+    /// font, metrics, scale, ligatures, the search colors. A change empties the
+    /// map, so nothing drawn for the old font is ever reused for the new one.
+    frame: u64,
+    last: std::collections::HashMap<u64, Option<gtk::gsk::RenderNode>>,
+    next: std::collections::HashMap<u64, Option<gtk::gsk::RenderNode>>,
+}
 
 /// Uploaded inline images, keyed by which image and which version of it.
 ///
@@ -449,6 +474,7 @@ mod imp {
         /// expensive half.
         pub(super) images: RefCell<Vec<tuni_vt::Placement>>,
         pub(super) textures: RefCell<Textures>,
+        pub(super) row_nodes: RefCell<RowNodes>,
         /// Handlers this widget added to the process-global `gtk::Settings`,
         /// taken off in `dispose`: the global outlives every terminal, so a
         /// handler left on it is a closure that survives every pane it was
@@ -525,6 +551,7 @@ mod imp {
                 progress_stale: RefCell::new(None),
                 images: RefCell::new(Vec::new()),
                 textures: RefCell::new(Textures::default()),
+                row_nodes: RefCell::new(RowNodes::default()),
                 settings_handlers: RefCell::new(Vec::new()),
                 frame_batch: match std::env::var("TUNI_DEBUG_FRAME_TIME") {
                     Ok(value) => value.trim().parse().unwrap_or(120).max(2),
@@ -3723,6 +3750,24 @@ impl TuniTerminal {
 
         self.draw_images(snapshot, &images, &textures, Layer::BelowText, m);
 
+        let frame = {
+            let mut hasher = DefaultHasher::new();
+            font.to_str().hash(&mut hasher);
+            [m.cell_width, m.cell_height, m.ascent, m.thickness]
+                .map(f32::to_bits)
+                .hash(&mut hasher);
+            imp.pango_serial.get().hash(&mut hasher);
+            self.scale_factor().hash(&mut hasher);
+            imp.config.borrow().font_ligatures.hash(&mut hasher);
+            hit_fg.map(|c| (c.r, c.g, c.b)).hash(&mut hasher);
+            hasher.finish()
+        };
+        let mut rows = imp.row_nodes.borrow_mut();
+        if rows.frame != frame {
+            rows.frame = frame;
+            rows.last.clear();
+        }
+
         for row in 0..grid.rows {
             let cells = grid.row(row);
             let y = row as f32 * m.cell_height;
@@ -3730,47 +3775,33 @@ impl TuniTerminal {
             let hot = |col: usize| hot.get(base + col).copied().unwrap_or(false);
             let mark = |col: usize| marks.get(base + col).copied().unwrap_or(0);
 
-            // Text, batched into runs sharing a style.
-            let mut col = 0usize;
-            while col < cells.len() {
-                if cells[col].text.is_empty() {
-                    col += 1;
-                    continue;
+            let key = row_key(cells, hot, mark);
+            let node = match rows.last.get(&key) {
+                Some(node) => node.clone(),
+                None => {
+                    let recorder = gtk::Snapshot::new();
+                    let painter = Painter {
+                        snapshot: &recorder,
+                        layout: painter.layout,
+                        font: painter.font,
+                        plain: painter.plain.clone(),
+                        m,
+                    };
+                    painter.draw_row(cells, hot, mark, &hit_fg, &mut text);
+                    recorder.to_node()
                 }
-
-                let start = col;
-                let style = style_key(&cells[col], hot(col), mark(col));
-                text.clear();
-
-                while col < cells.len() {
-                    let cell = &cells[col];
-                    if cell.text.is_empty() || style_key(cell, hot(col), mark(col)) != style {
-                        break;
-                    }
-                    // Anything that is not one plain ASCII character is laid
-                    // out alone, so it lands on its own column rather than
-                    // wherever the run's accumulated advances put it.
-                    let simple = is_simple(&cell.text);
-                    if !simple && col != start {
-                        break;
-                    }
-                    text.push_str(&cell.text);
-                    // A double-width grapheme owns the following cell; the VT
-                    // reports that cell as empty, and stepping over it keeps
-                    // the run's column arithmetic honest.
-                    col += UnicodeWidthStr::width(cell.text.as_str()).max(1);
-                    if !simple {
-                        break;
-                    }
-                }
-
-                let fg = match mark(start) {
-                    0 => cells[start].fg,
-                    other => hit_fg[usize::from(other)],
-                };
-                painter.draw_run(start, y, &text, &cells[start], hot(start), fg);
+            };
+            if let Some(node) = &node {
+                snapshot.save();
+                snapshot.translate(&graphene::Point::new(0.0, y));
+                snapshot.append_node(node);
+                snapshot.restore();
             }
+            rows.next.insert(key, node);
         }
+        let rows = &mut *rows;
+        std::mem::swap(&mut rows.last, &mut rows.next);
+        rows.next.clear();
         drop(hovered);
 
         let cursor = grid.cursor;
@@ -4057,6 +4088,27 @@ fn is_simple(text: &str) -> bool {
     matches!(chars.next(), Some(c) if c == ' ' || c.is_ascii_graphic()) && chars.next().is_none()
 }
 
+/// A row's text as one number: every cell's grapheme and, where there is one,
+/// the part of its style the text pass draws. Backgrounds are left out because
+/// they are a pass of their own, drawn every frame. See `RowNodes`.
+fn row_key(
+    cells: &[tuni_vt::Cell],
+    hot: impl Fn(usize) -> bool,
+    mark: impl Fn(usize) -> u8,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for (col, cell) in cells.iter().enumerate() {
+        cell.text.hash(&mut hasher);
+        if cell.text.is_empty() {
+            continue;
+        }
+        let fg = cell.fg;
+        (fg.r, fg.g, fg.b, cell.bold, cell.italic, cell.underline).hash(&mut hasher);
+        (cell.strikethrough, hot(col), mark(col)).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn style_key(cell: &tuni_vt::Cell, link: bool, mark: u8) -> StyleKey {
     StyleKey {
         fg: cell.fg,
@@ -4181,6 +4233,58 @@ impl Painter<'_> {
             &rgba(color),
             &graphene::Rect::new(x, y, w, self.m.cell_height),
         );
+    }
+
+    /// The text of one row, at the top of the snapshot, batched into runs
+    /// sharing a style. The caller places it; see `RowNodes`.
+    fn draw_row(
+        &self,
+        cells: &[tuni_vt::Cell],
+        hot: impl Fn(usize) -> bool,
+        mark: impl Fn(usize) -> u8,
+        hit_fg: &[Rgb; 3],
+        text: &mut String,
+    ) {
+        let y = 0.0;
+        let mut col = 0usize;
+        while col < cells.len() {
+            if cells[col].text.is_empty() {
+                col += 1;
+                continue;
+            }
+
+            let start = col;
+            let style = style_key(&cells[col], hot(col), mark(col));
+            text.clear();
+
+            while col < cells.len() {
+                let cell = &cells[col];
+                if cell.text.is_empty() || style_key(cell, hot(col), mark(col)) != style {
+                    break;
+                }
+                // Anything that is not one plain ASCII character is laid
+                // out alone, so it lands on its own column rather than
+                // wherever the run's accumulated advances put it.
+                let simple = is_simple(&cell.text);
+                if !simple && col != start {
+                    break;
+                }
+                text.push_str(&cell.text);
+                // A double-width grapheme owns the following cell; the VT
+                // reports that cell as empty, and stepping over it keeps
+                // the run's column arithmetic honest.
+                col += UnicodeWidthStr::width(cell.text.as_str()).max(1);
+                if !simple {
+                    break;
+                }
+            }
+
+            let fg = match mark(start) {
+                0 => cells[start].fg,
+                other => hit_fg[usize::from(other)],
+            };
+            self.draw_run(start, y, text, &cells[start], hot(start), fg);
+        }
     }
 
     /// One run of text sharing a style, placed at its own column origin so
