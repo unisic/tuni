@@ -156,8 +156,23 @@ asked of the account's usage endpoint, the numbers its own usage page shows,
 with the login the agent already keeps on disk, at most once a minute, only
 while the agent runs. That request is the one exception to everything staying
 on this machine, it goes to the same place the agent itself talks to, and it
-carries nothing that was not already in `~/.claude`. Tokens and percentages,
-never prices, and nothing here signs in anywhere.
+carries nothing that was not already in `~/.claude`. Pi on Anthropic with a
+Claude login spends the same plan, so it gets the same bars, asked with the
+login Pi keeps in `~/.pi/agent/auth.json`; on an API key there is no plan and no
+bars. The request goes out as `tuni/<version>`, never under another client's
+name. Measured on 2026-10-26, the endpoint answered Pi's login that way and
+refused Claude Code's own with a 429 under every name but Claude Code's, so a
+Claude Code pane shows its session without bars while that holds. Tokens and
+percentages, never prices, and nothing here signs in anywhere.
+
+Which record is the pane's is the agent's to say where it says it. Claude Code
+names its conversation in `~/.claude/sessions/<pid>.json` and rewrites it on
+`/clear` or a resume, so two Claude Codes in one checkout each read their own;
+the newest record in the checkout is the guess only where that file is
+missing. Pi writes nothing until its first answer, so a Pi log older than the
+Pi process is the run before and is not shown; a switch of model is its own
+line in the log, written when it is made, so the heading follows it before
+the next answer.
 
 The section's heading names the model and who serves it, in the agent's own
 word for it: "Pi · gemini-3.8-flash via antigravity". Pi, Codex and OpenCode
@@ -541,16 +556,18 @@ at all while nothing wants a look. Kero has the same foot and the same key:
 it is the one place that answers "is anything waiting on me" without reading
 every row.
 
-What it reads is what the agent says about itself, and nothing else. Claude
-Code writes its own state in the title — `✳ Claude Code` between turns, a braille spinner frame in place of the
-star while it works — so a pane reports for itself over an escape sequence the
-terminal parses anyway. No process is polled for it and no screen is scraped;
-the CPU an agent burns was measured first and cannot tell thinking from waiting,
-which is the reason this is read rather than sampled. Braille is the whole test:
-a spinner is drawn out of that block and no prompt, path or command line starts
-with one. Pi says it with the progress report instead, once its
-`terminal.showTerminalProgress` is on: OSC 9;4 in the state that only knows it
-is busy, sent again every second of a turn and cleared when the turn ends.
+What it reads is what the agent says about itself, and nothing else. Claude Code
+writes its own state in the title — `✳ Claude Code` between turns, a braille
+spinner frame in place of the star while it works, or by 2.1.311 one of two
+half-filled circles, `◐` and `◑` — so a pane reports for itself over an escape
+sequence the terminal parses anyway. No process is polled for it and no screen
+is scraped; the CPU an agent burns was measured first and cannot tell thinking
+from waiting, which is the reason this is read rather than sampled. Braille and
+those two circles are the whole test: a spinner is drawn out of them and no
+prompt, path or command line starts with one. Pi says it with the progress
+report instead, once its `terminal.showTerminalProgress` is on: OSC 9;4 in the
+state that only knows it is busy, sent again every second of a turn and cleared
+when the turn ends.
 Either one is a turn, and neither names the agent, so an agent tuni has never
 heard of is recognised the same way, with no list to add it to. The price is
 that anything else reporting progress without a percentage counts as well, and
@@ -1299,7 +1316,7 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `panel.files`, `panel.git`, `panel.info`, `panel.debug` | `true` | Which pages the panel's switcher offers. The Remote page manages itself: it exists while a pane is on a host |
 | `agent.usage` | `true` | Whether the Info panel reads a coding agent's own session log. Off takes the Agent section away and stops every file below it from being opened |
 | `agent.claude`, `agent.codex`, `agent.opencode`, `agent.pi` | `true` | Which agents count as one. An agent turned off is a pane like any other: no section, no log read, no request made |
-| `agent.plan` | `true` | Whether Claude Code's plan bars are asked of the account's usage page, at most once a minute, with the login the agent already keeps on disk. The one thing a session log does not carry, so the one thing that leaves the machine. Codex's bars come out of its log and are not affected |
+| `agent.plan` | `true` | Whether Claude Code's plan bars, and Pi's on a Claude login, are asked of the account's usage page, at most once a minute, with the login the agent already keeps on disk. The one thing a session log does not carry, so the one thing that leaves the machine. Codex's bars come out of its log and are not affected |
 | `agent.spinner` | `true` | Whether a tab whose agent is thinking spins. This also decides the title: the agent's own glyph is taken off the tab name exactly while tuni draws the spinner in its place |
 | `agent.mark` | `true` | Whether a turn that ends into a tab nobody is looking at marks that tab and its project's row, to be cleared by looking at it |
 | `agent.notify` | `true` | Whether the same moment raises a desktop notification, which also fires for a window sitting behind another one |

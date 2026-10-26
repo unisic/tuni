@@ -21,7 +21,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -100,19 +100,25 @@ impl Agent {
 /// title as well as on the screen. Claude Code writes `✳ Claude Code` while it
 /// waits for a turn and swaps the star for a braille frame while it works:
 /// `⠂ Claude Code`, `⠐ Claude Code`, and so on until the answer lands. Measured
-/// from its own output rather than assumed, on 2.1.221.
+/// from its own output rather than assumed, on 2.1.221. By 2.1.311 the frames
+/// are two half-filled circles, `◐` and `◑`, swapped about once a second, read
+/// out of its bundle, and both are spinners here.
 ///
 /// Reading the title is what makes this affordable. It arrives as an escape
 /// sequence the terminal parses anyway, so nothing polls `/proc` for it and
 /// nothing scrapes the screen; a pane whose agent says nothing simply never
 /// reports, which is also what every non-agent pane does.
 ///
-/// Braille is the whole test on purpose. A spinner is drawn out of that block
-/// and nothing else is: no directory, no command line and no hostname a prompt
-/// puts in a title starts with one.
+/// Braille and those two circles are the whole test on purpose. A spinner is
+/// drawn out of them and nothing else is: no directory, no command line and no
+/// hostname a prompt puts in a title starts with one.
 #[must_use]
 pub fn thinking(title: &str) -> bool {
-    matches!(title.chars().next(), Some(first) if ('\u{2800}'..='\u{28ff}').contains(&first))
+    title.chars().next().is_some_and(spinner_frame)
+}
+
+fn spinner_frame(glyph: char) -> bool {
+    ('\u{2800}'..='\u{28ff}').contains(&glyph) || glyph == '◐' || glyph == '◑'
 }
 
 /// The same title with the agent's own status glyph taken off the front.
@@ -132,7 +138,7 @@ pub fn strip_spinner(title: &str) -> &str {
     let Some(first) = rest.next() else {
         return title;
     };
-    if !('\u{2800}'..='\u{28ff}').contains(&first) && first != '✳' {
+    if !spinner_frame(first) && first != '✳' {
         return title;
     }
     let rest = rest.as_str().trim_start();
@@ -259,7 +265,16 @@ pub struct Reader {
 #[derive(Debug)]
 struct Plan {
     at: i64,
+    login: Login,
     limits: Vec<Limit>,
+}
+
+/// Whose Claude login the plan is asked with: the one Claude Code keeps, or
+/// the one Pi signed in with itself when it is on Anthropic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Login {
+    Claude,
+    Pi,
 }
 
 /// What a log has said so far, and how much of it has been read. Which fields
@@ -302,7 +317,7 @@ impl Reader {
             Agent::Claude => self.claude(pid, cwd, plan),
             Agent::Codex => self.codex(cwd),
             Agent::OpenCode => opencode(cwd),
-            Agent::Pi => self.pi(cwd),
+            Agent::Pi => self.pi(pid, cwd, plan),
         };
         if !fleet {
             self.fleet = None;
@@ -337,9 +352,7 @@ impl Reader {
             source: Some(self.claude_source(pid).to_owned()),
             ..Snapshot::default()
         };
-        let root = home().join(".claude/projects");
-
-        if let Some(log) = newest(&root.join(claude_slug(cwd))) {
+        if let Some(log) = claude_log(&home().join(".claude"), pid, cwd) {
             let tail = self.claude_tail(&log);
             snapshot.session = tail.tokens;
             snapshot.model.clone_from(&tail.model);
@@ -348,7 +361,7 @@ impl Reader {
         // No bars rather than stale ones: a cached answer redrawn after the
         // switch went off would look like the request was still being made.
         snapshot.limits = if plan {
-            self.claude_plan()
+            self.claude_plan(Login::Claude)
         } else {
             self.plan = None;
             Vec::new()
@@ -359,20 +372,24 @@ impl Reader {
     /// The plan's windows, the way the account's own usage page draws them,
     /// cached so the answer is asked for at most once a minute. The one thing
     /// the log cannot say, since the plan is spent by every session at once.
-    fn claude_plan(&mut self) -> Vec<Limit> {
+    fn claude_plan(&mut self, login: Login) -> Vec<Limit> {
         let at = now();
         if let Some(plan) = &self.plan
+            && plan.login == login
             && at - plan.at < PLAN_FRESH
         {
             return plan.limits.clone();
         }
         // A failed ask keeps the previous answer on the bars: percentages a
         // minute or two old are still the picture, and the sky being out is no
-        // reason to blank the panel.
-        let limits = fetch_plan().or_else(|| self.plan.take().map(|plan| plan.limits));
+        // reason to blank the panel. Only the same login's, though: another
+        // one can be another account.
+        let previous = self.plan.take().filter(|plan| plan.login == login);
+        let limits = fetch_plan(login).or_else(|| previous.map(|plan| plan.limits));
         let limits = limits.unwrap_or_default();
         self.plan = Some(Plan {
             at,
+            login,
             limits: limits.clone(),
         });
         limits
@@ -514,21 +531,37 @@ impl Reader {
     ///
     /// Neither the context window nor a plan is written down anywhere in there,
     /// so the session's spending is all this can honestly report.
-    fn pi(&mut self, cwd: &Path) -> Snapshot {
+    fn pi(&mut self, pid: u32, cwd: &Path, plan: bool) -> Snapshot {
         let mut snapshot = Snapshot {
             agent: Some(Agent::Pi),
             ..Snapshot::default()
         };
 
+        // Pi writes its log with the first answer and not before, so until
+        // then the newest one here is the run before this one, with its model
+        // and its total. A log older than the process is not the process's.
+        // ponytail: a session resumed with `pi -c` is older too, and shows
+        // nothing until its next answer; the session id on Pi's command line
+        // would name it, if that wait ever matters.
+        let started = crate::info::age(pid).map(|age| SystemTime::now() - Duration::from_secs(age));
         let mut logs = newest_first(&home().join(".pi/agent/sessions"));
         logs.truncate(CANDIDATES);
-        let Some(log) = logs.into_iter().find(|log| self.pi_works_in(log, cwd)) else {
+        let Some(log) = logs
+            .into_iter()
+            .take_while(|log| started.is_none_or(|started| modified(log) >= Some(started)))
+            .find(|log| self.pi_works_in(log, cwd))
+        else {
             return snapshot;
         };
         let tail = self.pi_tail(&log);
         snapshot.session = tail.tokens;
         snapshot.model.clone_from(&tail.model);
         snapshot.source.clone_from(&tail.source);
+        // On Anthropic with a Claude login, Pi spends the plan Claude Code
+        // does, and its own login can ask for the same bars.
+        if plan && snapshot.source.as_deref() == Some("anthropic") {
+            snapshot.limits = self.claude_plan(Login::Pi);
+        }
         snapshot
     }
 
@@ -559,6 +592,13 @@ impl Reader {
             let Ok(entry) = serde_json::from_str::<PiLine>(line) else {
                 return;
             };
+            // A switch is written the moment it is made, a turn only once it
+            // is answered, so this is what says the model changed in between.
+            if entry.kind.as_deref() == Some("model_change") && entry.model_id.is_some() {
+                tail.model = entry.model_id;
+                tail.source = entry.provider;
+                return;
+            }
             let Some(message) = entry.message else {
                 return;
             };
@@ -718,6 +758,29 @@ fn read_lines(log: &Path, tail: &mut Tail, mut line: impl FnMut(&mut Tail, &str)
     }
 }
 
+/// The record the Claude Code in `pid` is writing, under `claude` (its
+/// `~/.claude`).
+///
+/// Each running Claude Code names its conversation in `sessions/<pid>.json`
+/// and writes the new one there when `/clear` or a resume moves it, so a pane
+/// gets its own and not whichever other one in the same checkout was written
+/// to last. Read on 2.1.310 and 2.1.311. Where that file is missing the newest
+/// record stands in, which is the guess this made before.
+fn claude_log(claude: &Path, pid: u32, cwd: &Path) -> Option<PathBuf> {
+    let store = claude.join("projects").join(claude_slug(cwd));
+    let Ok(live) = std::fs::read_to_string(claude.join(format!("sessions/{pid}.json"))) else {
+        return newest(&store);
+    };
+    let id = serde_json::from_str::<ClaudeLive>(&live).ok()?.session_id;
+    // Joined onto a path, so nothing an id is not made of.
+    let valid = !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    valid.then(|| store.join(format!("{id}.jsonl")))
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    path.metadata().and_then(|meta| meta.modified()).ok()
+}
+
 /// The newest file in a directory, which for a directory of session logs is the
 /// session still being written.
 fn newest(directory: &Path) -> Option<PathBuf> {
@@ -747,24 +810,37 @@ fn newest_first(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Asks the account's usage endpoint how full the plan's windows are, with the
-/// login Claude Code keeps in `~/.claude/.credentials.json`. The request goes
+/// login the agent keeps on disk. The request goes
 /// to the same place the agent itself talks to, and it carries nothing but the
 /// token that was already there.
-fn fetch_plan() -> Option<Vec<Limit>> {
-    let credentials = home().join(".claude/.credentials.json");
-    let credentials = std::fs::read_to_string(credentials).ok()?;
-    let oauth = serde_json::from_str::<Credentials>(&credentials)
-        .ok()?
-        .claude_ai_oauth;
+fn fetch_plan(login: Login) -> Option<Vec<Limit>> {
+    let (token, expires) = match login {
+        Login::Claude => {
+            let credentials = home().join(".claude/.credentials.json");
+            let credentials = std::fs::read_to_string(credentials).ok()?;
+            let oauth = serde_json::from_str::<Credentials>(&credentials)
+                .ok()?
+                .claude_ai_oauth;
+            (oauth.access_token, oauth.expires_at)
+        }
+        // Pi keeps its own sign-in, made with Claude Code's client and the
+        // same `user:profile` scope the usage page wants. A key in its place
+        // has no plan behind it, and no expiry either.
+        Login::Pi => {
+            let auth = std::fs::read_to_string(home().join(".pi/agent/auth.json")).ok()?;
+            let login = serde_json::from_str::<PiAuth>(&auth).ok()?.anthropic?;
+            (login.access, login.expires)
+        }
+    };
     // An expired token would only buy a 401: the agent refreshes it while it
     // runs, and the bars are only drawn while it runs.
-    if oauth.expires_at <= now().saturating_mul(1000) {
+    if expires <= now().saturating_mul(1000) {
         return None;
     }
 
     let body = get(
         "https://api.anthropic.com/api/oauth/usage",
-        &format!("Authorization: Bearer {}", oauth.access_token),
+        &format!("Authorization: Bearer {token}"),
         &["anthropic-beta: oauth-2025-04-20"],
     )?;
     Some(plan_limits(&body))
@@ -800,7 +876,10 @@ fn fetch_fleet() -> Option<Fleet> {
 /// stdin, where `/proc` cannot read it off the argument list the way it could a
 /// flag. These are the only requests the module sends anywhere.
 fn get(url: &str, secret: &str, headers: &[&str]) -> Option<String> {
-    let mut args = vec!["-sf", "--max-time", "4", "-H", "@-"];
+    // Named for what it is rather than as curl, whose own `curl/8.15.0` the
+    // plan endpoint refused with a 429 every time, measured on 2026-10-26.
+    let agent = concat!("tuni/", env!("CARGO_PKG_VERSION"));
+    let mut args = vec!["-sf", "--max-time", "4", "-A", agent, "-H", "@-"];
     for header in headers {
         args.extend(["-H", header]);
     }
@@ -1148,15 +1227,22 @@ struct OpenCodeModel {
     provider: Option<String>,
 }
 
-/// A line of a Pi session log: the header that opens it, or one message.
+/// A line of a Pi session log: the header that opens it, one message, or a
+/// switch of model.
 #[derive(Deserialize)]
 struct PiLine {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
     message: Option<PiMessage>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default, rename = "modelId")]
+    model_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1189,6 +1275,13 @@ struct FleetConfig {
     /// one and files each one's usage in its own fleet.
     #[serde(default, rename = "accountTokens")]
     account_tokens: HashMap<String, String>,
+}
+
+/// `~/.claude/sessions/<pid>.json`, for which conversation a Claude Code is in.
+#[derive(Deserialize)]
+struct ClaudeLive {
+    #[serde(rename = "sessionId")]
+    session_id: String,
 }
 
 /// `~/.claude.json`, for which account Claude Code is signed in to.
@@ -1236,6 +1329,21 @@ struct Oauth {
     expires_at: i64,
 }
 
+/// The file Pi keeps its logins and keys in, of which only Anthropic's is read.
+#[derive(Deserialize)]
+struct PiAuth {
+    anthropic: Option<PiLogin>,
+}
+
+#[derive(Deserialize)]
+struct PiLogin {
+    #[serde(default)]
+    access: String,
+    /// In milliseconds, as Claude Code's.
+    #[serde(default)]
+    expires: i64,
+}
+
 impl CodexWindow {
     fn into_limit(self) -> Limit {
         Limit {
@@ -1263,12 +1371,15 @@ mod tests {
         // Measured from Claude Code itself, both states.
         assert!(thinking("⠂ Claude Code"));
         assert!(thinking("⠐ Claude Code"));
+        assert!(thinking("◐ Claude Code"));
+        assert!(thinking("◑ Claude Code"));
         assert!(!thinking("✳ Claude Code"));
     }
 
     #[test]
     fn the_agents_own_spinner_comes_off_the_tab() {
         assert_eq!(strip_spinner("⠂ Claude Code"), "Claude Code");
+        assert_eq!(strip_spinner("◑ Claude Code"), "Claude Code");
         assert_eq!(strip_spinner("✳ Claude Code"), "Claude Code");
         assert_eq!(strip_spinner("Claude Code"), "Claude Code");
         assert_eq!(strip_spinner("~/Projects/tuni"), "~/Projects/tuni");
@@ -1403,7 +1514,57 @@ mod tests {
         assert_eq!(tail.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(tail.source.as_deref(), Some("antigravity"));
 
+        // A switch shows before anything is asked of the new model, the line
+        // as Pi wrote it.
+        let switch = r#"{"type":"model_change","id":"c","parentId":"b","timestamp":"2026-08-03T15:05:00.000Z","provider":"anthropic","modelId":"claude-haiku-5-5"}"#;
+        let mut log = std::fs::read_to_string(&mine).expect("read");
+        log.push_str(switch);
+        log.push('\n');
+        std::fs::write(&mine, log).expect("append");
+        let tail = reader.pi_tail(&mine);
+        assert_eq!(tail.model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(tail.source.as_deref(), Some("anthropic"));
+        assert_eq!(tail.tokens.total(), 200);
+
         std::fs::remove_dir_all(&directory).expect("clean up");
+    }
+
+    #[test]
+    fn a_claude_code_reads_the_conversation_it_says_it_is_in() {
+        let claude = tempdir();
+        let cwd = Path::new("/home/dean/Projects/tuni");
+        let store = claude.join("projects").join(claude_slug(cwd));
+        std::fs::create_dir_all(&store).expect("store");
+        std::fs::create_dir_all(claude.join("sessions")).expect("sessions");
+        let mine = store.join("8b3993e8-8068.jsonl");
+        std::fs::write(&mine, "").expect("mine");
+        File::options()
+            .write(true)
+            .open(&mine)
+            .and_then(|file| file.set_modified(SystemTime::now() - Duration::from_secs(60)))
+            .expect("age");
+        // Another conversation in the same checkout, written to since.
+        std::fs::write(store.join("51314179-5847.jsonl"), "").expect("theirs");
+
+        std::fs::write(
+            claude.join("sessions/343430.json"),
+            r#"{"pid":343430,"sessionId":"8b3993e8-8068","cwd":"/home/dean/Projects/tuni","status":"idle"}"#,
+        )
+        .expect("live");
+        assert_eq!(claude_log(&claude, 343_430, cwd), Some(mine));
+        // One with no file of its own falls back to the newest.
+        assert_eq!(
+            claude_log(&claude, 1, cwd),
+            Some(store.join("51314179-5847.jsonl"))
+        );
+        std::fs::write(
+            claude.join("sessions/2.json"),
+            r#"{"sessionId":"../../.credentials"}"#,
+        )
+        .expect("bad");
+        assert_eq!(claude_log(&claude, 2, cwd), None);
+
+        std::fs::remove_dir_all(&claude).expect("clean up");
     }
 
     #[test]

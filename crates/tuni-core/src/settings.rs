@@ -109,7 +109,8 @@ pub struct Agents {
     pub codex: bool,
     pub opencode: bool,
     pub pi: bool,
-    /// Whether Claude Code's plan bars are asked of the account's usage page.
+    /// Whether Claude Code's plan bars are asked of the account's usage page,
+    /// and Pi's when it is on Anthropic with a Claude login of its own.
     ///
     /// The one thing its log does not carry, so it is the one thing that leaves
     /// the machine: at most one request a minute, with the login the agent
