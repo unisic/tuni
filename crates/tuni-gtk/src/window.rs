@@ -175,6 +175,12 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "win.reopen-tab",
     ),
     (
+        "Go to What Needs You",
+        DONE_ICON,
+        Some("Ctrl+Shift+J"),
+        "win.jump-attention",
+    ),
+    (
         "New Connection",
         "network-server-symbolic",
         Some("Ctrl+Shift+O"),
@@ -413,6 +419,9 @@ mod imp {
         pub labels: RefCell<Vec<gtk::Label>>,
         /// Shared context menu for the sidebar rows, parented once.
         pub row_menu: RefCell<Option<gtk::PopoverMenu>>,
+        /// The sidebar's foot, counting the tabs that want a look, and the
+        /// words on it.
+        pub attention: RefCell<Option<(gtk::Revealer, adw::ButtonContent)>>,
         /// Stack of tab strips, one page per project.
         pub stack: RefCell<Option<gtk::Stack>>,
         /// Tab strips, or the empty state when there is nothing to show.
@@ -674,9 +683,39 @@ impl TuniWindow {
             .propagate_natural_height(true)
             .child(&sidebar)
             .build();
+        // At the foot, as kero has it: how many tabs want a look, as a button
+        // that goes to the next of them. Slid in rather than shown, so a count
+        // appearing in the corner of an eye reads as news and not as a jolt,
+        // and nothing at all while nothing does.
+        let attention_label = adw::ButtonContent::builder()
+            .icon_name(DONE_ICON)
+            .halign(gtk::Align::Start)
+            .build();
+        let attention_button = gtk::Button::builder()
+            .child(&attention_label)
+            .tooltip_text("Go to It (Ctrl+Shift+J)")
+            .action_name("win.jump-attention")
+            .build();
+        attention_button.add_css_class("flat");
+        attention_button.add_css_class("accent");
+        attention_button.set_margin_start(6);
+        attention_button.set_margin_end(6);
+        attention_button.set_margin_bottom(6);
+        let attention = gtk::Revealer::builder()
+            .transition_type(gtk::RevealerTransitionType::SlideUp)
+            .transition_duration(200)
+            .reveal_child(false)
+            .vexpand(true)
+            .valign(gtk::Align::End)
+            .child(&attention_button)
+            .build();
+        imp.attention
+            .replace(Some((attention.clone(), attention_label)));
+
         let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         column.append(&scroller);
         column.append(&new_project);
+        column.append(&attention);
 
         let sidebar_header = adw::HeaderBar::builder()
             .show_end_title_buttons(false)
@@ -1197,6 +1236,7 @@ impl TuniWindow {
                 }
             }),
             entry("palette", None, |window, _| window.show_palette()),
+            entry("jump-attention", None, |window, _| window.jump_attention()),
             // Jumps to a pane wherever it is: its project, then its tab, then
             // the pane itself. What the palette's second section runs.
             entry("reveal-pane", uint64, |window, target| {
@@ -2166,6 +2206,14 @@ impl TuniWindow {
         let page = view.insert(&grid, position);
         page.set_title(&name);
         page.set_live_thumbnail(true);
+        // Whoever raised or cleared the mark, the foot hears of it. Through the
+        // window the page is in now rather than the one that built it: a tab
+        // dragged to another window takes its mark there.
+        page.connect_needs_attention_notify(|page| {
+            if let Some(window) = page.child().root().and_downcast::<TuniWindow>() {
+                window.refresh_attention();
+            }
+        });
         imp.pages.borrow_mut().insert(tab, page.clone());
 
         // Every pane's widget exists before any of them is drawn, so the grid
@@ -4979,6 +5027,66 @@ impl TuniWindow {
 
         self.refresh_names();
         self.refresh_discord();
+        self.refresh_attention();
+    }
+
+    /// Counts the tabs whose mark is up into the sidebar's foot. A walk over
+    /// this window's pages, which is tens of them.
+    fn refresh_attention(&self) {
+        let imp = self.imp();
+        let count = imp
+            .pages
+            .borrow()
+            .values()
+            .filter(|page| page.needs_attention())
+            .count();
+        let Some((revealer, label)) = imp.attention.borrow().clone() else {
+            return;
+        };
+        // Left as it was while sliding away, so the words do not change under
+        // a button on its way out.
+        if count > 0 {
+            label.set_label(&if count == 1 {
+                "1 tab needs you".to_owned()
+            } else {
+                format!("{count} tabs need you")
+            });
+        }
+        revealer.set_reveal_child(count > 0);
+    }
+
+    /// Goes to the next tab that wants a look, after the one on screen: a bell,
+    /// a long command that ended, an agent that finished. Lands on the pane an
+    /// agent finished in, since that is where its answer is, and otherwise on
+    /// the pane the tab was left on.
+    fn jump_attention(&self) {
+        let imp = self.imp();
+        let current = self.selected_tab().map(|(_, tab)| tab);
+        let target = {
+            let pages = imp.pages.borrow();
+            let finished = imp.finished.borrow();
+            let workspace = imp.workspace.borrow();
+            workspace
+                .next_tab_after(current, |tab| {
+                    pages.get(&tab).is_some_and(adw::TabPage::needs_attention)
+                        || finished.values().any(|&(_, marked)| marked == tab)
+                })
+                .and_then(|tab| {
+                    finished
+                        .iter()
+                        .find(|(_, (_, marked))| *marked == tab)
+                        .map(|(&pane, _)| pane)
+                        .or_else(|| {
+                            workspace.projects().iter().find_map(|project| {
+                                project.tab(tab).map(|entry| entry.layout().focused())
+                            })
+                        })
+                })
+        };
+        match target {
+            Some(pane) => self.reveal_pane(pane),
+            None => self.toast("Nothing needs you"),
+        }
     }
 
     fn refresh_names(&self) {

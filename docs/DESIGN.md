@@ -362,6 +362,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+Shift+T` | New tab: a shell, or the host list when `new-tab` says so |
 | `Ctrl+Shift+O` | The host list, in a tab of its own, whichever that setting says |
 | `Ctrl+Shift+R` | Reopen the tab just closed, with its layout, its name and what its shells had printed |
+| `Ctrl+Shift+J` | Go to the next tab that wants a look: a bell, a long command that ended, an agent that finished |
 | `Ctrl+Page Down` / `Ctrl+Page Up` | Next tab, previous tab |
 | Drag a tab off the strip | A window of its own, with the shells still running in it |
 | Drag a tab onto a project row | Move it into that project; its menu says "Move to Project" for the same thing |
@@ -462,6 +463,17 @@ Selecting the tab clears it, on the click that reads the answer. A turn that
 ends in the tab already on screen is marked nowhere: it was watched as it
 happened, and a mark to dismiss for something already seen is a mark that
 teaches people to dismiss marks.
+
+Every one of those marks is counted at the foot of the sidebar, "2 tabs need
+you", on a button that goes to the next of them, and `Ctrl+Shift+J` does the
+same from the keyboard. Next means after the tab on screen, down the sidebar
+and along each strip, wrapping, so pressing it again works through the queue
+rather than going back to the first. It lands on the pane an agent finished
+in, since that is where the answer is, and otherwise on the pane the tab was
+left on. The count slides in and out rather than appearing, and is not there
+at all while nothing wants a look. Kero has the same foot and the same key:
+it is the one place that answers "is anything waiting on me" without reading
+every row.
 
 What it reads is the title, and nothing else. Claude Code writes its own state
 there — `✳ Claude Code` between turns, a braille spinner frame in place of the

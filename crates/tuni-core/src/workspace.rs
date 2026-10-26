@@ -460,6 +460,30 @@ impl Workspace {
         self.shift_selection(-1);
     }
 
+    /// The first tab after `current` that `wanted` picks, reading the sidebar
+    /// top to bottom and each project's strip left to right, and wrapping
+    /// round to `current` itself last. Pressed again from where it lands, it
+    /// goes on to the next one rather than back to the first, which is how a
+    /// queue of things waiting on a person is worked through.
+    #[must_use]
+    pub fn next_tab_after(&self, current: Option<Id>, wanted: impl Fn(Id) -> bool) -> Option<Id> {
+        let order: Vec<Id> = self
+            .projects
+            .iter()
+            .flat_map(|project| project.tabs.iter().map(Tab::id))
+            .collect();
+        let start = current
+            .and_then(|tab| order.iter().position(|&id| id == tab))
+            .map_or(0, |index| index + 1);
+        order
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(order.len())
+            .copied()
+            .find(|&tab| wanted(tab))
+    }
+
     /// Wraps at both ends: the sidebar is a ring, and stopping at the last
     /// project would make the shortcut feel broken rather than safe.
     fn shift_selection(&mut self, offset: isize) {
@@ -679,6 +703,43 @@ mod tests {
             vec![first, third, second]
         );
         assert_eq!(workspace.selected_id(), Some(third));
+    }
+
+    #[test]
+    fn the_next_tab_wanting_a_look_is_found_after_this_one_and_wraps() {
+        let mut workspace = Workspace::new();
+        let first = workspace.open_project();
+        let second = workspace.open_project();
+        let tabs: Vec<Id> = [first, first, second, second]
+            .into_iter()
+            .map(|project| {
+                let tab = Tab::new();
+                let id = tab.id();
+                let entry = workspace.project_mut(project).unwrap();
+                entry.insert_tab(entry.tabs().len(), tab);
+                id
+            })
+            .collect();
+        let wanting = [tabs[0], tabs[2]];
+        let wanted = |tab| wanting.contains(&tab);
+
+        // Across into the next project, then round past the end to the top.
+        assert_eq!(
+            workspace.next_tab_after(Some(tabs[1]), wanted),
+            Some(tabs[2])
+        );
+        assert_eq!(
+            workspace.next_tab_after(Some(tabs[2]), wanted),
+            Some(tabs[0])
+        );
+        // Nothing on screen yet starts from the top.
+        assert_eq!(workspace.next_tab_after(None, wanted), Some(tabs[0]));
+        // The tab on screen is the last one asked about, not skipped.
+        assert_eq!(
+            workspace.next_tab_after(Some(tabs[0]), |tab| tab == tabs[0]),
+            Some(tabs[0])
+        );
+        assert_eq!(workspace.next_tab_after(Some(tabs[0]), |_| false), None);
     }
 
     #[test]

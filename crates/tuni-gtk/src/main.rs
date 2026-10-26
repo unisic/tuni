@@ -68,6 +68,7 @@ pub(crate) const ACCELS: &[(&str, &[&str])] = &[
     // had an undo for closing one. `R` for reopen is free on both sides - a
     // shell reads `Ctrl+R` as reverse search and never sees the shifted key.
     ("win.reopen-tab", &["<Ctrl><Shift>r"]),
+    ("win.jump-attention", &["<Ctrl><Shift>j"]),
     // One command typed into every pane of the tab. iTerm2 spends ⇧⌘I on this,
     // which is taken here by the session inspector, so it goes one modifier
     // over. `Ctrl+Alt+I` costs a shell nothing it would miss: `Ctrl+I` is a

@@ -30,7 +30,8 @@ A native terminal workspace for Linux.
   typed with `Ctrl+Shift+Backspace` whatever the shell
 - A project's row takes an icon from the desktop's theme, or an emoji
 - A coding agent thinking in a pane spins on its tab and on its project, and
-  leaves an exclamation there when it finishes into a tab you are not watching
+  leaves an exclamation there when it finishes into a tab you are not watching;
+  `Ctrl+Shift+J` goes to the next tab that wants you
 - Ghostty's 574 themes, which paint the window chrome as well as the terminal
 - The window comes back as it was left, once "Restore the Last Session" is on;
   a fresh shell every time is the default
