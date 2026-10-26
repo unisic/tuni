@@ -51,6 +51,8 @@ jobs:
           check data/dev.unisic.Tuni.metainfo.xml \
             "$(sed -n '0,/<release /s/.*<release version="\([^"]*\)".*/\1/p' \
               data/dev.unisic.Tuni.metainfo.xml)"
+          # The newest section is what the release publishes as its notes.
+          check CHANGELOG.md "$(sed -n '0,/^## /s/^## //p' CHANGELOG.md)"
 
           # workflow_dispatch has no tag to disagree with.
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
@@ -87,10 +89,10 @@ jobs:
           mkdir -p dist && cp "rpmbuild/RPMS/x86_64/tuni-${VERSION}-"*.rpm dist/
 
       - name: Install what was built
-        run: dnf install -y ./dist/*.rpm && test -x /usr/bin/tuni
+        run: dnf install -y ./dist/*.rpm && test -x /usr/bin/tuni && test -x /usr/bin/tuni-gtk
 
       - name: Check the binary against the baseline CPU
-        run: scripts/check-baseline.sh /usr/bin/tuni
+        run: scripts/check-baseline.sh /usr/bin/tuni-gtk
 
       - uses: actions/upload-artifact@v7
         with:
@@ -133,10 +135,10 @@ jobs:
           mkdir -p dist && mv ../*.deb dist/
 
       - name: Install what was built
-        run: apt-get install -y ./dist/*.deb && test -x /usr/bin/tuni
+        run: apt-get install -y ./dist/*.deb && test -x /usr/bin/tuni && test -x /usr/bin/tuni-gtk
 
       - name: Check the binary against the baseline CPU
-        run: scripts/check-baseline.sh /usr/bin/tuni
+        run: scripts/check-baseline.sh /usr/bin/tuni-gtk
 
       - uses: actions/upload-artifact@v7
         with:
@@ -174,10 +176,10 @@ jobs:
           mkdir -p dist && cp packaging/arch/*.pkg.tar.zst dist/
 
       - name: Install what was built
-        run: pacman -U --noconfirm ./dist/*.pkg.tar.zst && test -x /usr/bin/tuni
+        run: pacman -U --noconfirm ./dist/*.pkg.tar.zst && test -x /usr/bin/tuni && test -x /usr/bin/tuni-gtk
 
       - name: Check the binary against the baseline CPU
-        run: scripts/check-baseline.sh /usr/bin/tuni
+        run: scripts/check-baseline.sh /usr/bin/tuni-gtk
 
       - uses: actions/upload-artifact@v7
         with:
@@ -205,7 +207,26 @@ jobs:
       - name: Publish
         run: |
           ls -la dist
+          # This version's section of CHANGELOG.md, which gh puts above the
+          # generated notes; with no pull requests those are only the link to
+          # the full comparison, which is why the section is written by hand.
+          notes=$(awk -v h="## ${VERSION}" '$0 == h {f = 1; next} /^## / {f = 0} f' CHANGELOG.md)
           gh release create "v${VERSION}" dist/* \
             --target "$GITHUB_SHA" \
             --title "Tuni ${VERSION}" \
+            --notes "$notes" \
             --generate-notes
+
+  aur:
+    name: AUR
+    # After the release, because sync.sh hashes the published Arch package,
+    # which does not exist until `release` has created it. A separate workflow
+    # so a failed push can be run again on its own. Off until the repository
+    # variable AUR is "on": without an AUR account there is no key to push
+    # with, and a job that can only fail would turn every release red.
+    if: vars.AUR == 'on'
+    needs: [version, release]
+    uses: ./.github/workflows/aur.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+    secrets: inherit

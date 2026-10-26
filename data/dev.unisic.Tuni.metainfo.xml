@@ -67,6 +67,38 @@
   </provides>
 
   <releases>
+    <release version="1.7.0" date="2026-10-25">
+      <description>
+        <p>A host's files open in a pane of their own, beside this machine's:
+        the Files tree on one side, the remote folder on the other, and a drag
+        goes either way. Whole folders copy and delete, a remote file opens in
+        the editor and saves back, and the transfers waiting can be listed and
+        cancelled one at a time. Sixty-four requests are in flight instead of
+        one, so latency no longer sets the speed: an 8 MiB file over a link
+        with 50 ms added comes down in 0.9 s instead of 16.6.</p>
+        <p>Hosts can sit in groups and be filtered by a tag, a host can paint
+        its panes in a theme of its own, and the host editor has switches for
+        agent forwarding and environment variables. The connection settings
+        that only a hand-edited file reached are under Session in
+        Preferences.</p>
+        <p>A snippet can leave blanks that are asked for before it runs,
+        Ctrl+Shift+S opens the snippets alone, and one snippet can run on every
+        host the list is showing.</p>
+        <p>A dropped connection can dial again by itself when the network is
+        back, a changed host key can be forgotten from the bar that reports
+        it, a key can be made on a FIDO2 security key, and the "+" in the tab
+        strip offers the five hosts connected to last.</p>
+        <p>A launch starts the shell in about 5 ms instead of 660, before GTK
+        is loaded, and the window is up in a third of the time it took. A
+        flood of output is read in bursts, nearly a third faster than 1.6.0,
+        and the window holds a fifth less memory. Idle panes wake the window
+        together, so sixteen of them cost a quarter of the wakeups they did.
+        Beside eighteen other terminals measured in one run, Tuni came first
+        in throughput and first to start a shell.</p>
+        <p>Fedora can take Tuni from COPR, and updates then arrive with the
+        rest of the system.</p>
+      </description>
+    </release>
     <release version="1.6.0" date="2026-10-10">
       <description>
         <p>A host can keep its password. It goes into the desktop's keyring

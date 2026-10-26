@@ -139,9 +139,36 @@ pub fn present<F>(
         .title("Tags")
         .text(meta.tags.join(", "))
         .build();
+    let group = adw::EntryRow::builder()
+        .title("Group")
+        .text(&meta.group)
+        .build();
+    // The window's colors first, as nothing is first among the snippets. A
+    // name the catalog has lost stays on the list rather than turning into
+    // the first one, the way a missing font stays in Preferences.
+    let mut themes = vec!["Same as the Window".to_owned()];
+    if !meta.theme.is_empty() && !tuni_core::theme::exists(&meta.theme) {
+        themes.push(meta.theme.clone());
+    }
+    themes.extend(tuni_core::theme::names().map(str::to_owned));
+    let theme = adw::ComboRow::builder()
+        .title("Theme")
+        .subtitle("The colors of this host's panes")
+        .model(&string_list(&themes))
+        .selected(
+            themes
+                .iter()
+                .position(|name| *name == meta.theme)
+                .unwrap_or(0) as u32,
+        )
+        .enable_search(true)
+        .build();
+    crate::preferences::searchable(&theme);
     general.add(&name);
     general.add(&label);
+    general.add(&group);
     general.add(&tags);
+    general.add(&theme);
     page.append(&general);
 
     let connection = adw::PreferencesGroup::builder().title("Connection").build();
@@ -183,24 +210,42 @@ pub fn present<F>(
         .sensitive(false)
         .build();
     known.add_css_class("flat");
+    // The row edits the first key. A host with more keeps the rest as they
+    // were, and says so, rather than losing them to a change of user.
+    let others = host.identities.get(1..).unwrap_or_default().to_vec();
+    if !others.is_empty() {
+        let more = gtk::Label::builder()
+            .label(format!("and {} more", others.len()))
+            .tooltip_text(others.join("\n"))
+            .valign(gtk::Align::Center)
+            .build();
+        more.add_css_class("dim-label");
+        more.add_css_class("caption");
+        identity.add_suffix(&more);
+    }
     identity.add_suffix(&known);
     identity.add_suffix(&choose);
     offer_keys(&known, &identity);
-    // Nothing is a real answer here, and it is the first one, so the index of a
-    // chosen alias is one past where it sits in the list.
-    let mut names = vec!["None".to_owned()];
-    names.extend(jumps.iter().filter(|alias| **alias != host.alias).cloned());
-    let jump = adw::ComboRow::builder()
-        .title("Jump host")
-        .subtitle("Reached through this host first")
-        .model(&string_list(&names))
-        .selected(
-            names
-                .iter()
-                .position(|alias| *alias == host.proxy_jump)
-                .unwrap_or(0) as u32,
-        )
+    // Typed rather than picked, because `ProxyJump` is a chain and its links
+    // need not be hosts in this list: a combo of aliases saved `a,b` and
+    // `user@gate:2222` as nothing. The menu adds an alias at the end, which
+    // is the order ssh dials them in.
+    let jump = adw::EntryRow::builder()
+        .title("Jump hosts, in order")
+        .text(&host.proxy_jump)
         .build();
+    let add_jump = gtk::MenuButton::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Add a host to the chain")
+        .valign(gtk::Align::Center)
+        .build();
+    add_jump.add_css_class("flat");
+    jump.add_suffix(&add_jump);
+    offer_jumps(
+        &add_jump,
+        &jump,
+        jumps.into_iter().filter(|alias| *alias != host.alias),
+    );
     // Keyed by the alias rather than by the address, because the alias is what
     // `ssh` is handed and what a changed hostname leaves alone.
     let saved = Rc::new(RefCell::new(meta.password));
@@ -237,11 +282,14 @@ pub fn present<F>(
     page.append(&revealer);
 
     // Same shape as the jump host: nothing is the first answer and a real one.
+    // A snippet with blanks is left off, since a pane that is still connecting
+    // has nobody in front of it to fill them in.
     let mut snippets = vec!["None".to_owned()];
     snippets.extend(
         tuni_core::snippets::Snippets::load()
             .all()
             .iter()
+            .filter(|snippet| tuni_core::snippets::blanks(&snippet.body).is_empty())
             .map(|snippet| snippet.name.clone()),
     );
     let on_connect = adw::ComboRow::builder()
@@ -255,8 +303,27 @@ pub fn present<F>(
                 .unwrap_or(0) as u32,
         )
         .build();
+    // Two options with rows of their own. They are taken out of the extra
+    // lines below, so the text there cannot say something else about them.
+    // A value other than yes or no names a socket, which on keeps, since the
+    // switch only says whether. `false` is ssh's other spelling of no, and kept
+    // as a socket it would leave a switch turned on still meaning off.
+    let agent_was = host
+        .option("ForwardAgent")
+        .filter(|value| !value.eq_ignore_ascii_case("no") && !value.eq_ignore_ascii_case("false"));
+    let agent = adw::SwitchRow::builder()
+        .title("Forward the agent")
+        .subtitle("Root on the host can sign with your keys while you are connected")
+        .active(agent_was.is_some())
+        .build();
+    let environment = adw::EntryRow::builder()
+        .title("Environment, as NAME=value")
+        .text(host.option("SetEnv").unwrap_or_default())
+        .build();
     let session = adw::PreferencesGroup::builder().title("Session").build();
     session.add(&on_connect);
+    session.add(&agent);
+    session.add(&environment);
     advanced.append(&session);
 
     // Held apart from the rows, because a forward is added and removed rather
@@ -314,7 +381,10 @@ pub fn present<F>(
         .left_margin(6)
         .right_margin(6)
         .build();
-    extra.buffer().set_text(&host.extra.join("\n"));
+    let mut rest = host.clone();
+    rest.set_option("ForwardAgent", "");
+    rest.set_option("SetEnv", "");
+    extra.buffer().set_text(&rest.extra.join("\n"));
     let extra_frame = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .min_content_height(90)
@@ -417,26 +487,38 @@ pub fn present<F>(
         name,
         move |_| {
             let buffer = extra.buffer();
-            let written = Host {
+            let mut written = Host {
                 alias: name.text().trim().to_owned(),
                 hostname: address.text().trim().to_owned(),
                 port: port.value() as u16,
                 user: user.text().trim().to_owned(),
-                identities: once(identity.text().trim()),
-                proxy_jump: names
-                    .get(jump.selected() as usize)
-                    .filter(|_| jump.selected() != 0)
-                    .cloned()
-                    .unwrap_or_default(),
+                identities: identities(identity.text().trim(), &others),
+                proxy_jump: chain(&jump.text()),
                 forwards: forwards.borrow().clone(),
                 extra: lines(&buffer.text(&buffer.start_iter(), &buffer.end_iter(), false)),
                 source: Source::Tuni,
                 origin: None,
                 shadowed: false,
             };
+            // Off writes `no` over a value that was there, because taking the
+            // line out hands the question to whatever `Host *` says further
+            // down, and that may well be yes.
+            let forward = match (agent.is_active(), host.option("ForwardAgent")) {
+                (true, _) => agent_was.clone().unwrap_or_else(|| "yes".to_owned()),
+                (false, Some(_)) => "no".to_owned(),
+                (false, None) => String::new(),
+            };
+            written.set_option("ForwardAgent", &forward);
+            written.set_option("SetEnv", &environment.text());
             let written_meta = Meta {
                 label: label.text().trim().to_owned(),
                 tags: split_tags(&tags.text()),
+                group: group.text().trim().to_owned(),
+                theme: themes
+                    .get(theme.selected() as usize)
+                    .filter(|_| theme.selected() != 0)
+                    .cloned()
+                    .unwrap_or_default(),
                 icon: icon.borrow().clone(),
                 on_connect: snippets
                     .get(on_connect.selected() as usize)
@@ -789,6 +871,38 @@ fn offer_keys(button: &gtk::MenuButton, row: &adw::EntryRow) {
     ));
 }
 
+/// Hangs the aliases a chain can go through under `button`, each one added to
+/// the end of what `row` holds. A list with none in it leaves the button off.
+fn offer_jumps(
+    button: &gtk::MenuButton,
+    row: &adw::EntryRow,
+    aliases: impl Iterator<Item = String>,
+) {
+    let popover = gtk::Popover::new();
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    for alias in aliases {
+        let item = gtk::Button::builder().label(&alias).build();
+        item.add_css_class("flat");
+        if let Some(label) = item.child().and_downcast::<gtk::Label>() {
+            label.set_xalign(0.0);
+        }
+        item.connect_clicked(glib::clone!(
+            #[weak]
+            row,
+            #[weak]
+            popover,
+            move |_| {
+                row.set_text(&chained(&row.text(), &alias));
+                popover.popdown();
+            }
+        ));
+        list.append(&item);
+    }
+    button.set_sensitive(list.first_child().is_some());
+    popover.set_child(Some(&list));
+    button.set_popover(Some(&popover));
+}
+
 fn pick_key(dialog: &adw::Dialog, row: &adw::EntryRow) {
     let chooser = gtk::FileDialog::builder().title("Choose a Key").build();
     if let Some(home) = std::env::var_os("HOME") {
@@ -839,6 +953,29 @@ fn once(value: &str) -> Vec<String> {
     }
 }
 
+/// The key the row holds, then the ones it did not show.
+fn identities(first: &str, rest: &[String]) -> Vec<String> {
+    once(first)
+        .into_iter()
+        .chain(rest.iter().cloned())
+        .collect()
+}
+
+/// A chain as ssh reads it: links joined by commas and nothing else, since
+/// a space would make the value one quoted word ssh cannot resolve.
+fn chain(text: &str) -> String {
+    text.split(',')
+        .map(str::trim)
+        .filter(|link| !link.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `chain` with one more link at its end.
+fn chained(text: &str, alias: &str) -> String {
+    chain(&format!("{text},{alias}"))
+}
+
 fn lines(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
@@ -866,6 +1003,29 @@ fn string_list(items: &[String]) -> gtk::StringList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_the_first_key_keeps_the_others() {
+        let rest = vec!["~/.ssh/work".to_owned(), "~/.ssh/old".to_owned()];
+        assert_eq!(
+            identities("~/.ssh/new", &rest),
+            vec!["~/.ssh/new", "~/.ssh/work", "~/.ssh/old"]
+        );
+        assert_eq!(identities("", &rest), rest);
+    }
+
+    #[test]
+    fn a_jump_is_added_to_the_end_of_the_chain() {
+        assert_eq!(chained("", "gate"), "gate");
+        assert_eq!(chained("gate", "inner"), "gate,inner");
+        assert_eq!(chained("gate, ", "inner"), "gate,inner");
+    }
+
+    #[test]
+    fn a_chain_typed_with_spaces_is_written_without_them() {
+        assert_eq!(chain(" gate , dean@inner:2222 ,"), "gate,dean@inner:2222");
+        assert_eq!(chain("  "), "");
+    }
 
     #[test]
     fn tags_are_read_the_way_somebody_would_type_them() {

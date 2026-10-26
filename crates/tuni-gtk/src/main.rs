@@ -3,6 +3,7 @@
 //! Everything the window does lives in `window.rs`; this file is the process.
 
 mod blur;
+mod browser;
 mod debug;
 mod debugger;
 mod diff;
@@ -39,11 +40,11 @@ use std::path::{Path, PathBuf};
 
 use adw::prelude::*;
 use gtk::glib;
+use tuni_core::launch::{APP_ID, launch_directory};
+use tuni_pty::Pty;
 
 use terminal::TuniTerminal;
 use window::TuniWindow;
-
-const APP_ID: &str = "dev.unisic.Tuni";
 
 /// What the keyboard does, as data rather than as scattered constants, so a
 /// configurable keymap has one table to read instead of a scattered set.
@@ -125,6 +126,9 @@ pub(crate) const ACCELS: &[(&str, &[&str])] = &[
     // kero's palette is ⌘K; `Ctrl+K` is kill-line in a shell, so the palette
     // takes the key every editor on this desktop puts it on.
     ("win.palette", &["<Ctrl><Shift>p"]),
+    // Termius keeps its snippets a click away; here they are the palette
+    // narrowed to them, one key over from the palette itself.
+    ("win.pick-snippet", &["<Ctrl><Shift>s"]),
     // Walking the scrollback a command at a time. kitty, Ghostty and WezTerm all
     // put this on `Ctrl+Shift`+arrow, which is taken here by project switching,
     // so it goes one key over onto the pair that already scrolls by page.
@@ -148,7 +152,25 @@ pub(crate) const ACCELS: &[(&str, &[&str])] = &[
 
 fn main() -> glib::ExitCode {
     debug::mark("main");
-    quieten();
+    // SAFETY: the first statements of `main`, before GTK, its renderer, or a
+    // thread of ours exists.
+    let inherited = unsafe { Pty::inherited() };
+    unsafe {
+        tuni_core::launch::quieten(
+            tuni_core::settings::Settings::load()
+                .terminal
+                .background_opacity,
+        );
+    }
+    if let Some(shell) = inherited {
+        terminal::expect_early_shell(shell);
+    }
+    // The launcher's own name, so the process reads as `tuni` in `top` and to
+    // `pkill` whichever of the two programs it was started as. The threads
+    // started after this take it too, as they did before there were two.
+    // SAFETY: a fixed, NUL-terminated name, read by the kernel and kept.
+    unsafe { libc::prctl(libc::PR_SET_NAME, c"tuni".as_ptr()) };
+    init_adwaita();
     debug::mark("gtk::init");
 
     // One instance, and every later launch is forwarded to it as a command
@@ -167,23 +189,34 @@ fn main() -> glib::ExitCode {
                 | separate_process(),
         )
         .build();
+    // GTK loads the icon theme on a thread as soon as anything asks for it,
+    // and any change to where icons are looked up after that throws the load
+    // away and does it again, on the main thread, at the next lookup. With a
+    // large theme (Papirus is 44 000 files) one load is 170 ms. GtkApplication
+    // adds the resource path `/dev/unisic/Tuni/icons/` during startup whether
+    // or not a resource is there, and this program has no resources at all,
+    // so the base path goes and the load GTK started is the one that is used.
+    app.set_resource_base_path(None);
+    // Names the installed icon rather than carrying one: the desktop looks
+    // it up in the icon theme, which is also where the notification daemon
+    // and the window switcher look for it. Before `run` rather than in
+    // `startup`, because GtkApplication sets one itself when there is none,
+    // and finding out whether the theme has the icon waits for the whole
+    // theme to load before the window has been built. Only a build under an
+    // ID of its own asks, for the grey development icon when one is
+    // installed, and pays that wait.
+    if gtk::is_initialized_main_thread() {
+        let id = app_id();
+        let themed = id != APP_ID
+            && gtk::gdk::Display::default()
+                .is_some_and(|display| gtk::IconTheme::for_display(&display).has_icon(&id));
+        gtk::Window::set_default_icon_name(if themed { &id } else { APP_ID });
+    }
 
     app.connect_startup(|app| {
         debug::mark("startup begin");
-        // Names the installed icon rather than carrying one: the desktop looks
-        // it up in the icon theme, which is also where the notification daemon
-        // and the window switcher look for it. A build under its own ID names
-        // its own icon when one is installed, the grey development one.
-        let id = app_id();
-        let themed = gtk::gdk::Display::default()
-            .is_some_and(|display| gtk::IconTheme::for_display(&display).has_icon(&id));
-        gtk::Window::set_default_icon_name(if themed { &id } else { APP_ID });
-        // The icons Adwaita does not have, like the Git page's commit graph.
-        // An installed build finds them in hicolor beside the app icon; this
-        // path is for a checkout run, and points at nothing anywhere else.
         if let Some(display) = gtk::gdk::Display::default() {
-            gtk::IconTheme::for_display(&display)
-                .add_search_path(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/icons"));
+            checkout_icons(&display);
         }
         // The table with the config file's overrides on top; a change made in
         // the settings window later reapplies the same way.
@@ -216,7 +249,11 @@ fn main() -> glib::ExitCode {
     // line, so both jobs are here: the first launch builds the window, and
     // every launch after it is a project in the window that exists.
     app.connect_command_line(|app, cmdline| {
-        let directory = launch_directory(cmdline);
+        let directory = launch_directory(
+            cmdline.cwd(),
+            &cmdline.arguments(),
+            cmdline.getenv("HOME").map(PathBuf::from),
+        );
         // The focused window, else any of them: a window that has never been
         // focused is still a window to open the project in, and building a
         // second one would be the thing this is here to avoid.
@@ -270,151 +307,218 @@ fn app_id() -> String {
         .unwrap_or_else(|| APP_ID.to_owned())
 }
 
-/// `NON_UNIQUE` when this run must not join the one already going.
+/// The icons Adwaita does not have, like the Git page's commit graph, out of
+/// the checkout when this build's own have not been installed.
 ///
-/// A capture renders a window and quits, and forwarded to a running instance it
-/// would render nothing and quit anyway. A build being worked on is the same
-/// problem the other way around: `cargo run` while an installed Tuni is up
-/// would open a window in the installed one and test nothing.
+/// An installed build finds them in hicolor beside the app icon, and adding a
+/// search path anyway is not free: it reloads the whole icon theme on the main
+/// thread before the first frame (see `set_resource_base_path` in `main`). So
+/// the path is added only when one of the checkout's icons is missing from
+/// every hicolor the theme already searches, which is a run out of a checkout
+/// that was never installed, or one that added an icon since.
+fn checkout_icons(display: &gtk::gdk::Display) {
+    let checkout = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/icons"));
+    let Ok(icons) = std::fs::read_dir(checkout.join("hicolor/scalable/actions")) else {
+        return;
+    };
+    let installed: Vec<PathBuf> = std::iter::once(glib::user_data_dir())
+        .chain(glib::system_data_dirs())
+        .map(|dir| dir.join("icons/hicolor/scalable/actions"))
+        .collect();
+    let missing = icons.flatten().any(|icon| {
+        !installed
+            .iter()
+            .any(|dir| dir.join(icon.file_name()).exists())
+    });
+    if missing {
+        gtk::IconTheme::for_display(display).add_search_path(checkout);
+    }
+}
+
+/// `NON_UNIQUE` when this run must not join the one already going, for the
+/// reasons `tuni_core::launch::separate_process` gives.
 fn separate_process() -> gtk::gio::ApplicationFlags {
-    let separate = std::env::var_os("TUNI_CAPTURE_PNG").is_some()
-        || std::env::var("TUNI_SINGLE_INSTANCE").is_ok_and(|value| value == "0");
-    if separate {
+    if tuni_core::launch::separate_process() {
         gtk::gio::ApplicationFlags::NON_UNIQUE
     } else {
         gtk::gio::ApplicationFlags::empty()
     }
 }
 
-/// The directory a launch was about, if it was about one.
-///
-/// An argument names it outright, which is what a shell alias or a `.desktop`
-/// file with a path in it would use. Otherwise it is the working directory the
-/// launch was made from, which is how a file manager says it: KDE's launcher
-/// sets the child process's directory rather than passing a flag, since only
-/// konsole takes one. A launch from the home directory is not read as naming
-/// it, because that is where an application menu launches everything from and a
-/// session restored with a project per checkout does not want a tenth project
-/// for the home directory on top.
-fn launch_directory(cmdline: &gtk::gio::ApplicationCommandLine) -> Option<PathBuf> {
-    let cwd = cmdline.cwd();
-    let named = cmdline
-        .arguments()
-        .into_iter()
-        .skip(1)
-        .find(|argument| !argument.to_string_lossy().starts_with('-'));
-    if let Some(named) = named {
-        let path = PathBuf::from(named);
-        let path = match path.is_absolute() {
-            true => path,
-            false => cwd?.join(path),
-        };
-        return path.is_dir().then_some(path);
-    }
-
-    let cwd = cwd?;
-    let home = cmdline.getenv("HOME").map(PathBuf::from);
-    (Some(&cwd) != home.as_ref() && cwd.is_dir()).then_some(cwd)
-}
-
-/// The two lines a terminal on this desktop prints before it has drawn
-/// anything, neither of which is a fault of the program that lands in.
+/// GTK, then libadwaita, with a warning that is no fault of this program
+/// dropped on the way.
 ///
 /// A desktop that dresses GTK3 in a dark theme writes
 /// `gtk-application-prefer-dark-theme` into `settings.ini` for GTK4 as well,
 /// and libadwaita — which decides light and dark for itself, out of
 /// `AdwStyleManager` and the desktop's own color scheme, and is doing that here
-/// too — warns once that the setting means nothing to it. It is answered by
-/// clearing the setting for this process before libadwaita ever looks at it,
-/// which is what the empty value would have been anyway. Nothing on screen
-/// moves: the property is the one libadwaita ignores.
-///
-/// Mesa's RADV prints a conformance notice for every Vulkan context, which is
-/// what GTK renders with. It is a statement about the driver's certification,
-/// not about this machine or this program, and Mesa has an environment
-/// variable for saying so once and not again. A value already in the
-/// environment is left alone: somebody who asked for the notice can have it.
-fn quieten() {
-    if std::env::var_os("MESA_VK_IGNORE_CONFORMANCE_WARNING").is_none() {
-        // SAFETY: nothing else has started yet — this is the first statement
-        // of `main`, before GTK, its renderer, or a thread of ours exists.
-        unsafe { std::env::set_var("MESA_VK_IGNORE_CONFORMANCE_WARNING", "1") };
+/// too — warns once that the setting means nothing to it. The warning is
+/// dropped for the one call that prints it, since libadwaita then overwrites
+/// the setting itself. Nothing on screen moves: the property is the one
+/// libadwaita ignores.
+fn init_adwaita() {
+    // libadwaita before anything reads a GtkSettings, because the first read
+    // loads the theme's CSS, the CSS creates the icon theme, and creating it
+    // starts loading the whole theme on a thread under the theme's lock.
+    // libadwaita's own initialisation then adds its icons to that theme, which
+    // waits for the lock and throws the finished load away, so the next lookup
+    // does it again on the main thread: 170 ms each with Papirus, both before
+    // the first frame. Initialised first, it adds its path before the thread
+    // has the lock, and the one load there is uses it. Running it again inside
+    // the application's startup is a no-op. Clearing the dark setting before
+    // libadwaita looked at it, which is how the warning used to be avoided, is
+    // a GtkSettings read, so it would put the double load back.
+    //
+    // GLib aborts on a warning under `G_DEBUG=fatal-warnings` after whichever
+    // handler took it, so that mode is lifted for the one call too, and only
+    // that call: `gtk::init` opens the display outside it.
+    if gtk::init().is_err() {
+        return;
     }
-
-    // A translucent window has no opaque chrome: every bar's background is
-    // `transparent` and the only paint under a label is the window's own
-    // color, so a pixel GSK's damage tracking leaves out is never covered
-    // again and a sliver of text that has since changed stays on screen. Full
-    // redraws are the one lever GSK offers against that, and the window is
-    // already repainting whole for every terminal frame, so the added work is
-    // the chrome around it. An opaque window paints its own backgrounds and is
-    // left with damage tracking on, because it does not have the problem.
-    // `TUNI_PARTIAL_REDRAW=1` puts it back either way.
-    if std::env::var_os("GSK_DEBUG").is_none()
-        && std::env::var_os("TUNI_PARTIAL_REDRAW").is_none()
-        && tuni_core::settings::Settings::load()
-            .terminal
-            .background_opacity
-            < 1.0
-    {
-        // SAFETY: as above — still before GTK, its renderer, or any thread.
-        unsafe { std::env::set_var("GSK_DEBUG", "full-redraw") };
-    }
-
-    // Before the application rather than inside its startup: libadwaita reads
-    // the setting while GtkApplication starts up, and a warning is only avoided
-    // by having answered it first. `gtk::init` is what opens the display the
-    // settings come from, and running it twice is a no-op.
-    if gtk::init().is_ok()
-        && let Some(settings) = gtk::Settings::default()
-    {
-        settings.set_gtk_application_prefer_dark_theme(false);
-    }
+    let fatal = glib::log_set_always_fatal(glib::LogLevels::empty());
+    let quiet = glib::log_set_handler(
+        Some("Adwaita"),
+        glib::LogLevels::LEVEL_WARNING,
+        false,
+        false,
+        |domain, level, message| {
+            if !message.starts_with("Using GtkSettings:gtk-application-prefer-dark-theme") {
+                glib::log_default_handler(domain, level, Some(message));
+            }
+        },
+    );
+    let _ = adw::init();
+    glib::log_remove_handler(Some("Adwaita"), quiet);
+    glib::log_set_always_fatal(fatal);
 }
 
 fn build_window(app: &adw::Application, directory: Option<&Path>) {
     debug::mark("activate");
     let settings = settings();
     window::apply_appearance(settings.appearance);
-    let window = TuniWindow::new(app, settings);
+    let window = TuniWindow::without_content(app, settings);
     debug::mark("window built");
     // The window the application opens with is the one the saved session
     // belongs to. Windows opened beside it neither restore it nor write it.
     window.own_session();
-    window.present();
-    debug::mark("presented");
-    // The first frame is what the person is waiting for, and `present` only
-    // asks for it. The frame clock says when it arrived.
-    window.connect_map(|window| {
-        if let Some(clock) = window.frame_clock() {
-            clock.connect_after_paint(|_| debug::mark("first frame"));
-        }
-    });
-
-    // The first project's shell learns its size from the first allocation, so
-    // it opens after the window is on screen rather than before.
-    let directory = directory.map(Path::to_path_buf);
-    glib::idle_add_local_once(glib::clone!(
-        #[weak]
-        window,
-        move || {
-            // A saved session opens as it was left; anything else opens as a
-            // first run does.
-            let restored = window::session_enabled() && window.restore_session();
-            // A launch that named a directory gets a project for it either way:
-            // the session is what was there before, and the directory is what
-            // was asked for now.
-            if let Some(directory) = directory {
-                window.open_project_in(Some(&directory));
-            } else if !restored {
-                window.open_project();
+    // A saved session opens as it was left; anything else opens as a first
+    // run does.
+    let restored = tuni_core::session::enabled() && window.restore_session();
+    // A launch that named a directory gets a project for it either way: the
+    // session is what was there before, and the directory is what was asked
+    // for now.
+    if let Some(directory) = directory {
+        window.open_project_in(Some(directory));
+    } else if !restored {
+        window.open_project();
+    }
+    debug::mark("project open");
+    // The shells start before the window has its content, not after. The
+    // content waits for the icon theme (see `TuniWindow::without_content`),
+    // which with a big theme is most of the wait before the first frame, and
+    // a shell started first loads its own configuration in the same time, so
+    // the prompt is there when the window is. The price is the size: nothing
+    // has been laid out, so the shell opens at the 80x24 fallback and the
+    // first allocation corrects it, the way a shell in a tab behind the
+    // selected one always has. Each start waits in an idle; this one is
+    // lower, so they all run before it.
+    glib::idle_add_local_full(
+        glib::Priority::LOW,
+        glib::clone!(
+            #[weak]
+            window,
+            #[upgrade_or]
+            glib::ControlFlow::Break,
+            move || {
+                window.attach_content();
+                debug::mark("content");
+                window.present();
+                debug::mark("presented");
+                trim_after_first_frame(&window);
+                // A window restored onto a file or a diff has no terminal in
+                // the pane that is focused, and a capture of it is still a
+                // capture.
+                maybe_capture(&window, window.active_terminal().as_ref());
+                glib::ControlFlow::Break
             }
-            debug::mark("project open");
-            // A window restored onto a file or a diff has no terminal in the
-            // pane that is focused, and a capture of it is still a capture.
-            maybe_capture(&window, window.active_terminal().as_ref());
+        ),
+    );
+}
+
+/// Hands back to the system what starting the window freed.
+///
+/// Startup allocates a great deal it lets go of at once: the icon theme's
+/// loader thread, the parse of every stylesheet, the renderer compiling its
+/// shaders for the first frame. glibc keeps freed memory in its arenas and
+/// only returns what sits at the very top of one, so without this those pages
+/// stay counted against the window for as long as it is open, about 1.4 MiB.
+/// The second tick is the first one after a frame has been painted, which is
+/// when the renderer's share has been freed too. One walk of the arenas, once
+/// per window, well under a millisecond.
+fn trim_after_first_frame(window: &TuniWindow) {
+    #[cfg(target_env = "gnu")]
+    {
+        let painted = std::cell::Cell::new(false);
+        window.add_tick_callback(move |_, _| {
+            if !painted.replace(true) {
+                return glib::ControlFlow::Continue;
+            }
+            // SAFETY: takes no pointer and only touches allocator state,
+            // which it locks itself.
+            unsafe { libc::malloc_trim(0) };
+            glib::ControlFlow::Break
+        });
+    }
+    #[cfg(not(target_env = "gnu"))]
+    let _ = window;
+}
+
+/// How long `trim_soon` waits without being asked again before it trims.
+#[cfg(target_env = "gnu")]
+const TRIM_QUIET_SECONDS: u32 = 2;
+
+#[cfg(target_env = "gnu")]
+thread_local! {
+    /// When `trim_soon` was last asked, for as long as its timer is armed.
+    static TRIM_ASKED: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Hands back to the system, once the freeing stops, what a closed pane or a
+/// flood of output let go of.
+///
+/// The same glibc behaviour `trim_after_first_frame` is for, after the fact:
+/// a closed pane's grid and what it had cached for drawing, and the buffers a
+/// flood was read through, stay counted against the window otherwise. A trim
+/// from gdb took 1.8 to 1.9 MiB off a window with fifteen of sixteen panes
+/// closed and 1.9 to 2.3 MiB off one that had shown 200 MiB of output. The
+/// trim waits for two seconds without another ask, so a flood gets one at its
+/// end rather than one per chunk, each of which the next read would fault
+/// straight back in. While armed it is one seconds timer, on the tick every
+/// other one in the process shares; idle, it is nothing.
+pub fn trim_soon() {
+    #[cfg(target_env = "gnu")]
+    TRIM_ASKED.with(|asked| {
+        if asked.replace(Some(std::time::Instant::now())).is_some() {
+            return;
         }
-    ));
+        glib::timeout_add_seconds_local(TRIM_QUIET_SECONDS, || {
+            let quiet = std::time::Duration::from_secs(TRIM_QUIET_SECONDS.into());
+            let asked_since = TRIM_ASKED.with(|asked| match asked.get() {
+                Some(at) if at.elapsed() < quiet => true,
+                _ => {
+                    asked.set(None);
+                    false
+                }
+            });
+            if asked_since {
+                return glib::ControlFlow::Continue;
+            }
+            // SAFETY: as in `trim_after_first_frame`.
+            unsafe { libc::malloc_trim(0) };
+            glib::ControlFlow::Break
+        });
+    });
 }
 
 /// The settings for this run: the file, then the environment on top of it.
@@ -496,12 +600,20 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                         let (name, target) = match action.split_once('(') {
                             // A bare number is the i32 most actions take; the
                             // project actions take a u64 id, which a `u` suffix
-                            // asks for: `close-project(3u)`.
+                            // asks for: `close-project(3u)`. Quotes are a
+                            // string, which is how a host is named:
+                            // `browse-files('web')`.
                             Some((name, rest)) => {
                                 let rest = rest.trim_end_matches(')');
-                                let target = match rest.strip_suffix('u') {
-                                    Some(id) => id.parse::<u64>().ok().map(|id| id.to_variant()),
-                                    None => rest.parse::<i32>().ok().map(|n| n.to_variant()),
+                                let quoted = rest
+                                    .strip_prefix('\'')
+                                    .and_then(|rest| rest.strip_suffix('\''));
+                                let target = match (quoted, rest.strip_suffix('u')) {
+                                    (Some(text), _) => Some(text.to_variant()),
+                                    (_, Some(id)) => {
+                                        id.parse::<u64>().ok().map(|id| id.to_variant())
+                                    }
+                                    _ => rest.parse::<i32>().ok().map(|n| n.to_variant()),
                                 };
                                 (name.to_owned(), target)
                             }
@@ -512,30 +624,37 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                             name.strip_prefix("diff."),
                             name.strip_prefix("hosts."),
                             name.strip_prefix("term."),
+                            name.strip_prefix("sftp."),
                         ) {
-                            (Some(rest), _, _, _) => match window.active_editor() {
+                            (Some(rest), _, _, _, _) => match window.active_editor() {
                                 Some(editor) => {
                                     (editor.upcast::<gtk::Widget>(), format!("editor.{rest}"))
                                 }
                                 None => return eprintln!("no file is open: {name}"),
                             },
-                            (_, Some(rest), _, _) => match window.active_diff() {
+                            (_, Some(rest), _, _, _) => match window.active_diff() {
                                 Some(diff) => {
                                     (diff.upcast::<gtk::Widget>(), format!("diff.{rest}"))
                                 }
                                 None => return eprintln!("no diff is open: {name}"),
                             },
-                            (_, _, Some(rest), _) => match window.active_hosts() {
+                            (_, _, Some(rest), _, _) => match window.active_hosts() {
                                 Some(hosts) => {
                                     (hosts.upcast::<gtk::Widget>(), format!("hosts.{rest}"))
                                 }
                                 None => return eprintln!("no host list is open: {name}"),
                             },
-                            (_, _, _, Some(rest)) => match window.active_terminal() {
+                            (_, _, _, Some(rest), _) => match window.active_terminal() {
                                 Some(terminal) => {
                                     (terminal.upcast::<gtk::Widget>(), format!("term.{rest}"))
                                 }
                                 None => return eprintln!("no terminal is open: {name}"),
+                            },
+                            (_, _, _, _, Some(rest)) => match window.active_sftp() {
+                                Some(sftp) => {
+                                    (sftp.upcast::<gtk::Widget>(), format!("sftp.{rest}"))
+                                }
+                                None => return eprintln!("no remote page: {name}"),
                             },
                             _ => {
                                 let name = name.strip_prefix("win.").unwrap_or(&name);
@@ -673,12 +792,11 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                 #[weak]
                 window,
                 move || {
-                    let (Some(find), Some(terminal)) =
-                        (window.find_bar(), window.active_terminal())
-                    else {
+                    let Some(terminal) = window.active_terminal() else {
                         eprintln!("TUNI_CAPTURE_SEARCH: no terminal is open");
                         return;
                     };
+                    let find = window.find_bar();
                     find.open(&terminal);
                     find.search_text(&needle);
                     // The entry waits a moment before it searches, the way it

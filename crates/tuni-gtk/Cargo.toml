@@ -5,11 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+# Two programs: `tuni`, the launcher in `src/bin/tuni.rs`, and `tuni-gtk`, the
+# application it becomes. `cargo run` means the application, because running
+# the launcher builds only the launcher and would `exec` whatever `tuni-gtk`
+# was last built.
+default-run = "tuni-gtk"
 version.workspace = true
-
-[[bin]]
-name = "tuni"
-path = "src/main.rs"
 
 [dependencies]
 tuni-core.workspace = true
@@ -24,6 +25,11 @@ adw = { package = "libadwaita", version = "0.9", features = ["v1_6", "gtk_v4_10"
 # The same bridge tuni-pty crosses: a language server's reader thread feeds the
 # main loop through one of these.
 async-channel = "2"
+# What the launcher asks the session bus, linked on its own so that the
+# launcher does not load GTK. The version gtk4 itself uses.
+gio = "0.22"
+# `malloc_trim`, once the first frame is up, and the process name.
+libc = "0.2"
 # 4.14 for the path API the box drawing characters are stroked with. No floor
 # is raised by it: libadwaita 1.6 already asks for a newer GTK than that.
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }

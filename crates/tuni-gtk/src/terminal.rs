@@ -7,6 +7,7 @@
 //! this keeps up under a firehose is exactly what the Etap 0 benchmark decides.
 
 use std::cell::{Cell, RefCell};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -52,17 +53,52 @@ const PROGRESS_STALE: Duration = Duration::from_secs(15);
 /// it costs throughput rather than the window's ability to answer.
 const FEED_BUDGET: Duration = Duration::from_millis(8);
 
+/// How much output a pane reads before it asks for `trim_soon`. A flood asks
+/// many times over and is trimmed once at its end; what a prompt prints takes
+/// hours to add up to one ask.
+const TRIM_AFTER_BYTES: usize = 1 << 20;
+
 /// How often a shell that has never sent OSC 7 is looked up in `/proc`. The
 /// same couple of seconds the panel polls its own reads at, for the same
 /// reason: the answer is wanted by the time somebody looks, and one `readlink`
 /// is not worth a tighter loop than that.
-const CWD_POLL: Duration = Duration::from_secs(2);
+///
+/// Whole seconds, and armed with `timeout_add_seconds_local`, because GLib
+/// fires every seconds timer in a process on the same tick: sixteen panes
+/// polling twice each were 92 context switches in 20 idle seconds as
+/// millisecond timers, each pane's pair landing on a moment of its own, and
+/// are 22 this way, against 13 for a single pane. The price is up to a second
+/// of slack on when a poll runs, which a two-second poll absorbs.
+const CWD_POLL_SECONDS: u32 = 2;
 
 /// How long a command has to run before its ending is worth a notification.
 /// Long enough that nothing typed and answered at the prompt qualifies, short
 /// enough to cover the builds and test runs somebody walks away from - and
 /// anything shorter than the poll above cannot be measured anyway.
 const LONG_COMMAND_SECONDS: u64 = 10;
+
+thread_local! {
+    /// The first window's shell and what it was started with, by the `tuni`
+    /// launcher before this program was (see `src/bin/tuni.rs`).
+    static EARLY_SHELL: RefCell<Option<(PtyConfig, Pty)>> = const { RefCell::new(None) };
+}
+
+pub fn expect_early_shell(shell: (PtyConfig, Pty)) {
+    EARLY_SHELL.replace(Some(shell));
+}
+
+/// The shell started early, when it runs what `config` asks for, wherever it
+/// asks for it. Only the first terminal to start asks: a guess that turned out
+/// wrong is dropped there, which hangs it up, rather than kept for a pane that
+/// may never come.
+fn early_shell(config: &PtyConfig) -> Option<Pty> {
+    let (early, pty) = EARLY_SHELL.take()?;
+    (early.shell == config.shell
+        && early.argv == config.argv
+        && early.cwd == config.cwd
+        && early.env == config.env)
+        .then_some(pty)
+}
 
 /// What a pane's session runs. `Launch::default()` is the configured shell in
 /// no particular directory, which is what every pane was before a pane could
@@ -184,6 +220,30 @@ const TEXTURE_CACHE_BYTES: usize = 64 << 20;
 /// answer each one; kitty's own debounce is in the same range.
 const RESIZE_SETTLE: Duration = Duration::from_millis(50);
 
+/// The text of the rows the last frame drew, as render nodes, keyed by a hash
+/// of what each row held.
+///
+/// Laying text out through Pango is most of what a frame costs, and most rows
+/// are the same from one frame to the next: a spinner rewrites one line, a
+/// cursor blink none, a line of output moves every other row up by one. Keyed
+/// by content rather than by position, a row that scrolled is found again
+/// wherever it landed and only the new line is laid out. A row the frame did
+/// not draw is dropped at the end of it, so the map never outgrows a viewport,
+/// and the nodes kept are the ones GTK holds for the frame on screen anyway.
+///
+/// The hash stands in for the row. Two different rows meeting on the same 64
+/// bits would draw the older one until either changed, odds too small to
+/// spend a copy of every cell on ruling out.
+#[derive(Default)]
+struct RowNodes {
+    /// What every row of a frame shares and that changes how text is drawn:
+    /// font, metrics, scale, ligatures, the search colors. A change empties the
+    /// map, so nothing drawn for the old font is ever reused for the new one.
+    frame: u64,
+    last: std::collections::HashMap<u64, Option<gtk::gsk::RenderNode>>,
+    next: std::collections::HashMap<u64, Option<gtk::gsk::RenderNode>>,
+}
+
 /// Uploaded inline images, keyed by which image and which version of it.
 ///
 /// The key carries the storage's generation, so a plot redrawn under the same
@@ -278,6 +338,13 @@ mod imp {
         /// the widget's own chrome — the scrollbar, the empty background before
         /// a shell starts — is painted from the theme rather than from CSS.
         pub(super) theme: RefCell<Theme>,
+        /// What the window last handed down, kept so a pin can be lifted
+        /// without asking the window again.
+        pub(super) given: RefCell<Theme>,
+        /// A host's own colors, which win over what the window hands down. A
+        /// desktop going light is no reason to repaint the pane somebody
+        /// marked as the production machine.
+        pub(super) pinned: RefCell<Option<Theme>>,
         pub(super) font: RefCell<pango::FontDescription>,
         /// Point size in effect, which the zoom shortcuts move away from the
         /// configured one and put back.
@@ -410,6 +477,7 @@ mod imp {
         /// expensive half.
         pub(super) images: RefCell<Vec<tuni_vt::Placement>>,
         pub(super) textures: RefCell<Textures>,
+        pub(super) row_nodes: RefCell<RowNodes>,
         /// Handlers this widget added to the process-global `gtk::Settings`,
         /// taken off in `dispose`: the global outlives every terminal, so a
         /// handler left on it is a closure that survives every pane it was
@@ -430,6 +498,10 @@ mod imp {
                 theme: RefCell::new(
                     TerminalConfig::default().theme(adw::StyleManager::default().is_dark()),
                 ),
+                given: RefCell::new(
+                    TerminalConfig::default().theme(adw::StyleManager::default().is_dark()),
+                ),
+                pinned: RefCell::new(None),
                 font_size: Cell::new(TerminalConfig::default().font_size),
                 config: RefCell::new(TerminalConfig::default()),
                 font: RefCell::new(pango::FontDescription::new()),
@@ -483,6 +555,7 @@ mod imp {
                 progress_stale: RefCell::new(None),
                 images: RefCell::new(Vec::new()),
                 textures: RefCell::new(Textures::default()),
+                row_nodes: RefCell::new(RowNodes::default()),
                 settings_handlers: RefCell::new(Vec::new()),
                 frame_batch: match std::env::var("TUNI_DEBUG_FRAME_TIME") {
                     Ok(value) => value.trim().parse().unwrap_or(120).max(2),
@@ -530,8 +603,11 @@ mod imp {
             SIGNALS.get_or_init(|| {
                 vec![
                     // The shell is gone. Whoever placed this widget decides what
-                    // that means — the tab strip closes the tab.
-                    glib::subclass::Signal::builder("exited").build(),
+                    // that means — the tab strip closes the tab. Carries the
+                    // exit code, or -1 for a shell a signal ended.
+                    glib::subclass::Signal::builder("exited")
+                        .param_types([i32::static_type()])
+                        .build(),
                     // The application rang. A tab that is not on screen shows it
                     // as an attention mark rather than as a sound.
                     glib::subclass::Signal::builder("bell").build(),
@@ -628,6 +704,7 @@ mod imp {
             // Drop the session before the widget so the reader thread's channel
             // closes and the shell gets its SIGHUP.
             self.session.replace(None);
+            crate::trim_soon();
         }
     }
 
@@ -789,8 +866,8 @@ impl TuniTerminal {
     /// prompt is the last thing printed, and a poll that rides on output would
     /// have nothing left to ride on at the moment the answer changed.
     fn follow_directory(&self) {
-        glib::timeout_add_local(
-            CWD_POLL,
+        glib::timeout_add_seconds_local(
+            CWD_POLL_SECONDS,
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
@@ -831,8 +908,8 @@ impl TuniTerminal {
     /// is alive, two while something is running under it. It ends with the
     /// session or with the widget.
     fn watch_commands(&self) {
-        glib::timeout_add_local(
-            CWD_POLL,
+        glib::timeout_add_seconds_local(
+            CWD_POLL_SECONDS,
             glib::clone!(
                 #[weak(rename_to = this)]
                 self,
@@ -879,6 +956,18 @@ impl TuniTerminal {
             .borrow()
             .as_ref()
             .and_then(|session| session.pty.as_ref()?.shell_pid())
+    }
+
+    /// Whether the program in here has the terminal out of line mode. See
+    /// [`tuni_pty::Pty::is_raw`].
+    #[must_use]
+    pub fn is_raw(&self) -> bool {
+        self.imp()
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|session| session.pty.as_ref())
+            .is_some_and(tuni_pty::Pty::is_raw)
     }
 
     /// Whether anything is running in here. False before the first session
@@ -1345,14 +1434,32 @@ impl TuniTerminal {
     /// the session when one is created. Safe to call repeatedly, which is what
     /// happens when the desktop flips between light and dark.
     pub fn set_theme(&self, theme: &Theme) {
+        self.imp().given.replace(theme.clone());
+        self.repaint();
+    }
+
+    /// Paint in these colors whatever the window says afterwards, or, given
+    /// nothing, go back to the window's.
+    pub fn pin_theme(&self, theme: Option<Theme>) {
+        self.imp().pinned.replace(theme);
+        self.repaint();
+    }
+
+    fn repaint(&self) {
         let imp = self.imp();
-        if *imp.theme.borrow() == *theme {
+        let theme = imp
+            .pinned
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| imp.given.borrow().clone());
+        if *imp.theme.borrow() == theme {
             return;
         }
-        imp.theme.replace(theme.clone());
+        let colors = colors(&theme);
+        imp.theme.replace(theme);
 
         if let Some(session) = imp.session.borrow_mut().as_mut() {
-            let _ = session.term.set_colors(&colors(theme));
+            let _ = session.term.set_colors(&colors);
         }
         self.queue_draw();
     }
@@ -1468,7 +1575,15 @@ impl TuniTerminal {
             ..PtyConfig::default()
         };
         config.env.extend(launch.env.iter().cloned());
-        let pty = Pty::spawn(&config).map_err(|e| e.to_string())?;
+        let pty = match early_shell(&config) {
+            Some(pty) => {
+                // Started before there were metrics to give it pixels; a size
+                // it already has costs the kernel a comparison.
+                let _ = pty.resize(cols, rows, config.cell_width_px, config.cell_height_px);
+                pty
+            }
+            None => Pty::spawn(&config).map_err(|e| e.to_string())?,
+        };
 
         let events = pty.events();
         imp.session.replace(Some(Session {
@@ -1497,10 +1612,16 @@ impl TuniTerminal {
                 // chunk keeps the main loop answering within a frame without
                 // paying a round trip through the loop for each 64 KiB.
                 let mut served = Instant::now();
+                let mut unasked = 0;
                 while let Ok(event) = events.recv().await {
                     match event {
                         PtyEvent::Output(bytes) => {
                             this.feed(&bytes);
+                            unasked += bytes.len();
+                            if unasked >= TRIM_AFTER_BYTES {
+                                unasked = 0;
+                                crate::trim_soon();
+                            }
                             // A closed pane's session is gone, but a shell
                             // that ignored its SIGHUP can keep printing, and
                             // every chunk it prints would keep this future —
@@ -1530,17 +1651,40 @@ impl TuniTerminal {
                             // The pty goes and the screen stays, so whatever
                             // the session said on its way out is still there to
                             // read. Scoped, because emitting reaches back in.
-                            if let Some(session) = this.imp().session.borrow_mut().as_mut() {
-                                session.pty = None;
-                            }
+                            let pty = this
+                                .imp()
+                                .session
+                                .borrow_mut()
+                                .as_mut()
+                                .and_then(|session| session.pty.take());
                             // A shell killed mid-turn leaves the agent's last
                             // title, or its last progress report, standing, and
-                            // nothing will ever arrive to contradict it, so the pane stops reporting work
+                            // nothing will ever arrive to contradict it, so the
+                            // pane stops reporting work
                             // here rather than pulsing the bar forever.
                             this.imp().spinning.set(false);
                             this.apply_progress(Progress::Remove);
                             this.queue_draw();
-                            this.emit_by_name::<()>("exited", &[]);
+                            // Reaped off this thread, since waiting for a
+                            // process is a wait however short this one usually
+                            // is, and by a future of its own that holds the
+                            // widget weakly: a shell that closed its terminal
+                            // and lives on would otherwise keep a closed pane
+                            // alive for as long as it runs.
+                            let widget = this.downgrade();
+                            glib::spawn_future_local(async move {
+                                let code = match pty {
+                                    Some(pty) => gio::spawn_blocking(move || pty.finish())
+                                        .await
+                                        .ok()
+                                        .flatten(),
+                                    None => None,
+                                };
+                                let code = code.and_then(|code| i32::try_from(code).ok());
+                                if let Some(this) = widget.upgrade() {
+                                    this.emit_by_name::<()>("exited", &[&code.unwrap_or(-1)]);
+                                }
+                            });
                             break;
                         }
                     }
@@ -1598,6 +1742,13 @@ impl TuniTerminal {
         let guard = self.imp().session.borrow();
         let session = guard.as_ref()?;
         session.term.dump_history(max_lines).ok().flatten()
+    }
+
+    /// The last `max_lines` lines this terminal is holding, as plain text.
+    pub fn text(&self, max_lines: usize) -> Option<String> {
+        let guard = self.imp().session.borrow();
+        let session = guard.as_ref()?;
+        session.term.history_text(max_lines).ok().flatten()
     }
 
     /// Replays a saved terminal above the prompt of the shell that just
@@ -3662,6 +3813,24 @@ impl TuniTerminal {
 
         self.draw_images(snapshot, &images, &textures, Layer::BelowText, m);
 
+        let frame = {
+            let mut hasher = DefaultHasher::new();
+            font.to_str().hash(&mut hasher);
+            [m.cell_width, m.cell_height, m.ascent, m.thickness]
+                .map(f32::to_bits)
+                .hash(&mut hasher);
+            imp.pango_serial.get().hash(&mut hasher);
+            self.scale_factor().hash(&mut hasher);
+            imp.config.borrow().font_ligatures.hash(&mut hasher);
+            hit_fg.map(|c| (c.r, c.g, c.b)).hash(&mut hasher);
+            hasher.finish()
+        };
+        let mut rows = imp.row_nodes.borrow_mut();
+        if rows.frame != frame {
+            rows.frame = frame;
+            rows.last.clear();
+        }
+
         for row in 0..grid.rows {
             let cells = grid.row(row);
             let y = row as f32 * m.cell_height;
@@ -3669,47 +3838,33 @@ impl TuniTerminal {
             let hot = |col: usize| hot.get(base + col).copied().unwrap_or(false);
             let mark = |col: usize| marks.get(base + col).copied().unwrap_or(0);
 
-            // Text, batched into runs sharing a style.
-            let mut col = 0usize;
-            while col < cells.len() {
-                if cells[col].text.is_empty() {
-                    col += 1;
-                    continue;
+            let key = row_key(cells, hot, mark);
+            let node = match rows.last.get(&key) {
+                Some(node) => node.clone(),
+                None => {
+                    let recorder = gtk::Snapshot::new();
+                    let painter = Painter {
+                        snapshot: &recorder,
+                        layout: painter.layout,
+                        font: painter.font,
+                        plain: painter.plain.clone(),
+                        m,
+                    };
+                    painter.draw_row(cells, hot, mark, &hit_fg, &mut text);
+                    recorder.to_node()
                 }
-
-                let start = col;
-                let style = style_key(&cells[col], hot(col), mark(col));
-                text.clear();
-
-                while col < cells.len() {
-                    let cell = &cells[col];
-                    if cell.text.is_empty() || style_key(cell, hot(col), mark(col)) != style {
-                        break;
-                    }
-                    // Anything that is not one plain ASCII character is laid
-                    // out alone, so it lands on its own column rather than
-                    // wherever the run's accumulated advances put it.
-                    let simple = is_simple(&cell.text);
-                    if !simple && col != start {
-                        break;
-                    }
-                    text.push_str(&cell.text);
-                    // A double-width grapheme owns the following cell; the VT
-                    // reports that cell as empty, and stepping over it keeps
-                    // the run's column arithmetic honest.
-                    col += UnicodeWidthStr::width(cell.text.as_str()).max(1);
-                    if !simple {
-                        break;
-                    }
-                }
-
-                let fg = match mark(start) {
-                    0 => cells[start].fg,
-                    other => hit_fg[usize::from(other)],
-                };
-                painter.draw_run(start, y, &text, &cells[start], hot(start), fg);
+            };
+            if let Some(node) = &node {
+                snapshot.save();
+                snapshot.translate(&graphene::Point::new(0.0, y));
+                snapshot.append_node(node);
+                snapshot.restore();
             }
+            rows.next.insert(key, node);
         }
+        let rows = &mut *rows;
+        std::mem::swap(&mut rows.last, &mut rows.next);
+        rows.next.clear();
         drop(hovered);
 
         let cursor = grid.cursor;
@@ -4012,6 +4167,27 @@ fn is_simple(text: &str) -> bool {
     matches!(chars.next(), Some(c) if c == ' ' || c.is_ascii_graphic()) && chars.next().is_none()
 }
 
+/// A row's text as one number: every cell's grapheme and, where there is one,
+/// the part of its style the text pass draws. Backgrounds are left out because
+/// they are a pass of their own, drawn every frame. See `RowNodes`.
+fn row_key(
+    cells: &[tuni_vt::Cell],
+    hot: impl Fn(usize) -> bool,
+    mark: impl Fn(usize) -> u8,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for (col, cell) in cells.iter().enumerate() {
+        cell.text.hash(&mut hasher);
+        if cell.text.is_empty() {
+            continue;
+        }
+        let fg = cell.fg;
+        (fg.r, fg.g, fg.b, cell.bold, cell.italic, cell.underline).hash(&mut hasher);
+        (cell.strikethrough, hot(col), mark(col)).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn style_key(cell: &tuni_vt::Cell, link: bool, mark: u8) -> StyleKey {
     StyleKey {
         fg: cell.fg,
@@ -4136,6 +4312,58 @@ impl Painter<'_> {
             &rgba(color),
             &graphene::Rect::new(x, y, w, self.m.cell_height),
         );
+    }
+
+    /// The text of one row, at the top of the snapshot, batched into runs
+    /// sharing a style. The caller places it; see `RowNodes`.
+    fn draw_row(
+        &self,
+        cells: &[tuni_vt::Cell],
+        hot: impl Fn(usize) -> bool,
+        mark: impl Fn(usize) -> u8,
+        hit_fg: &[Rgb; 3],
+        text: &mut String,
+    ) {
+        let y = 0.0;
+        let mut col = 0usize;
+        while col < cells.len() {
+            if cells[col].text.is_empty() {
+                col += 1;
+                continue;
+            }
+
+            let start = col;
+            let style = style_key(&cells[col], hot(col), mark(col));
+            text.clear();
+
+            while col < cells.len() {
+                let cell = &cells[col];
+                if cell.text.is_empty() || style_key(cell, hot(col), mark(col)) != style {
+                    break;
+                }
+                // Anything that is not one plain ASCII character is laid
+                // out alone, so it lands on its own column rather than
+                // wherever the run's accumulated advances put it.
+                let simple = is_simple(&cell.text);
+                if !simple && col != start {
+                    break;
+                }
+                text.push_str(&cell.text);
+                // A double-width grapheme owns the following cell; the VT
+                // reports that cell as empty, and stepping over it keeps
+                // the run's column arithmetic honest.
+                col += UnicodeWidthStr::width(cell.text.as_str()).max(1);
+                if !simple {
+                    break;
+                }
+            }
+
+            let fg = match mark(start) {
+                0 => cells[start].fg,
+                other => hit_fg[usize::from(other)],
+            };
+            self.draw_run(start, y, text, &cells[start], hot(start), fg);
+        }
     }
 
     /// One run of text sharing a style, placed at its own column origin so

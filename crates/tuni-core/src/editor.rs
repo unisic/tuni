@@ -136,7 +136,7 @@ pub fn save(path: &Path, text: &str) -> Result<(), String> {
 /// A name beside the file being written. The process id is in it because two
 /// windows saving the same file at once would otherwise share the temporary and
 /// write each other's halves.
-fn temporary_name(target: &Path) -> PathBuf {
+pub(crate) fn temporary_name(target: &Path) -> PathBuf {
     let name = target
         .file_name()
         .and_then(|name| name.to_str())
@@ -144,7 +144,8 @@ fn temporary_name(target: &Path) -> PathBuf {
     PathBuf::from(format!(".{name}.tuni-{}", std::process::id()))
 }
 
-fn size_text(bytes: u64) -> String {
+#[must_use]
+pub fn size_text(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     const KIB: f64 = 1024.0;
     #[expect(

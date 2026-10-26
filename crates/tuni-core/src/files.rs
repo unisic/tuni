@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 /// How deep an expansion may go. A symlink pointing at one of its own parents
 /// is a cycle the tree would otherwise follow forever.
-const MAX_DEPTH: usize = 32;
+pub(crate) const MAX_DEPTH: usize = 32;
 
 /// One row.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,6 +26,20 @@ pub struct Item {
     pub is_directory: bool,
     /// Rows under the root are at zero; the indent is drawn from this.
     pub depth: usize,
+    /// What a remote listing said about it besides its name. Nothing for a
+    /// row on this machine, which the Files page draws without.
+    pub details: Option<Details>,
+}
+
+/// A remote row's size, time and permission bits, as the listing gave them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Details {
+    pub size: u64,
+    /// Seconds since the epoch.
+    pub mtime: u64,
+    /// The permission bits and the file type, or zero from a server that did
+    /// not send them.
+    pub mode: u32,
 }
 
 impl Item {
@@ -228,6 +242,7 @@ fn read_directory(directory: &Path) -> Vec<Item> {
                 name,
                 path,
                 depth: 0,
+                details: None,
             })
         })
         .collect();

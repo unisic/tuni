@@ -15,17 +15,22 @@
 //! terminal. Here names are bytes, attributes are integers, and nothing is
 //! parsed out of prose.
 //!
-//! There is no timer in here. Every call blocks on a round trip, so the caller
-//! belongs off the main thread, and a connection that has died is noticed the
+//! There is no timer in here. Every call blocks until it is answered, so the
+//! caller belongs off the main thread, and a connection that has died is noticed the
 //! way it always is: the master gives up on its own `ServerAlive` count, the
 //! pipe closes, and the next read ends short.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, FileExt};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStderr, Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::files::Failure;
+use crate::editor::temporary_name;
+use crate::files::{Failure, MAX_DEPTH};
 
 /// The protocol version this speaks and the only one it accepts.
 const VERSION: u32 = 3;
@@ -50,6 +55,16 @@ const STAT: u8 = 17;
 const RENAME: u8 = 18;
 const LSTAT: u8 = 7;
 const CLOSE: u8 = 4;
+const SETSTAT: u8 = 9;
+const FSETSTAT: u8 = 10;
+/// A request named by a string rather than a number, for what a server offers
+/// past version 3.
+const EXTENSION: u8 = 200;
+
+/// OpenSSH's rename that replaces a taken name in one step, the way
+/// `rename(2)` does, where version 3's own leaves it to the server and
+/// OpenSSH's refuses.
+const POSIX_RENAME: &str = "posix-rename@openssh.com";
 
 // Replies.
 const REPLY_VERSION: u8 = 2;
@@ -66,11 +81,19 @@ const READABLE: u32 = 0x0000_0001;
 const WRITABLE: u32 = 0x0000_0002;
 const CREATE: u32 = 0x0000_0008;
 const TRUNCATE: u32 = 0x0000_0010;
+/// With `CREATE`, refuse rather than open a file that is already there.
+const EXCLUSIVE: u32 = 0x0000_0020;
 
 /// How much of a file moves in one request, which is what OpenSSH's own client
-/// asks for. Nothing here pipelines, so this is also the round trip: a file
-/// crosses a 50 ms link at about 640 KB/s and a distant host feels it.
+/// asks for.
 const CHUNK: usize = 32 * 1024;
+
+/// How many of those a transfer keeps in flight, OpenSSH's default as well. One
+/// at a time made the round trip the speed limit, 640 KB/s across a 50 ms link
+/// however fast the link was; 64 is 2 MiB on the wire, which a 50 ms link fills
+/// at 40 MB/s. None of it is held here: the requests are a few bytes each on
+/// the way down, and the answers are read one at a time as they arrive.
+const WINDOW: usize = 64;
 
 // The status codes worth telling apart. The rest are one failure.
 const OK: u32 = 0;
@@ -89,6 +112,13 @@ const EXTENDED: u32 = 0x8000_0000;
 const TYPE: u32 = 0o170_000;
 const DIRECTORY: u32 = 0o040_000;
 const LINK: u32 = 0o120_000;
+const REGULAR: u32 = 0o100_000;
+
+/// How many files and folders one copy or delete of a folder may come to. The
+/// plan is held whole before any of it is carried out, under two hundred bytes
+/// a step, so this is what keeps a home directory dropped by mistake to a
+/// couple of dozen megabytes rather than whatever it holds.
+const MAX_STEPS: usize = 100_000;
 
 /// One name in a directory, with what the server said about it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -106,9 +136,375 @@ pub struct Entry {
     pub is_link: bool,
 }
 
+/// Which way a copy goes. Everything else about the two is the same.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Way {
+    Up,
+    Down,
+}
+
+/// One thing a copy makes or moves, or a delete removes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Step {
+    pub remote: String,
+    /// Where it comes from or lands on this machine, and empty in a delete,
+    /// which has no side here.
+    pub local: PathBuf,
+    pub is_directory: bool,
+    pub size: u64,
+}
+
+/// What a copy or a delete comes to, worked out before any of it is done: one
+/// file, or a folder and everything in it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Plan {
+    /// In the order they are carried out. A copy makes every directory before
+    /// what goes in it, and a delete empties every directory before it goes.
+    pub steps: Vec<Step>,
+    pub bytes: u64,
+    /// How many things were left out, and why the first of them was, as a
+    /// sentence.
+    pub skipped: usize,
+    pub left_out: Option<String>,
+    /// Whether what is at the top lands on something of the same name and
+    /// kind that is already there: a file that it replaces, or a folder it
+    /// goes into, so that a file in both is replaced.
+    pub replaces: bool,
+}
+
+impl Plan {
+    /// What the folder at the top holds, for the sentence that asks whether
+    /// to delete it: "214 files and 9 folders". Nothing for a file, or for a
+    /// folder with nothing in it.
+    #[must_use]
+    pub fn inside(&self) -> Option<String> {
+        let folders = self.steps.iter().filter(|step| step.is_directory).count();
+        let files = self.steps.len() - folders;
+        files_and_folders(files, folders.checked_sub(1)?)
+    }
+
+    /// Everything in the plan, what was chosen included: "3 files and 1
+    /// folder", for the question about deleting several things at once.
+    #[must_use]
+    pub fn count(&self) -> String {
+        let folders = self.steps.iter().filter(|step| step.is_directory).count();
+        files_and_folders(self.steps.len() - folders, folders).unwrap_or_else(|| counted(0, "file"))
+    }
+
+    /// `false` once the plan is as big as it may get.
+    fn add(&mut self, step: Step) -> bool {
+        if self.steps.len() >= MAX_STEPS {
+            return false;
+        }
+        self.bytes += step.size;
+        self.steps.push(step);
+        true
+    }
+
+    fn leave_out(&mut self, why: String) {
+        self.skipped += 1;
+        self.left_out.get_or_insert(why);
+    }
+}
+
+/// How a plan went.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Report {
+    pub done: usize,
+    pub failed: usize,
+    /// Why the first step that failed did. The ones after it are counted, not
+    /// kept, since a folder of a hundred thousand refusals is one piece of news.
+    pub first: Option<Failure>,
+    /// Cancelled, or the connection went, and nothing after that was tried.
+    pub stopped: bool,
+}
+
+/// How sending an edited file back went, when it did not fail outright.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SaveBack {
+    /// It is there now, and this is its size and time as the far end says
+    /// them, which the next save compares against.
+    Sent((u64, u64)),
+    /// Somebody else changed it there, or took it away, since it was fetched,
+    /// so nothing was written over it.
+    Changed,
+}
+
+/// Where a remote file is kept while it is edited here:
+/// `$XDG_RUNTIME_DIR/tuni/sftp/<alias>/<path>`, so the same file on the same
+/// host is always the same copy and opening it twice shows the pane it is
+/// already in. Nothing for an alias that would be a path, or a remote path
+/// that is not absolute or steps up.
+///
+/// ponytail: copies are never swept. They live on the tmpfs a logout empties
+/// and are at most [`crate::editor::MAX_BYTES`] each; a sweep on the last pane
+/// closing would race a save still on its way.
+#[must_use]
+pub fn copy_path(alias: &str, remote: &str) -> Option<PathBuf> {
+    copy_path_in(&copies(), alias, remote)
+}
+
+/// The host and remote path a copy from [`copy_path`] stands for, or nothing
+/// for any other file. Read off the path rather than kept, so a pane restored
+/// from the session still saves to where it came from.
+#[must_use]
+pub fn origin(local: &Path) -> Option<(String, String)> {
+    origin_in(&copies(), local)
+}
+
+/// A local file's size and time to the second, which is what a copy fresh off
+/// [`Session::get`] shares with the remote file, and so what
+/// [`Session::send_back`] compares against.
+#[must_use]
+pub fn seen(local: &Path) -> Option<(u64, u64)> {
+    let data = std::fs::metadata(local).ok()?;
+    let mtime = data
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((data.len(), mtime.as_secs()))
+}
+
+/// Permission bits the way `ls -l` writes them, `rwxr-xr-x`, with the set-id
+/// and sticky bits in the execute column.
+#[must_use]
+pub fn permissions(mode: u32) -> String {
+    let special = [(0o4000, 's'), (0o2000, 's'), (0o1000, 't')];
+    let mut text = String::with_capacity(9);
+    for (who, (bit, mark)) in special.into_iter().enumerate() {
+        let shift = 6 - 3 * who;
+        let bits = (mode >> shift) & 0o7;
+        text.push(if bits & 4 != 0 { 'r' } else { '-' });
+        text.push(if bits & 2 != 0 { 'w' } else { '-' });
+        text.push(match (bits & 1 != 0, mode & bit != 0) {
+            (true, true) => mark,
+            (false, true) => mark.to_ascii_uppercase(),
+            (true, false) => 'x',
+            (false, false) => '-',
+        });
+    }
+    text
+}
+
+fn copies() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| crate::settings::home().join(".cache"))
+        .join("tuni/sftp")
+}
+
+fn copy_path_in(base: &Path, alias: &str, remote: &str) -> Option<PathBuf> {
+    if alias.is_empty() || alias == "." || alias == ".." || alias.contains(['/', '\0']) {
+        return None;
+    }
+    let inside = Path::new(remote).strip_prefix("/").ok()?;
+    let plain = inside
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)));
+    if !plain || inside.as_os_str().is_empty() || remote.contains('\0') {
+        return None;
+    }
+    Some(base.join(alias).join(inside))
+}
+
+fn origin_in(base: &Path, local: &Path) -> Option<(String, String)> {
+    let mut parts = local.strip_prefix(base).ok()?.components();
+    let std::path::Component::Normal(alias) = parts.next()? else {
+        return None;
+    };
+    let inside = parts.as_path();
+    if inside.as_os_str().is_empty() {
+        return None;
+    }
+    Some((
+        alias.to_str()?.to_owned(),
+        Path::new("/").join(inside).to_str()?.to_owned(),
+    ))
+}
+
+/// What a finished copy or delete has to say, or nothing when all of it went
+/// and nothing was left out. `verb` is what was being done to it.
+#[must_use]
+pub fn summary(plan: &Plan, report: &Report, verb: &str) -> Option<Failure> {
+    let left_out = plan.left_out.as_ref().map(|first| match plan.skipped {
+        1 => first.clone(),
+        more => format!("{first} {} more left out as well.", more - 1),
+    });
+    if report.failed == 0 {
+        return left_out
+            .map(|why| Failure::new(format!("Left out {}.", counted(plan.skipped, "item")), why));
+    }
+    let first = report
+        .first
+        .clone()
+        .unwrap_or_else(|| Failure::new(format!("Couldn't {verb} it."), "The far end refused."));
+    if plan.steps.len() == 1 && left_out.is_none() {
+        return Some(first);
+    }
+    let mut detail = format!("{} {}", first.message, first.detail);
+    if let Some(left_out) = left_out {
+        detail = format!("{detail}\n\n{left_out}");
+    }
+    Some(Failure::new(
+        format!(
+            "Couldn't {verb} {} of {}.",
+            report.failed,
+            counted(plan.steps.len(), "item")
+        ),
+        detail,
+    ))
+}
+
+/// How many failed transfers are kept on the list. Each one is a few hundred
+/// bytes, and a list longer than this is one nobody reads to the end.
+pub const FAILED_KEPT: usize = 50;
+
+/// One file or folder to move, and the host it moves to or from. The host is
+/// part of it because the queue outlives the page's interest in one host: a
+/// file still going up to the last machine keeps going while the page browses
+/// the next.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Job {
+    /// Handed out by the queue, so a button can name the job it was drawn for
+    /// after the jobs around it have moved.
+    pub id: u64,
+    pub alias: String,
+    pub way: Way,
+    pub remote: String,
+    pub local: PathBuf,
+    /// Whether the name it lands on was chosen in a dialog that has already
+    /// asked about replacing what is there, so asking again would be asking
+    /// twice.
+    pub asked: bool,
+}
+
+impl Job {
+    /// The name the job is known by, which is the end it starts from.
+    #[must_use]
+    pub fn name(&self) -> String {
+        let path = match self.way {
+            Way::Up => self.local.clone(),
+            Way::Down => PathBuf::from(&self.remote),
+        };
+        path.file_name().map_or_else(
+            || path.to_string_lossy().into_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    }
+}
+
+/// The transfers a page was asked for that are not running: the ones waiting,
+/// in the order they were asked for, and the ones that failed, kept until
+/// somebody dismisses them.
+///
+/// The one running is not in here. It is held by whoever is running it, with
+/// the flag that stops it, and comes back through [`Queue::fail`] if it fails.
+/// ponytail: what waits is bounded only by what was dropped on the page, a
+/// few hundred bytes a job; nothing here reads the disk or the network.
+#[derive(Debug, Default)]
+pub struct Queue {
+    waiting: VecDeque<Job>,
+    failed: VecDeque<(Job, Failure)>,
+    next: u64,
+}
+
+impl Queue {
+    /// Puts a job at the back and returns its id.
+    pub fn push(
+        &mut self,
+        alias: &str,
+        way: Way,
+        remote: String,
+        local: PathBuf,
+        asked: bool,
+    ) -> u64 {
+        self.next += 1;
+        self.waiting.push_back(Job {
+            id: self.next,
+            alias: alias.to_owned(),
+            way,
+            remote,
+            local,
+            asked,
+        });
+        self.next
+    }
+
+    /// The next job to run, taken off the queue.
+    pub fn pop(&mut self) -> Option<Job> {
+        self.waiting.pop_front()
+    }
+
+    /// Takes a waiting job off the queue, or a failed one off the list.
+    /// Whether there was one by that id.
+    pub fn remove(&mut self, id: u64) -> bool {
+        let before = self.waiting.len() + self.failed.len();
+        self.waiting.retain(|job| job.id != id);
+        self.failed.retain(|(job, _)| job.id != id);
+        self.waiting.len() + self.failed.len() != before
+    }
+
+    /// Forgets everything waiting. The failures stay: they are news nobody has
+    /// read yet, and cancelling the rest is not reading it.
+    pub fn clear(&mut self) {
+        self.waiting.clear();
+    }
+
+    /// Forgets every failure.
+    pub fn dismiss(&mut self) {
+        self.failed.clear();
+    }
+
+    /// Puts a job that did not go on the failed list.
+    ///
+    /// With `give_up`, the jobs waiting for the same host go with it, and the
+    /// failure says how many: whatever the far end refused this one for, or
+    /// the connection that died under it, is what the next ones were about to
+    /// meet, and the same failure once a file is not more information. Jobs
+    /// for other hosts are a different connection and wait on.
+    pub fn fail(&mut self, job: Job, failure: Failure, give_up: bool) {
+        let mut failure = failure;
+        if give_up {
+            let before = self.waiting.len();
+            self.waiting.retain(|waiting| waiting.alias != job.alias);
+            let rest = match before - self.waiting.len() {
+                0 => None,
+                1 => Some(String::from("The one behind it was left where it is.")),
+                more => Some(format!("The {more} behind it were left where they are.")),
+            };
+            if let Some(rest) = rest {
+                failure.detail = format!("{} {rest}", failure.detail);
+            }
+        }
+        if self.failed.len() == FAILED_KEPT {
+            self.failed.pop_front();
+        }
+        self.failed.push_back((job, failure));
+    }
+
+    #[must_use]
+    pub fn waiting(&self) -> &VecDeque<Job> {
+        &self.waiting
+    }
+
+    #[must_use]
+    pub fn failed(&self) -> &VecDeque<(Job, Failure)> {
+        &self.failed
+    }
+
+    /// Whether anything is waiting to go to or from `alias`.
+    #[must_use]
+    pub fn wants(&self, alias: &str) -> bool {
+        self.waiting.iter().any(|job| job.alias == alias)
+    }
+}
+
 /// A connection to one host's sftp subsystem.
 ///
-/// Every call blocks on a round trip. The child is killed when this is dropped,
+/// Every call blocks until it is answered, and a transfer keeps up to
+/// [`WINDOW`] requests in flight on the way. The child is killed when this is dropped,
 /// which is what closes the channel; the shared master it went over stays up.
 pub struct Session {
     child: Option<Child>,
@@ -116,6 +512,14 @@ pub struct Session {
     input: BufReader<Box<dyn Read + Send>>,
     next: u32,
     failure: Option<Failure>,
+    /// The status code of the last refusal, for the one caller that acts on
+    /// which code it was rather than only on the sentence.
+    refusal: Option<u32>,
+    /// Raised when the pipe broke or the far end lost the thread, after which
+    /// nothing sent on this session will be answered.
+    lost: bool,
+    /// The extensions the server named when it said hello.
+    extensions: Vec<String>,
 }
 
 impl Session {
@@ -124,25 +528,64 @@ impl Session {
     /// The argv is built by the caller because it is the same `ssh` invocation
     /// as a pane's, options and all: the point is to land on the machine the
     /// pane is on, over the connection it already opened.
-    pub fn open(argv: &[String]) -> Option<Self> {
-        let (program, args) = argv.split_first()?;
+    ///
+    /// A session that does not start says why, from what `ssh` wrote on its
+    /// way out: a refused key, a host key nobody has accepted and a server
+    /// with no SFTP in it are three different things to do next.
+    pub fn open(argv: &[String]) -> Result<Self, Failure> {
+        let unstarted = |detail: String| Failure::new("Couldn't start a file transfer.", detail);
+        let (program, args) = argv
+            .split_first()
+            .ok_or_else(|| unstarted("There is no command to run.".to_owned()))?;
         let mut child = Command::new(program)
             .args(args)
+            // The environment every background ssh here runs in, for the
+            // reasons `ssh::run` gives: no askpass dialog out of nowhere, and
+            // error text that can be read.
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .env("LC_ALL", "C")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
-            .ok()?;
-        let out = child.stdin.take()?;
-        let input = child.stdout.take()?;
+            .map_err(|error| unstarted(error.to_string()))?;
+        let (Some(out), Some(input), Some(mut errors)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            return Err(unstarted("Its pipes did not open.".to_owned()));
+        };
         let mut session = Self {
             child: Some(child),
             out: Box::new(out),
             input: BufReader::new(Box::new(input)),
             next: 1,
             failure: None,
+            refusal: None,
+            lost: false,
+            extensions: Vec::new(),
         };
-        session.handshake().then_some(session)
+        if session.handshake() {
+            // Read for as long as the pipe is open and thrown away: ssh stops
+            // dead once a pipe nobody reads is full, and a `LogLevel` turned
+            // up in somebody's config fills one. One small thread per
+            // session, gone when the pipe closes.
+            std::thread::spawn(move || std::io::copy(&mut errors, &mut std::io::sink()));
+            return Ok(session);
+        }
+        // Gone before it answered, or answering something else. Reaped, it has
+        // said everything it was going to.
+        if let Some(mut child) = session.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let said = waiting(&mut errors);
+        if said.trim().is_empty() {
+            return Err(session
+                .failure
+                .take()
+                .unwrap_or_else(|| unstarted("The sftp subsystem did not answer.".to_owned())));
+        }
+        Err(explain(&said))
     }
 
     /// Where a path really is, with `~`, `.` and symlinks resolved by the far
@@ -165,14 +608,15 @@ impl Session {
     ///
     /// One `OPENDIR` and then `READDIR` until the server says there is no more,
     /// which is how the protocol spells the end of a listing: a status packet
-    /// carrying `EOF` rather than an empty answer.
+    /// carrying `EOF` rather than an empty answer. A connection that ends
+    /// before that is no listing at all, since half a directory drawn as the
+    /// whole of it is a folder that looks emptier than it is.
     pub fn list(&mut self, path: &str) -> Option<Vec<Entry>> {
         let handle = self.opendir(path)?;
         let mut entries = Vec::new();
-        while let Some(id) = self.request(READDIR, &encode_string_bytes(&handle)) {
-            let Some((kind, body)) = self.reply(id) else {
-                break;
-            };
+        loop {
+            let id = self.request(READDIR, &encode_string_bytes(&handle))?;
+            let (kind, body) = self.reply(id)?;
             if kind == REPLY_STATUS {
                 let mut reader = Reader::new(&body);
                 if reader.u32() != Some(EOF) {
@@ -196,7 +640,13 @@ impl Session {
                 reader.string()?;
                 let mut entry = reader.attributes()?;
                 entry.name = String::from_utf8_lossy(&name).into_owned();
-                if entry.name != "." && entry.name != ".." {
+                // A name is one component, and a server that sends `../x` or
+                // `a/b` is either broken or hoping something here joins it
+                // onto a path and walks out of the directory. Neither is
+                // listed.
+                if !matches!(entry.name.as_str(), "" | "." | "..")
+                    && !entry.name.contains(['/', '\0'])
+                {
                     entries.push(entry);
                 }
             }
@@ -218,22 +668,31 @@ impl Session {
 
     /// Copies a remote file to `local`, calling `progress` with how much has
     /// arrived and how much there is. `progress` answering `false` stops the
-    /// transfer where it stands: the handle is closed, the half-written local
-    /// file is left for the caller (who named it), and the failure says
-    /// cancelled.
+    /// transfer where it stands, and the failure says cancelled.
     ///
-    /// The caller decides what `local` is named. Nothing here renames anything,
-    /// so a caller that wants a half-written file to be unopenable writes to a
-    /// name nobody looks for and moves it afterwards.
+    /// The bytes land beside `local` under a dotted name and are moved onto it
+    /// once they are whole, which is how the editor saves: a transfer that dies
+    /// leaves nothing under a name something else would open, and a file that
+    /// was already there stays what it was. The rest of the editor's rules come
+    /// with the rename: a symlink is resolved first so the link stays a link,
+    /// and a file that was already there keeps its permissions, so a script
+    /// fetched over itself stays executable.
     pub fn get(
         &mut self,
         remote: &str,
         local: &Path,
         progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Option<()> {
-        let total = self.stat(remote).map_or(0, |entry| entry.size);
+        let found = self.stat(remote);
+        let total = found.as_ref().map_or(0, |entry| entry.size);
+        // Zero from a server that did not say.
+        let changed = found
+            .filter(|entry| entry.mtime != 0)
+            .map(|entry| UNIX_EPOCH + std::time::Duration::from_secs(entry.mtime));
         let handle = self.open_file(remote, READABLE, None)?;
-        let file = match File::create(local) {
+        let target = std::fs::canonicalize(local).unwrap_or_else(|_| local.to_path_buf());
+        let part = target.with_file_name(temporary_name(&target));
+        let file = match File::create(&part) {
             Ok(file) => file,
             Err(error) => {
                 self.failure = Some(Failure::new(
@@ -244,19 +703,59 @@ impl Session {
                 return None;
             }
         };
-        let done = self.download(&handle, file, remote, total, progress);
+        let done = self.download(&handle, &file, remote, total, progress);
         self.close(&handle);
-        done
+        if done.is_some()
+            && let Some(changed) = changed
+        {
+            // When it was last changed over there, which is what a file
+            // manager's copy keeps too. Not worth failing for: the bytes are
+            // what was asked for, and they are right.
+            let _ = file.set_modified(changed);
+        }
+        let finish = || -> std::io::Result<()> {
+            // Before the rename, so a machine that loses power just after it
+            // has the bytes to go with the name.
+            file.sync_all()?;
+            if let Ok(metadata) = std::fs::metadata(&target) {
+                std::fs::set_permissions(&part, metadata.permissions())?;
+            }
+            std::fs::rename(&part, &target)
+        };
+        let landed = match done.map(|()| finish()) {
+            Some(Ok(())) => Some(()),
+            Some(Err(error)) => {
+                self.failure = Some(Failure::new(
+                    format!("Couldn't finish {}.", local.display()),
+                    error.to_string(),
+                ));
+                None
+            }
+            None => None,
+        };
+        if landed.is_none() {
+            // Dead, cancelled or refused, and nothing is coming back for the
+            // half that arrived. The failure already says why; a temporary
+            // that will not go is not a second thing worth saying.
+            let _ = std::fs::remove_file(&part);
+        }
+        landed
     }
 
     /// Copies a local file to `remote`, calling `progress` with how much has
     /// gone and how much there is. `progress` answering `false` stops the
-    /// transfer where it stands, leaving a truncated file at the far end for
-    /// the caller to keep or sweep.
+    /// transfer where it stands.
     ///
-    /// The file arrives with the permission bits it has here, which is what the
+    /// The bytes land beside `remote` under a dotted name and replace it only
+    /// once they are whole, so a cancelled or broken upload leaves whatever was
+    /// there exactly as it was rather than cut short under its own name. A new
+    /// file arrives with the permission bits it has here, which is what the
     /// `sftp` program does too: a script that is executable on this machine is
-    /// executable on the other one.
+    /// executable on the other one. A file it replaces keeps the bits it had
+    /// over there, which is what writing into it would have done; its owner
+    /// becomes the account this logged in as, the one thing a rename cannot
+    /// carry across. A symlink is followed to what it points at rather than
+    /// replaced by a file.
     pub fn put(
         &mut self,
         local: &Path,
@@ -275,13 +774,153 @@ impl Session {
         };
         let data = file.metadata().ok();
         let total = data.as_ref().map_or(0, std::fs::Metadata::len);
-        let mode = data.map_or(0o644, |data| {
+        let times = data.as_ref().and_then(times);
+        let here = data.map_or(0o644, |data| {
             std::os::unix::fs::PermissionsExt::mode(&data.permissions()) & 0o777
         });
+
+        // Asked with the failure kept, since a name that is not there yet is
+        // the usual answer rather than something that went wrong.
+        let found = self.probe(|session| session.lstat(remote));
+        if found.as_ref().is_some_and(|entry| entry.is_directory) {
+            self.failure = Some(Failure::new(
+                format!("Couldn't write {remote}."),
+                "There is a directory there with that name.",
+            ));
+            return None;
+        }
+        let (target, found) = match found {
+            Some(entry) if entry.is_link => match self.probe(|session| session.realpath(remote)) {
+                Some(real) => {
+                    let found = self.probe(|session| session.stat(&real));
+                    (real, found)
+                }
+                // Somewhere the far end cannot name, so the link is written
+                // through, which is what opening it does.
+                None => return self.overwrite(file, local, remote, total, here, progress),
+            },
+            found => (remote.to_owned(), found),
+        };
+        let kept = found
+            .as_ref()
+            .map(|entry| entry.mode & 0o777)
+            .filter(|mode| *mode != 0);
+
+        let part = beside(&target);
+        self.refusal = None;
+        let Some(handle) = self.open_file(
+            &part,
+            WRITABLE | CREATE | TRUNCATE,
+            Some(kept.unwrap_or(here)),
+        ) else {
+            // A directory this account may not write into can still hold a
+            // file it may write to, so that file is written where it stands.
+            // It costs what the temporary exists to prevent, a cancel there
+            // leaves the file cut short, and it is the only way such a file
+            // can be sent at all.
+            if found.is_some() && self.refusal == Some(PERMISSION_DENIED) {
+                return self.overwrite(file, local, remote, total, here, progress);
+            }
+            // Named as the file that was asked for. The temporary is this
+            // client's business and nobody asked to write it.
+            if let Some(failure) = self.failure.as_mut() {
+                failure.message = format!("Couldn't write {remote}.");
+            }
+            return None;
+        };
+        let done = self.upload(&handle, file, local, remote, total, progress);
+        if done.is_some() {
+            // The mode went through the far end's umask on the way in, so a
+            // file that was group-writable would come back without it.
+            self.stamp(&handle, &part, kept, times);
+        }
+        self.close(&handle);
+        if done.is_none() {
+            // The one thing to sweep is the temporary. On a connection that
+            // died this cannot reach it either, and a dotted name is what is
+            // left over there rather than half of the real one.
+            self.probe(|session| session.remove(&part));
+            return None;
+        }
+        self.replace(&part, &target, found.is_some())
+    }
+
+    /// Straight into `remote`, cut to nothing first. What [`Self::put`] falls
+    /// back to when there is nowhere beside the file to write.
+    fn overwrite(
+        &mut self,
+        file: File,
+        local: &Path,
+        remote: &str,
+        total: u64,
+        mode: u32,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Option<()> {
+        let times = file.metadata().ok().as_ref().and_then(times);
         let handle = self.open_file(remote, WRITABLE | CREATE | TRUNCATE, Some(mode))?;
         let done = self.upload(&handle, file, local, remote, total, progress);
+        if done.is_some() {
+            self.stamp(&handle, remote, None, times);
+        }
         self.close(&handle);
         done
+    }
+
+    /// Sets on an open handle what the bytes do not carry: a mode, past the
+    /// far end's umask, and the access and change times the file has here,
+    /// which is what a file manager's copy keeps. Not fatal when refused: the
+    /// bytes are the thing that was asked for, and they are right.
+    fn stamp(&mut self, handle: &[u8], path: &str, mode: Option<u32>, times: Option<(u32, u32)>) {
+        let flags = mode.map_or(0, |_| PERMISSIONS) | times.map_or(0, |_| ACMODTIME);
+        if flags == 0 {
+            return;
+        }
+        let mut request = encode_string_bytes(handle);
+        request.extend_from_slice(&flags.to_be_bytes());
+        if let Some(mode) = mode {
+            request.extend_from_slice(&mode.to_be_bytes());
+        }
+        if let Some((accessed, changed)) = times {
+            request.extend_from_slice(&accessed.to_be_bytes());
+            request.extend_from_slice(&changed.to_be_bytes());
+        }
+        self.probe(|session| session.settle(FSETSTAT, &request, "write", path));
+    }
+
+    /// Moves a finished upload onto the name it was for.
+    ///
+    /// A file that is there is replaced in one step where the server offers
+    /// [`POSIX_RENAME`]. Elsewhere version 3 leaves a rename onto a taken name
+    /// to the server and OpenSSH's refuses, so the file goes first, and between
+    /// the two there is a moment with nothing under the name. A name that was
+    /// free gets the plain rename either way, which refuses rather than
+    /// replaces whatever appeared there in the meantime. The new bytes are
+    /// whole by then, so when the rename is what fails they stay where they
+    /// landed and the failure says where.
+    fn replace(&mut self, part: &str, target: &str, taken: bool) -> Option<()> {
+        let moved = if taken && self.offers(POSIX_RENAME) {
+            let mut request = encode_string(POSIX_RENAME);
+            request.extend_from_slice(&encode_string(part));
+            request.extend_from_slice(&encode_string(target));
+            self.settle(EXTENSION, &request, "replace", target)
+        } else {
+            if taken && self.remove(target).is_none() {
+                if let Some(failure) = self.failure.as_mut() {
+                    failure.message = format!("Couldn't replace {target}.");
+                }
+                self.probe(|session| session.remove(part));
+                return None;
+            }
+            self.rename(part, target)
+        };
+        if moved.is_some() {
+            return Some(());
+        }
+        if let Some(failure) = self.failure.as_mut() {
+            failure.message = format!("Couldn't replace {target}.");
+            failure.detail = format!("The new copy arrived whole and is at {part}.");
+        }
+        None
     }
 
     /// Makes one directory, which the far end refuses if it is already there.
@@ -345,10 +984,409 @@ impl Session {
         self.settle(RENAME, &request, "rename", from)
     }
 
+    /// Makes one empty file, which the far end refuses if the name is taken,
+    /// so nothing that was there is emptied.
+    pub fn create(&mut self, path: &str) -> Option<()> {
+        if let Some(handle) = self.open_file(path, WRITABLE | CREATE | EXCLUSIVE, None) {
+            self.close(&handle);
+            return Some(());
+        }
+        if self.probe(|session| session.lstat(path)).is_some() {
+            self.because("There is already something there with that name.");
+        }
+        None
+    }
+
+    /// Sets the permission bits of one path, set-id and sticky bits included,
+    /// and leaves its type alone.
+    pub fn chmod(&mut self, path: &str, mode: u32) -> Option<()> {
+        let mut request = encode_string(path);
+        request.extend_from_slice(&PERMISSIONS.to_be_bytes());
+        request.extend_from_slice(&(mode & 0o7777).to_be_bytes());
+        self.settle(SETSTAT, &request, "change the permissions of", path)
+    }
+
+    /// Fetches a remote file into its copy from [`copy_path`] for the editor,
+    /// refusing what the editor would refuse to open before any of it moves.
+    pub fn fetch_to_edit(&mut self, remote: &str, local: &Path) -> Option<()> {
+        let entry = self.stat(remote)?;
+        let refuse =
+            |detail: String| Some(Failure::new(format!("Couldn't edit {remote}."), detail));
+        if entry.is_directory || (entry.mode != 0 && entry.mode & TYPE != REGULAR) {
+            self.failure = refuse("It is not a file.".to_owned());
+            return None;
+        }
+        if entry.size > crate::editor::MAX_BYTES {
+            let said = crate::editor::Document::TooLarge(entry.size).message();
+            self.failure = refuse(said.unwrap_or_default());
+            return None;
+        }
+        // Owner-only all the way down, in case the runtime directory was not
+        // there and this is under the home directory instead.
+        let made = local.parent().map(|parent| {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+        });
+        if let Some(Err(error)) = made {
+            self.failure = refuse(error.to_string());
+            return None;
+        }
+        self.get(remote, local, &mut |_, _| true)
+    }
+
+    /// Sends an edited copy back over `remote`, unless the file there is no
+    /// longer the one `seen` describes. `force` sends it anyway, which is what
+    /// the person says once they have been told.
+    ///
+    /// The look and the write are two requests, so a change landing between
+    /// them is still written over. Version 3 has no way to make them one.
+    pub fn send_back(
+        &mut self,
+        local: &Path,
+        remote: &str,
+        seen: Option<(u64, u64)>,
+        force: bool,
+    ) -> Option<SaveBack> {
+        if !force {
+            let now = self.probe(|session| session.stat(remote));
+            if self.lost {
+                return None;
+            }
+            if seen.is_none() || now.map(|entry| (entry.size, entry.mtime)) != seen {
+                return Some(SaveBack::Changed);
+            }
+        }
+        self.put(local, remote, &mut |_, _| true)?;
+        // What the far end says now rather than what was sent, since a server
+        // that will not set times has stamped its own.
+        let after = self
+            .probe(|session| session.stat(remote))
+            .map(|entry| (entry.size, entry.mtime))
+            .or_else(|| crate::sftp::seen(local))?;
+        Some(SaveBack::Sent(after))
+    }
+
+    /// Works out what sending `local` to `remote` comes to.
+    ///
+    /// What was chosen is followed if it is a link, since that is what
+    /// choosing it meant. Nothing inside it is: a link in a folder is either a
+    /// loop back up it or a way out of it, so it is left out and counted, and
+    /// so is a device, a socket, and a folder more than [`MAX_DEPTH`] deep.
+    pub fn plan_upload(&mut self, local: &Path, remote: &str) -> Option<Plan> {
+        let data = match std::fs::metadata(local) {
+            Ok(data) => data,
+            Err(error) => {
+                self.failure = Some(Failure::new(
+                    format!("Couldn't read {}.", local.display()),
+                    error.to_string(),
+                ));
+                return None;
+            }
+        };
+        let mut plan = Plan::default();
+        let top = Step {
+            remote: remote.to_owned(),
+            local: local.to_path_buf(),
+            is_directory: data.is_dir(),
+            size: if data.is_file() { data.len() } else { 0 },
+        };
+        if data.is_file() {
+            plan.replaces = self
+                .probe(|session| session.stat(remote))
+                .is_some_and(|entry| !entry.is_directory);
+            plan.add(top);
+            return Some(plan);
+        }
+        if !data.is_dir() {
+            self.failure = Some(Failure::new(
+                format!("Couldn't send {}.", local.display()),
+                "It is not a file or a folder.",
+            ));
+            return None;
+        }
+        plan.replaces = self
+            .probe(|session| session.stat(remote))
+            .is_some_and(|entry| entry.is_directory);
+        if !plan.add(top) || !gather_here(&mut plan, local, remote, 1) {
+            self.failure = Some(too_many());
+            return None;
+        }
+        Some(plan)
+    }
+
+    /// The same for fetching `remote` to `local`, read off the far end one
+    /// directory at a time.
+    pub fn plan_download(&mut self, remote: &str, local: &Path) -> Option<Plan> {
+        let top = self.stat(remote)?;
+        // A pipe or a device reads forever, or never, and either way is no
+        // file to keep.
+        if !top.is_directory && top.mode != 0 && top.mode & TYPE != REGULAR {
+            self.failure = Some(Failure::new(
+                format!("Couldn't fetch {remote}."),
+                "It is not a file or a folder.",
+            ));
+            return None;
+        }
+        let mut plan = Plan {
+            replaces: if top.is_directory {
+                local.is_dir()
+            } else {
+                local.is_file()
+            },
+            ..Plan::default()
+        };
+        plan.add(Step {
+            remote: remote.to_owned(),
+            local: local.to_path_buf(),
+            is_directory: top.is_directory,
+            size: if top.is_directory { 0 } else { top.size },
+        });
+        if top.is_directory {
+            self.gather_there(&mut plan, remote, Some(local), 1)?;
+        }
+        Some(plan)
+    }
+
+    /// What deleting `remotes` comes to, as one plan. A link is never
+    /// followed, here or anywhere under it: it goes, and what it points at
+    /// stays. Something inside another of them is left to that one, so a
+    /// folder and a file in it, both selected, are not deleted twice.
+    pub fn plan_delete(&mut self, remotes: &[String]) -> Option<Plan> {
+        let mut plan = Plan::default();
+        for remote in remotes {
+            let under = |other: &String| other != remote && Path::new(remote).starts_with(other);
+            if remotes.iter().any(under) {
+                continue;
+            }
+            let top = self.lstat(remote)?;
+            if top.is_directory {
+                self.gather_there(&mut plan, remote, None, 1)?;
+            }
+            let top = Step {
+                remote: remote.clone(),
+                is_directory: top.is_directory,
+                ..Step::default()
+            };
+            if !plan.add(top) {
+                self.failure = Some(too_many());
+                return None;
+            }
+        }
+        Some(plan)
+    }
+
+    /// Carries out a plan from [`Self::plan_upload`] or
+    /// [`Self::plan_download`], calling `progress` with the bytes moved across
+    /// the whole of it.
+    ///
+    /// A step that fails is counted and the rest go on, since one file the
+    /// account may not read is no reason to leave the other two hundred where
+    /// they are. A cancel or a lost connection stops it there. A directory
+    /// that is already there is gone into rather than refused, which is what
+    /// [`Plan::replaces`] warned about.
+    ///
+    /// ponytail: one file at a time, about six round trips each before its
+    /// bytes, so a tree of many small files is as slow as the link is far.
+    /// Several files in flight at once if that ever matters more than rsync.
+    pub fn copy(
+        &mut self,
+        way: Way,
+        plan: &Plan,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Report {
+        let mut report = Report::default();
+        let mut before = 0_u64;
+        for step in &plan.steps {
+            let mut halted = false;
+            let mut note = |at: u64, _: u64| {
+                let go = progress(before + at, plan.bytes.max(before + at));
+                halted |= !go;
+                go
+            };
+            let done = match (way, step.is_directory) {
+                (Way::Up, true) => self.make_there(&step.remote),
+                (Way::Up, false) => self.put(&step.local, &step.remote, &mut note),
+                (Way::Down, true) => self.make_here(&step.local),
+                (Way::Down, false) => self.get(&step.remote, &step.local, &mut note),
+            };
+            before += step.size;
+            if halted || self.lost {
+                report.stopped = true;
+                break;
+            }
+            self.tally(&mut report, done);
+        }
+        report
+    }
+
+    /// Carries out a plan from [`Self::plan_delete`].
+    ///
+    /// Up to [`WINDOW`] removals are in flight at once, the way a transfer's
+    /// chunks are, since one round trip a name would make a build directory
+    /// take minutes across a slow link. A directory waits for every answer
+    /// owed before it is asked for, and those are the answers for what was in
+    /// it. Something that would not go is counted and the rest carry on; the
+    /// directory holding it then refuses too, which is the truth.
+    pub fn delete(&mut self, plan: &Plan) -> Report {
+        let mut report = Report::default();
+        // Request ids, and the step each one is for.
+        let mut flight: Vec<(u32, usize)> = Vec::with_capacity(WINDOW);
+        for (index, step) in plan.steps.iter().enumerate() {
+            while !flight.is_empty() && (step.is_directory || flight.len() == WINDOW) {
+                if self.deleted(&mut flight, plan, &mut report).is_none() {
+                    report.stopped = true;
+                    return report;
+                }
+            }
+            let kind = if step.is_directory { RMDIR } else { REMOVE };
+            let Some(id) = self.request(kind, &encode_string(&step.remote)) else {
+                report.stopped = true;
+                return report;
+            };
+            flight.push((id, index));
+        }
+        while !flight.is_empty() {
+            if self.deleted(&mut flight, plan, &mut report).is_none() {
+                report.stopped = true;
+                break;
+            }
+        }
+        report
+    }
+
+    /// Takes one answer off a delete's flight and counts it.
+    fn deleted(
+        &mut self,
+        flight: &mut Vec<(u32, usize)>,
+        plan: &Plan,
+        report: &mut Report,
+    ) -> Option<()> {
+        let (id, kind, body) = self.any_reply()?;
+        let Some(at) = flight.iter().position(|(asked, _)| *asked == id) else {
+            self.lost("The far end answered a request nobody made.");
+            return None;
+        };
+        let (_, index) = flight.swap_remove(at);
+        let done = (kind == REPLY_STATUS && Reader::new(&body).u32() == Some(OK)).then_some(());
+        if done.is_none() {
+            self.blame(kind, &body, "delete", &plan.steps[index].remote);
+        }
+        self.tally(report, done);
+        Some(())
+    }
+
+    fn tally(&self, report: &mut Report, done: Option<()>) {
+        if done.is_some() {
+            report.done += 1;
+            return;
+        }
+        report.failed += 1;
+        if report.first.is_none() {
+            report.first.clone_from(&self.failure);
+        }
+    }
+
+    /// A directory at the far end for a copy to go into, made unless it is
+    /// there already.
+    fn make_there(&mut self, path: &str) -> Option<()> {
+        if self.mkdir(path).is_some() {
+            return Some(());
+        }
+        self.probe(|session| session.stat(path))
+            .filter(|entry| entry.is_directory)
+            .map(|_| ())
+    }
+
+    /// The same on this machine.
+    fn make_here(&mut self, path: &Path) -> Option<()> {
+        match std::fs::create_dir(path) {
+            Ok(()) => Some(()),
+            Err(_) if path.is_dir() => Some(()),
+            Err(error) => {
+                self.failure = Some(Failure::new(
+                    format!("Couldn't make {}.", path.display()),
+                    error.to_string(),
+                ));
+                None
+            }
+        }
+    }
+
+    /// Adds everything inside the remote directory `remote` to `plan`: for a
+    /// download, landing under `local`, every directory before what is in it;
+    /// for a delete, with no `local`, every directory after. `None` when the
+    /// plan has to be given up, because the connection went or it grew past
+    /// [`MAX_STEPS`].
+    fn gather_there(
+        &mut self,
+        plan: &mut Plan,
+        remote: &str,
+        local: Option<&Path>,
+        depth: usize,
+    ) -> Option<()> {
+        let Some(mut entries) = self.list(remote) else {
+            if self.lost {
+                return None;
+            }
+            plan.leave_out(format!("{remote} could not be read."));
+            return Some(());
+        };
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for entry in entries {
+            let there = join(remote, &entry.name);
+            let here = local.map(|local| local.join(&entry.name));
+            let step = Step {
+                remote: there.clone(),
+                local: here.clone().unwrap_or_default(),
+                is_directory: entry.is_directory,
+                size: if entry.is_directory { 0 } else { entry.size },
+            };
+            let added = if entry.is_directory {
+                if depth >= MAX_DEPTH {
+                    plan.leave_out(format!("{there} is more than {MAX_DEPTH} folders deep."));
+                    continue;
+                }
+                if let Some(here) = here {
+                    plan.add(step)
+                        && self
+                            .gather_there(plan, &there, Some(&here), depth + 1)
+                            .is_some()
+                } else {
+                    self.gather_there(plan, &there, None, depth + 1).is_some() && plan.add(step)
+                }
+            // A delete takes a link or a device away like a file. A copy
+            // leaves it, for the reasons `plan_upload` gives.
+            } else if local.is_none() || (entry.mode == 0 || entry.mode & TYPE == REGULAR) {
+                plan.add(step)
+            } else {
+                plan.leave_out(format!(
+                    "{there} is a link or a device, which is not copied."
+                ));
+                continue;
+            };
+            if !added {
+                if !self.lost {
+                    self.failure = Some(too_many());
+                }
+                return None;
+            }
+        }
+        Some(())
+    }
+
     /// Why the last call failed, in the two parts a dialog wants.
     #[must_use]
     pub fn failure(&self) -> Option<&Failure> {
         self.failure.as_ref()
+    }
+
+    /// Whether the connection under this session has gone, so the next thing
+    /// to do is open another rather than ask this one again.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.lost
     }
 
     /// Asks the far end one more question with the failure that prompted it
@@ -413,14 +1451,25 @@ impl Session {
         // A server may answer with a version below ours and every one of them
         // answers with three, since three is where the protocol stopped being
         // the same protocol.
-        if kind != REPLY_VERSION || Reader::new(&body).u32() != Some(VERSION) {
+        let mut reader = Reader::new(&body);
+        if kind != REPLY_VERSION || reader.u32() != Some(VERSION) {
             self.failure = Some(Failure::new(
                 "Couldn't start a file transfer.",
                 "The far end does not speak SFTP version 3.".to_owned(),
             ));
             return false;
         }
+        // The rest is name and version pairs. Only the names are kept, since
+        // every extension used here has had one version.
+        while let (Some(name), Some(_)) = (reader.string(), reader.string()) {
+            self.extensions
+                .push(String::from_utf8_lossy(&name).into_owned());
+        }
         true
+    }
+
+    fn offers(&self, extension: &str) -> bool {
+        self.extensions.iter().any(|name| name == extension)
     }
 
     fn opendir(&mut self, path: &str) -> Option<Vec<u8>> {
@@ -462,60 +1511,91 @@ impl Session {
 
     /// The body of a download, split out so the handle is closed on every way
     /// out of it.
+    ///
+    /// The window opens one read at a time and grows by one with each read
+    /// answered in full, which is how OpenSSH's client starts too: a small file
+    /// costs the round trips it always did, and a short answer, usually the
+    /// tail of the file, asks for nothing past it. Answers may arrive in any order,
+    /// so each lands at its own offset. A refusal or a cancel stops new reads
+    /// and still waits for the ones in flight, which is what lets the session
+    /// carry on afterwards rather than meet their answers as a lost thread.
     fn download(
         &mut self,
         handle: &[u8],
-        mut file: File,
+        file: &File,
         remote: &str,
         total: u64,
         progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Option<()> {
+        let mut flight: Vec<(u32, u64, u32)> = Vec::with_capacity(WINDOW);
+        let mut window = 1;
+        let mut next = 0_u64;
         let mut at = 0_u64;
+        let mut ended = false;
+        let mut stopped = false;
         if !progress(0, total) {
             return self.cancelled();
         }
         loop {
-            let mut request = encode_string_bytes(handle);
-            request.extend_from_slice(&at.to_be_bytes());
-            request.extend_from_slice(&(CHUNK as u32).to_be_bytes());
-            let id = self.request(READ, &request)?;
-            let (kind, body) = self.reply(id)?;
-            if kind == REPLY_STATUS {
-                // The end of a file is a status packet, the way the end of a
-                // listing is.
-                if Reader::new(&body).u32() != Some(EOF) {
-                    self.blame(kind, &body, "read", remote);
-                    return None;
-                }
+            while !ended && flight.len() < window {
+                let id = self.read_request(handle, next, CHUNK as u32)?;
+                flight.push((id, next, CHUNK as u32));
+                next += CHUNK as u64;
+            }
+            if flight.is_empty() {
                 break;
             }
-            if kind != REPLY_DATA {
+            let ((offset, length), kind, body) = self.answer_in(&mut flight)?;
+            if stopped {
+                continue;
+            }
+            // The end of a file is a status packet, the way the end of a
+            // listing is. Reads already past it get the same answer.
+            if kind == REPLY_STATUS && Reader::new(&body).u32() == Some(EOF) {
+                ended = true;
+                continue;
+            }
+            let Some(mut chunk) = (kind == REPLY_DATA)
+                .then(|| Reader::new(&body).string())
+                .flatten()
+            else {
                 self.blame(kind, &body, "read", remote);
-                return None;
-            }
-            let chunk = Reader::new(&body).string()?;
-            // A server may answer with less than was asked for and that means
-            // nothing; only the status packet above says the file has ended.
+                (ended, stopped) = (true, true);
+                continue;
+            };
             if chunk.is_empty() {
-                break;
+                ended = true;
+                continue;
             }
-            if let Err(error) = file.write_all(&chunk) {
+            // More than was asked for would land on the next read's bytes.
+            chunk.truncate(length as usize);
+            if let Err(error) = file.write_all_at(&chunk, offset) {
                 self.wrote(&error.to_string());
-                return None;
+                (ended, stopped) = (true, true);
+                continue;
             }
-            at += chunk.len() as u64;
+            let got = chunk.len() as u32;
+            at += u64::from(got);
+            // Less than was asked for means nothing about the end of the file,
+            // only about the server, so the rest of the span is asked again.
+            if got < length {
+                let id = self.read_request(handle, offset + u64::from(got), length - got)?;
+                flight.push((id, offset + u64::from(got), length - got));
+            } else {
+                window = (window + 1).min(WINDOW);
+            }
             if !progress(at, total.max(at)) {
-                return self.cancelled();
+                self.cancelled();
+                (ended, stopped) = (true, true);
             }
         }
-        if let Err(error) = file.flush() {
-            self.wrote(&error.to_string());
-            return None;
-        }
-        Some(())
+        (!stopped).then_some(())
     }
 
-    /// The body of an upload, closed over the same way.
+    /// The body of an upload, closed over the same way, with the window full
+    /// from the start: the size is known here, so there is nothing to find out
+    /// by asking slowly. The same waiting on whatever is in flight when it
+    /// stops, for the same reason.
     fn upload(
         &mut self,
         handle: &[u8],
@@ -526,37 +1606,57 @@ impl Session {
         progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Option<()> {
         let mut buffer = vec![0_u8; CHUNK];
+        let mut flight: Vec<(u32, u64, u32)> = Vec::with_capacity(WINDOW);
+        let mut next = 0_u64;
         let mut at = 0_u64;
+        let mut ended = false;
+        let mut stopped = false;
         if !progress(0, total) {
             return self.cancelled();
         }
         loop {
-            let read = match file.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => read,
-                Err(error) => {
-                    self.failure = Some(Failure::new(
-                        format!("Couldn't read {}.", local.display()),
-                        error.to_string(),
-                    ));
-                    return None;
-                }
-            };
-            let mut request = encode_string_bytes(handle);
-            request.extend_from_slice(&at.to_be_bytes());
-            request.extend_from_slice(&encode_string_bytes(&buffer[..read]));
-            let id = self.request(WRITE, &request)?;
-            let (kind, body) = self.reply(id)?;
+            while !ended && flight.len() < WINDOW {
+                let read = match file.read(&mut buffer) {
+                    Ok(0) => {
+                        ended = true;
+                        break;
+                    }
+                    Ok(read) => read,
+                    Err(error) => {
+                        self.failure = Some(Failure::new(
+                            format!("Couldn't read {}.", local.display()),
+                            error.to_string(),
+                        ));
+                        (ended, stopped) = (true, true);
+                        break;
+                    }
+                };
+                let mut request = encode_string_bytes(handle);
+                request.extend_from_slice(&next.to_be_bytes());
+                request.extend_from_slice(&encode_string_bytes(&buffer[..read]));
+                let id = self.request(WRITE, &request)?;
+                flight.push((id, next, read as u32));
+                next += read as u64;
+            }
+            if flight.is_empty() {
+                break;
+            }
+            let ((_, length), kind, body) = self.answer_in(&mut flight)?;
+            if stopped {
+                continue;
+            }
             if kind != REPLY_STATUS || Reader::new(&body).u32() != Some(OK) {
                 self.blame(kind, &body, "write", remote);
-                return None;
+                (ended, stopped) = (true, true);
+                continue;
             }
-            at += read as u64;
+            at += u64::from(length);
             if !progress(at, total.max(at)) {
-                return self.cancelled();
+                self.cancelled();
+                (ended, stopped) = (true, true);
             }
         }
-        Some(())
+        (!stopped).then_some(())
     }
 
     /// The failure a refused `progress` callback turns into. A message all the
@@ -568,6 +1668,31 @@ impl Session {
             String::new(),
         ));
         None
+    }
+
+    /// Asks for `length` bytes of `handle` from `offset`.
+    fn read_request(&mut self, handle: &[u8], offset: u64, length: u32) -> Option<u32> {
+        let mut request = encode_string_bytes(handle);
+        request.extend_from_slice(&offset.to_be_bytes());
+        request.extend_from_slice(&length.to_be_bytes());
+        self.request(READ, &request)
+    }
+
+    /// The next answer to one of the requests in `flight`, taken off it with
+    /// the offset and length it was for. `None` when the connection went, or
+    /// the answer was to a request nobody made, which is a server that has lost
+    /// the thread.
+    fn answer_in(
+        &mut self,
+        flight: &mut Vec<(u32, u64, u32)>,
+    ) -> Option<((u64, u32), u8, Vec<u8>)> {
+        let (id, kind, body) = self.any_reply()?;
+        let Some(index) = flight.iter().position(|(asked, ..)| *asked == id) else {
+            self.lost("The far end answered a request nobody made.");
+            return None;
+        };
+        let (_, offset, length) = flight.swap_remove(index);
+        Some(((offset, length), kind, body))
     }
 
     fn close(&mut self, handle: &[u8]) {
@@ -604,16 +1729,26 @@ impl Session {
 
     /// The answer to one request, with the id checked off the front.
     ///
-    /// Requests go out one at a time, so anything carrying another id is a
-    /// server that has lost the thread and the session with it.
+    /// Outside a transfer requests go out one at a time, so anything carrying
+    /// another id is a server that has lost the thread and the session with it.
     fn reply(&mut self, id: u32) -> Option<(u8, Vec<u8>)> {
-        let (kind, body) = self.packet()?;
-        let mut reader = Reader::new(&body);
-        if reader.u32()? != id {
+        let (answered, kind, body) = self.any_reply()?;
+        if answered != id {
             self.lost("The far end answered a request nobody made.");
             return None;
         }
-        Some((kind, body[4..].to_vec()))
+        Some((kind, body))
+    }
+
+    /// The next answer to anything, with the id it carries split off.
+    fn any_reply(&mut self) -> Option<(u32, u8, Vec<u8>)> {
+        let (kind, mut body) = self.packet()?;
+        let Some(id) = Reader::new(&body).u32() else {
+            self.lost("The far end sent an answer with no request in it.");
+            return None;
+        };
+        body.drain(..4);
+        Some((id, kind, body))
     }
 
     /// One packet off the wire: its type, and everything after it.
@@ -649,6 +1784,7 @@ impl Session {
         }
         let mut reader = Reader::new(body);
         let code = reader.u32().unwrap_or(OK);
+        self.refusal = Some(code);
         let message = reader
             .string()
             .map(|text| String::from_utf8_lossy(&text).into_owned())
@@ -668,6 +1804,7 @@ impl Session {
     }
 
     fn lost(&mut self, detail: &str) {
+        self.lost = true;
         self.failure = Some(Failure::new("The connection ended.", detail));
     }
 
@@ -684,6 +1821,176 @@ impl Drop for Session {
             let _ = child.wait();
         }
     }
+}
+
+/// Adds everything inside the local directory `local` to `plan`, going to
+/// `remote`. `false` once the plan has grown past [`MAX_STEPS`].
+fn gather_here(plan: &mut Plan, local: &Path, remote: &str, depth: usize) -> bool {
+    let mut entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(local) {
+        Ok(read) => read.filter_map(Result::ok).collect(),
+        Err(error) => {
+            plan.leave_out(format!("{} could not be read: {error}.", local.display()));
+            return true;
+        }
+    };
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        // Names go across as text, so one that is not would land spelled
+        // otherwise.
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            plan.leave_out(format!("{} has a name that is not text.", path.display()));
+            continue;
+        };
+        let there = join(remote, &name);
+        // Not followed, which is what the directory entry's own type is.
+        let kind = entry.file_type().ok();
+        if kind.is_some_and(|kind| kind.is_dir()) {
+            if depth >= MAX_DEPTH {
+                plan.leave_out(format!(
+                    "{} is more than {MAX_DEPTH} folders deep.",
+                    path.display()
+                ));
+                continue;
+            }
+            let step = Step {
+                remote: there.clone(),
+                local: path.clone(),
+                is_directory: true,
+                size: 0,
+            };
+            if !plan.add(step) || !gather_here(plan, &path, &there, depth + 1) {
+                return false;
+            }
+        } else if kind.is_some_and(|kind| kind.is_file()) {
+            let size = entry.metadata().map_or(0, |data| data.len());
+            let step = Step {
+                remote: there,
+                local: path,
+                is_directory: false,
+                size,
+            };
+            if !plan.add(step) {
+                return false;
+            }
+        } else {
+            plan.leave_out(format!(
+                "{} is a link or a device, which is not copied.",
+                path.display()
+            ));
+        }
+    }
+    true
+}
+
+/// A name inside a remote directory.
+fn join(directory: &str, name: &str) -> String {
+    Path::new(directory)
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn files_and_folders(files: usize, folders: usize) -> Option<String> {
+    match (files, folders) {
+        (0, 0) => None,
+        (files, 0) => Some(counted(files, "file")),
+        (0, folders) => Some(counted(folders, "folder")),
+        (files, folders) => Some(format!(
+            "{} and {}",
+            counted(files, "file"),
+            counted(folders, "folder")
+        )),
+    }
+}
+
+fn too_many() -> Failure {
+    Failure::new(
+        "That is too much to do in one go.",
+        format!(
+            "It comes to more than {MAX_STEPS} files and folders. rsync, or a shell \
+             in a pane, is the tool for a tree that size."
+        ),
+    )
+}
+
+/// "1 file", "2 files".
+fn counted(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// A local file's access and change times in the seconds version 3 carries,
+/// or nothing for one outside what 32 bits can say.
+fn times(data: &std::fs::Metadata) -> Option<(u32, u32)> {
+    let seconds = |time: SystemTime| {
+        let since = time.duration_since(UNIX_EPOCH).ok()?;
+        u32::try_from(since.as_secs()).ok()
+    };
+    Some((
+        seconds(data.accessed().ok()?)?,
+        seconds(data.modified().ok()?)?,
+    ))
+}
+
+/// Whatever `ssh` left in its error pipe, up to 4 KiB, without waiting for
+/// more. Non-blocking because the pipe can outlive the ssh that wrote to it: a
+/// `ProxyCommand` inherits it and may hold it open long after.
+fn waiting(errors: &mut ChildStderr) -> String {
+    let fd = errors.as_raw_fd();
+    // Safe: the flags of a descriptor this owns, and the kernel checks both
+    // calls. Failing leaves it blocking, which a reaped ssh still ends.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let mut said = Vec::new();
+    // Ends on `WouldBlock` with what was there kept, which is the point.
+    let _ = errors.take(4096).read_to_end(&mut said);
+    String::from_utf8_lossy(&said).into_owned()
+}
+
+/// What `ssh` said when it gave up, turned into what to do about it.
+///
+/// Matched on the text because ssh has no other way to say it: its exit code
+/// is 255 for every one of these. `LC_ALL=C` keeps the text the text, and a
+/// line nothing here recognizes is shown as it is, since ssh's own sentence
+/// beats a guess. The last line rather than the first, because the warnings
+/// ssh prints on the way in come before the reason it stopped.
+#[must_use]
+pub fn explain(said: &str) -> Failure {
+    let detail = if said.contains("Permission denied") {
+        "Nothing here can answer a password or a passphrase, so the connection \
+         has to be open already. Connect the host in a pane first."
+            .to_owned()
+    } else if said.contains("Host key verification failed") {
+        "This machine does not know the host's key yet, or the key has changed. \
+         Connect in a pane, where ssh can show it and ask."
+            .to_owned()
+    } else if said.contains("subsystem request failed") {
+        "The far end has no SFTP server switched on.".to_owned()
+    } else {
+        said.lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or("The connection ended before the far end answered.")
+            .to_owned()
+    };
+    Failure::new("Couldn't start a file transfer.", detail)
+}
+
+/// Where an unfinished copy of `path` is written: beside it, so it is on the
+/// same filesystem and moves onto it in one rename.
+fn beside(path: &str) -> String {
+    let path = Path::new(path);
+    path.with_file_name(temporary_name(path))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// A string as the protocol writes one: its length and then its bytes, with no
@@ -803,14 +2110,168 @@ mod tests {
             }
             asked
         });
-        let session = Session {
+        (session_on(ours), far)
+    }
+
+    fn session_on(stream: UnixStream) -> Session {
+        Session {
             child: None,
-            out: Box::new(ours.try_clone().expect("a writer")),
-            input: BufReader::new(Box::new(ours)),
+            out: Box::new(stream.try_clone().expect("a writer")),
+            input: BufReader::new(Box::new(stream)),
             next: 1,
             failure: None,
-        };
-        (session, far)
+            refusal: None,
+            lost: false,
+            extensions: Vec::new(),
+        }
+    }
+
+    /// A far end holding one file, `content` to read and whatever arrives to
+    /// write, that answers everything asked together in the reverse of the
+    /// order it was asked. Out of order is within the protocol, and this is
+    /// how to be sure the client copes. Every third chunk is read short.
+    ///
+    /// Answers with the most requests that were ever waiting at once, and the
+    /// bytes that were written.
+    fn serve_file(content: Vec<u8>) -> (Session, std::thread::JoinHandle<(usize, Vec<u8>)>) {
+        use std::io::{BufRead, ErrorKind};
+        let (ours, theirs) = UnixStream::pair().expect("a pipe");
+        let far = std::thread::spawn(move || {
+            let mut out = theirs.try_clone().expect("a writer");
+            let mut input = BufReader::new(theirs);
+            let mut waiting: Vec<Vec<u8>> = Vec::new();
+            let (mut widest, mut written) = (0, Vec::new());
+            loop {
+                // Whatever has arrived by the time the pipe goes quiet is one
+                // batch. Waiting on the buffer rather than in a read means a
+                // packet is never cut in half by the timeout.
+                let quiet = Some(std::time::Duration::from_millis(20));
+                input.get_ref().set_read_timeout(quiet).expect("a timeout");
+                match input.fill_buf() {
+                    Ok([]) => break,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                    {
+                        widest = widest.max(waiting.len());
+                        for packet in waiting.drain(..).rev() {
+                            out.write_all(&packet).expect("an answer");
+                        }
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+                input.get_ref().set_read_timeout(None).expect("no timeout");
+                let mut header = [0_u8; 5];
+                input.read_exact(&mut header).expect("a header");
+                let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+                let mut rest = vec![0_u8; length as usize - 1];
+                input.read_exact(&mut rest).expect("a request");
+                let mut reader = Reader::new(&rest);
+                let id = reader.u32().expect("an id");
+                let (kind, answer) = match header[4] {
+                    INIT => (REPLY_VERSION, VERSION.to_be_bytes().to_vec()),
+                    STAT => {
+                        let mut attributes = SIZE.to_be_bytes().to_vec();
+                        attributes.extend_from_slice(&(content.len() as u64).to_be_bytes());
+                        (REPLY_ATTRS, body(id, &attributes))
+                    }
+                    LSTAT => (REPLY_STATUS, body(id, &NO_SUCH_FILE.to_be_bytes())),
+                    OPEN => (REPLY_HANDLE, body(id, &encode_string("h"))),
+                    READ => {
+                        reader.string().expect("a handle");
+                        let at = reader.u64().expect("an offset") as usize;
+                        let mut asked = reader.u32().expect("a length") as usize;
+                        if (at / CHUNK) % 3 == 1 {
+                            asked = asked.min(CHUNK / 2);
+                        }
+                        if at >= content.len() {
+                            (REPLY_STATUS, body(id, &EOF.to_be_bytes()))
+                        } else {
+                            let end = content.len().min(at + asked);
+                            (
+                                REPLY_DATA,
+                                body(id, &encode_string_bytes(&content[at..end])),
+                            )
+                        }
+                    }
+                    WRITE => {
+                        reader.string().expect("a handle");
+                        let at = reader.u64().expect("an offset") as usize;
+                        let data = reader.string().expect("the bytes");
+                        if written.len() < at + data.len() {
+                            written.resize(at + data.len(), 0);
+                        }
+                        written[at..at + data.len()].copy_from_slice(&data);
+                        (REPLY_STATUS, body(id, &OK.to_be_bytes()))
+                    }
+                    _ => (REPLY_STATUS, body(id, &OK.to_be_bytes())),
+                };
+                let mut packet = ((answer.len() + 1) as u32).to_be_bytes().to_vec();
+                packet.push(kind);
+                packet.extend_from_slice(&answer);
+                waiting.push(packet);
+            }
+            (widest, written)
+        });
+        (session_on(ours), far)
+    }
+
+    fn a_megabyte() -> Vec<u8> {
+        (0..1_000_003_u32).map(|at| (at % 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_download_keeps_many_reads_in_flight_and_lands_each_where_it_belongs() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-many-{}", std::process::id()));
+        let content = a_megabyte();
+        let (mut session, far) = serve_file(content.clone());
+        assert!(session.handshake());
+        assert_eq!(session.get("/srv/big", &local, &mut |_, _| true), Some(()));
+        assert!(std::fs::read(&local).expect("the file") == content);
+
+        drop(session);
+        let (widest, _) = far.join().expect("the far end");
+        assert!(widest > 1, "never more than {widest} at once");
+        let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn an_upload_keeps_many_writes_in_flight_and_lands_each_where_it_belongs() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-send-{}", std::process::id()));
+        let content = a_megabyte();
+        std::fs::write(&local, &content).expect("a file to send");
+        let (mut session, far) = serve_file(Vec::new());
+        assert!(session.handshake());
+        assert_eq!(session.put(&local, "/srv/big", &mut |_, _| true), Some(()));
+
+        drop(session);
+        let (widest, written) = far.join().expect("the far end");
+        assert!(written == content);
+        assert!(widest > 1, "never more than {widest} at once");
+        let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn a_cancelled_download_waits_for_its_reads_and_the_session_carries_on() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-halt-{}", std::process::id()));
+        let (mut session, _far) = serve_file(a_megabyte());
+        assert!(session.handshake());
+        let enough = 4 * CHUNK as u64;
+        assert!(
+            session
+                .get("/srv/big", &local, &mut |at, _| at < enough)
+                .is_none()
+        );
+        assert!(!local.exists());
+        // The reads still in flight were answered into the cancelled transfer
+        // rather than into whatever was asked next.
+        assert!(
+            session.stat("/srv/big").is_some(),
+            "{:?}",
+            session.failure()
+        );
+        assert!(!session.is_lost());
     }
 
     /// A reply body: the id it answers, then the rest.
@@ -871,6 +2332,49 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_cut_off_halfway_is_no_listing() {
+        let mut one = 1_u32.to_be_bytes().to_vec();
+        one.extend_from_slice(&name_entry("notes.txt", 0o100_644, 12));
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        // The script ends after the first page, so the pipe closes where the
+        // second `READDIR` is waiting for its answer.
+        let (mut session, _far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_HANDLE, body(1, &encode_string("h"))),
+            (REPLY_NAME, body(2, &one)),
+        ]);
+        assert!(session.handshake());
+        assert!(session.list("/home/dean").is_none());
+        assert!(session.is_lost());
+    }
+
+    #[test]
+    fn a_name_the_far_end_sends_with_a_slash_in_it_is_not_listed() {
+        let mut four = 4_u32.to_be_bytes().to_vec();
+        four.extend_from_slice(&name_entry("../../etc/passwd", 0o100_644, 1));
+        four.extend_from_slice(&name_entry("a/b", 0o100_644, 1));
+        four.extend_from_slice(&name_entry("", 0o100_644, 1));
+        four.extend_from_slice(&name_entry("notes.txt", 0o100_644, 1));
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let (mut session, _far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_HANDLE, body(1, &encode_string("h"))),
+            (REPLY_NAME, body(2, &four)),
+            (REPLY_STATUS, body(3, &EOF.to_be_bytes())),
+            (REPLY_STATUS, body(4, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+        let entries = session.list("/home/dean").expect("a listing");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["notes.txt"]);
+        assert!(!session.is_lost());
+    }
+
+    #[test]
     fn a_directory_that_is_not_there_says_so_rather_than_answering() {
         let mut version = Vec::new();
         version.extend_from_slice(&VERSION.to_be_bytes());
@@ -888,15 +2392,17 @@ mod tests {
     }
 
     #[test]
-    fn a_download_lands_as_the_bytes_the_far_end_sent() {
+    fn a_download_lands_as_the_bytes_and_the_time_the_far_end_sent() {
         let local = std::env::temp_dir().join(format!("tuni-sftp-get-{}", std::process::id()));
         let _ = std::fs::remove_file(&local);
 
         let mut version = Vec::new();
         version.extend_from_slice(&VERSION.to_be_bytes());
-        let mut attributes = (SIZE | PERMISSIONS).to_be_bytes().to_vec();
+        let mut attributes = (SIZE | PERMISSIONS | ACMODTIME).to_be_bytes().to_vec();
         attributes.extend_from_slice(&5_u64.to_be_bytes());
         attributes.extend_from_slice(&0o100_644_u32.to_be_bytes());
+        attributes.extend_from_slice(&1_700_000_000_u32.to_be_bytes());
+        attributes.extend_from_slice(&A_WHILE_AGO.to_be_bytes());
         let (mut session, far) = serve(vec![
             (REPLY_VERSION, version),
             (REPLY_ATTRS, body(1, &attributes)),
@@ -915,12 +2421,65 @@ mod tests {
         assert_eq!(done, Some(()));
         assert_eq!(std::fs::read(&local).expect("the file"), b"hello");
         assert_eq!(seen, vec![(0, 5), (5, 5)]);
+        let changed = std::fs::metadata(&local).and_then(|data| data.modified());
+        assert_eq!(
+            changed.ok(),
+            Some(UNIX_EPOCH + std::time::Duration::from_secs(A_WHILE_AGO.into()))
+        );
 
         drop(session);
         let asked = far.join().expect("the far end");
         assert_eq!(asked[2].0, OPEN);
         assert_eq!(asked[3].0, READ);
         let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn a_download_over_a_link_writes_through_it_and_keeps_the_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = std::env::temp_dir().join(format!("tuni-sftp-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a directory");
+        let real = directory.join("deploy.sh");
+        std::fs::write(&real, b"old").expect("the old file");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let link = directory.join("current");
+        std::os::unix::fs::symlink(&real, &link).expect("a link");
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let mut attributes = (SIZE | PERMISSIONS).to_be_bytes().to_vec();
+        attributes.extend_from_slice(&5_u64.to_be_bytes());
+        attributes.extend_from_slice(&0o100_644_u32.to_be_bytes());
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_ATTRS, body(1, &attributes)),
+            (REPLY_HANDLE, body(2, &encode_string("h"))),
+            (REPLY_DATA, body(3, &encode_string("hello"))),
+            (REPLY_STATUS, body(4, &EOF.to_be_bytes())),
+            (REPLY_STATUS, body(5, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+
+        let done = session.get("/srv/deploy.sh", &link, &mut |_, _| true);
+        assert_eq!(done, Some(()));
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("the link")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&real).expect("the file"), b"hello");
+        let mode = std::fs::metadata(&real)
+            .expect("the file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+
+        drop(session);
+        far.join().expect("the far end");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -944,6 +2503,9 @@ mod tests {
 
         let done = session.get("/home/dean/notes.txt", &local, &mut |_, _| false);
         assert_eq!(done, None);
+        // Neither the name asked for nor the one the bytes were landing under.
+        assert!(!local.exists());
+        assert!(!local.with_file_name(temporary_name(&local)).exists());
         assert!(
             session
                 .failure
@@ -958,17 +2520,20 @@ mod tests {
     }
 
     #[test]
-    fn an_upload_sends_the_file_from_its_start() {
+    fn an_upload_sends_the_file_from_its_start_and_the_time_it_was_changed() {
         let local = std::env::temp_dir().join(format!("tuni-sftp-put-{}", std::process::id()));
-        std::fs::write(&local, b"hello").expect("a file to send");
+        a_file_changed_a_while_ago(&local);
 
         let mut version = Vec::new();
         version.extend_from_slice(&VERSION.to_be_bytes());
         let (mut session, far) = serve(vec![
             (REPLY_VERSION, version),
-            (REPLY_HANDLE, body(1, &encode_string("h"))),
-            (REPLY_STATUS, body(2, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(1, &NO_SUCH_FILE.to_be_bytes())),
+            (REPLY_HANDLE, body(2, &encode_string("h"))),
             (REPLY_STATUS, body(3, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(4, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(5, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(6, &OK.to_be_bytes())),
         ]);
         assert!(session.handshake());
         assert_eq!(
@@ -978,14 +2543,180 @@ mod tests {
 
         drop(session);
         let asked = far.join().expect("the far end");
-        assert_eq!(asked[1].0, OPEN);
-        assert_eq!(asked[2].0, WRITE);
+        let kinds: Vec<u8> = asked.iter().map(|(kind, _)| *kind).collect();
+        // Nothing was there, so nothing is removed before the rename.
+        assert_eq!(
+            kinds,
+            vec![INIT, LSTAT, OPEN, WRITE, FSETSTAT, CLOSE, RENAME]
+        );
+        // A new file's mode went with the open, so only the times are set.
+        let mut reader = Reader::new(&asked[4].1);
+        reader.u32().expect("the request id");
+        reader.string().expect("the handle");
+        assert_eq!(reader.u32(), Some(ACMODTIME));
+        reader.u32().expect("the access time");
+        assert_eq!(reader.u32(), Some(A_WHILE_AGO));
 
-        let mut reader = Reader::new(&asked[2].1);
+        let mut reader = Reader::new(&asked[3].1);
         reader.u32().expect("the request id");
         assert_eq!(reader.string().as_deref(), Some(&b"h"[..]));
         assert_eq!(reader.u64(), Some(0));
         assert_eq!(reader.string().as_deref(), Some(&b"hello"[..]));
+        let _ = std::fs::remove_file(&local);
+    }
+
+    /// The paths a request names, in order, read off what the far end was sent.
+    fn paths(asked: &Packet) -> Vec<String> {
+        let mut reader = Reader::new(&asked.1);
+        reader.u32().expect("the request id");
+        std::iter::from_fn(|| reader.string())
+            .map(|path| String::from_utf8_lossy(&path).into_owned())
+            .collect()
+    }
+
+    /// A time well before the test runs, so one that was kept is not the
+    /// same number as one the clock happened to give.
+    const A_WHILE_AGO: u32 = 1_000_000_000;
+
+    fn a_file_changed_a_while_ago(path: &Path) {
+        std::fs::write(path, b"hello").expect("a file to send");
+        let file = File::options().write(true).open(path).expect("the file");
+        let then = UNIX_EPOCH + std::time::Duration::from_secs(A_WHILE_AGO.into());
+        file.set_modified(then).expect("a time");
+    }
+
+    fn a_regular_file(mode: u32) -> Vec<u8> {
+        let mut attributes = (SIZE | PERMISSIONS).to_be_bytes().to_vec();
+        attributes.extend_from_slice(&3_u64.to_be_bytes());
+        attributes.extend_from_slice(&(0o100_000 | mode).to_be_bytes());
+        attributes
+    }
+
+    #[test]
+    fn an_upload_over_a_file_lands_under_a_temporary_name_and_is_moved_on_at_the_end() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-over-{}", std::process::id()));
+        a_file_changed_a_while_ago(&local);
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_ATTRS, body(1, &a_regular_file(0o664))),
+            (REPLY_HANDLE, body(2, &encode_string("h"))),
+            (REPLY_STATUS, body(3, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(4, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(5, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(6, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(7, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+        assert_eq!(
+            session.put(&local, "/srv/notes.txt", &mut |_, _| true),
+            Some(())
+        );
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        let kinds: Vec<u8> = asked.iter().map(|(kind, _)| *kind).collect();
+        assert_eq!(
+            kinds,
+            vec![INIT, LSTAT, OPEN, WRITE, FSETSTAT, CLOSE, REMOVE, RENAME]
+        );
+        let temporary = format!("/srv/.notes.txt.tuni-{}", std::process::id());
+        assert_eq!(paths(&asked[2])[0], temporary);
+        assert_eq!(paths(&asked[6]), vec!["/srv/notes.txt"]);
+        assert_eq!(
+            paths(&asked[7]),
+            vec![temporary, "/srv/notes.txt".to_owned()]
+        );
+
+        // The bits the file had over there, set past the far end's umask, and
+        // the time it was changed here.
+        let mut reader = Reader::new(&asked[4].1);
+        reader.u32().expect("the request id");
+        reader.string().expect("the handle");
+        assert_eq!(reader.u32(), Some(PERMISSIONS | ACMODTIME));
+        assert_eq!(reader.u32(), Some(0o664));
+        reader.u32().expect("the access time");
+        assert_eq!(reader.u32(), Some(A_WHILE_AGO));
+        let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn a_server_that_can_replace_a_name_in_one_step_is_asked_to() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-posix-{}", std::process::id()));
+        std::fs::write(&local, b"hello").expect("a file to send");
+
+        let mut version = VERSION.to_be_bytes().to_vec();
+        for (name, revision) in [("statvfs@openssh.com", "2"), (POSIX_RENAME, "1")] {
+            version.extend_from_slice(&encode_string(name));
+            version.extend_from_slice(&encode_string(revision));
+        }
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_ATTRS, body(1, &a_regular_file(0o644))),
+            (REPLY_HANDLE, body(2, &encode_string("h"))),
+            (REPLY_STATUS, body(3, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(4, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(5, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(6, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+        assert_eq!(
+            session.put(&local, "/srv/notes.txt", &mut |_, _| true),
+            Some(())
+        );
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        let kinds: Vec<u8> = asked.iter().map(|(kind, _)| *kind).collect();
+        // No remove: there is never a moment with nothing under the name.
+        assert_eq!(
+            kinds,
+            vec![INIT, LSTAT, OPEN, WRITE, FSETSTAT, CLOSE, EXTENSION]
+        );
+        let temporary = format!("/srv/.notes.txt.tuni-{}", std::process::id());
+        assert_eq!(
+            paths(&asked[6]),
+            vec![
+                POSIX_RENAME.to_owned(),
+                temporary,
+                "/srv/notes.txt".to_owned()
+            ]
+        );
+        let _ = std::fs::remove_file(&local);
+    }
+
+    #[test]
+    fn a_cancelled_upload_leaves_the_file_that_was_there() {
+        let local = std::env::temp_dir().join(format!("tuni-sftp-keep-{}", std::process::id()));
+        std::fs::write(&local, b"hello").expect("a file to send");
+
+        let mut version = Vec::new();
+        version.extend_from_slice(&VERSION.to_be_bytes());
+        let (mut session, far) = serve(vec![
+            (REPLY_VERSION, version),
+            (REPLY_ATTRS, body(1, &a_regular_file(0o644))),
+            (REPLY_HANDLE, body(2, &encode_string("h"))),
+            (REPLY_STATUS, body(3, &OK.to_be_bytes())),
+            (REPLY_STATUS, body(4, &OK.to_be_bytes())),
+        ]);
+        assert!(session.handshake());
+        assert!(
+            session
+                .put(&local, "/srv/notes.txt", &mut |_, _| false)
+                .is_none()
+        );
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        let kinds: Vec<u8> = asked.iter().map(|(kind, _)| *kind).collect();
+        assert_eq!(kinds, vec![INIT, LSTAT, OPEN, CLOSE, REMOVE]);
+        // The only thing deleted is the temporary; the real name was never
+        // opened, so it was never cut short.
+        let temporary = format!("/srv/.notes.txt.tuni-{}", std::process::id());
+        assert_eq!(paths(&asked[2])[0], temporary);
+        assert_eq!(paths(&asked[4]), vec![temporary]);
         let _ = std::fs::remove_file(&local);
     }
 
@@ -998,9 +2729,13 @@ mod tests {
         version.extend_from_slice(&VERSION.to_be_bytes());
         let mut status = PERMISSION_DENIED.to_be_bytes().to_vec();
         status.extend_from_slice(&encode_string("Permission denied"));
-        let (mut session, _far) = serve(vec![
+        // Refused beside the file, since nobody may write into /etc, and then
+        // refused in it, since nobody may write that file either.
+        let (mut session, far) = serve(vec![
             (REPLY_VERSION, version),
-            (REPLY_STATUS, body(1, &status)),
+            (REPLY_ATTRS, body(1, &a_regular_file(0o644))),
+            (REPLY_STATUS, body(2, &status)),
+            (REPLY_STATUS, body(3, &status)),
         ]);
         assert!(session.handshake());
         assert!(
@@ -1015,6 +2750,10 @@ mod tests {
             failure.detail,
             "The account this connection logged in as may not write it."
         );
+
+        drop(session);
+        let asked = far.join().expect("the far end");
+        assert_eq!(paths(&asked[3])[0], "/etc/passwd");
         let _ = std::fs::remove_file(&local);
     }
 
@@ -1088,6 +2827,53 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_key_says_to_connect_in_a_pane_first() {
+        let said = "Warning: Permanently added 'box' (ED25519) to the list of known hosts.\r\n\
+                    dean@box: Permission denied (publickey,password).\r\n";
+        assert!(
+            explain(said)
+                .detail
+                .contains("Connect the host in a pane first")
+        );
+    }
+
+    #[test]
+    fn a_server_without_sftp_says_so() {
+        let said = "subsystem request failed on channel 0\n";
+        assert_eq!(
+            explain(said).detail,
+            "The far end has no SFTP server switched on."
+        );
+    }
+
+    #[test]
+    fn a_reason_nothing_here_knows_is_shown_as_ssh_said_it() {
+        let said = "** WARNING: connection is not using a post-quantum key exchange algorithm.\n\
+                    ssh: Could not resolve hostname nowhere: Name or service not known\n\n";
+        assert_eq!(
+            explain(said).detail,
+            "ssh: Could not resolve hostname nowhere: Name or service not known"
+        );
+    }
+
+    #[test]
+    fn an_ssh_that_exits_at_once_says_what_it_printed() {
+        let argv: Vec<String> = [
+            "sh",
+            "-c",
+            "echo 'Host key verification failed.' >&2; exit 255",
+        ]
+        .iter()
+        .map(|&part| part.to_owned())
+        .collect();
+        let failure = Session::open(&argv).err().expect("no session");
+        assert!(
+            failure.detail.contains("does not know the host's key"),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
     fn a_path_is_resolved_by_the_far_end() {
         let mut version = Vec::new();
         version.extend_from_slice(&VERSION.to_be_bytes());
@@ -1099,5 +2885,422 @@ mod tests {
         ]);
         assert!(session.handshake());
         assert_eq!(session.realpath(".").as_deref(), Some("/home/dean"));
+    }
+
+    /// OpenSSH's own server, run as a plain process on this machine's files,
+    /// for what a script of answers cannot stand in for: a walk of a real tree.
+    fn real_server() -> Session {
+        let found = [
+            "/usr/libexec/openssh/sftp-server",
+            "/usr/lib/openssh/sftp-server",
+        ]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+        .expect("these tests need sftp-server, which openssh-server installs");
+        Session::open(&[found.to_owned()]).expect("sftp-server started")
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("tuni-sftp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn text(path: &Path) -> String {
+        path.to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn a_folder_goes_across_and_comes_back_with_everything_in_it_but_a_link() {
+        let root = scratch("tree");
+        let here = root.join("here");
+        std::fs::create_dir_all(here.join("sub")).unwrap();
+        std::fs::write(here.join("a.txt"), "one").unwrap();
+        std::fs::write(here.join("sub/b.txt"), "two two").unwrap();
+        std::os::unix::fs::symlink(here.join("a.txt"), here.join("link")).unwrap();
+        let there = text(&root.join("there"));
+        let mut session = real_server();
+
+        let plan = session.plan_upload(&here, &there).expect("planned");
+        let order: Vec<&str> = plan.steps.iter().map(|step| step.remote.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                there.clone(),
+                format!("{there}/a.txt"),
+                format!("{there}/sub"),
+                format!("{there}/sub/b.txt"),
+            ]
+        );
+        assert_eq!((plan.bytes, plan.skipped, plan.replaces), (10, 1, false));
+        let report = session.copy(Way::Up, &plan, &mut |_, _| true);
+        assert_eq!((report.done, report.failed, report.stopped), (4, 0, false));
+        assert!(!root.join("there/link").exists());
+
+        let back = root.join("back");
+        let plan = session.plan_download(&there, &back).expect("planned");
+        assert_eq!(
+            (plan.steps.len(), plan.bytes, plan.replaces),
+            (4, 10, false)
+        );
+        let mut seen = 0;
+        let report = session.copy(Way::Down, &plan, &mut |at, total| {
+            seen = at;
+            assert!(at <= total);
+            true
+        });
+        assert_eq!((report.done, report.failed), (4, 0));
+        assert_eq!(seen, 10);
+        assert_eq!(
+            std::fs::read_to_string(back.join("sub/b.txt")).unwrap(),
+            "two two"
+        );
+        assert_eq!(std::fs::read_to_string(back.join("a.txt")).unwrap(), "one");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_onto_a_file_of_the_same_name_is_a_replace_either_way_and_onto_nothing_is_not() {
+        let root = scratch("replace");
+        std::fs::create_dir_all(root.join("here")).unwrap();
+        std::fs::create_dir_all(root.join("there")).unwrap();
+        std::fs::write(root.join("here/a.txt"), "new").unwrap();
+        std::fs::write(root.join("there/a.txt"), "old").unwrap();
+        let mut session = real_server();
+
+        let onto = text(&root.join("there/a.txt"));
+        let plan = session
+            .plan_upload(&root.join("here/a.txt"), &onto)
+            .unwrap();
+        assert!(plan.replaces);
+        let fresh = text(&root.join("there/b.txt"));
+        let plan = session
+            .plan_upload(&root.join("here/a.txt"), &fresh)
+            .unwrap();
+        assert!(!plan.replaces);
+
+        let plan = session
+            .plan_download(&onto, &root.join("here/a.txt"))
+            .unwrap();
+        assert!(plan.replaces);
+        let plan = session
+            .plan_download(&onto, &root.join("here/c.txt"))
+            .unwrap();
+        assert!(!plan.replaces);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_folder_sent_onto_one_of_the_same_name_replaces_what_is_in_both_and_keeps_the_rest() {
+        let root = scratch("merge");
+        std::fs::create_dir_all(root.join("here")).unwrap();
+        std::fs::create_dir_all(root.join("there")).unwrap();
+        std::fs::write(root.join("here/a.txt"), "new").unwrap();
+        std::fs::write(root.join("there/a.txt"), "old").unwrap();
+        std::fs::write(root.join("there/only.txt"), "kept").unwrap();
+        let mut session = real_server();
+
+        let plan = session
+            .plan_upload(&root.join("here"), &text(&root.join("there")))
+            .unwrap();
+        assert!(plan.replaces);
+        let report = session.copy(Way::Up, &plan, &mut |_, _| true);
+        assert_eq!((report.done, report.failed), (2, 0));
+        assert_eq!(
+            std::fs::read_to_string(root.join("there/a.txt")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("there/only.txt")).unwrap(),
+            "kept"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deleting_a_folder_empties_it_first_and_leaves_what_a_link_in_it_points_at() {
+        let root = scratch("delete");
+        let gone = root.join("gone");
+        std::fs::create_dir_all(gone.join("sub/deep")).unwrap();
+        std::fs::write(gone.join("a"), "").unwrap();
+        std::fs::write(gone.join("sub/b"), "").unwrap();
+        std::fs::write(gone.join("sub/deep/c"), "").unwrap();
+        std::fs::write(root.join("outside"), "stays").unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), gone.join("link")).unwrap();
+        let mut session = real_server();
+
+        let plan = session.plan_delete(&[text(&gone)]).expect("planned");
+        assert_eq!(plan.inside().as_deref(), Some("4 files and 2 folders"));
+        assert_eq!(
+            plan.steps.last().map(|step| step.remote.clone()),
+            Some(text(&gone))
+        );
+        let report = session.delete(&plan);
+        assert_eq!((report.done, report.failed, report.stopped), (7, 0, false));
+        assert!(!gone.exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("outside")).unwrap(),
+            "stays"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_summary_counts_what_failed_and_what_was_left_out() {
+        let step = Step::default();
+        let mut plan = Plan {
+            steps: vec![step.clone(), step.clone(), step],
+            ..Plan::default()
+        };
+        assert_eq!(summary(&plan, &Report::default(), "send"), None);
+
+        plan.leave_out("x is a link or a device, which is not copied.".to_owned());
+        plan.leave_out("y is a link or a device, which is not copied.".to_owned());
+        let refused = Failure::new("Couldn't send y.", "Permission denied.");
+        let report = Report {
+            done: 2,
+            failed: 1,
+            first: Some(refused.clone()),
+            stopped: false,
+        };
+        let said = summary(&plan, &report, "send").expect("something to say");
+        assert_eq!(said.message, "Couldn't send 1 of 3 items.");
+        assert_eq!(
+            said.detail,
+            "Couldn't send y. Permission denied.\n\n\
+             x is a link or a device, which is not copied. 1 more left out as well."
+        );
+
+        let nothing_failed = summary(&plan, &Report::default(), "send").expect("left out");
+        assert_eq!(nothing_failed.message, "Left out 2 items.");
+
+        let one = Plan {
+            steps: vec![Step::default()],
+            ..Plan::default()
+        };
+        assert_eq!(summary(&one, &report, "send"), Some(refused));
+        assert_eq!(one.inside(), None);
+    }
+
+    #[test]
+    fn a_failure_gives_up_on_its_own_host_and_leaves_the_others_waiting() {
+        let mut queue = Queue::default();
+        let push = |queue: &mut Queue, alias: &str, name: &str| {
+            queue.push(
+                alias,
+                Way::Up,
+                format!("/srv/{name}"),
+                PathBuf::from(name),
+                false,
+            )
+        };
+        push(&mut queue, "web", "a");
+        push(&mut queue, "web", "b");
+        push(&mut queue, "db", "c");
+        push(&mut queue, "web", "d");
+
+        let first = queue.pop().unwrap();
+        assert_eq!(first.name(), "a");
+        let refused = Failure::new("Couldn't send a.", "Permission denied.");
+        queue.fail(first, refused, true);
+
+        let left: Vec<String> = queue.waiting().iter().map(Job::name).collect();
+        assert_eq!(left, ["c"]);
+        let (job, said) = &queue.failed()[0];
+        assert_eq!(job.alias, "web");
+        assert_eq!(
+            said.detail,
+            "Permission denied. The 2 behind it were left where they are."
+        );
+
+        // A folder that went partly is news, not a reason to stop the rest.
+        let next = queue.pop().unwrap();
+        push(&mut queue, "db", "e");
+        queue.fail(next, Failure::new("Couldn't send 1 of 3 items.", ""), false);
+        assert_eq!(queue.waiting().len(), 1);
+        assert_eq!(queue.failed().len(), 2);
+    }
+
+    #[test]
+    fn a_job_is_cancelled_by_its_id_after_the_queue_has_moved() {
+        let mut queue = Queue::default();
+        let first = queue.push("web", Way::Down, "/a".into(), "a".into(), false);
+        let second = queue.push("web", Way::Down, "/b".into(), "b".into(), false);
+        assert_eq!(queue.pop().map(|job| job.id), Some(first));
+        assert!(!queue.remove(first), "running is not waiting");
+        assert!(queue.remove(second));
+        assert!(queue.waiting().is_empty());
+        assert!(!queue.wants("web"));
+    }
+
+    #[test]
+    fn the_failed_list_keeps_the_newest_and_cancelling_the_rest_keeps_it() {
+        let mut queue = Queue::default();
+        for name in 0..=FAILED_KEPT {
+            let id = queue.push(
+                "web",
+                Way::Up,
+                format!("/{name}"),
+                name.to_string().into(),
+                false,
+            );
+            let job = queue.pop().unwrap();
+            assert_eq!(job.id, id);
+            queue.fail(job, Failure::new("No.", ""), false);
+        }
+        assert_eq!(queue.failed().len(), FAILED_KEPT);
+        assert_eq!(queue.failed()[0].0.name(), "1");
+
+        queue.push("web", Way::Up, "/x".into(), "x".into(), false);
+        queue.clear();
+        assert!(queue.waiting().is_empty());
+        assert_eq!(queue.failed().len(), FAILED_KEPT);
+        queue.dismiss();
+        assert!(queue.failed().is_empty());
+    }
+
+    #[test]
+    fn a_copy_to_edit_is_named_by_its_host_and_path_and_nothing_else() {
+        let base = Path::new("/run/user/1000/tuni/sftp");
+        let copy = copy_path_in(base, "web", "/etc/nginx/site.conf").unwrap();
+        assert_eq!(copy, base.join("web/etc/nginx/site.conf"));
+        assert_eq!(
+            origin_in(base, &copy),
+            Some(("web".to_owned(), "/etc/nginx/site.conf".to_owned()))
+        );
+        for (alias, remote) in [
+            ("web", "etc/passwd"),
+            ("web", "/etc/../../escape"),
+            ("web", "/"),
+            ("a/b", "/etc/hosts"),
+            ("..", "/etc/hosts"),
+            ("", "/etc/hosts"),
+        ] {
+            assert_eq!(copy_path_in(base, alias, remote), None, "{alias} {remote}");
+        }
+        assert_eq!(origin_in(base, Path::new("/home/dean/notes.txt")), None);
+        assert_eq!(origin_in(base, &base.join("web")), None);
+    }
+
+    #[test]
+    fn an_edited_file_goes_back_unless_it_changed_there_meanwhile() {
+        let root = scratch("edit");
+        let remote = root.join("there.conf");
+        std::fs::write(&remote, "listen 80;").unwrap();
+        let local = root.join("copy/there.conf");
+        let mut session = real_server();
+
+        session
+            .fetch_to_edit(&text(&remote), &local)
+            .expect("fetched");
+        let fetched = seen(&local);
+        let there = session
+            .stat(&text(&remote))
+            .map(|entry| (entry.size, entry.mtime));
+        assert_eq!(fetched, there);
+
+        std::fs::write(&local, "listen 8080;").unwrap();
+        let sent = session.send_back(&local, &text(&remote), fetched, false);
+        let Some(SaveBack::Sent(now)) = sent else {
+            panic!("{sent:?} {:?}", session.failure());
+        };
+        assert_eq!(std::fs::read_to_string(&remote).unwrap(), "listen 8080;");
+
+        // Somebody else's edit, a different length and so a different file.
+        std::fs::write(&remote, "listen 443 ssl;").unwrap();
+        std::fs::write(&local, "listen 81;").unwrap();
+        assert_eq!(
+            session.send_back(&local, &text(&remote), Some(now), false),
+            Some(SaveBack::Changed)
+        );
+        assert_eq!(std::fs::read_to_string(&remote).unwrap(), "listen 443 ssl;");
+        assert!(matches!(
+            session.send_back(&local, &text(&remote), Some(now), true),
+            Some(SaveBack::Sent(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&remote).unwrap(), "listen 81;");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_too_big_for_the_editor_is_not_fetched_at_all() {
+        let root = scratch("big");
+        let remote = root.join("big.log");
+        std::fs::File::create(&remote)
+            .unwrap()
+            .set_len(crate::editor::MAX_BYTES + 1)
+            .unwrap();
+        let local = root.join("copy/big.log");
+        let mut session = real_server();
+        assert_eq!(session.fetch_to_edit(&text(&remote), &local), None);
+        assert!(!local.exists());
+        let failure = session.failure().expect("said why");
+        assert!(failure.detail.contains("past the"), "{failure:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn permissions_read_the_way_ls_writes_them() {
+        assert_eq!(permissions(0o100_644), "rw-r--r--");
+        assert_eq!(permissions(0o040_755), "rwxr-xr-x");
+        assert_eq!(permissions(0o4755), "rwsr-xr-x");
+        assert_eq!(permissions(0o2750), "rwxr-s---");
+        assert_eq!(permissions(0o1777), "rwxrwxrwt");
+        assert_eq!(permissions(0o1666), "rw-rw-rwT");
+        assert_eq!(permissions(0), "---------");
+    }
+
+    #[test]
+    fn a_new_file_is_empty_and_a_taken_name_is_left_as_it_was() {
+        let root = scratch("create");
+        let path = root.join("new.txt");
+        let mut session = real_server();
+        session.create(&text(&path)).expect("created");
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+        std::fs::write(&path, "keep me").unwrap();
+        assert_eq!(session.create(&text(&path)), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+        let failure = session.failure().expect("said why");
+        assert!(
+            failure.detail.contains("already something there"),
+            "{failure:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chmod_sets_the_bits_asked_for_and_nothing_else() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("chmod");
+        let path = root.join("run.sh");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        let mut session = real_server();
+        session.chmod(&text(&path), 0o100_750).expect("changed");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode, 0o100_750);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deleting_a_folder_and_a_file_in_it_together_deletes_each_once() {
+        let root = scratch("delete-many");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/inner"), "").unwrap();
+        std::fs::write(root.join("loose"), "").unwrap();
+        let mut session = real_server();
+
+        let chosen = [
+            text(&root.join("dir/inner")),
+            text(&root.join("dir")),
+            text(&root.join("loose")),
+        ];
+        let plan = session.plan_delete(&chosen).expect("planned");
+        assert_eq!(plan.count(), "2 files and 1 folder");
+        let report = session.delete(&plan);
+        assert_eq!((report.done, report.failed), (3, 0));
+        assert!(!root.join("dir").exists() && !root.join("loose").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

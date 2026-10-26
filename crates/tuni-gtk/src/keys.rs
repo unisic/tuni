@@ -583,6 +583,12 @@ fn area(title: &str, description: &str, buffer: &gtk::TextBuffer) -> adw::Prefer
 /// The one key tuni offers to make. Ed25519 because there is no reason to
 /// choose anything else in 2026, and the choice is the first thing a page of
 /// options would ask about and the last thing that matters.
+///
+/// The one question that does matter is where the private half lives: in a
+/// file, or on a FIDO2 security key, where the file is only a handle and the
+/// key has to be touched each time it signs. `ssh-keygen` talks to the device
+/// itself, in the pane, which is where its "touch your authenticator" prompt
+/// and any PIN belong.
 fn generate_key(parent: &adw::Dialog, run: &Run) {
     let directory = glib::home_dir().join(".ssh");
     let name = adw::EntryRow::builder()
@@ -597,11 +603,32 @@ fn generate_key(parent: &adw::Dialog, run: &Run) {
             glib::host_name()
         ))
         .build();
+    let hardware = adw::SwitchRow::builder()
+        .title("On a Security Key")
+        .subtitle("A FIDO2 key such as a YubiKey, touched each time the key is used")
+        .build();
+    // The suggested name follows the switch until somebody types their own,
+    // which is the name ssh looks for by default either way.
+    hardware.connect_active_notify(glib::clone!(
+        #[weak]
+        name,
+        move |hardware| {
+            let (from, to) = if hardware.is_active() {
+                ("id_ed25519", "id_ed25519_sk")
+            } else {
+                ("id_ed25519_sk", "id_ed25519")
+            };
+            if name.text() == from {
+                name.set_text(to);
+            }
+        }
+    ));
     let group = adw::PreferencesGroup::builder()
         .description("Written into ~/.ssh. The passphrase is asked for in the pane.")
         .build();
     group.add(&name);
     group.add(&comment);
+    group.add(&hardware);
     let page = adw::PreferencesPage::new();
     page.add(&group);
 
@@ -668,12 +695,19 @@ fn generate_key(parent: &adw::Dialog, run: &Run) {
         name,
         #[strong]
         comment,
+        #[strong]
+        hardware,
         move |_| {
             let path = directory.join(name.text().trim());
+            let kind = if hardware.is_active() {
+                "ed25519-sk"
+            } else {
+                "ed25519"
+            };
             run(vec![
                 "ssh-keygen".to_owned(),
                 "-t".to_owned(),
-                "ed25519".to_owned(),
+                kind.to_owned(),
                 "-f".to_owned(),
                 path.to_string_lossy().into_owned(),
                 "-C".to_owned(),

@@ -27,7 +27,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use libghostty_vt::fmt::Format;
-use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
+use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIterator};
 use libghostty_vt::screen::RowSemanticPrompt;
 use libghostty_vt::selection::gesture::{
     Autoscroll, AutoscrollTickEvent, Behavior, Behaviors, DragEvent, Geometry as GestureGeometry,
@@ -1267,6 +1267,16 @@ impl Terminal {
     ///
     /// `None` when there is nothing on screen worth keeping.
     pub fn dump_history(&self, max_lines: usize) -> Result<Option<String>> {
+        self.export(Format::Vt, max_lines)
+    }
+
+    /// The same lines as plain text, the way a person reads them off the
+    /// screen: what a program that has exited said last, for finding out why.
+    pub fn history_text(&self, max_lines: usize) -> Result<Option<String>> {
+        self.export(Format::Plain, max_lines)
+    }
+
+    fn export(&self, format: Format, max_lines: usize) -> Result<Option<String>> {
         // Not installed as the terminal's selection: this runs on a live
         // terminal, and saving the session should not take away what the user
         // had highlighted.
@@ -1277,7 +1287,7 @@ impl Terminal {
         let mut buf = vec![0u8; 64 * 1024];
         let text = loop {
             let options = FormatOptions::new()
-                .with_emit_format(Format::Vt)
+                .with_emit_format(format)
                 .with_selection(&selection)
                 .with_unwrap(true)
                 .with_trim(true);
@@ -1296,7 +1306,12 @@ impl Terminal {
         if text.trim().is_empty() {
             return Ok(None);
         }
-        Ok(Some(last_lines(text, max_lines)))
+        let reset = if matches!(format, Format::Vt) {
+            "\x1b[0m"
+        } else {
+            ""
+        };
+        Ok(Some(last_lines(text, max_lines, reset)))
     }
 
     /// Flatten the current viewport into an owned grid.
@@ -1305,6 +1320,16 @@ impl Terminal {
     /// cell iteration) whose lifetimes cannot leave this method, so the frame
     /// is copied out. Buffers are reused, so a steady-state redraw does not
     /// allocate.
+    ///
+    /// Only the rows the library marks dirty are copied again. Reading a cell
+    /// is half a dozen calls across the FFI, and a cursor blink or a spinner
+    /// asks for a whole viewport of them to learn that one row, or none,
+    /// changed. Anything that touches every row arrives as a full redraw: a
+    /// scroll, a resize, a selection, reverse video, and any color, the
+    /// defaults `set_colors` hands over included. So a theme repaints the
+    /// selection colors kept here too. That is how Ghostty's own renderer
+    /// reads the same flags. Both layers are cleared here because the library
+    /// never clears them itself.
     pub fn snapshot(&mut self) -> Result<&Grid> {
         let snapshot = self.render.update(&self.inner)?;
         let colors = snapshot.colors()?;
@@ -1329,14 +1354,29 @@ impl Terminal {
             None
         };
 
-        self.grid.resize_and_clear(cols, rows);
+        let dirty = snapshot.dirty()?;
+        let full = dirty == Dirty::Full || (self.grid.cols, self.grid.rows) != (cols, rows);
+        if full {
+            self.grid.resize_and_clear(cols, rows);
+        }
         self.grid.fg = colors.foreground.into();
         self.grid.bg = colors.background.into();
         self.grid.cursor = cursor;
+        if !full && dirty == Dirty::Clean {
+            return Ok(&self.grid);
+        }
 
         let mut row_it = self.rows.update(&snapshot)?;
         let mut y: u16 = 0;
         while let Some(row) = row_it.next() {
+            if !full {
+                if !row.dirty()? {
+                    y += 1;
+                    continue;
+                }
+                self.grid.clear_row(y);
+            }
+            row.set_dirty(false)?;
             // A row-level flag, tolerant of false positives, that saves an FFI
             // call per cell on the overwhelming majority of rows, which carry
             // no hyperlink at all.
@@ -1417,6 +1457,7 @@ impl Terminal {
             y += 1;
         }
 
+        snapshot.set_dirty(Dirty::Clean)?;
         Ok(&self.grid)
     }
 }
@@ -1433,16 +1474,16 @@ impl Drop for Terminal {
 /// The tail of `text`, at most `max_lines` lines of it.
 ///
 /// Trimming a VT dump from the front can cut away the escape that turned a
-/// color on, so what survives starts with a reset rather than with whatever
+/// color on, so what survives starts with `reset` rather than with whatever
 /// style the discarded lines happened to leave behind.
-fn last_lines(text: String, max_lines: usize) -> String {
+fn last_lines(text: String, max_lines: usize, reset: &str) -> String {
     if max_lines == 0 {
         return String::new();
     }
     let Some((offset, _)) = text.rmatch_indices('\n').nth(max_lines - 1) else {
         return text;
     };
-    format!("\x1b[0m{}", &text[offset + 1..])
+    format!("{reset}{}", &text[offset + 1..])
 }
 
 /// The local path a `file://` URI names, or `None` when it names another host.

@@ -6,7 +6,7 @@
 # GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
 # populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.6.0/ -o tuni-1.6.0.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.7.0/ -o tuni-1.7.0.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.15.2
 
 Name:           tuni
-Version:        1.6.0
+Version:        1.7.0
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -35,6 +35,10 @@ BuildRequires:  pkgconfig(gtksourceview-5)
 BuildRequires:  pkgconfig(sqlite3)
 BuildRequires:  desktop-file-utils
 BuildRequires:  libappstream-glib
+# libghostty-vt's build script clones the pinned Ghostty commit with the git
+# command rather than cargo's own fetcher, and COPR's buildroot has no git:
+# 1.7.0 failed there on "failed to execute git clone ghostty".
+BuildRequires:  git-core
 
 # Everything the panels shell out to. curl fetches the plan bars the Info
 # page shows next to a running Claude Code, and the host list is read with the
@@ -79,6 +83,7 @@ appstream-util validate-relax --nonet \
 %license LICENSE
 %doc README.md
 %{_bindir}/%{name}
+%{_bindir}/%{name}-gtk
 %{_datadir}/applications/%{app_id}.desktop
 %{_datadir}/metainfo/%{app_id}.metainfo.xml
 # Globbed rather than listed: the icons come from `make install-data`, which is
@@ -89,6 +94,27 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/*/*/*.svg
 
 %changelog
+* Sun Oct 25 2026 Unisic <contact@unisic.app> - 1.7.0-1
+- A host's files open in a pane beside this machine's, and a drag goes either
+  way. Whole folders copy and delete, a remote file opens in the editor and
+  saves back, and waiting transfers can be listed and cancelled. Sixty-four
+  requests are in flight instead of one: 8 MiB over a link with 50 ms added
+  comes down in 0.9 s instead of 16.6.
+- Hosts sit in groups and filter by a tag, a host can paint its panes in a theme
+  of its own, and the host editor switches agent forwarding and environment
+  variables. The connection settings are under Session in Preferences.
+- A snippet can leave blanks asked for before it runs, Ctrl+Shift+S opens the
+  snippets alone, and a snippet can run on every host the list shows.
+- A dropped connection dials again when the network is back, a changed host key
+  can be forgotten from the bar that reports it, a key can be made on a FIDO2
+  security key, and the "+" in the tab strip offers the last five hosts.
+- The shell starts about 5 ms after launch instead of 660, before GTK is loaded,
+  and the window is up in a third of the time. A flood of output is read nearly
+  a third faster, and PSS is a fifth lower than 1.6.0's. Idle panes wake the
+  window together, so sixteen of them cost a quarter of the wakeups they did.
+- Fedora can take Tuni from COPR, and updates then arrive with the rest of the
+  system.
+
 * Sat Oct 10 2026 Unisic <contact@unisic.app> - 1.6.0-1
 - A host can keep its password, in the desktop keyring through secret-tool. ssh
   reads it through a helper, only for a host whose key is already known; Tuni

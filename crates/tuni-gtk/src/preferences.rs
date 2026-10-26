@@ -21,7 +21,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk::pango;
 
-use tuni_core::settings::{Appearance, NewTab, Settings};
+use tuni_core::settings::{Appearance, CONTROL_PERSIST_MAX, NewTab, Settings};
 use tuni_core::theme;
 use tuni_core::{CursorStyle, FONT_SIZE_MAX, FONT_SIZE_MIN, OPACITY_MIN, PADDING_MAX};
 
@@ -341,12 +341,7 @@ fn theme_row(
         .selected(names.iter().position(|name| *name == current).unwrap_or(0) as u32)
         .enable_search(true)
         .build();
-    // Search needs to be told what part of the model to match against.
-    row.set_expression(Some(gtk::PropertyExpression::new(
-        gtk::StringObject::static_type(),
-        None::<gtk::Expression>,
-        "string",
-    )));
+    searchable(&row);
     row.connect_selected_notify(glib::clone!(
         #[weak]
         window,
@@ -758,6 +753,112 @@ fn session_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw:
             .build();
     }
     page.add(&session);
+
+    // --- ssh
+
+    // Every one of these is read when a connection starts, so a change is for
+    // the next pane rather than the ones already open.
+    let connections = adw::PreferencesGroup::builder()
+        .title("Connections")
+        .description("How an SSH pane connects. A change applies to the next connection.")
+        .build();
+
+    let share = adw::SwitchRow::builder()
+        .title("Share One Connection per Host")
+        .subtitle("Panes, tunnels and file lists on a host log in once")
+        .active(settings.ssh_share_connections)
+        .build();
+    share.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.ssh_share_connections = on);
+        }
+    ));
+    connections.add(&share);
+
+    let persist = adw::SpinRow::builder()
+        .title("Keep It Open")
+        .subtitle("Seconds after the last pane closes; 0 closes it with the pane")
+        .adjustment(&gtk::Adjustment::new(
+            f64::from(settings.ssh_control_persist),
+            0.0,
+            f64::from(CONTROL_PERSIST_MAX),
+            60.0,
+            600.0,
+            0.0,
+        ))
+        .build();
+    persist.connect_value_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let seconds = row.value().clamp(0.0, f64::from(CONTROL_PERSIST_MAX)) as u32;
+            edit(&window, |settings| settings.ssh_control_persist = seconds);
+        }
+    ));
+    share
+        .bind_property("active", &persist, "sensitive")
+        .sync_create()
+        .build();
+    connections.add(&persist);
+
+    let dial = adw::SwitchRow::builder()
+        .title("Connect Restored Panes")
+        .subtitle("Off, a restored pane waits for Connect unless its host is already connected")
+        .active(settings.ssh_reconnect_on_restore)
+        .build();
+    dial.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.ssh_reconnect_on_restore = on);
+        }
+    ));
+    connections.add(&dial);
+
+    let reconnect = adw::SwitchRow::builder()
+        .title("Reconnect Dropped Connections")
+        .subtitle("Dial again, for about five minutes, when a connection that was up goes away")
+        .active(settings.ssh_reconnect)
+        .build();
+    reconnect.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.ssh_reconnect = on);
+        }
+    ));
+    connections.add(&reconnect);
+
+    // Empty is the default rather than an empty `TERM`, which every program at
+    // the far end would read as a terminal that can do nothing.
+    let term = adw::EntryRow::builder()
+        .title("TERM on the Host")
+        .text(&settings.ssh_term)
+        .show_apply_button(true)
+        .build();
+    term.connect_apply(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let text = row.text();
+            let chosen = match text.trim() {
+                "" => tuni_core::ssh::REMOTE_TERM,
+                chosen => chosen,
+            }
+            .to_owned();
+            if chosen != text.as_str() {
+                row.set_text(&chosen);
+            }
+            edit(&window, |settings| settings.ssh_term = chosen);
+        }
+    ));
+    connections.add(&term);
+    page.add(&connections);
 
     // Not a group on Appearance, which is about what the window looks like.
     // This is one more thing tuni does on its own behalf when it starts, so it
@@ -1518,6 +1619,16 @@ fn apply_preview_style(settings: &Settings, theme: &theme::Theme) {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     });
+}
+
+/// Search in a combo row of strings needs to be told what part of the model
+/// to match against.
+pub(crate) fn searchable(row: &adw::ComboRow) {
+    row.set_expression(Some(gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        None::<gtk::Expression>,
+        "string",
+    )));
 }
 
 fn list<'a>(items: impl Iterator<Item = &'a str>) -> gtk::StringList {

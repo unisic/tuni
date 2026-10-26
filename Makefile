@@ -145,6 +145,7 @@ dev: build
 
 install: build install-data
 	install -Dm755 $(CARGO_TARGET_DIR)/release/tuni $(bindir)/tuni
+	install -Dm755 $(CARGO_TARGET_DIR)/release/tuni-gtk $(bindir)/tuni-gtk
 
 # The window names its icon rather than carrying one, so a Tuni run straight
 # out of the build directory shows the desktop's fallback icon until the entry
@@ -166,7 +167,7 @@ install-data:
 	done
 
 uninstall:
-	rm -f $(bindir)/tuni
+	rm -f $(bindir)/tuni $(bindir)/tuni-gtk
 	rm -f $(datadir)/applications/$(APP_ID).desktop
 	rm -f $(datadir)/metainfo/$(APP_ID).metainfo.xml
 	rm -f $(icondir)/scalable/apps/$(APP_ID).svg

@@ -17,6 +17,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -31,6 +32,7 @@ use tuni_core::settings::{Appearance, HISTORY_LINE_LIMIT, NewTab, Settings};
 use tuni_core::theme::{Rgb, Theme};
 use tuni_core::workspace::{Id, Tab, Workspace};
 
+use crate::browser::TuniBrowser;
 use crate::diff::TuniDiff;
 use crate::editor::TuniEditor;
 use crate::find::TuniFind;
@@ -81,8 +83,8 @@ const PANEL_POLL_SECONDS: u32 = 2;
 
 /// How long a host's on-connect snippet waits for the connection, and how often
 /// it looks. Long enough for somebody to find a phone and type a code into it,
-/// and each look is one `stat` of a socket rather than anything that asks ssh a
-/// question.
+/// and each look is one `tcgetattr` on the pane's own terminal rather than
+/// anything that asks ssh a question.
 const CONNECT_INTERVAL: Duration = Duration::from_millis(250);
 const CONNECT_TRIES: u32 = 240;
 
@@ -111,6 +113,26 @@ pub struct ClosedTab {
     snapshot: tuni_core::session::TabSnapshot,
     history: History,
 }
+
+/// A dropped connection being dialled again, for the panes that were on it.
+///
+/// Kept per host rather than per pane because the panes on one shared
+/// connection drop together, and each of them dialling would be as many
+/// logins: one pane leads, and the rest attach to what it brings back.
+#[derive(Default)]
+pub struct Reconnect {
+    /// Tries made so far, which is what the backoff reads.
+    attempt: u32,
+    /// Panes waiting for a connection to attach to, the next leader among them.
+    panes: Vec<Id>,
+    /// The next try, while one is scheduled.
+    timer: Option<glib::SourceId>,
+}
+
+/// How often a reconnect waiting for the network looks again. Each look reads
+/// one property the network monitor already keeps, so it asks nothing of
+/// anyone, and the try it is waiting to make is not counted until it is made.
+const OFFLINE_POLL: Duration = Duration::from_secs(5);
 
 thread_local! {
     /// The tab a drag is carrying between strips: the window and project it
@@ -410,9 +432,9 @@ const COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
 
 mod imp {
     use super::{
-        Cell, ClosedTab, HashMap, Id, RefCell, Settings, TuniDiff, TuniEditor, TuniFind, TuniGrid,
-        TuniHosts, TuniPanel, TuniRemote, TuniSwitcher, TuniTerminal, VecDeque, Workspace, gio,
-        glib,
+        Cell, ClosedTab, HashMap, HashSet, Id, PathBuf, Reconnect, RefCell, Settings, TuniBrowser,
+        TuniDiff, TuniEditor, TuniFind, TuniGrid, TuniHosts, TuniPanel, TuniRemote, TuniSwitcher,
+        TuniTerminal, VecDeque, Workspace, gio, glib,
     };
     use adw::subclass::prelude::*;
     use gtk::prelude::WidgetExt;
@@ -431,8 +453,18 @@ mod imp {
         /// terminal underneath is in `terminals` like any other, since it is
         /// one: only what the grid draws differs.
         pub remotes: RefCell<HashMap<Id, TuniRemote>>,
+        /// Text to type into an ssh pane once it has connected, in place of
+        /// the host's own on-connect snippet, by pane id. Put there by running
+        /// a snippet on several hosts, and taken out when the pane starts or
+        /// closes, whichever is first.
+        pub due: RefCell<HashMap<Id, String>>,
+        /// Dropped connections being dialled again, by host alias. Bounded by
+        /// the hosts the window has panes on, and each entry by its panes.
+        pub reconnects: RefCell<HashMap<String, Reconnect>>,
         /// One host list per pane showing one, by pane id.
         pub hosts: RefCell<HashMap<Id, TuniHosts>>,
+        /// One file browser per pane showing a host's files, by pane id.
+        pub browsers: RefCell<HashMap<Id, TuniBrowser>>,
         /// One layout of panes per tab, by tab id.
         pub grids: RefCell<HashMap<Id, TuniGrid>>,
         /// The strip entry each tab was given, by tab id.
@@ -446,6 +478,20 @@ mod imp {
         /// Where the cursor was in each restored file pane, by pane id, until
         /// its editor exists to be told.
         pub pending_cursors: RefCell<HashMap<Id, usize>>,
+        /// The size and time each copy of a remote file had on the far end
+        /// when it was last fetched or sent, by copy, which is what the next
+        /// save checks nobody has changed it since. One entry per remote file
+        /// edited in this run.
+        pub remote_seen: RefCell<HashMap<PathBuf, (u64, u64)>>,
+        /// The copies on their way back, and whether another save landed while
+        /// one was, which sends again once it is there. Two sends of one file
+        /// at once would race to the rename.
+        pub uploading: RefCell<HashMap<PathBuf, bool>>,
+        /// The copies saved here and not yet taken by the far end: refused as
+        /// changed there, or lost on the way. Opening one again shows the copy
+        /// rather than fetching over it, which would throw the edit away
+        /// after the dialog said it was kept. Bounded like `remote_seen`.
+        pub unsent: RefCell<HashSet<PathBuf>>,
         /// The "Move to Project" part of every tab's context menu, filled in
         /// as the menu opens. One `GMenu` shared by every strip in the window,
         /// because `AdwTabBox` builds its popover from the model once and
@@ -611,6 +657,22 @@ glib::wrapper! {
 impl TuniWindow {
     #[must_use]
     pub fn new(app: &adw::Application, settings: Settings) -> Self {
+        let window = Self::without_content(app, settings);
+        window.attach_content();
+        window
+    }
+
+    /// The window [`Self::new`] builds, with its content not in it yet.
+    ///
+    /// The content is what waits for the icon theme. Putting it in the window
+    /// roots the header bar, whose window buttons look up the application's
+    /// icon, and that lookup waits for the theme GTK began loading on a thread
+    /// in `adw::init`: with a big theme, some 165 ms on the main thread with
+    /// nothing else allowed to happen. Projects and their shells can be opened
+    /// on a window without it, so the first window opens them first and
+    /// attaches the content after.
+    #[must_use]
+    pub fn without_content(app: &adw::Application, settings: Settings) -> Self {
         let window: Self = glib::Object::builder()
             .property("application", app)
             .property("default-width", 1100)
@@ -649,14 +711,31 @@ impl TuniWindow {
             }
         });
         window.connect_unrealize(crate::blur::forget);
-        // Nothing on the machine notices a release while no distribution
-        // packages tuni, so the window asks once itself. It is the last thing
+        // Outside COPR and the AUR nothing on the machine notices a release,
+        // so the window asks once itself. It is the last thing
         // `new` does and it answers on another thread, so a slow network
         // delays no part of the first frame.
         if window.imp().settings.borrow().check_updates {
             window.check_updates(false);
         }
         window
+    }
+
+    /// Puts the content in the window, and the keyboard on the focused pane: a
+    /// shell started before there was content to root it had nowhere to take
+    /// the focus.
+    pub fn attach_content(&self) {
+        // Realizing is what creates the renderer, which on Vulkan opens every
+        // installed driver in turn, some 35 ms. The content waits for the icon
+        // theme, so realizing first runs the two side by side instead of
+        // leaving the renderer to `present`. It waits until here because GTK
+        // gives the surface its app id, the thing a desktop matches to the
+        // .desktop entry, only to a window that has its application when it is
+        // realized, and that property is set after `constructed`.
+        WidgetExt::realize(self);
+        let toasts = self.imp().toasts.borrow().clone();
+        self.set_content(toasts.as_ref());
+        self.focus_pane();
     }
 
     /// Says this window owns the saved session: it is the one restored at
@@ -841,9 +920,17 @@ impl TuniWindow {
         let menu = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
             .tooltip_text("Main Menu")
-            .menu_model(&main_menu())
             .primary(true)
             .build();
+        // Built as it first opens, F10 included, since GTK calls this before
+        // any popup: a popover menu that may never be opened is half a MiB of
+        // a window's PSS. The button stays sensitive and announces its popup
+        // with no model yet, which is GTK's own rule for a button given this.
+        menu.set_create_popup_func(|menu| {
+            if menu.menu_model().is_none() {
+                menu.set_menu_model(Some(&main_menu()));
+            }
+        });
         header.pack_end(&menu);
 
         let show_files = gtk::ToggleButton::builder()
@@ -856,37 +943,40 @@ impl TuniWindow {
         stack.set_hexpand(true);
         stack.set_vexpand(true);
 
-        let status_button = gtk::Button::builder()
-            .label("New Terminal")
-            .action_name("win.new-tab")
-            .halign(gtk::Align::Center)
-            .build();
-        status_button.add_css_class("pill");
-        status_button.add_css_class("suggested-action");
-        let status = adw::StatusPage::builder()
-            .icon_name("utilities-terminal-symbolic")
-            .title("No Tabs Open")
-            .child(&status_button)
-            .build();
-
+        // The empty state joins it the first time there is nothing to show:
+        // see `empty_state`.
         let content_stack = gtk::Stack::new();
         content_stack.add_named(&stack, Some("tabs"));
-        content_stack.add_named(&status, Some("empty"));
 
         // The find bar floats over whichever pane is showing rather than living
         // inside one: a pane's widgets are rebuilt whenever the layout changes
-        // shape, and a bar parented there would go with them.
-        let find = TuniFind::new();
-        let switcher = TuniSwitcher::new();
+        // shape, and a bar parented there would go with them. It and the tab
+        // switcher join the overlay when first wanted: see `find_bar`.
         let content_overlay = gtk::Overlay::new();
         content_overlay.set_child(Some(&content_stack));
-        content_overlay.add_overlay(&find);
-        content_overlay.add_overlay(&switcher);
 
-        let new_tab = gtk::Button::builder()
+        // Split, so the "+" every tab strip has is also the way to a host: the
+        // arrow holds the hosts connected to last and the whole list under
+        // them, and the button half still does what a "+" does.
+        let recent_hosts = Rc::new(RecentHosts::default());
+        let connections = gio::Menu::new();
+        connections.append_section(None, &recent_hosts.menu);
+        let all_hosts = gio::Menu::new();
+        all_hosts.append(Some("New Connection"), Some("win.new-connection"));
+        connections.append_section(None, &all_hosts);
+        let connections = gtk::PopoverMenu::from_model(Some(&connections));
+        connections.connect_show(glib::clone!(
+            #[strong]
+            recent_hosts,
+            move |_| recent_hosts.refill()
+        ));
+        recent_hosts.refill();
+        let new_tab = adw::SplitButton::builder()
             .icon_name("tab-new-symbolic")
             .tooltip_text("New Tab (Ctrl+Shift+T)")
+            .dropdown_tooltip("Connect to a Host")
             .action_name("win.new-tab")
+            .popover(&connections)
             .build();
         new_tab.add_css_class("flat");
         // Autohide is a setting, and settings arrive after construction; see
@@ -933,23 +1023,8 @@ impl TuniWindow {
 
         // --- the Files and Git panel, on the far side of the terminals
 
-        crate::debug::mark("   panel begin");
+        // Empty until it first opens: see `build_panel`.
         let panel_view = TuniPanel::new();
-        crate::debug::mark("   panel end");
-        if let Some(files) = panel_view.files() {
-            files.connect_message(glib::clone!(
-                #[weak(rename_to = this)]
-                self,
-                move |message| this.files_message(&message)
-            ));
-        }
-        if let Some(git) = panel_view.git() {
-            git.connect_open(glib::clone!(
-                #[weak(rename_to = this)]
-                self,
-                move |path, staged| this.open_diff(&path, staged)
-            ));
-        }
         // The tab strip belongs to the terminals, so it stops where they do:
         // stretched over the panel it would name tabs for a column that shows
         // the same three pages whichever tab is in front.
@@ -993,6 +1068,9 @@ impl TuniWindow {
             #[weak(rename_to = this)]
             self,
             move |panel| {
+                if panel.shows_sidebar() {
+                    this.build_panel();
+                }
                 this.sync_files();
                 let mut timer = this.imp().panel_timer.borrow_mut();
                 if panel.shows_sidebar() {
@@ -1045,9 +1123,8 @@ impl TuniWindow {
 
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&split));
-        self.imp().toasts.replace(Some(toasts.clone()));
-        self.set_content(Some(&toasts));
-        crate::debug::mark("   set_content");
+        // Put in by `new`, once the window is realized.
+        self.imp().toasts.replace(Some(toasts));
 
         // What being given the window back is worth: a host list re-reads files
         // the user edits somewhere else, since coming back is when they would
@@ -1088,10 +1165,6 @@ impl TuniWindow {
         imp.row_menu.replace(Some(row_menu));
         imp.stack.replace(Some(stack));
         imp.content.replace(Some(content_stack));
-        imp.find.replace(Some(find));
-        imp.switcher.replace(Some(switcher));
-        imp.status.replace(Some(status));
-        imp.status_button.replace(Some(status_button));
         imp.tab_bar.replace(Some(tab_bar));
         imp.banner.replace(Some(banner));
         imp.title.replace(Some(title));
@@ -1358,10 +1431,22 @@ impl TuniWindow {
             }),
             // Opens a connection in a tab of its own. The target is the name
             // `ssh` is given, which is either a saved alias or an address
-            // somebody typed.
+            // somebody typed. What the palette and the "+" button's menu run,
+            // so it dates the host the way a pick from the host list does.
             entry("connect", string, |window, target| {
                 if let Some(alias) = target.and_then(glib::Variant::str) {
                     window.open_pane(Pane::ssh(alias.to_owned()));
+                    let alias = alias.to_owned();
+                    glib::spawn_future_local(async move {
+                        let _ = gio::spawn_blocking(move || tuni_core::ssh::note_use(&alias)).await;
+                    });
+                }
+            }),
+            // A host's files beside the ones here, in a pane next to the one
+            // being worked in. The target is the host's alias.
+            entry("browse-files", string, |window, target| {
+                if let Some(alias) = target.and_then(glib::Variant::str) {
+                    window.browse_files(alias);
                 }
             }),
             // Opens the host list in a tab of its own, whatever a new tab is
@@ -1436,6 +1521,7 @@ impl TuniWindow {
             entry("snippets", None, |window, _| {
                 crate::snippets::present(window);
             }),
+            entry("pick-snippet", None, |window, _| window.pick_snippet()),
             entry("keys", None, |window, _| {
                 crate::keys::present(
                     window,
@@ -1701,14 +1787,21 @@ impl TuniWindow {
     /// terminal is the one program that can offer it a place to ask. A Flatpak
     /// is told rather than offered a button that could not work: the sandbox
     /// cannot install packages on the host, and pretending otherwise would
-    /// leave somebody watching a command fail.
+    /// leave somebody watching a command fail. An AUR build is told too,
+    /// because its helper is what updates it.
     fn offer_update(&self, latest: &str) {
         let current = env!("CARGO_PKG_VERSION");
         let sandboxed = tuni_core::updates::in_flatpak();
+        let from_aur = !sandboxed && tuni_core::updates::from_aur();
         let body = if sandboxed {
             format!(
                 "You are running {current}. This copy is a Flatpak, and a sandboxed app cannot \
                  install packages on the host; rebuild it from the manifest to move to {latest}."
+            )
+        } else if from_aur {
+            format!(
+                "You are running {current}. This copy came from the AUR, so the AUR helper that \
+                 installed it, such as paru or yay, moves it to {latest} on its next upgrade."
             )
         } else {
             format!(
@@ -1718,7 +1811,7 @@ impl TuniWindow {
         };
         let heading = format!("Tuni {latest} Is Available");
         let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
-        if sandboxed {
+        if sandboxed || from_aur {
             dialog.add_response("close", "Close");
             dialog.set_close_response("close");
         } else {
@@ -1837,6 +1930,9 @@ impl TuniWindow {
     /// seen from the keyboard, so nothing here has to know which shell it is,
     /// and whether the last of them is a newline decides whether it runs or
     /// waits on the prompt.
+    ///
+    /// The pane is the one that had the keyboard when the snippet was picked,
+    /// not whichever has it once the blanks are filled in.
     fn run_snippet(&self, name: &str) {
         let Some(snippet) = tuni_core::snippets::Snippets::load().get(name).cloned() else {
             return;
@@ -1844,8 +1940,18 @@ impl TuniWindow {
         let Some(terminal) = self.active_terminal() else {
             return;
         };
-        terminal.send_text(&snippet.body);
-        terminal.grab_focus();
+        crate::snippets::ask(
+            self,
+            &snippet,
+            glib::clone!(
+                #[weak]
+                terminal,
+                move |text| {
+                    terminal.send_text(&text);
+                    terminal.grab_focus();
+                }
+            ),
+        );
     }
 
     /// Opens an editor on a directory, as the Info page's editor button does.
@@ -2062,7 +2168,7 @@ impl TuniWindow {
     /// Runs while the window is closing, so it does the least it can: a
     /// snapshot of the model, one pass over the live terminals, two files.
     fn save_session(&self) {
-        if !session_enabled() || !self.imp().session_owner.get() {
+        if !tuni_core::session::enabled() || !self.imp().session_owner.get() {
             return;
         }
         let imp = self.imp();
@@ -2505,14 +2611,14 @@ impl TuniWindow {
         let started: Vec<(TuniTerminal, Id, Content, Option<PathBuf>)> = panes
             .into_iter()
             .filter_map(|(pane, directory, content)| {
-                if !matches!(content, Content::Terminal | Content::Ssh { .. }) {
-                    self.new_content(tab, pane, &content);
-                    return None;
-                }
                 let cwd = directory
                     .map(PathBuf::from)
                     .filter(|path| path.is_dir())
                     .or_else(|| fallback.clone());
+                if !matches!(content, Content::Terminal | Content::Ssh { .. }) {
+                    self.new_content(tab, pane, &content, cwd, requested);
+                    return None;
+                }
                 let terminal = self.new_terminal(tab, pane);
                 if is_remote(&content) {
                     self.new_remote(tab, pane, &terminal);
@@ -2747,13 +2853,44 @@ impl TuniWindow {
                     Message::LocalShell => this.replace_pane(project, tab, pane, Pane::new()),
                     Message::ConnectToSide(alias) => this.open_pane_to_side(Pane::ssh(alias)),
                     Message::ConnectInTab(alias) => this.open_pane(Pane::ssh(alias)),
+                    Message::Browse(alias) => this.browse_files(&alias),
                     Message::OpenFile(path, line) => this.open_file_at(&path, line),
                     Message::RunLocally(argv) => this.run_locally(&argv),
+                    Message::RunSnippet(aliases, name) => this.run_snippet_on(aliases, &name),
                 }
             }
         ));
         self.imp().hosts.borrow_mut().insert(pane, hosts.clone());
         hosts
+    }
+
+    /// A host's files beside the ones here, for one pane. The local side asks
+    /// the window for what it cannot do itself, the same way the panel's
+    /// Files page does.
+    fn new_browser(&self, pane: Id, alias: &str, directory: &Path, dial: bool) -> TuniBrowser {
+        let browser = TuniBrowser::new(alias, directory, dial);
+        browser.set_hexpand(true);
+        browser.set_vexpand(true);
+        browser.files().connect_message(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |message| this.files_message(&message)
+        ));
+        self.imp()
+            .browsers
+            .borrow_mut()
+            .insert(pane, browser.clone());
+        browser
+    }
+
+    /// Opens a host's files beside the pane being worked in, with this
+    /// machine's side where a new shell would start.
+    fn browse_files(&self, alias: &str) {
+        let directory = self
+            .selected_tab()
+            .and_then(|(project, _)| self.directory_for_new_shell(project))
+            .map(|path| path.to_string_lossy().into_owned());
+        self.open_pane_to_side(Pane::sftp(alias.to_owned(), directory));
     }
 
     /// Puts something else in a pane that is already on screen: the model, the
@@ -2792,7 +2929,7 @@ impl TuniWindow {
                 Some(terminal)
             }
             _ => {
-                self.new_content(tab, pane, content);
+                self.new_content(tab, pane, content, cwd.clone(), true);
                 None
             }
         };
@@ -2832,8 +2969,157 @@ impl TuniWindow {
                 }
             }
         ));
+        if tuni_core::sftp::origin(path).is_some() {
+            // A copy restored with the session was not fetched in this run,
+            // and the time a fetch left on it is the far end's.
+            if let Some(seen) = tuni_core::sftp::seen(path) {
+                imp.remote_seen
+                    .borrow_mut()
+                    .entry(path.to_path_buf())
+                    .or_insert(seen);
+            }
+            let local = path.to_path_buf();
+            editor.connect_saved(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move || this.send_back(local.clone(), false)
+            ));
+        }
         imp.editors.borrow_mut().insert(pane, editor.clone());
         editor
+    }
+
+    /// Whether a pane in any project already has `path` open, or it holds a
+    /// save the far end has not taken yet. Either way, fetching over it would
+    /// lose something.
+    pub fn is_editing(&self, path: &Path) -> bool {
+        self.imp().unsent.borrow().contains(path)
+            || self
+                .imp()
+                .editors
+                .borrow()
+                .values()
+                .any(|editor| editor.path() == path)
+    }
+
+    /// Opens a copy of a remote file that has just been fetched, remembering
+    /// what the far end had so a save can tell whether it still does.
+    pub fn edit_fetched(&self, local: &Path) {
+        if let Some(seen) = tuni_core::sftp::seen(local) {
+            self.imp()
+                .remote_seen
+                .borrow_mut()
+                .insert(local.to_path_buf(), seen);
+        }
+        self.open_file(local);
+    }
+
+    /// Sends a saved copy back to the host it came from, asking first when the
+    /// file there has changed since.
+    ///
+    /// ponytail: one ssh channel per save, on a shared connection or a fresh
+    /// login without one. A session per edited host if saves feel slow.
+    fn send_back(&self, local: PathBuf, force: bool) {
+        use tuni_core::sftp::{SaveBack, Session};
+        let imp = self.imp();
+        let Some((alias, remote)) = tuni_core::sftp::origin(&local) else {
+            return;
+        };
+        imp.unsent.borrow_mut().insert(local.clone());
+        if let Some(again) = imp.uploading.borrow_mut().get_mut(&local) {
+            *again = true;
+            return;
+        }
+        imp.uploading.borrow_mut().insert(local.clone(), false);
+        let seen = imp.remote_seen.borrow().get(&local).copied();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let host = alias.clone();
+                let (from, to) = (local.clone(), remote.clone());
+                let sent = gio::spawn_blocking(move || {
+                    let control = crate::hosts::control();
+                    let argv = tuni_core::ssh::sftp_command(&tuni_core::ssh::host(&host), &control);
+                    let mut session = Session::open(&argv)?;
+                    session.send_back(&from, &to, seen, force).ok_or_else(|| {
+                        session
+                            .failure()
+                            .cloned()
+                            .unwrap_or_else(|| tuni_core::files::Failure {
+                                message: format!("Couldn't send {to} back."),
+                                detail: String::from("The connection ended."),
+                            })
+                    })
+                })
+                .await;
+                let again = this
+                    .imp()
+                    .uploading
+                    .borrow_mut()
+                    .remove(&local)
+                    .unwrap_or(false);
+                let editor = this
+                    .imp()
+                    .editors
+                    .borrow()
+                    .values()
+                    .find(|editor| editor.path() == local)
+                    .cloned();
+                match sent {
+                    Ok(Ok(SaveBack::Sent(now))) => {
+                        this.imp().unsent.borrow_mut().remove(&local);
+                        this.imp()
+                            .remote_seen
+                            .borrow_mut()
+                            .insert(local.clone(), now);
+                        if again {
+                            this.send_back(local, false);
+                        }
+                    }
+                    Ok(Ok(SaveBack::Changed)) => {
+                        let name = Path::new(&remote)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| remote.clone());
+                        let dialog = adw::AlertDialog::new(
+                            Some(&format!("Overwrite “{name}” on {alias}?")),
+                            Some(
+                                "It has changed there since it was opened here, or is not \
+                                 there any more. Overwriting replaces it with what you saved; \
+                                 your copy stays saved here either way.",
+                            ),
+                        );
+                        dialog.add_response("cancel", "Cancel");
+                        dialog.add_response("overwrite", "Overwrite");
+                        dialog.set_response_appearance(
+                            "overwrite",
+                            adw::ResponseAppearance::Destructive,
+                        );
+                        dialog.set_default_response(Some("cancel"));
+                        dialog.set_close_response("cancel");
+                        if dialog.choose_future(Some(&this)).await == "overwrite" {
+                            this.send_back(local, true);
+                        }
+                    }
+                    Ok(Err(failure)) => {
+                        let said = format!("{} {}", failure.message, failure.detail);
+                        match editor {
+                            Some(editor) => editor.show_error(&said),
+                            None => {
+                                let dialog = adw::AlertDialog::new(
+                                    Some(&failure.message),
+                                    Some(&failure.detail),
+                                );
+                                dialog.add_response("close", "Close");
+                                dialog.present(Some(&this));
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        ));
     }
 
     /// A diff for one pane, opened on a file and remembered.
@@ -2964,8 +3250,23 @@ impl TuniWindow {
     /// Builds whatever a pane holds, for a pane already in the layout. Not a
     /// terminal or a connection: those need a directory to start in and
     /// something to start, which only the caller knows.
-    fn new_content(&self, tab: Id, pane: Id, content: &Content) {
+    ///
+    /// `cwd` is where a file browser's local side starts, and `requested`
+    /// whether it may dial its host, the same two things a connection is told.
+    fn new_content(
+        &self,
+        tab: Id,
+        pane: Id,
+        content: &Content,
+        cwd: Option<PathBuf>,
+        requested: bool,
+    ) {
         match content {
+            Content::Sftp { alias } => {
+                let dial = requested || self.settings().ssh_reconnect_on_restore;
+                let directory = cwd.unwrap_or_else(glib::home_dir);
+                self.new_browser(pane, alias, &directory, dial);
+            }
             Content::Terminal | Content::Ssh { .. } => (),
             Content::File(path) => {
                 self.new_editor(tab, pane, path);
@@ -3089,6 +3390,8 @@ impl TuniWindow {
         };
         let alias = alias.clone();
         let name = alias.clone();
+        self.leave_reconnect(pane);
+        let due = self.imp().due.borrow_mut().remove(&pane);
         let settings = self.settings();
         let term = settings.ssh_term.clone();
         let dial = requested || settings.ssh_reconnect_on_restore;
@@ -3098,7 +3401,12 @@ impl TuniWindow {
             #[weak]
             terminal,
             async move {
-                let Ok(dialled) = gio::spawn_blocking(move || {
+                let Ok((painted, dialled)) = gio::spawn_blocking(move || {
+                    let meta = tuni_core::ssh::Notes::load().get(&alias);
+                    // Looked up whether or not the pane dials, so a pane a
+                    // restore left waiting for Connect is in the host's colors
+                    // already.
+                    let painted = tuni_core::theme::theme(&meta.theme);
                     let control = tuni_core::ssh::Control::new(
                         settings.ssh_control_persist,
                         settings.ssh_share_connections,
@@ -3106,29 +3414,32 @@ impl TuniWindow {
                     let host = tuni_core::ssh::host(&alias);
                     let destination = host.target();
                     if !dial && !control.is_live(&destination) {
-                        return None;
+                        return (painted, None);
                     }
-                    // The snippet and the socket to wait on are read here
-                    // because both are files and this is the thread that reads
-                    // files. Nothing is typed unless the host names one.
-                    let waited = greeting(&alias)
-                        .and_then(|body| Some((body, control.socket(&destination)?.0)));
+                    // The snippet is read here because it is a file and this is
+                    // the thread that reads files. Nothing is typed unless the
+                    // host names one or the pane was opened to run one.
+                    let waited = due.or_else(|| greeting(&meta));
                     // Subprocesses of its own — the keyring and `ssh-keygen -F`
                     // — so it belongs on this thread with the rest of them.
                     // Empty unless the host has a saved password, which is the
                     // pane asking in the terminal the way it always has.
                     let askpass = tuni_core::secrets::askpass(&destination);
-                    Some((
-                        tuni_core::ssh::command(&host, &control),
-                        destination,
-                        waited,
-                        askpass,
-                    ))
+                    (
+                        painted,
+                        Some((
+                            tuni_core::ssh::command(&host, &control),
+                            destination,
+                            waited,
+                            askpass,
+                        )),
+                    )
                 })
                 .await
                 else {
                     return;
                 };
+                terminal.pin_theme(painted);
                 let remote = this.imp().remotes.borrow().get(&pane).cloned();
                 let Some((argv, destination, waited, askpass)) = dialled else {
                     if let Some(remote) = remote {
@@ -3136,8 +3447,8 @@ impl TuniWindow {
                     }
                     return;
                 };
-                if let Some((body, socket)) = waited {
-                    this.type_on_connect(&terminal, destination.clone(), socket, body);
+                if let Some(body) = waited {
+                    this.type_on_connect(&terminal, body);
                 }
                 // Written down before the pane starts, so a connection is on the
                 // list to be hung up from the moment there is one to hang up.
@@ -3164,44 +3475,33 @@ impl TuniWindow {
     /// into.
     ///
     /// Waiting is the whole of this. Sent too early the text goes wherever the
-    /// login went, and a password prompt is one of the places that could be. The
-    /// control socket is the signal: `ssh` binds it after it has authenticated,
-    /// so a socket that exists means the far end is done asking. Watching for it
-    /// is a `stat`, which is why this can look four times a second without
-    /// asking ssh anything; one `-O check` at the end is what tells a live master
-    /// from a socket somebody's kill left behind.
+    /// login went, and a password prompt is one of the places that could be.
+    /// The pane's own terminal is the signal: `ssh` reads a password, a
+    /// passphrase or a host-key answer a line at a time, and takes the terminal
+    /// raw only once the session is up, master and mux client alike.
     ///
-    /// A host whose configuration turns sharing off has no socket, and so no
-    /// moment this can point at. Nothing is typed there, which is the safe way to
-    /// be wrong.
-    fn type_on_connect(
-        &self,
-        terminal: &TuniTerminal,
-        destination: String,
-        socket: PathBuf,
-        body: String,
-    ) {
-        let settings = self.settings();
+    /// The control socket was the signal before, and it cannot be one. With
+    /// sharing on, `%C` names one socket per host, so a second pane dialled
+    /// while the first was still logging in sees that socket appear while it is
+    /// sitting at its own password prompt. With sharing off there is no socket
+    /// at all and the snippet was never typed.
+    ///
+    /// A connection that is not up within the minute gets nothing typed, which
+    /// is the safe way to be wrong.
+    fn type_on_connect(&self, terminal: &TuniTerminal, body: String) {
         glib::spawn_future_local(glib::clone!(
             #[weak]
             terminal,
             async move {
                 for _ in 0..CONNECT_TRIES {
                     glib::timeout_future(CONNECT_INTERVAL).await;
-                    if !socket.exists() {
-                        continue;
+                    // Into this pane only. `send_text` is what the keyboard
+                    // goes through, and in a tab that broadcasts it would type
+                    // one host's snippet into every other pane in the tab.
+                    if terminal.is_raw() {
+                        terminal.send_bytes(body.as_bytes());
+                        return;
                     }
-                    let destination = destination.clone();
-                    let persist = settings.ssh_control_persist;
-                    let shared = settings.ssh_share_connections;
-                    let live = gio::spawn_blocking(move || {
-                        tuni_core::ssh::Control::new(persist, shared).is_live(&destination)
-                    })
-                    .await;
-                    if live.unwrap_or(false) {
-                        terminal.send_text(&body);
-                    }
-                    return;
                 }
             }
         ));
@@ -3210,7 +3510,9 @@ impl TuniWindow {
     /// Starts a shell once its widget has been allocated.
     ///
     /// The shell learns its window size from that first allocation, so starting
-    /// it any earlier opens it at 80x24 and corrects it under its own feet.
+    /// it any earlier opens it at 80x24 and corrects it under its own feet. The
+    /// first window starts its shells before it has been laid out at all, on
+    /// purpose; see `build_window`.
     ///
     /// A restored pane replays what it had printed once the shell is up, so the
     /// old output sits above the new prompt rather than racing it.
@@ -3379,6 +3681,12 @@ impl TuniWindow {
                 .borrow()
                 .iter()
                 .map(|(id, hosts)| (*id, hosts.clone().upcast())),
+        );
+        widgets.extend(
+            imp.browsers
+                .borrow()
+                .iter()
+                .map(|(id, browser)| (*id, browser.clone().upcast())),
         );
         // Last, so a connection's bar replaces the bare terminal already
         // entered for it above.
@@ -3635,9 +3943,9 @@ impl TuniWindow {
             glib::closure_local!(
                 #[weak(rename_to = this)]
                 self,
-                move |_: TuniTerminal| {
+                move |_: TuniTerminal, code: i32| {
                     if let Some((this, project)) = this.owner(tab) {
-                        this.session_ended(project, tab, pane);
+                        this.session_ended(project, tab, pane, code);
                     }
                 }
             ),
@@ -3650,14 +3958,357 @@ impl TuniWindow {
     /// asks for. A connection that ends does not: a mistyped hostname, a
     /// refused key or a dropped link leaves an explanation on the screen, and
     /// closing the pane throws the explanation away with it.
-    fn session_ended(&self, project: Id, tab: Id, pane: Id) {
+    fn session_ended(&self, project: Id, tab: Id, pane: Id, code: i32) {
         let Some(Content::Ssh { alias }) = self.pane_content(project, tab, pane) else {
             self.close_pane(project, tab, pane);
             return;
         };
-        let remote = self.imp().remotes.borrow().get(&pane).cloned();
-        if let Some(remote) = remote {
-            remote.set_idle(&format!("Disconnected from {alias}"), "Reconnect");
+        let Some(remote) = self.imp().remotes.borrow().get(&pane).cloned() else {
+            return;
+        };
+        let Some(terminal) = self.imp().terminals.borrow().get(&pane).cloned() else {
+            return;
+        };
+        // Forty lines is the whole warning with room to spare, and all that is
+        // read: what ssh says last is the only part that is about this attempt.
+        let text = terminal.text(40).unwrap_or_default();
+        let code = u32::try_from(code).ok();
+        let settings = self.settings();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            remote,
+            #[weak]
+            terminal,
+            async move {
+                let looked = alias.clone();
+                // `ssh -G` for the key, `ssh -O check` for a shared line: both
+                // subprocesses, and asked only when the screen calls for them.
+                let read = gio::spawn_blocking(move || {
+                    let destination = tuni_core::ssh::host(&looked).target();
+                    match tuni_core::ssh::changed_key(&text) {
+                        Some(key) if key.belongs_to(&tuni_core::ssh::describe(&destination)) => {
+                            Err(key)
+                        }
+                        _ => Ok(tuni_core::ssh::ending(code, &text, || {
+                            tuni_core::ssh::Control::new(
+                                settings.ssh_control_persist,
+                                settings.ssh_share_connections,
+                            )
+                            .is_live(&destination)
+                        })),
+                    }
+                })
+                .await;
+                // Closed, or started again, while ssh was being asked, which
+                // makes the answer about a session that is no longer on screen.
+                let current = this.imp().remotes.borrow().get(&pane) == Some(&remote);
+                if !current || terminal.is_running() {
+                    return;
+                }
+                let disconnected = format!("Disconnected from {alias}");
+                match read {
+                    Ok(Err(key)) => remote.set_offer(
+                        &format!("The host key of {alias} has changed"),
+                        "Forget Old Key",
+                        glib::clone!(
+                            #[weak]
+                            this,
+                            #[weak]
+                            remote,
+                            move || {
+                                this.run_locally(&key.forget());
+                                remote.set_idle(&disconnected, "Reconnect");
+                            }
+                        ),
+                    ),
+                    Ok(Ok(ending)) if this.retry(&alias, pane, ending) => {}
+                    _ => remote.set_idle(&disconnected, "Reconnect"),
+                }
+            }
+        ));
+    }
+
+    /// Puts a pane whose connection ended in line for another try, when the
+    /// ending and `ssh-reconnect` both say so. False leaves the bar to the
+    /// caller.
+    ///
+    /// A host that cannot be reached is tried again only as part of bringing
+    /// back a drop. A first attempt that finds no route is an answer, and
+    /// anything else a try ends on, a refused key or a logout, ends the series
+    /// for every pane in it.
+    fn retry(&self, alias: &str, pane: Id, ending: tuni_core::ssh::Ending) -> bool {
+        use tuni_core::ssh::Ending;
+        if !self.settings().ssh_reconnect {
+            return false;
+        }
+        let going = self.imp().reconnects.borrow().contains_key(alias);
+        match ending {
+            Ending::Dropped => {}
+            Ending::Unreachable if going => {}
+            _ => {
+                if going {
+                    self.give_up(alias);
+                }
+                return false;
+            }
+        }
+        let delay = {
+            let mut reconnects = self.imp().reconnects.borrow_mut();
+            let entry = reconnects.entry(alias.to_owned()).or_default();
+            if !entry.panes.contains(&pane) {
+                entry.panes.push(pane);
+            }
+            if entry.timer.is_some() {
+                // Another pane on the same connection got here first and the
+                // try it scheduled covers this one too.
+                None
+            } else {
+                let Some(delay) = tuni_core::ssh::retry_delay(entry.attempt) else {
+                    drop(reconnects);
+                    self.give_up(alias);
+                    return true;
+                };
+                entry.timer = Some(self.redial_after(alias, delay));
+                Some(delay)
+            }
+        };
+        if let Some(delay) = delay {
+            self.reconnect_bar(
+                alias,
+                &format!(
+                    "Lost the connection to {alias}, trying again in {} s",
+                    delay.as_secs()
+                ),
+            );
+        } else if let Some(remote) = self.imp().remotes.borrow().get(&pane) {
+            remote.set_idle(&format!("Lost the connection to {alias}"), "Reconnect");
+        }
+        true
+    }
+
+    fn redial_after(&self, alias: &str, delay: Duration) -> glib::SourceId {
+        let alias = alias.to_owned();
+        glib::timeout_add_local_once(
+            delay,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move || this.redial(&alias)
+            ),
+        )
+    }
+
+    /// The scheduled try: the first pane still waiting dials as if Connect had
+    /// been pressed, prompt and all, and the others wait for its connection.
+    fn redial(&self, alias: &str) {
+        let imp = self.imp();
+        // Switched off while a try was scheduled.
+        if !self.settings().ssh_reconnect {
+            if let Some(entry) = imp.reconnects.borrow_mut().get_mut(alias) {
+                entry.timer = None;
+            }
+            self.give_up(alias);
+            return;
+        }
+        let leader = {
+            let mut reconnects = imp.reconnects.borrow_mut();
+            let Some(entry) = reconnects.get_mut(alias) else {
+                return;
+            };
+            entry.timer = None;
+            if !gio::NetworkMonitor::default().is_network_available() {
+                entry.timer = Some(self.redial_after(alias, OFFLINE_POLL));
+                drop(reconnects);
+                self.reconnect_bar(
+                    alias,
+                    &format!("Waiting for the network to reconnect to {alias}"),
+                );
+                return;
+            }
+            entry.attempt += 1;
+            let terminals = imp.terminals.borrow();
+            entry.panes.retain(|pane| terminals.contains_key(pane));
+            if entry.panes.is_empty() {
+                None
+            } else {
+                Some(entry.panes.remove(0))
+            }
+        };
+        let Some(leader) = leader else {
+            imp.reconnects.borrow_mut().remove(alias);
+            return;
+        };
+        let terminal = imp.terminals.borrow().get(&leader).cloned();
+        if let Some(terminal) = terminal {
+            let content = Content::Ssh {
+                alias: alias.to_owned(),
+            };
+            self.start_session(&terminal, leader, &content, None, true);
+        }
+        self.reconnect_bar(alias, &format!("Reconnecting to {alias}"));
+        self.follow(alias.to_owned());
+    }
+
+    /// Waits for the leader's connection, then attaches the panes waiting on
+    /// it, and closes the series either way.
+    ///
+    /// The control socket is what says the leader is through, the same signal
+    /// `type_on_connect` watches and for the same reason. A host without one
+    /// cannot share, so its panes each dial for themselves straight away, and
+    /// the series ends once the leader has lasted the wait without dropping.
+    /// A leader still at a prompt by then leaves the others with Reconnect,
+    /// which attaches them once somebody has answered it.
+    ///
+    /// Stamped with the attempt it follows, because a leader that drops again
+    /// starts another try, and another `follow`, while this one is still
+    /// waiting. The old one would otherwise read the new try's empty timer at
+    /// the end of its wait and give the series up in the middle of a login.
+    fn follow(&self, alias: String) {
+        let Some(attempt) = self
+            .imp()
+            .reconnects
+            .borrow()
+            .get(&alias)
+            .map(|entry| entry.attempt)
+        else {
+            return;
+        };
+        let current = move |this: &Self, alias: &str| {
+            this.imp()
+                .reconnects
+                .borrow()
+                .get(alias)
+                .is_some_and(|entry| entry.attempt == attempt)
+        };
+        let settings = self.settings();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let persist = settings.ssh_control_persist;
+                let shared = settings.ssh_share_connections;
+                let looked = alias.clone();
+                let socket = gio::spawn_blocking(move || {
+                    let control = tuni_core::ssh::Control::new(persist, shared);
+                    let destination = tuni_core::ssh::host(&looked).target();
+                    control
+                        .socket(&destination)
+                        .map(|(path, _)| (destination, path))
+                })
+                .await
+                .ok()
+                .flatten();
+                if !current(&this, &alias) {
+                    return;
+                }
+                if socket.is_none() {
+                    this.attach_waiting(&alias, true);
+                }
+                for _ in 0..CONNECT_TRIES {
+                    glib::timeout_future(CONNECT_INTERVAL).await;
+                    if !current(&this, &alias) {
+                        return;
+                    }
+                    let Some((destination, path)) = socket.clone() else {
+                        continue;
+                    };
+                    if !path.exists() {
+                        continue;
+                    }
+                    let live = gio::spawn_blocking(move || {
+                        tuni_core::ssh::Control::new(persist, shared).is_live(&destination)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if live && current(&this, &alias) {
+                        this.attach_waiting(&alias, false);
+                        this.imp().reconnects.borrow_mut().remove(&alias);
+                        return;
+                    }
+                }
+                // A leader that dropped again has scheduled the next try, which
+                // carries the series on; one that did not is connected or
+                // waiting on somebody, and either way the series is done.
+                let done = this
+                    .imp()
+                    .reconnects
+                    .borrow()
+                    .get(&alias)
+                    .is_some_and(|entry| entry.attempt == attempt && entry.timer.is_none());
+                if done {
+                    this.give_up(&alias);
+                }
+            }
+        ));
+    }
+
+    /// Starts every pane waiting on `alias`. Not `requested` when there is a
+    /// connection to attach to, so a master gone again by now leaves the pane
+    /// offering Connect rather than starting a login.
+    fn attach_waiting(&self, alias: &str, requested: bool) {
+        let panes = self
+            .imp()
+            .reconnects
+            .borrow_mut()
+            .get_mut(alias)
+            .map(|entry| std::mem::take(&mut entry.panes))
+            .unwrap_or_default();
+        let content = Content::Ssh {
+            alias: alias.to_owned(),
+        };
+        for pane in panes {
+            let terminal = self.imp().terminals.borrow().get(&pane).cloned();
+            if let Some(terminal) = terminal {
+                self.start_session(&terminal, pane, &content, None, requested);
+            }
+        }
+    }
+
+    /// Ends a series of tries, leaving each pane still waiting with Reconnect.
+    fn give_up(&self, alias: &str) {
+        let entry = self.imp().reconnects.borrow_mut().remove(alias);
+        let Some(entry) = entry else {
+            return;
+        };
+        if let Some(timer) = entry.timer {
+            timer.remove();
+        }
+        let remotes = self.imp().remotes.borrow();
+        for pane in entry.panes {
+            if let Some(remote) = remotes.get(&pane) {
+                remote.set_idle(&format!("Disconnected from {alias}"), "Reconnect");
+            }
+        }
+    }
+
+    /// Takes a pane out of any series it is waiting in, because it is being
+    /// started some other way or is going away. The last pane out of a series
+    /// whose next try is still scheduled takes the try with it.
+    fn leave_reconnect(&self, pane: Id) {
+        self.imp().reconnects.borrow_mut().retain(|_, entry| {
+            entry.panes.retain(|waiting| *waiting != pane);
+            if entry.panes.is_empty()
+                && let Some(timer) = entry.timer.take()
+            {
+                timer.remove();
+                return false;
+            }
+            true
+        });
+    }
+
+    fn reconnect_bar(&self, alias: &str, message: &str) {
+        let reconnects = self.imp().reconnects.borrow();
+        let Some(entry) = reconnects.get(alias) else {
+            return;
+        };
+        let remotes = self.imp().remotes.borrow();
+        for pane in &entry.panes {
+            if let Some(remote) = remotes.get(pane) {
+                remote.set_idle(message, "Reconnect");
+            }
         }
     }
 
@@ -3825,7 +4476,10 @@ impl TuniWindow {
         }
         imp.editors.borrow_mut().remove(&pane);
         imp.remotes.borrow_mut().remove(&pane);
+        imp.due.borrow_mut().remove(&pane);
+        self.leave_reconnect(pane);
         imp.hosts.borrow_mut().remove(&pane);
+        imp.browsers.borrow_mut().remove(&pane);
         // A pane closed mid-turn never sends the notify that would have said it
         // stopped, so both marks are cleared here instead.
         let forgotten = imp.working.borrow_mut().remove(&pane).is_some()
@@ -4511,6 +5165,7 @@ impl TuniWindow {
             move_entry(&imp.diffs, &other.diffs, id);
             move_entry(&imp.remotes, &other.remotes, id);
             move_entry(&imp.hosts, &other.hosts, id);
+            move_entry(&imp.browsers, &other.browsers, id);
             // An agent still thinking, or one that finished into a tab nobody
             // was watching, is now thinking or finished in the other window.
             for (from, to) in [
@@ -4865,6 +5520,31 @@ impl TuniWindow {
         self.imp().terminals.borrow().get(&pane).cloned()
     }
 
+    /// Builds the panel's pages the first time it opens, and hooks the window
+    /// to the two of them that ask it for something.
+    fn build_panel(&self) {
+        let Some(panel) = self.imp().panel_view.borrow().clone() else {
+            return;
+        };
+        if !panel.ensure_built() {
+            return;
+        }
+        if let Some(files) = panel.files() {
+            files.connect_message(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |message| this.files_message(&message)
+            ));
+        }
+        if let Some(git) = panel.git() {
+            git.connect_open(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |path, staged| this.open_diff(&path, staged)
+            ));
+        }
+    }
+
     /// Opens the panel on a page, or closes it if that page is already the one
     /// showing.
     fn show_panel(&self, page: &str) {
@@ -4903,8 +5583,8 @@ impl TuniWindow {
         if let Some(editor) = self.active_editor() {
             return Some(Search::Editor(editor));
         }
-        let find = self.imp().find.borrow().clone()?;
-        Some(Search::Terminal(find, self.active_terminal()?))
+        let terminal = self.active_terminal()?;
+        Some(Search::Terminal(self.find_bar(), terminal))
     }
 
     /// Walks to the next match in the focused pane, or the previous one.
@@ -4991,12 +5671,19 @@ impl TuniWindow {
     }
 
     fn switcher_key(&self, key: gdk::Key, state: gdk::ModifierType) -> glib::Propagation {
-        let Some(switcher) = self.imp().switcher.borrow().clone() else {
-            return glib::Propagation::Proceed;
-        };
+        // Every key in the window comes through here, and only one that opens
+        // the switcher makes one.
+        let open = self
+            .imp()
+            .switcher
+            .borrow()
+            .clone()
+            .filter(TuniSwitcher::is_open);
         // Escape is only the switcher's while it is up; the rest of the time it
         // belongs to whatever is in the pane.
-        if switcher.is_open() && key == gdk::Key::Escape {
+        if let Some(switcher) = &open
+            && key == gdk::Key::Escape
+        {
             switcher.close();
             return glib::Propagation::Stop;
         }
@@ -5014,7 +5701,7 @@ impl TuniWindow {
         }
         let forward = !state.contains(gdk::ModifierType::SHIFT_MASK);
 
-        if switcher.is_open() {
+        if let Some(switcher) = open {
             switcher.step(forward);
             return glib::Propagation::Stop;
         }
@@ -5022,6 +5709,15 @@ impl TuniWindow {
         if cards.len() < 2 {
             return glib::Propagation::Proceed;
         }
+        let made = self.imp().switcher.borrow().clone();
+        let switcher = made.unwrap_or_else(|| {
+            let switcher = TuniSwitcher::new();
+            if let Some(overlay) = self.overlay() {
+                overlay.add_overlay(&switcher);
+            }
+            self.imp().switcher.replace(Some(switcher.clone()));
+            switcher
+        });
         // Opening lands on the tab before this one, which is what one press and
         // release is for: the way back to where the work just was.
         let start = if forward { 1 } else { cards.len() - 1 };
@@ -5114,6 +5810,7 @@ impl TuniWindow {
                     .unwrap_or_else(|| alias.clone()),
             ),
             Content::Hosts => ("network-server-symbolic", "Connect".to_owned()),
+            Content::Sftp { alias } => ("folder-remote-symbolic", format!("{alias} files")),
             Content::File(path) => ("text-x-generic-symbolic", shorten(&path.to_string_lossy())),
             Content::Diff { path, staged } => (
                 "media-record-symbolic",
@@ -5216,7 +5913,51 @@ impl TuniWindow {
     }
 
     fn show_palette(&self) {
-        crate::palette::present(self, self.palette_entries());
+        crate::palette::present(
+            self,
+            self.palette_entries(),
+            "Search commands and terminals",
+        );
+    }
+
+    /// Connects to each host in a tab of its own and types the snippet into
+    /// every one once it is in. Its blanks are asked for once, here, and the
+    /// same answers go to every host.
+    ///
+    /// The typing waits on the same signal a host's own on-connect snippet
+    /// does, and replaces that snippet for these panes: two snippets typed
+    /// back to back would run as one line whenever the first has no newline.
+    fn run_snippet_on(&self, aliases: Vec<String>, name: &str) {
+        let Some(snippet) = tuni_core::snippets::Snippets::load().get(name).cloned() else {
+            return;
+        };
+        crate::snippets::ask(
+            self,
+            &snippet,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |text| {
+                    for alias in &aliases {
+                        let pane = Pane::ssh(alias.clone());
+                        this.imp().due.borrow_mut().insert(pane.id(), text.clone());
+                        this.open_pane(pane);
+                    }
+                }
+            ),
+        );
+    }
+
+    /// The palette with the snippets in it and nothing else, for somebody who
+    /// knows it is a snippet they want. With none written yet it is the list
+    /// they are written in instead, rather than a palette with no rows.
+    fn pick_snippet(&self) {
+        let entries = snippet_entries();
+        if entries.is_empty() {
+            crate::snippets::present(self);
+        } else {
+            crate::palette::present(self, entries, "Search snippets");
+        }
     }
 
     /// What the palette lists: the window's own actions, every host ssh knows
@@ -5259,21 +6000,20 @@ impl TuniWindow {
                 target: Some(host.alias.to_variant()),
                 terminal: false,
             });
-        }
-
-        for snippet in tuni_core::snippets::Snippets::load().all() {
             entries.push(palette::Entry {
-                search: snippet.name.clone(),
-                words: "snippet run",
-                title: snippet.name.clone(),
-                subtitle: Some(crate::snippets::summary(&snippet.body)),
-                icon: "text-x-generic-symbolic",
+                search: format!("{} {}", host.alias, host.address()),
+                words: "sftp files browse",
+                title: format!("Browse Files on {}", host.alias),
+                subtitle: Some(host.address()),
+                icon: "folder-remote-symbolic",
                 shortcut: None,
-                action: "win.run-snippet",
-                target: Some(snippet.name.to_variant()),
+                action: "win.browse-files",
+                target: Some(host.alias.to_variant()),
                 terminal: false,
             });
         }
+
+        entries.extend(snippet_entries());
 
         // What the checkout under the shell on screen declares, read again on
         // every opening, so a script added a moment ago is there. A handful of
@@ -5461,10 +6201,36 @@ impl TuniWindow {
         entries
     }
 
-    /// The find bar, for the smoke captures.
+    /// The find bar, made the first time a search asks for it.
+    ///
+    /// Not with the window: the bar and the tab switcher are about a third of
+    /// a MiB of a window's PSS, measured, for two widgets a session may never
+    /// show.
     #[must_use]
-    pub(crate) fn find_bar(&self) -> Option<TuniFind> {
-        self.imp().find.borrow().clone()
+    pub(crate) fn find_bar(&self) -> TuniFind {
+        if let Some(find) = self.imp().find.borrow().clone() {
+            return find;
+        }
+        let find = TuniFind::new();
+        // Under the switcher if that came first, which is how the two were
+        // stacked when both were built with the window. `add_overlay` is this
+        // same call with no sibling.
+        let switcher = self.imp().switcher.borrow().clone();
+        if let Some(overlay) = self.overlay() {
+            find.insert_before(&overlay, switcher.as_ref());
+        }
+        self.imp().find.replace(Some(find.clone()));
+        find
+    }
+
+    /// What floats over the panes: the find bar and the tab switcher.
+    fn overlay(&self) -> Option<gtk::Overlay> {
+        self.imp()
+            .content
+            .borrow()
+            .as_ref()?
+            .parent()
+            .and_downcast()
     }
 
     pub(crate) fn active_editor(&self) -> Option<TuniEditor> {
@@ -5477,7 +6243,70 @@ impl TuniWindow {
         self.imp().hosts.borrow().get(&pane).cloned()
     }
 
+    /// The remote list of the file browser holding the keyboard, or else the
+    /// panel's Remote page, which a capture drives the way it drives the
+    /// editor: by its own action group.
+    pub(crate) fn active_sftp(&self) -> Option<crate::sftp::TuniSftp> {
+        let browser = self
+            .focused_pane()
+            .and_then(|pane| self.imp().browsers.borrow().get(&pane).cloned());
+        match browser {
+            Some(browser) => Some(browser.sftp().clone()),
+            None => self.imp().panel_view.borrow().as_ref()?.sftp(),
+        }
+    }
+
     // --- rendering the model -----------------------------------------------
+
+    /// Puts the page shown in place of the tabs into the content stack, the
+    /// first time there are none. Not built with the window, because a window
+    /// opens with a tab: the page is half a MiB of PSS that would sit behind
+    /// the terminals until the last one closes, if it ever does. `refresh`
+    /// fills in its words.
+    ///
+    /// Asked for from an idle rather than from `refresh` itself, since a new
+    /// project is refreshed once before its first tab exists, and that empty
+    /// moment is never drawn. The idle runs above the redraw priority, so a
+    /// window that really has nothing to show gets the page before the frame
+    /// that shows it.
+    fn empty_state(&self) {
+        let imp = self.imp();
+        if imp.status.borrow().is_some() {
+            return;
+        }
+        let Some(content) = imp.content.borrow().clone() else {
+            return;
+        };
+        let status_button = gtk::Button::builder()
+            .label("New Terminal")
+            .action_name("win.new-tab")
+            .halign(gtk::Align::Center)
+            .build();
+        status_button.add_css_class("pill");
+        status_button.add_css_class("suggested-action");
+        // The other thing a window is opened for. Without it the empty page
+        // knows one way out, and the way to a host is a shortcut to have read
+        // about or a menu to have opened.
+        let status_connect = gtk::Button::builder()
+            .label("New Connection")
+            .tooltip_text("New Connection (Ctrl+Shift+O)")
+            .action_name("win.new-connection")
+            .build();
+        status_connect.add_css_class("pill");
+        status_button.set_halign(gtk::Align::Fill);
+        let status_buttons = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        status_buttons.set_halign(gtk::Align::Center);
+        status_buttons.append(&status_button);
+        status_buttons.append(&status_connect);
+        let status = adw::StatusPage::builder()
+            .icon_name("utilities-terminal-symbolic")
+            .title("No Tabs Open")
+            .child(&status_buttons)
+            .build();
+        content.add_named(&status, Some("empty"));
+        imp.status.replace(Some(status));
+        imp.status_button.replace(Some(status_button));
+    }
 
     /// Titles, names, and which of the two empty states is showing. Cheap
     /// enough to call on every change.
@@ -5501,7 +6330,34 @@ impl TuniWindow {
             title.set_subtitle(&subtitle.unwrap_or_default());
         }
         if let Some(content) = imp.content.borrow().as_ref() {
-            content.set_visible_child_name(if tabs { "tabs" } else { "empty" });
+            if tabs {
+                content.set_visible_child_name("tabs");
+            } else if imp.status.borrow().is_some() {
+                content.set_visible_child_name("empty");
+            } else {
+                glib::idle_add_local_full(
+                    glib::Priority::HIGH_IDLE,
+                    glib::clone!(
+                        #[weak(rename_to = this)]
+                        self,
+                        #[upgrade_or]
+                        glib::ControlFlow::Break,
+                        move || {
+                            let empty = this
+                                .imp()
+                                .workspace
+                                .borrow()
+                                .selected_project()
+                                .is_none_or(|project| project.is_empty());
+                            if empty {
+                                this.empty_state();
+                                this.refresh();
+                            }
+                            glib::ControlFlow::Break
+                        }
+                    ),
+                );
+            }
         }
         if let (Some(status), Some(button)) = (
             imp.status.borrow().as_ref(),
@@ -6147,16 +7003,40 @@ impl TuniWindow {
     }
 }
 
+/// A palette row per snippet, each running it by name.
+fn snippet_entries() -> Vec<palette::Entry> {
+    tuni_core::snippets::Snippets::load()
+        .all()
+        .iter()
+        .map(|snippet| palette::Entry {
+            search: snippet.name.clone(),
+            words: "snippet run",
+            title: snippet.name.clone(),
+            subtitle: Some(crate::snippets::summary(&snippet.body)),
+            icon: "text-x-generic-symbolic",
+            shortcut: None,
+            action: "win.run-snippet",
+            target: Some(snippet.name.to_variant()),
+            terminal: false,
+        })
+        .collect()
+}
+
 /// What a host asked to have typed once it answers, if it asked for anything
-/// and the snippet it named is still there. Two file reads.
-fn greeting(alias: &str) -> Option<String> {
-    let named = tuni_core::ssh::Notes::load().get(alias).on_connect;
-    if named.is_empty() {
+/// and the snippet it named is still there. One file read: the caller has
+/// the host's notes already.
+///
+/// A snippet with blanks is not typed: nobody is looking at a pane that is
+/// still connecting, so there is nobody to fill them in. The editor does not
+/// offer one; this is for a snippet that gained a blank after it was picked.
+fn greeting(meta: &tuni_core::ssh::Meta) -> Option<String> {
+    if meta.on_connect.is_empty() {
         return None;
     }
     tuni_core::snippets::Snippets::load()
-        .get(&named)
+        .get(&meta.on_connect)
         .map(|snippet| snippet.body.clone())
+        .filter(|body| tuni_core::snippets::blanks(body).is_empty())
 }
 
 /// One action, spelled the way `add_action_entries` wants it.
@@ -6272,6 +7152,65 @@ fn item(label: &str, action: &str, target: &glib::Variant) -> gio::MenuItem {
     item
 }
 
+/// The hosts connected to last, at the top of the "+" button's menu.
+///
+/// Read again each time the menu opens, because the host list is what writes
+/// down a connection and nothing tells the window it did. Two small files and
+/// no subprocess, on the blocking pool. The menu is rebuilt only when the
+/// answer differs from what it shows, since a rebuild under an open menu
+/// takes the keyboard focus off the item it was on.
+#[derive(Default)]
+struct RecentHosts {
+    menu: gio::Menu,
+    asked: Cell<u64>,
+    shown: RefCell<Vec<(String, String)>>,
+}
+
+impl RecentHosts {
+    fn refill(self: &Rc<Self>) {
+        let generation = self.asked.get().wrapping_add(1);
+        self.asked.set(generation);
+        let this = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            let Ok(recent) = gio::spawn_blocking(|| {
+                let hosts = tuni_core::ssh::Hosts::load();
+                let notes = tuni_core::ssh::Notes::load();
+                notes
+                    .recent(hosts.all(), crate::hosts::RECENT)
+                    .into_iter()
+                    .map(|host| {
+                        let meta = notes.get(&host.alias);
+                        let name = if meta.label.is_empty() {
+                            host.alias.clone()
+                        } else {
+                            meta.label
+                        };
+                        (name, host.alias.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            else {
+                return;
+            };
+            if this.asked.get() != generation || *this.shown.borrow() == recent {
+                return;
+            }
+            this.menu.remove_all();
+            for (name, alias) in &recent {
+                // A menu reads its labels for mnemonics, and `db_primary`
+                // would lose its underscore to one.
+                this.menu.append_item(&item(
+                    &name.replace('_', "__"),
+                    "win.connect",
+                    &alias.to_variant(),
+                ));
+            }
+            this.shown.replace(recent);
+        });
+    }
+}
+
 /// The header bar's menu — everything reachable by keyboard that a pointer
 /// should be able to reach too.
 fn main_menu() -> gio::Menu {
@@ -6279,6 +7218,7 @@ fn main_menu() -> gio::Menu {
     opening.append(Some("New Tab"), Some("win.new-tab"));
     opening.append(Some("New Project"), Some("win.new-project"));
     opening.append(Some("New Window"), Some("win.new-window"));
+    opening.append(Some("New Connection"), Some("win.new-connection"));
 
     let panes = gio::Menu::new();
     panes.append(Some("Split Right"), Some("win.split-right"));
@@ -6640,18 +7580,6 @@ fn load_css() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     });
-}
-
-/// Whether this run reads and writes the saved session at all.
-///
-/// `TUNI_SESSION=off` opens an empty window and leaves the saved one exactly
-/// as it was, which is what the smoke captures want: a capture that restored
-/// yesterday's window would be a picture of yesterday, and one that saved its
-/// own would throw away a real session.
-#[must_use]
-pub fn session_enabled() -> bool {
-    !std::env::var("TUNI_SESSION")
-        .is_ok_and(|value| matches!(value.trim(), "0" | "off" | "no" | "false"))
 }
 
 /// Tell libadwaita which appearance was asked for.

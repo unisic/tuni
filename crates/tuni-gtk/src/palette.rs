@@ -162,7 +162,7 @@ fn row_title(row: &gtk::ListBoxRow) -> Option<String> {
 }
 
 /// Opens the palette over `parent`, listing `entries`.
-pub fn present(parent: &impl IsA<gtk::Widget>, entries: Vec<Entry>) {
+pub fn present(parent: &impl IsA<gtk::Widget>, entries: Vec<Entry>, placeholder: &str) {
     let entries = Rc::new(entries);
     let rows = Rc::new(RefCell::new(Rows {
         rows: Vec::new(),
@@ -188,7 +188,7 @@ pub fn present(parent: &impl IsA<gtk::Widget>, entries: Vec<Entry>) {
     nothing.add_css_class("compact");
 
     let search = gtk::SearchEntry::builder()
-        .placeholder_text("Search commands and terminals")
+        .placeholder_text(placeholder)
         .margin_top(6)
         .margin_bottom(6)
         .margin_start(6)

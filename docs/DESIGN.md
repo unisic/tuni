@@ -258,7 +258,25 @@ in tuni, in one list, narrowed by the same typing the palette answers to, with
 Enter connecting in this pane, `Ctrl+Enter` in a split beside it, and
 `Shift+Enter` in a tab of its own. A dot says which machines are answering.
 Setting `new-tab` to `hosts` makes that list what `Ctrl+Shift+T` opens, for
-people who connect more often than they start a shell here.
+people who connect more often than they start a shell here. The arrow beside
+the "+" at the end of the tab strip holds the five hosts connected to last and
+New Connection under them, and a window with no tabs offers New Connection
+beside New Terminal, so the way to a host is never only a shortcut. A
+connection from the list, the palette or that arrow dates the host the same
+way, so all three agree on which hosts are recent.
+
+A host can sit in one group and carry any number of tags, both kept in
+`meta.json` beside the label, so a host from `~/.ssh/config` takes them as
+readily as one saved here. Groups are headings under Recent, by name, with the
+hosts in none of them last under Hosts; a heading folds its hosts away until the
+pane closes, and the fold is not saved, because a host a restart hid is a host
+somebody looks for and cannot find. Groups do not nest and do not hand settings
+down: `Host` patterns in ssh already give several hosts one setting, and a
+second way of doing that would answer differently from `ssh -G`. Tags narrow the
+list through a picker beside the search, one at a time, which drops the local
+shell and Recent from the list since neither answers which hosts are `prod`. A
+picker rather than a strip of chips because the pane is often a third of a
+window wide and a strip wraps into rows that push the hosts off it.
 
 None of the connecting is tuni's own work. Opening a host runs `ssh` in the
 pane, so every prompt an authentication can raise, the unknown-host question
@@ -271,7 +289,31 @@ host declared in `~/.ssh/config` is read, listed and connected to but never
 rewritten, and editing one opens that file at the line that declares it, in an
 editor pane. A session that ends leaves its last screen where it is with a
 Reconnect button over it, rather than closing the pane, since a connection that
-dropped has usually just said why. The panel grows another page while a pane is
+dropped has usually just said why. When what it said is that the host's key
+has changed, the button is Forget Old Key instead, and it types the
+`ssh-keygen -R` that removes the old one, naming the exact file and name ssh
+complained about, onto a local shell's prompt without running it. A changed key
+is also what a man in the middle looks like, so the decision is the person's to
+make with the fingerprint still on the screen beside it; after it the bar goes
+back to Reconnect, and the new key is asked about in the pane like any unknown
+one. Only a screen that ends on the refusal counts, so a warning some remote
+command echoed before the session carried on is not mistaken for one.
+
+With `ssh-reconnect` on, a connection that dropped is dialled again by itself,
+two seconds after, then five, fifteen, thirty and a minute apart, and given up
+after about five minutes. A drop is told from a logout by two things together,
+since ssh prints the same `Shared connection to box closed.` for both: the exit
+code, 255 only when ssh itself failed, and the line ssh wrote last. A host that
+refuses or has no route is tried again only while bringing back a drop, and a
+refused key or a logout ends the series. The panes on one shared connection
+drop together, so one of them dials and the rest attach once its connection is
+up, which is one login however many panes there were; a login that asks for a
+code stops the series by waiting in that pane for somebody to answer it. While
+the machine has no network at all nothing is tried and nothing is counted.
+Off by default, because each try is a login that nobody asked for at the
+moment it starts.
+
+The panel grows another page while a pane is
 on a host: the files at the other end, in the same tree the Files page draws,
 opened over the connection that is already there.
 
@@ -464,6 +506,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+,` | Preferences |
 | `Ctrl+S` | Save the file in the focused pane |
 | `Ctrl+Shift+P` | The command palette |
+| `Ctrl+Shift+S` | The command palette with only the snippets in it |
 | `Ctrl+Shift+F` | Find in the pane that has the keyboard; Enter and `Shift+Enter` walk the matches, `Escape` closes |
 | `F3` / `Shift+F3` | Next match, previous match |
 | `Ctrl+Shift+H` | Find and replace in the file pane that has the keyboard |
@@ -875,6 +918,33 @@ a label, tags, when a host was last opened, lives in
 `~/.config/tuni/ssh/meta.json` keyed by alias, which is what lets a hand-written
 host carry them without tuni putting a byte in the file that declares it.
 
+Agent forwarding and environment variables get rows of their own in the host
+editor, and both are still lines of ssh syntax: `ForwardAgent` and `SetEnv`,
+kept among the extra lines the block already carries and taken out of the text
+box while the rows show them, so the box and the row cannot say two different
+things. A second store for them would have been a second answer to what `ssh -G`
+reports. The agent row warns, because the man page does: anybody who is root on
+the far end can ask the forwarded agent to sign while the connection is up, and
+a switch that hides that is a switch nobody should flip blind. Turning it off
+writes `ForwardAgent no` when a value was there rather than deleting the line,
+since a missing line hands the question to whatever `Host *` says further down;
+turning it on keeps a socket path somebody wrote by hand, because the switch
+only says whether. `SetEnv` is sent by the client, and a server that does not
+`AcceptEnv` the name drops it without a word, which is the server's answer and
+not something the row can check.
+
+A host can have a theme of its own, picked in the editor from the same catalog
+Preferences lists and kept in `meta.json`, so a production machine can be red
+before anybody types into it. It is one theme, not a light and dark pair: a
+desktop going light is the window's business, and a pane that changed with it
+would no longer say which machine it is. The pane holds the host's colors as a
+pin over whatever the window hands down, so Preferences and the desktop still
+repaint every other pane and leave that one alone. The colors are read each
+time the pane connects, which includes a restore that only offers Connect; a
+pane already open when the theme is changed keeps its colors until it
+reconnects. Only the pane changes. The window's chrome is drawn from the
+window's theme, since one window holds panes on several hosts at once.
+
 A forwarded port is two different things under one name. A `LocalForward` in the
 host's own block belongs to ssh, which brings it up with the connection, and
 there is nothing in the window that could start or stop it. One kept in
@@ -893,8 +963,10 @@ is a race, and the real failure path is still there: the check only makes the
 ordinary case readable.
 
 Snippets are a file of the same kind, `{name, body}` in
-`~/.config/tuni/ssh/snippets.json`, offered by name in the command palette. One
-is typed into the pane that has the keyboard rather than run behind it, so it
+`~/.config/tuni/ssh/snippets.json`, offered by name in the command palette and
+on their own on `Ctrl+Shift+S`, which is the palette with everything else taken
+out. With none written yet that key opens the list they are written in. One is
+typed into the pane that has the keyboard rather than run behind it, so it
 works against whatever shell is there, on this machine or the far end, and what
 ran is on the screen where the person who ran it can read it. The last character
 carries the rest of the meaning: a body ending in a newline runs, one that does
@@ -906,6 +978,32 @@ and a password prompt is one of the places that could be, so tuni watches for
 the control socket, which ssh binds only after it has authenticated, and then
 asks the master once whether it is answering. A host whose configuration shares
 nothing has no such moment to point at and gets nothing typed.
+
+A body can leave blanks, `{{name}}`, and running it asks for each one once,
+however often it appears, before a character is typed. A name is a letter or an
+underscore followed by letters, digits, underscores and hyphens, and double
+braces around anything else are text, so `docker ps --format '{{.Names}}'` and
+a template's `{{ .Field }}` type as written without an escape. A value is typed
+as keystrokes, which is why a control character in one is refused and its row
+turns red rather than the snippet going out: a newline would run the line before
+the rest of it arrived, and Ctrl+C or Escape are keys of their own. The answers
+are not remembered. A field that offered last time's value would be a store of
+whatever was typed into it, and a password is one of the things that gets typed
+into a blank. A snippet with blanks cannot be a host's on-connect snippet,
+since nobody is in front of a pane that is still connecting to fill them in.
+
+The host list's menu runs one snippet on every host it is showing, each in a
+tab of its own. The set is the rows on screen, so the search and the tag picker
+are how it is chosen, and a folded group is left out because it is not showing;
+the dialog names the hosts before anything connects, because this is the one
+click in the window that reaches every machine on the list. Blanks are asked
+for once and the same answers go to every host. The typing waits on the same
+signal an on-connect snippet does and takes its place in those panes, since two
+bodies typed back to back run as one line whenever the first has no newline.
+That also means a host whose configuration shares nothing gets its tab and no
+snippet, which is the same safe way to be wrong. Each host is its own ssh
+process and its own tab: the cost is the length of the list, and the list is
+in front of the person who asked for it.
 
 Keys are read and never held. The list under the launcher's menu is `~/.ssh`
 scanned for `.pub` files, one `ssh-keygen -l` each for the type, the size, the
@@ -924,6 +1022,15 @@ managing the agent are all missing on purpose: `ssh-agent` and the desktop's
 keyring do that job already, and a wrong button in this window would be a
 security bug rather than a bad row.
 
+A key made here is Ed25519, and the one choice offered is where its private
+half lives: in a file, or on a FIDO2 security key, which is `-t ed25519-sk` and
+leaves in `~/.ssh` only a handle that is useless without the device. The device
+is reached by `ssh-keygen` itself, in the pane, which is where its request to
+touch the key and any PIN belong, and the key list needs nothing new because
+`ssh-keygen -l` reports the type as `ED25519-SK`. Resident keys and requiring
+a PIN on every use are options a person who wants them can add to the typed
+command before pressing Return.
+
 The files on the far machine are a fourth panel page, on the switcher while the
 pane holding the keyboard is on a host and off it the moment that pane is not,
 under a server icon rather than a second folder, because two folders a small
@@ -932,9 +1039,16 @@ a small client speaking version 3 of the SFTP protocol over
 `ssh -s <host> sftp`, which on a live master is one more channel on the
 connection the panes already have, so nothing authenticates twice, and
 `BatchMode=yes` makes sure a file listing is never the thing that asks for a
-password. The rows come from the tree the Files page already has: `Tree` reads
-through a `Directory`, which is the disk on one page and, on the other, what has
-so far come back. That indirection is the whole of the rule that nothing remote
+password. When that refusal is what stops it, the page says so from what `ssh`
+wrote on its way out, read without waiting since a `ProxyCommand` can hold the
+pipe open after ssh has gone: a refused key says to connect in a pane first, an
+unknown host key says the pane is where ssh can ask about it, a server without
+SFTP says that, and anything else is ssh's own last line. Every one of them
+exits 255, so the text is all there is to tell them apart, and `LC_ALL=C` keeps
+it the text. After the handshake the pipe is drained into nothing by a small
+thread, because an ssh writing to a full pipe stops dead. The rows come from
+the tree the Files page already has: `Tree` reads through a `Directory`, which
+is the disk on one page and, on the other, what has so far come back. That indirection is the whole of the rule that nothing remote
 touches the main loop. A directory nobody has asked about yet reads as empty and
 a request goes out on a worker thread, the rows appear when the answer lands, and
 an answer about a host that is no longer the one on screen is dropped by a
@@ -949,36 +1063,120 @@ header takes a typed path, and the buttons under the thumb walk the history,
 which empties with the session since every path in it names a machine this page
 has left.
 
-Files move one at a time. A download is written beside where it is going under a
-dotted name and renamed onto it once it is whole, the discipline the editor
-already saves with, so an interrupted transfer costs the copy rather than
-leaving half a file under the name something else would open. An upload arrives
-with the permission bits it has here, which is what the `sftp` program does too:
-a script that runs on this machine runs on the other one. How far it has got is
+A connection that ends under the page is said rather than drawn around. A
+listing cut off before the far end said it was finished is no listing, since
+half a directory shown as the whole of it is a folder that looks emptier than it
+is, and the page puts the reason where the rows were with a Reconnect button
+under it. The button is the only thing that dials again. The panel syncs on its
+two-second timer, so asking again whenever the same host came round would ring a
+host that cannot be reached every two seconds for as long as the page is open.
+A name in a listing that holds a slash or a NUL, or is empty, is left out: a
+name is one component, and a server sending `../x` is either broken or hoping
+something here joins it onto a path.
+
+Files move one at a time. Both ways a file is written beside where it is going
+under a dotted name and renamed onto it once it is whole, the discipline the
+editor already saves with, so an interrupted transfer costs the copy rather than
+leaving half a file under the name something else would open. That matters most
+going up: a cancelled upload over a file that was already there used to leave
+that file truncated and then delete it, and now it leaves it untouched and
+sweeps only the temporary. A server that offers OpenSSH's `posix-rename`
+extension, which OpenSSH's own has for years, puts the new copy over the old in
+one step, the way `rename(2)` does. One that does not costs two more round
+trips at the end, a remove and a rename, since version 3 lets a server refuse a
+rename onto a taken name and OpenSSH's does, and the moment between them has
+nothing under the name. A name that was free gets the plain rename either way,
+which refuses rather than replaces whatever appeared there meanwhile. When the
+rename is what fails, the new copy is whole and the dialog says where it is.
+Both ways a file keeps the time it was last changed, as `gio copy` does on the
+desktop, so a sort by date says when somebody edited it rather than when it was
+fetched. A
+replaced file also changes owner to the account that logged in, the one thing a
+rename cannot carry across, and a directory that account may not write into gets
+the old in-place write instead, since a file it may write to is still worth
+sending. A new file arrives with the permission bits it has here, which is what
+the `sftp` program does too: a script that runs on this machine runs on the
+other one. A replaced one keeps the bits it had there, set on the handle past the
+far end's umask, and a symlink is followed to what it points at rather than
+replaced by a file. How far it has got is
 counted rather than guessed, since this drives the loop instead of reading
 another program's output, and the number reaches the progress bar through two
 integers a worker writes and a local timer reads, which is a timer over memory
-and not a poll of anything remote. What it is not is quick: one request is
-outstanding at a time, so a file crosses at one round trip per 32 KiB, roughly
-640 KB/s on a 50 ms link. The protocol's request ids exist so that sixty-four
-can be in the air at once and that is a later commit. A second transfer waits
-behind the first in a queue the bar counts down, since one pipe carries one file
-and a request blocked on a lock is the thing with nothing on screen to say so. A
-failure empties that queue rather than trying the rest: whatever the far end
-refused this file for is what the ones behind it were about to meet, and the
-dialog says how many were left where they are.
+and not a poll of anything remote. Up to sixty-four requests of 32 KiB are in
+the air at once, OpenSSH's own default, because one at a time made the round
+trip the speed limit: 640 KB/s on a 50 ms link however fast the link was. Over
+an emulated 50 ms link an 8 MiB file took 16.6 s down and 14.7 s up that way,
+and takes 0.9 s and 0.5 s now. A download opens its window one read at a time
+and widens it with every read answered in full, the way OpenSSH's client does,
+so a small file costs what it did. Answers may come back in any order and each
+lands at its own offset. A cancel or a refusal stops asking and still waits for
+what is in flight, so the next request on the session meets its own answer
+rather than a stale one. Files travel on a session of their own, opened by the
+first transfer and kept while the page is on that host or a file waits for it,
+so the listing goes on answering while a large file is under way. Over a shared
+connection that is one more channel on the master; without one it is a second
+login, as unattended as the first.
 
-Files dragged onto the page go up. They land in the directory being shown, or in
-the one whose row they were dropped on, and they queue like any other transfer.
-A folder is refused, and the refusal says what to reach for instead: there is no
-recursive copy here, and one written on top of a single outstanding request
-would lose to `rsync` at the job `rsync` exists for.
+A second transfer waits behind the first in a queue, since a request waiting on
+a busy session is the thing with nothing on screen to say so. The bar counts it
+down, and the list button beside it opens the queue itself: the file moving with
+a button that stops it, each one waiting with a button that takes it off, and
+each one that failed with why, kept until it is dismissed or "Clear Failed"
+empties the lot. The cross at the end of the bar still cancels everything
+going, and leaves the failures, which are news nobody has read yet. Every job
+names its host, so going to look at another machine no longer stops a file on
+its way to the last one: it finishes on its own host's session, which is let go
+of once nothing more is waiting for that host. A failure goes on the list rather
+than into a dialog, because a dialog for something that broke on a host the page
+has left stands in front of whatever is being done now. It takes the rest of its
+own host's queue with it and says how many: whatever the far end refused this
+file for is what the ones behind it were about to meet. Another host's files are
+on another connection and wait on. With nothing moving and something failed,
+the bar becomes a line saying how many, so a failure while the panel was out of
+sight is still there to find. The queue lives in memory: it does not survive a
+restart, and the list draws its first hundred rows and counts the rest.
+
+Files and folders dragged onto the page go up. They land in the directory being
+shown, or in the one whose row they were dropped on, and they queue like any
+other transfer. A folder goes across with everything in it, either way: "Upload
+Folder Here…" on a directory or the page's menu, "Download…" on a folder's row.
+This used to be refused with a pointer to `rsync`, because a recursive copy on top
+of one outstanding request would have lost to it badly. With sixty-four requests
+in the air and a session of its own, a folder of source or photos is now a
+reasonable thing to send from here, and `rsync` is still the tool for keeping two
+trees in step. The folder is walked whole before anything moves, so the bar
+counts bytes across all of it, and a folder of the same name already at the
+other end is a question, "Merge with …?", asked before anything is written: a
+file in both is replaced, through the same temporary name a single file uses, and
+the rest stays. A file landing on a file of the same name is the same question,
+"Replace …?", whichever way it is going, since a drop names no destination and
+used to replace what was there without a word. A name typed into the save dialog
+is the exception, because that dialog has just asked. Cancel skips that one and
+the queue behind it carries on. What was chosen is followed if it is a link, since that is what
+choosing it meant. Nothing inside it is: a link in a folder is either a loop back
+up it or a way out of it, so it is left out, and so is a device, a pipe, a name
+that is not text, and anything more than 32 folders deep, the same limit the
+Files page draws to. What was left out is counted and the first reason is given
+when the copy ends. A file that fails is counted too and the rest carry on, since
+one file the account may not read is no reason to leave the other two hundred
+where they are; a cancel or a lost connection stops it there. The walk stops at
+100,000 files and folders, a couple of dozen megabytes of plan, with a dialog
+that says a tree that size is a job for `rsync` or a shell. Each small file
+still costs about six round trips, so a tree of many tiny files over a far link
+is as slow as the link is far.
 
 Making a directory, renaming and deleting are the rest of it. Deleting asks
 first, and the question says that there is no trash on the other machine, since
 nothing here can put one there and a dialog that implies otherwise is a lie a
-person only finds out about once. A directory goes only when it is empty, which
-is the far end's rule and not this one's. Every change re-reads the directory it
+person only finds out about once. A folder is walked before the question, so
+it says what will go with it: "It holds 214 files and 9 folders." Then it is
+emptied from the bottom up, sixty-four removals in flight at once, each
+directory once what was in it has answered, since one round trip a name would
+make a build directory take minutes over a slow link. A link inside is removed
+and what it points at stays. Something that would not go is counted, the folder
+holding it then refuses as well, and the dialog afterwards says how many of how
+many. The walk and the removals hold the session the page browses with, so a
+very large tree stops the listing until it is gone. Every change re-reads the directory it
 happened in, because nothing over there will say what changed. What version 3
 will not say is why it refused: OpenSSH's server answers a name that is taken and
 a directory that is not empty with the same bare failure, whose text is the word
@@ -986,6 +1184,77 @@ a directory that is not empty with the same bare failure, whose text is the word
 should have answered, and the dialog says that something is already there with
 that name, or that the directory still has something in it, rather than repeating
 the far end's least useful word. That costs nothing until something goes wrong.
+
+A file's row carries its size at the right edge, and its tooltip adds the
+permissions as `ls -l` spells them and when it was last changed, all of it from
+the attributes the listing already brought back, so none of it costs a request.
+A folder shows no size because the far end's number for one is the size of the
+directory entry, not of what is in it, and adding that up is a walk. The list
+takes a selection the way the desktop's does, Ctrl and Shift with the click, and
+the row menu acts on all of it when the row it opened on is part of it:
+"Download…" asks for a folder and sends each item there, "Delete…" counts
+everything that goes in one question, and a file picked along with the folder
+that holds it is deleted once rather than failing the second time. The items are
+taken when the menu opens rather than when it is clicked, because a listing that
+lands in between rebuilds the rows and would hand the action a different set.
+Delete, F2 and Ctrl+L on the list are the menu's Delete, Rename and the typed
+path; the keys are read with Caps Lock and Num Lock masked off, since a Delete
+that only works with Caps Lock off is a key that sometimes does nothing. The
+typed path is the Files page's own bar: `~` is the far end's home, a relative
+path starts at the root being shown, and the answer is the far end's `realpath`
+and `stat`, so a name that is not a directory turns the bar red instead of
+listing nothing. "New File…" creates with the exclusive flag, which refuses a
+name that is taken rather than truncating what is there. "Properties…" shows
+the nine read, write and run bits as boxes with the octal beside them and sends
+a `chmod` only when a box changed; setuid, setgid and sticky are kept as they
+were, since a checkbox for them is a way to switch one off by accident.
+"Copy Remote Address" puts `alias:path` on the clipboard, which is what `scp`
+and `rsync` take. Hidden files are dimmed rather than filtered, as on the Files
+page, and there is no "Open Terminal Here": a pane on that host is the one
+already open, and typing a `cd` into it would land in whatever program it is
+running.
+
+A file on the host opens in an editor pane: activate its row, or "Edit" in its
+menu. The file is fetched into `$XDG_RUNTIME_DIR/tuni/sftp/<alias>/<path>`, a
+place named by nothing but the host and the path, so the same file opened twice
+is the pane that already has it, and a copy some pane holds is shown rather than
+fetched over an unsaved buffer. The editor does everything it does with a local
+file, except start a language server, which would index a runtime directory, and
+the line under the name says `alias:/dir` rather than where the copy lives.
+Saving writes the copy and then sends it back on a channel of its own, through
+the same temporary name and rename an upload uses. Before it writes, it compares
+the size and time the far end has now with what it had when the copy was fetched
+or last sent, and if somebody changed the file there meanwhile, or took it away,
+it asks "Overwrite …?" rather than replacing their work with an older base under
+it. Answering no leaves the copy saved here. A failure to send lands in the
+editor's banner, since the save itself worked and the dirty mark has gone. The
+look and the write are two requests, which version 3 cannot make one, so a change
+in between them is still overwritten. A file the editor would not open, past
+5 MiB or not a regular file, is refused by a `stat` before any of it moves.
+Copies are not swept when the pane closes: they sit on the tmpfs a logout
+empties, each one at most the 5 MiB the editor opens, and sweeping on close
+would race a save still on its way.
+
+A host's files also open in a pane of their own, beside the files here: the
+Files page's tree on the left, the Remote page's list on the right, and a handle
+between them that starts in the middle. "Browse Files" in a host's row menu, the
+palette's "Browse Files on …" for each host, and the button on the Remote page's
+header all open one next to the pane being worked in, with this side where a new
+shell would start. The pane belongs to its host, so the focus moving to another
+pane leaves it where it is, which is the difference from the panel. A row
+dragged from the left lands where a dropped file always has; one dragged from
+the right lands in the directory the left is standing in, fetched under its own
+name and queued like a download. A remote row travels as a type only this
+process reads, because a remote path handed out as a file would send a file
+manager looking for it on this disk. A local row travels as a file, so it also
+drops into a terminal as its path. The left side is read every two seconds while
+the pane is on screen and the window is in front, the cadence the panel uses,
+so a file just fetched shows up. A restored pane follows the rule a restored
+connection does: it reads over a connection that is already up, and otherwise
+says "Not Connected" with a button that dials, since a window opening should not
+log into a list of hosts on its own. The local directory is kept in the session
+file as the pane's directory, which is also what an older build that does not
+know the pane opens a shell in.
 
 sshfs would have been free: mount the host, and every page in this window works
 on it unchanged, the editor and the git panel included. It is the worst idea
@@ -1225,7 +1494,7 @@ which is why both are commits rather than branches; releases are built from the
 
 ### Updating
 
-No package repository carries Tuni yet: no COPR, no AUR, no PPA. A release
+Outside COPR no package repository carries Tuni: no AUR, no PPA. A release
 therefore does not arrive with the rest of a system's updates, and an installed
 copy would stay the version it was installed at forever. `scripts/install.sh`
 stands in for the package repository that does not exist:
@@ -1315,8 +1584,9 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `new-tab-inherit-directory` | `true` | Whether a new tab or split starts where the visible shell is. Off opens every one where a shell started outside the window would; one project is taken out of it from its own menu instead |
 | `ssh-term` | `"xterm-256color"` | What an ssh pane calls itself at the far end. Tuni's own `TERM` describes terminfo that is on this machine and not necessarily on the other one |
 | `ssh-share-connections` | `true` | Whether every pane on a host goes through one authenticated connection. Ignored for a host whose own configuration already sets `ControlPath`, which tuni adopts rather than overrides |
-| `ssh-control-persist` | `600` | Seconds a shared connection outlives the last pane using it, up to a day. Zero closes it with the pane |
+| `ssh-control-persist` | `600` | Seconds a shared connection outlives the last pane using it, up to a day. Zero closes it with the last pane, a second after, since `ControlPersist=0` is forever to ssh |
 | `ssh-reconnect-on-restore` | `false` | Whether a restored ssh pane dials with nothing to attach to. Off, so a window putting eight panes back cannot start eight logins |
+| `ssh-reconnect` | `false` | Whether a pane whose connection dropped dials again by itself, backing off from two seconds to a minute and giving up after about five. Off, because a retry is a login and one that asks for a code should not start while nobody is looking |
 | `check-updates` | `true` | Whether the window asks the GitHub release page for a newer version, once per run. Off leaves the menu's "Check for Updates" to do it by hand |
 | `panel.files`, `panel.git`, `panel.info`, `panel.debug` | `true` | Which pages the panel's switcher offers. The Remote page manages itself: it exists while a pane is on a host |
 | `agent.usage` | `true` | Whether the Info panel reads a coding agent's own session log. Off takes the Agent section away and stops every file below it from being opened |

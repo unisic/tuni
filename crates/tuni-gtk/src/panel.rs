@@ -47,6 +47,9 @@ mod imp {
         /// Held so the page can be taken off the switcher: there is nothing to
         /// browse until a pane is connected to something.
         pub sftp_page: RefCell<Option<adw::ViewStackPage>>,
+        /// The page asked for before there were pages to show it on: a session
+        /// restores the page of a panel that may stay closed all day.
+        pub pending_page: RefCell<Option<String>>,
     }
 
     #[glib::object_subclass]
@@ -56,13 +59,7 @@ mod imp {
         type ParentType = adw::Bin;
     }
 
-    impl ObjectImpl for TuniPanel {
-        fn constructed(&self) {
-            self.parent_constructed();
-            self.obj().build();
-        }
-    }
-
+    impl ObjectImpl for TuniPanel {}
     impl WidgetImpl for TuniPanel {}
     impl BinImpl for TuniPanel {}
 }
@@ -83,6 +80,25 @@ impl TuniPanel {
     #[must_use]
     pub fn new() -> Self {
         glib::Object::new()
+    }
+
+    /// Builds the pages, once, and says whether this was the call that did.
+    ///
+    /// Not in `constructed`: five pages and their switcher are about 4 MiB of
+    /// a window's PSS, measured, and a panel is closed until someone opens it,
+    /// which a launch may never do. The window calls this as the panel opens;
+    /// until then every page accessor answers `None` and `sync` and `poll`
+    /// have nothing to do, which is what they would do on a panel that is not
+    /// showing anyway.
+    pub fn ensure_built(&self) -> bool {
+        if self.imp().stack.borrow().is_some() {
+            return false;
+        }
+        self.build();
+        if let Some(page) = self.imp().pending_page.take() {
+            self.set_page(&page);
+        }
+        true
     }
 
     fn build(&self) {
@@ -162,8 +178,8 @@ impl TuniPanel {
         imp.debug_page.replace(Some(debug_page));
 
         // The window re-applies the settings whenever they change; what it
-        // cannot do is reach a panel that has not finished building, so the
-        // first read happens here.
+        // cannot do is reach a panel that had not been built yet, so the first
+        // read happens here.
         self.apply_settings(&Settings::load());
     }
 
@@ -288,20 +304,29 @@ impl TuniPanel {
     /// Which page is showing, by the name it is saved under.
     #[must_use]
     pub fn page(&self) -> String {
-        self.imp()
-            .stack
-            .borrow()
-            .as_ref()
-            .and_then(adw::ViewStack::visible_child_name)
+        let imp = self.imp();
+        let Some(stack) = imp.stack.borrow().clone() else {
+            return imp
+                .pending_page
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| FILES.to_owned());
+        };
+        stack
+            .visible_child_name()
             .map_or_else(|| FILES.to_owned(), |name| name.to_string())
     }
 
     /// Shows a page by name. An unknown name — a session file from a version
     /// with pages this one does not have — leaves the panel where it is.
     pub fn set_page(&self, name: &str) {
-        if let Some(stack) = self.imp().stack.borrow().as_ref()
-            && stack.child_by_name(name).is_some()
-        {
+        let imp = self.imp();
+        let Some(stack) = imp.stack.borrow().clone() else {
+            // Checked against the stack once there is one.
+            imp.pending_page.replace(Some(name.to_owned()));
+            return;
+        };
+        if stack.child_by_name(name).is_some() {
             stack.set_visible_child_name(name);
         }
     }

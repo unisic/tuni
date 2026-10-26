@@ -12,154 +12,68 @@ A native terminal workspace for Linux.
 
 ## Features
 
-- Split panes in a niri-style layout, grouped into projects and tabs; the
-  ones without the keyboard dim, and the keyboard can follow the mouse
-- File tree, git panel with hunk staging, and a source editor, in panes beside
-  the shells
-- Session inspector: what is running, what is listening, what a connection
-  forwards; a dev server's port opens in the browser from the palette
-- Command palette, tab switcher, find in whichever pane has the keyboard; the
-  checkout on screen opens in Files or in an installed editor from the palette
-- The checkout's own tasks in the palette: `package.json` scripts, `just`,
-  `make`, Taskfile and `mise`, each run in a pane beside the one on screen
-- The hosts `~/.ssh/config` already declares, one shared connection per machine,
-  and an SFTP page for the machine a pane is on
-- Kitty graphics, OSC 8 hyperlinks, desktop notifications, progress bars
-- A long command finishing in a tab you are not watching says so, with what it
-  was and how long it took
-- Scroll a command at a time in a shell that marks its prompts, reopen the last
-  five closed tabs, drag a tab or a whole project out into a window of its own
-  without restarting the shells in it
-- Type one command into every pane of a tab at once, and wipe the one being
-  typed with `Ctrl+Shift+Backspace` whatever the shell
-- A project's row takes an icon from the desktop's theme, or an emoji; a folder
-  dropped on the sidebar opens as a project
-- A tab in a git worktree of its own, on a new branch, so agents working side
-  by side never edit the same files; closing it offers to remove the worktree
-- A coding agent thinking in a pane spins on its tab and on its project, and
-  leaves an exclamation there when it finishes into a tab you are not watching;
-  `Ctrl+Shift+J` goes to the next tab that wants you. Any agent that spins its
-  title or reports its progress counts, with no list to add it to
-- The checkout's recent Claude Code conversations in the palette, each picked
-  up again in a tab of its own
-- Paste a screenshot and the agent gets it: an image on the clipboard pastes
-  as the path of a file holding it
-- Ghostty's 574 themes, which paint the window chrome as well as the terminal
-- The window comes back as it was left, once "Restore the Last Session" is on;
-  a fresh shell every time is the default
+- Split panes in a niri-style layout, grouped into projects and tabs
+- File tree, git panel with hunk staging, and a source editor beside the shells
+- The hosts `~/.ssh/config` declares, one shared connection per machine, and
+  SFTP for the machine a pane is on
+- Command palette, tab switcher, find, and an inspector for what is running
+  and listening
+- Kitty graphics, OSC 8 links, notifications, Ghostty's 574 themes
+- A finished command or coding agent in a tab you are not watching says so
+- A tab in a git worktree of its own, so agents working side by side never
+  edit the same files
 
 Rust and GTK4/libadwaita, with Ghostty's `libghostty-vt` doing the emulation.
-
-Connecting to another machine is OpenSSH's job here, not tuni's: a host opens by
-running `ssh` in a pane, so a password, a passphrase or a 2FA push is answered
-where it has always been answered. Tuni stores no secret and has nowhere to put
-one, which is also why hosts will never sync to a cloud account - syncing a
-credential means storing one.
-
-Tuni is a ground-up Linux implementation of the workspace
-[egoist/kero](https://github.com/egoist/kero) built for macOS. Kero's Swift
-source is read as a specification of behavior, not translated.
+A Linux implementation of [egoist/kero](https://github.com/egoist/kero), whose
+source is read as a specification, not translated. SSH is OpenSSH running in a
+pane, so Tuni stores no password, passphrase or key.
 
 ## Performance
 
-200 MiB of mixed plain and SGR-colored output, best of two runs, on one
-machine. Time to consume it, so window and shell startup cancel out.
+200 MiB of mixed output, best of five, nineteen terminals in one run on one
+machine. Startup is launch until the shell ran.
 
-| Terminal | Engine | Consume | Throughput |
-| --- | --- | ---: | ---: |
-| urxvt | X11, CPU | 1.579 s | 126.6 MiB/s |
-| foot | Wayland, CPU | 1.691 s | 118.3 MiB/s |
-| **tuni** | GTK4 + libghostty-vt | 1.723 s | **116.0 MiB/s** |
-| alacritty | GPU (OpenGL) | 1.785 s | 112.0 MiB/s |
-| kitty | GPU (OpenGL) | 1.807 s | 110.6 MiB/s |
-| st | X11, CPU | 2.215 s | 90.2 MiB/s |
-| ghostty | GTK4 + GPU | 2.785 s | 71.8 MiB/s |
-| terminator | VTE 0.84 | 2.829 s | 70.6 MiB/s |
-| ptyxis | VTE 0.84 | 2.835 s | 70.5 MiB/s |
-| gnome-terminal | VTE 0.84 | 2.852 s | 70.1 MiB/s |
-| tilix | VTE 0.84 | 2.884 s | 69.3 MiB/s |
-| sakura | VTE 0.84 | 2.892 s | 69.1 MiB/s |
-| xterm | X11, CPU | 3.726 s | 53.6 MiB/s |
-| qterminal | QTermWidget | 4.276 s | 46.7 MiB/s |
-| konsole | Qt | 4.634 s | 43.1 MiB/s |
-| lxterminal | VTE 0.84 | 9.825 s | 20.3 MiB/s |
-| xfce4-terminal | VTE 0.84 | 10.136 s | 19.7 MiB/s |
+| Terminal | Startup | First frame | PSS | Throughput |
+| --- | ---: | ---: | ---: | ---: |
+| **tuni** | **0.005 s** | 233 ms | 47.5 MiB | **151.4 MiB/s** |
+| foot | 0.016 s | 21 ms | 7.3 MiB | 132.2 MiB/s |
+| alacritty | 0.045 s | 57 ms | 30.3 MiB | 118.0 MiB/s |
+| kitty | 0.113 s | 94 ms | 47.8 MiB | 116.8 MiB/s |
+| ptyxis | 0.520 s | 525 ms | 48.2 MiB | 66.1 MiB/s |
+| ghostty | 0.531 s | 471 ms | 83.5 MiB | 56.7 MiB/s |
+| konsole | 0.125 s | 127 ms | 31.1 MiB | 42.5 MiB/s |
+| wezterm | 0.034 s | 69 ms | 61.5 MiB | 25.5 MiB/s |
 
-Third of seventeen, within 10% of the fastest thing measured and ahead of both
-GPU terminals - with a whole workspace drawn around the terminal.
-
-[docs/BENCHMARK.md](docs/BENCHMARK.md) - method, environment, caveats, and the
-head-to-head with alacritty that the table above is too close to settle.
+All nineteen, the method and the caveats: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 ## Install
-
-One line, which opens a menu and installs the package your distribution wants:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/unisic/tuni/main/scripts/install.sh | bash
 ```
 
-The menu says which version is installed, installs or updates to the newest
-one, offers an older release from the list, and removes Tuni again with or
-without your settings. `-y` does the install with no menu and `--check` only
-reports.
-
-Run it again to update, or let Tuni do it: it checks the release page once per
-run and offers an Update button that opens the installer in a tab, where sudo
-has somewhere to ask for your password. Preferences - Session - Updates turns
-the check off.
-
-Every [release](https://github.com/unisic/tuni/releases) carries the same three
-packages for installing by hand:
+On Fedora, COPR instead:
 
 ```sh
-sudo dnf install ./tuni-*.rpm            # Fedora 44+
-sudo apt install ./tuni_*_amd64.deb      # Ubuntu 26.04+
-sudo pacman -U ./tuni-*-x86_64.pkg.tar.zst
+sudo dnf copr enable debondor/Tuni && sudo dnf install tuni
 ```
 
-Or from source, which is what all three do:
-
-```sh
-sudo make install PREFIX=/usr
-```
-
-`packaging/` holds those three recipes and a Flatpak manifest, each calling
-into that same target.
+Every [release](https://github.com/unisic/tuni/releases) also carries an RPM,
+a DEB and an Arch package. Tuni offers updates itself; Preferences - Session -
+Updates turns that off.
 
 ## Building
-
-Needs a Rust toolchain, GTK4, libadwaita, GtkSourceView and SQLite headers, and
-Zig 0.15.2, since `libghostty-vt` is Zig source compiled during the build.
 
 ```sh
 sudo dnf install cargo rust gcc make git-core curl tar xz \
     gtk4-devel libadwaita-devel gtksourceview5-devel sqlite-devel
-make zig
-cargo run --release
+make zig                        # Zig 0.15.2 into ~/.local, which the build needs
+cargo run --release             # make dev while an installed Tuni runs
+sudo make install PREFIX=/usr
 ```
 
-With Tuni installed and running, `make dev` instead: `cargo run` hands its
-window to the Tuni already up, which is the old version. `make dev` runs the
-build as an application of its own, and leaves the saved session alone.
-
-That is the list CI installs, so a machine with it builds what the release
-builds. Fedora's own `rust` is new enough; on a distribution whose is not,
-`rustup` puts a current toolchain beside it.
-
-`make zig` fetches the official 0.15.2 tarball into `~/.local`, because the
-distribution's own package is 0.16 by now and the pinned Ghostty commit does
-not build against it. To build the 0.16 way instead - that toolchain, and the
-newer Ghostty commit which requires it - `make build-next`.
-
-`make check` is what CI runs: format, clippy, tests, and the desktop and
-AppStream files. It needs four more packages, and none of them are needed to
-build:
-
-```sh
-sudo dnf install rustfmt clippy desktop-file-utils appstream
-make check
-```
+`make check` runs what CI runs and needs `rustfmt clippy desktop-file-utils
+appstream openssh-server` on top. [AGENTS.md](AGENTS.md) has the rest.
 
 ## Configuration
 
@@ -170,9 +84,6 @@ readable without it. The session lives under `~/.local/share/tuni`.
 
 [docs/DESIGN.md](docs/DESIGN.md) - every feature, every keyboard shortcut, and
 why each piece is built the way it is.
-
-[AGENTS.md](AGENTS.md) - the map a coding agent is handed: the commands, the
-four crates, and the rules that span files. `CLAUDE.md` is a symlink to it.
 
 ## License
 

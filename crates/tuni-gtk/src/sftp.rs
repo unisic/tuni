@@ -11,8 +11,9 @@
 //! reads on navigation, and when somebody asks it to.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -23,7 +24,7 @@ use gtk::gio;
 use gtk::glib;
 
 use tuni_core::files::{Directory, Failure, Item, Tree, natural_cmp};
-use tuni_core::sftp::Session;
+use tuni_core::sftp::{Job, Queue, Session, Way, summary};
 
 use crate::files::bind_row;
 use crate::files::row::Row;
@@ -44,12 +45,15 @@ pub struct Moved {
     stop: AtomicBool,
 }
 
-/// One file waiting its turn. A drop of five files is five of these, four of
-/// them behind the one the pipe is carrying.
-pub struct Job {
-    way: Way,
-    remote: String,
-    local: PathBuf,
+/// What a drag off the list carries: the rows, and the page they came off,
+/// since that page holds the connection they are fetched over. A type only
+/// this process knows, on purpose: a file manager handed a remote path as a
+/// file would go looking for it on this disk.
+#[derive(Clone, glib::Boxed)]
+#[boxed_type(name = "TuniRemoteRows")]
+pub struct Dragged {
+    pub source: glib::WeakRef<TuniSftp>,
+    pub items: Vec<Item>,
 }
 
 /// The directories that have come back, which is everything there is to draw.
@@ -64,8 +68,8 @@ impl Directory for Listed {
 
 mod imp {
     use super::{
-        Arc, Cell, HashSet, Item, Job, Link, Listed, Moved, PathBuf, RefCell, Tree, VecDeque, gio,
-        glib,
+        Arc, Cell, HashSet, Item, Job, Link, Listed, Moved, PathBuf, Queue, RefCell, Session, Tree,
+        gio, glib,
     };
     use adw::prelude::*;
     use adw::subclass::prelude::*;
@@ -75,6 +79,14 @@ mod imp {
         pub tree: RefCell<Tree>,
         pub listed: RefCell<Listed>,
         pub link: RefCell<Option<Link>>,
+        /// A second session that only carries files, so a long one does not
+        /// hold the listing behind its lock. Opened by the first transfer
+        /// rather than with the page, since most visits never move a file,
+        /// and kept while the page is on its host or a job waits for it. A
+        /// transfer takes it and hands it back, which is all the sharing one
+        /// transfer at a time needs. Named by its host, because the queue
+        /// outlives the page's visit to one.
+        pub carrier: RefCell<Option<(String, Session)>>,
         /// The host being browsed, and nothing at all when no pane is on one.
         pub alias: RefCell<Option<String>>,
         /// Bumped when the host changes. A listing already in flight names the
@@ -88,28 +100,45 @@ mod imp {
         pub list: RefCell<Option<gtk::ListView>>,
         pub stack: RefCell<Option<gtk::Stack>>,
         pub status: RefCell<Option<adw::StatusPage>>,
+        /// Under the sentence when the connection is what failed, since the
+        /// panel asks again only when the host changes.
+        pub reconnect: RefCell<Option<gtk::Button>>,
+        /// Opens the host being browsed in a pane of its own, beside the files
+        /// here. Hidden on the page that already is that pane.
+        pub beside: RefCell<Option<gtk::Button>>,
         pub title: RefCell<Option<gtk::Label>>,
         pub subtitle: RefCell<Option<gtk::Label>>,
         pub menu: RefCell<Option<gtk::PopoverMenu>>,
         pub progress: RefCell<Option<gtk::ProgressBar>>,
-        /// The bar and its cancel button, shown and hidden as one.
+        /// The bar, the list of transfers and the cancel button, shown while
+        /// any of them has something to say.
         pub progress_row: RefCell<Option<gtk::Box>>,
-        /// The transfer running, if one is. One pipe carries one at a time, so
-        /// a second would sit behind the lock with nothing on screen saying
-        /// why; this is what refuses it instead.
-        pub moving: RefCell<Option<Arc<Moved>>>,
-        /// What is waiting for the pipe, in the order it was asked for. A drop
-        /// of a directory's worth of files fills this and empties it one file
-        /// at a time.
-        pub queue: RefCell<VecDeque<Job>>,
+        /// In place of the bar once nothing is moving and something failed.
+        pub failed: RefCell<Option<gtk::Label>>,
+        pub cancel: RefCell<Option<gtk::Button>>,
+        /// The rows of the transfers popover, rebuilt each time it opens and
+        /// whenever a transfer changes while it is open.
+        pub transfers: RefCell<Option<gtk::ListBox>>,
+        pub transfers_popover: RefCell<Option<gtk::Popover>>,
+        /// The transfer running, if one is. The carrier moves one at a time,
+        /// so a second waits in [`Self::queue`] where the list can show it.
+        pub moving: RefCell<Option<(Job, Arc<Moved>)>>,
+        /// What is waiting for the pipe, in the order it was asked for, and
+        /// what failed. A drop of a directory's worth of files fills it and
+        /// empties it one file at a time.
+        pub queue: RefCell<Queue>,
         /// Where browsing has been, and where it was called back from, on the
         /// host being browsed now. Emptied with the session, since both are
         /// paths on a machine the page has left.
         pub back: RefCell<Vec<PathBuf>>,
         pub forward: RefCell<Vec<PathBuf>>,
-        /// The row whose context menu is open, and so the one its actions act
-        /// on.
-        pub target: RefCell<Option<Item>>,
+        /// The rows a context menu or a key was opened on, and so the ones its
+        /// actions act on. Taken when it opens rather than read from the
+        /// selection when it is chosen, since a listing landing in between
+        /// rebuilds the rows and the selection with them.
+        pub targets: RefCell<Vec<Item>>,
+        pub location: RefCell<Option<gtk::Entry>>,
+        pub location_bar: RefCell<Option<gtk::Revealer>>,
     }
 
     #[glib::object_subclass]
@@ -182,8 +211,18 @@ impl TuniSftp {
             .build();
         up.add_css_class("flat");
 
+        let jump = gtk::Button::builder()
+            .icon_name("folder-open-symbolic")
+            .tooltip_text("Go to Directory")
+            .action_name("sftp.location")
+            .valign(gtk::Align::Center)
+            .build();
+        jump.add_css_class("flat");
+
         let here = gio::Menu::new();
         here.append(Some("Upload File Here…"), Some("sftp.upload-here"));
+        here.append(Some("Upload Folder Here…"), Some("sftp.upload-folder-here"));
+        here.append(Some("New File…"), Some("sftp.new-file-here"));
         here.append(Some("New Folder…"), Some("sftp.new-folder-here"));
         let more = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
@@ -208,17 +247,70 @@ impl TuniSftp {
         header.set_margin_bottom(8);
         header.append(&names);
         header.append(&up);
+        header.append(&jump);
         header.append(&more);
+
+        let (location_bar, location) = crate::files::location_bar(
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |text: &str| this.go_to(text)
+            ),
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move || this.show_location(false)
+            ),
+        );
         header.append(&refresh);
+
+        // Its action and target are set with the host, since an action that
+        // takes a host and is handed none is a warning on every redraw.
+        let beside = gtk::Button::builder()
+            .icon_name("view-dual-symbolic")
+            .tooltip_text("Open in Pane")
+            .valign(gtk::Align::Center)
+            .build();
+        beside.add_css_class("flat");
+        header.append(&beside);
 
         let progress = gtk::ProgressBar::builder()
             .show_text(true)
             .hexpand(true)
             .valign(gtk::Align::Center)
             .build();
+        let failed = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .visible(false)
+            .build();
+        failed.add_css_class("error");
+        let transfers = gtk::ListBox::new();
+        transfers.set_selection_mode(gtk::SelectionMode::None);
+        let scrolled = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(320)
+            .min_content_width(280)
+            .child(&transfers)
+            .build();
+        let transfers_popover = gtk::Popover::new();
+        transfers_popover.set_child(Some(&scrolled));
+        transfers_popover.connect_show(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.list_transfers()
+        ));
+        let list_button = gtk::MenuButton::builder()
+            .icon_name("view-list-symbolic")
+            .tooltip_text("Transfers")
+            .popover(&transfers_popover)
+            .valign(gtk::Align::Center)
+            .build();
+        list_button.add_css_class("flat");
         let cancel = gtk::Button::builder()
             .icon_name("window-close-symbolic")
-            .tooltip_text("Cancel Transfer")
+            .tooltip_text("Cancel All Transfers")
             .valign(gtk::Align::Center)
             .build();
         cancel.add_css_class("flat");
@@ -233,14 +325,15 @@ impl TuniSftp {
         progress_row.set_margin_bottom(6);
         progress_row.set_visible(false);
         progress_row.append(&progress);
+        progress_row.append(&failed);
+        progress_row.append(&list_button);
         progress_row.append(&cancel);
 
         let rows = gio::ListStore::new::<Row>();
-        let selection = gtk::SingleSelection::builder()
-            .model(&rows)
-            .autoselect(false)
-            .can_unselect(true)
-            .build();
+        // Several at once, with the clicks and keys a file manager takes for
+        // that, because deleting or fetching twenty files one menu at a time is
+        // twenty menus.
+        let selection = gtk::MultiSelection::new(Some(rows.clone()));
 
         let factory = gtk::SignalListItemFactory::new();
         factory.connect_setup(glib::clone!(
@@ -256,6 +349,41 @@ impl TuniSftp {
             .vexpand(true)
             .build();
         list.add_css_class("navigation-sidebar");
+        // On the list, not the window: Delete and F2 mean nothing to a shell
+        // in the pane beside it, and the list is what has the focus when they
+        // are meant for it.
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, modifiers| {
+                // Caps Lock and Num Lock are modifiers too, and say nothing
+                // about which key was meant.
+                let held = modifiers
+                    & (gdk::ModifierType::CONTROL_MASK
+                        | gdk::ModifierType::ALT_MASK
+                        | gdk::ModifierType::SHIFT_MASK);
+                let plain = held.is_empty();
+                match key {
+                    gdk::Key::Delete | gdk::Key::KP_Delete if plain => {
+                        this.delete(this.selected());
+                    }
+                    gdk::Key::F2 if plain => {
+                        if let [item] = this.selected().as_slice() {
+                            this.rename(item);
+                        }
+                    }
+                    gdk::Key::l if held == gdk::ModifierType::CONTROL_MASK => {
+                        this.show_location(true);
+                    }
+                    _ => return glib::Propagation::Proceed,
+                }
+                glib::Propagation::Stop
+            }
+        ));
+        list.add_controller(keys);
         list.connect_activate(glib::clone!(
             #[weak(rename_to = this)]
             self,
@@ -266,10 +394,10 @@ impl TuniSftp {
                     .and_downcast::<Row>();
                 // Stepped into, which is what the parent button undoes. The
                 // chevron is the one that opens a directory in place.
-                if let Some(item) = row.and_then(|row| row.item())
-                    && item.is_directory
-                {
-                    this.browse(&item.path);
+                match row.and_then(|row| row.item()) {
+                    Some(item) if item.is_directory => this.browse(&item.path),
+                    Some(item) => this.edit(&item),
+                    None => {}
                 }
             }
         ));
@@ -300,9 +428,21 @@ impl TuniSftp {
         ));
         scroller.add_controller(drop);
 
+        let reconnect = gtk::Button::builder()
+            .label("Reconnect")
+            .halign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        reconnect.add_css_class("pill");
+        reconnect.connect_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| this.reconnect()
+        ));
         let status = adw::StatusPage::builder()
             .icon_name("network-server-symbolic")
             .vexpand(true)
+            .child(&reconnect)
             .build();
 
         let stack = gtk::Stack::new();
@@ -312,6 +452,7 @@ impl TuniSftp {
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&header);
+        content.append(&location_bar);
         content.append(&progress_row);
         content.append(&stack);
         self.set_child(Some(&content));
@@ -323,11 +464,19 @@ impl TuniSftp {
         imp.list.replace(Some(list));
         imp.stack.replace(Some(stack));
         imp.status.replace(Some(status));
+        imp.reconnect.replace(Some(reconnect));
+        imp.beside.replace(Some(beside));
         imp.title.replace(Some(title));
         imp.subtitle.replace(Some(subtitle));
         imp.menu.replace(Some(menu));
         imp.progress.replace(Some(progress));
         imp.progress_row.replace(Some(progress_row));
+        imp.failed.replace(Some(failed));
+        imp.cancel.replace(Some(cancel));
+        imp.transfers.replace(Some(transfers));
+        imp.transfers_popover.replace(Some(transfers_popover));
+        imp.location.replace(Some(location));
+        imp.location_bar.replace(Some(location_bar));
 
         self.say(
             "No Connection",
@@ -335,9 +484,9 @@ impl TuniSftp {
         );
     }
 
-    /// One row's widgets, in the shape [`bind_row`] fills: a chevron, an icon
-    /// and a name. The chevron opens a directory on one click, which the row
-    /// itself asks two for.
+    /// One row's widgets, in the shape [`bind_row`] fills: a chevron, an icon,
+    /// a name and a size. The chevron opens a directory on one click, which
+    /// the row itself asks two for.
     fn setup_row(&self, object: &glib::Object) {
         let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -352,10 +501,16 @@ impl TuniSftp {
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .build();
 
+        let size = gtk::Label::builder().xalign(1.0).build();
+        size.add_css_class("caption");
+        size.add_css_class("dim-label");
+        size.add_css_class("numeric");
+
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         content.append(&expander);
         content.append(&icon);
         content.append(&label);
+        content.append(&size);
 
         let toggle = gtk::GestureClick::new();
         toggle.connect_released(glib::clone!(
@@ -415,9 +570,9 @@ impl TuniSftp {
                 // Selected while the pointer is over it, since a row that is
                 // about to be dropped on should say so before the drop.
                 if let Some(list) = this.imp().list.borrow().as_ref()
-                    && let Some(selection) = list.model().and_downcast::<gtk::SingleSelection>()
+                    && let Some(selection) = list.model()
                 {
-                    selection.set_selected(list_item.position());
+                    selection.select_item(list_item.position(), true);
                 }
                 gdk::DragAction::COPY
             }
@@ -447,6 +602,45 @@ impl TuniSftp {
         ));
         content.add_controller(drop);
 
+        // Dragged, a row takes the selection with it if it is in it, and goes
+        // alone otherwise, the same rule the context menu follows.
+        let drag = gtk::DragSource::new();
+        drag.set_actions(gdk::DragAction::COPY);
+        drag.connect_prepare(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            list_item,
+            #[upgrade_or]
+            None,
+            move |_, _, _| {
+                let item = list_item
+                    .item()
+                    .and_downcast::<Row>()
+                    .and_then(|row| row.item())?;
+                if let Some(selection) = this
+                    .imp()
+                    .list
+                    .borrow()
+                    .as_ref()
+                    .and_then(|list| list.model())
+                    && !selection.is_selected(list_item.position())
+                {
+                    selection.select_item(list_item.position(), true);
+                }
+                let mut items = this.selected();
+                if items.is_empty() {
+                    items.push(item);
+                }
+                let dragged = Dragged {
+                    source: this.downgrade(),
+                    items,
+                };
+                Some(gdk::ContentProvider::for_value(&dragged.to_value()))
+            }
+        ));
+        content.add_controller(drag);
+
         list_item.set_child(Some(&content));
     }
 
@@ -468,25 +662,40 @@ impl TuniSftp {
             entry("back", self, |sftp| sftp.walk(false)),
             entry("forward", self, |sftp| sftp.walk(true)),
             entry("refresh", self, TuniSftp::reread),
-            entry("download", self, |sftp| {
-                let target = sftp.imp().target.borrow().clone();
-                if let Some(item) = target.filter(|item| !item.is_directory) {
-                    sftp.download(&item);
+            entry("location", self, |sftp| {
+                let bar = sftp.imp().location_bar.borrow().clone();
+                let open = bar.is_some_and(|bar| bar.reveals_child());
+                sftp.show_location(!open);
+            }),
+            entry("edit", self, |sftp| {
+                if let Some(item) = sftp.target().filter(|item| !item.is_directory) {
+                    sftp.edit(&item);
                 }
             }),
+            entry("download", self, |sftp| {
+                let targets = sftp.imp().targets.borrow().clone();
+                sftp.download(targets);
+            }),
             entry("upload", self, |sftp| {
-                let target = sftp.imp().target.borrow().clone();
-                if let Some(item) = target.filter(|item| item.is_directory) {
-                    sftp.upload(&item.path);
+                if let Some(item) = sftp.folder_target() {
+                    sftp.upload(&item.path, false);
+                }
+            }),
+            entry("upload-folder", self, |sftp| {
+                if let Some(item) = sftp.folder_target() {
+                    sftp.upload(&item.path, true);
                 }
             }),
             entry("upload-here", self, |sftp| {
                 let root = sftp.imp().tree.borrow().root().to_path_buf();
-                sftp.upload(&root);
+                sftp.upload(&root, false);
+            }),
+            entry("upload-folder-here", self, |sftp| {
+                let root = sftp.imp().tree.borrow().root().to_path_buf();
+                sftp.upload(&root, true);
             }),
             entry("new-folder", self, |sftp| {
-                let target = sftp.imp().target.borrow().clone();
-                if let Some(item) = target.filter(|item| item.is_directory) {
+                if let Some(item) = sftp.folder_target() {
                     sftp.new_folder(&item.path);
                 }
             }),
@@ -494,21 +703,41 @@ impl TuniSftp {
                 let root = sftp.imp().tree.borrow().root().to_path_buf();
                 sftp.new_folder(&root);
             }),
+            entry("new-file", self, |sftp| {
+                if let Some(item) = sftp.folder_target() {
+                    sftp.new_file(&item.path);
+                }
+            }),
+            entry("new-file-here", self, |sftp| {
+                let root = sftp.imp().tree.borrow().root().to_path_buf();
+                sftp.new_file(&root);
+            }),
             entry("rename", self, |sftp| {
-                let target = sftp.imp().target.borrow().clone();
-                if let Some(item) = target {
+                if let Some(item) = sftp.target() {
                     sftp.rename(&item);
                 }
             }),
             entry("delete", self, |sftp| {
-                let target = sftp.imp().target.borrow().clone();
-                if let Some(item) = target {
-                    sftp.delete(&item);
+                let targets = sftp.imp().targets.borrow().clone();
+                sftp.delete(targets);
+            }),
+            entry("properties", self, |sftp| {
+                if let Some(item) = sftp.target() {
+                    sftp.properties(&item);
                 }
             }),
             entry("copy-path", self, |sftp| {
-                if let Some(item) = sftp.imp().target.borrow().as_ref() {
+                if let Some(item) = sftp.target() {
                     sftp.clipboard().set_text(&item.path.to_string_lossy());
+                }
+            }),
+            // Host and path in the one string `scp` and `rsync` take, under the
+            // name the pane connected with.
+            entry("copy-address", self, |sftp| {
+                let alias = sftp.imp().alias.borrow().clone();
+                if let (Some(alias), Some(item)) = (alias, sftp.target()) {
+                    let address = format!("{alias}:{}", item.path.to_string_lossy());
+                    sftp.clipboard().set_text(&address);
                 }
             }),
         ]);
@@ -524,22 +753,44 @@ impl TuniSftp {
     /// the focus moves, so a host that has not changed is left entirely alone:
     /// re-reading it here would be a round trip per click.
     pub fn sync(&self, host: Option<&str>) {
+        self.point(host, true);
+    }
+
+    /// Puts the page on one host for good, which is what a pane of its own
+    /// is: the focus moving elsewhere is no reason for it to follow. `dial`
+    /// false is a window putting the pane back, and then it reads only over
+    /// a connection that is already up, the rule a restored shell follows,
+    /// and says how to open one otherwise.
+    pub fn open_host(&self, alias: &str, dial: bool) {
+        if let Some(beside) = self.imp().beside.borrow().as_ref() {
+            beside.set_visible(false);
+        }
+        self.point(Some(alias), dial);
+    }
+
+    fn point(&self, host: Option<&str>, dial: bool) {
         let imp = self.imp();
         if imp.alias.borrow().as_deref() == host {
             return;
         }
+        if let Some(beside) = imp.beside.borrow().as_ref() {
+            beside.set_action_target_value(host.map(ToVariant::to_variant).as_ref());
+            beside.set_action_name(host.map(|_| "win.browse-files"));
+        }
         imp.generation.set(imp.generation.get().wrapping_add(1));
         imp.alias.replace(host.map(ToOwned::to_owned));
         imp.pending.borrow_mut().clear();
-        // Queued against the host that is going away, and every one of them
-        // names a path on it. The history goes with them, for the same reason.
-        imp.queue.borrow_mut().clear();
+        // The history names paths on the host that is going away. The queue
+        // does too, but each job knows its host, and a file halfway up to one
+        // machine has no reason to stop because the page went to look at
+        // another.
         imp.back.borrow_mut().clear();
         imp.forward.borrow_mut().clear();
         imp.listed.replace(Listed::default());
         // Dropped, which kills the child and lets the master close the
         // channel. A session is one host's, and this is another host now.
         imp.link.replace(None);
+        self.release();
         *imp.tree.borrow_mut() = Tree::new();
         self.reload();
         self.refresh_header();
@@ -552,11 +803,60 @@ impl TuniSftp {
             return;
         };
         self.say(&format!("Opening {alias}"), "");
-        self.open(alias.to_owned());
+        self.open(alias.to_owned(), dial);
+    }
+
+    /// The button under a failure: the same host, from the start.
+    ///
+    /// Not done on its own when the host comes round again, because the panel
+    /// syncs on a timer and a host that cannot be reached would be dialled
+    /// every two seconds for as long as the page is open.
+    fn reconnect(&self) {
+        let alias = self.imp().alias.take();
+        self.sync(alias.as_deref());
+    }
+
+    /// Lets go of a session that will not answer again, and says why in place
+    /// of a listing that can no longer be trusted.
+    ///
+    /// The carrier goes too when it is this host's, since it came over the
+    /// same connection. What is queued stays: the first of this host's jobs
+    /// to meet the same failure takes the rest with it, and the other hosts'
+    /// jobs were never on this connection.
+    fn lose(&self, failure: &Failure) {
+        let imp = self.imp();
+        imp.link.replace(None);
+        let alias = imp.alias.borrow().clone();
+        let mine = matches!(
+            (imp.carrier.borrow().as_ref(), alias),
+            (Some((carried, _)), Some(alias)) if *carried == alias
+        );
+        if mine {
+            imp.carrier.replace(None);
+        }
+        imp.pending.borrow_mut().clear();
+        self.fail(&failure.message, &failure.detail);
+    }
+
+    /// Drops the carrier if nothing needs it: not the host the page is on, and
+    /// nothing waiting to go to or from the host it is for. A transfer that is
+    /// running has it, so there is nothing here to drop while it does.
+    fn release(&self) {
+        let imp = self.imp();
+        let idle = match imp.carrier.borrow().as_ref() {
+            Some((carried, _)) => {
+                imp.alias.borrow().as_deref() != Some(carried.as_str())
+                    && !imp.queue.borrow().wants(carried)
+            }
+            None => false,
+        };
+        if idle {
+            imp.carrier.replace(None);
+        }
     }
 
     /// Starts a session and lists whatever the far end calls home.
-    fn open(&self, alias: String) {
+    fn open(&self, alias: String, dial: bool) {
         let generation = self.imp().generation.get();
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
@@ -566,19 +866,11 @@ impl TuniSftp {
                 let Ok(opened) = gio::spawn_blocking(move || {
                     let control = crate::hosts::control();
                     let host = tuni_core::ssh::host(&alias);
+                    if !dial && !control.is_live(&host.target()) {
+                        return None;
+                    }
                     let argv = tuni_core::ssh::sftp_command(&host, &control);
-                    let Some(mut session) = Session::open(&argv) else {
-                        return Err(String::from(
-                            "Nothing here can answer a password or a passphrase, \
-                             so the connection has to be open already. Connect \
-                             the host in a pane first.",
-                        ));
-                    };
-                    let Some(home) = session.realpath(".") else {
-                        return Err(reason(&session));
-                    };
-                    let rows = rows(&mut session, &home).ok_or_else(|| reason(&session))?;
-                    Ok((session, PathBuf::from(home), rows))
+                    Some(connect(&argv))
                 })
                 .await
                 else {
@@ -588,7 +880,12 @@ impl TuniSftp {
                     return;
                 }
                 match opened {
-                    Ok((session, home, rows)) => {
+                    None => this.tell(
+                        &format!("Not Connected to {name}"),
+                        "A window putting its panes back does not dial on its own.",
+                        Some("Connect"),
+                    ),
+                    Some(Ok((session, home, rows))) => {
                         this.imp().link.replace(Some(Arc::new(Mutex::new(session))));
                         this.imp().listed.borrow_mut().0.insert(home.clone(), rows);
                         this.imp()
@@ -599,7 +896,7 @@ impl TuniSftp {
                         this.reload();
                         this.refresh_header();
                     }
-                    Err(detail) => this.say(&format!("Couldn't Read {name}"), &detail),
+                    Some(Err(detail)) => this.fail(&format!("Couldn't Read {name}"), &detail),
                 }
             }
         ));
@@ -678,7 +975,10 @@ impl TuniSftp {
     /// directory that is open under it.
     fn reread(&self) {
         let imp = self.imp();
+        // With nothing to re-read it dials, which is the one thing the button
+        // can usefully mean over a host the page is not connected to.
         if imp.link.borrow().is_none() {
+            self.reconnect();
             return;
         }
         let open: Vec<PathBuf> = imp.listed.borrow().0.keys().cloned().collect();
@@ -704,9 +1004,12 @@ impl TuniSftp {
             self,
             async move {
                 let remote = path.to_string_lossy().into_owned();
-                let Ok(listed) = gio::spawn_blocking(move || {
-                    let mut session = link.lock().ok()?;
-                    rows(&mut session, &remote)
+                let Ok((listed, gone)) = gio::spawn_blocking(move || {
+                    let Ok(mut session) = link.lock() else {
+                        return (None, Some(ended()));
+                    };
+                    let listed = rows(&mut session, &remote);
+                    (listed, gone(&session))
                 })
                 .await
                 else {
@@ -716,6 +1019,10 @@ impl TuniSftp {
                     return;
                 }
                 this.imp().pending.borrow_mut().remove(&path);
+                if let Some(failure) = gone {
+                    this.lose(&failure);
+                    return;
+                }
                 // A directory that would not open is left closed and left
                 // where it is: the row above it is still a row, and the tree
                 // has nowhere to say more than that.
@@ -740,65 +1047,170 @@ impl TuniSftp {
 
     // --- moving files ---------------------------------------------------------
 
-    /// Copies one remote file to wherever the user says.
-    fn download(&self, item: &Item) {
+    /// Opens a remote file in an editor pane, from a copy fetched over the
+    /// browsing session; saving the pane sends the copy back.
+    ///
+    /// A copy some pane already has open is shown rather than fetched again,
+    /// since fetching would write the far end's text under an unsaved buffer,
+    /// and so is one whose last save never reached the far end.
+    fn edit(&self, item: &Item) {
+        let imp = self.imp();
+        let Some(window) = self.root().and_downcast::<crate::window::TuniWindow>() else {
+            return;
+        };
+        let Some(alias) = imp.alias.borrow().clone() else {
+            return;
+        };
         let remote = item.path.to_string_lossy().into_owned();
+        let Some(local) = tuni_core::sftp::copy_path(&alias, &remote) else {
+            self.report(&Failure {
+                message: format!("Couldn't edit {remote}."),
+                detail: String::from("The host or the path cannot name a file on this machine."),
+            });
+            return;
+        };
+        if window.is_editing(&local) {
+            window.open_file(&local);
+            return;
+        }
+        let Some(link) = imp.link.borrow().clone() else {
+            return;
+        };
+        let generation = imp.generation.get();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            window,
+            async move {
+                let into = local.clone();
+                let Ok(fetched) = gio::spawn_blocking(move || {
+                    let Ok(mut session) = link.lock() else {
+                        return Err((ended(), true));
+                    };
+                    session
+                        .fetch_to_edit(&remote, &into)
+                        .ok_or_else(|| (failed(&session), session.is_lost()))
+                })
+                .await
+                else {
+                    return;
+                };
+                if generation != this.imp().generation.get() {
+                    return;
+                }
+                match fetched {
+                    Ok(()) => window.edit_fetched(&local),
+                    Err((failure, true)) => this.lose(&failure),
+                    Err((failure, false)) => this.report(&failure),
+                }
+            }
+        ));
+    }
+
+    /// Copies one remote file to wherever the user says, or folders and
+    /// several files, each under its own name, into the folder the user picks.
+    fn download(&self, items: Vec<Item>) {
+        let one_file = match items.as_slice() {
+            [] => return,
+            [item] if !item.is_directory => Some(item.name.clone()),
+            _ => None,
+        };
         let dialog = gtk::FileDialog::builder()
-            .title("Download File")
+            .title(match items.as_slice() {
+                [item] if item.is_directory => "Download Folder",
+                [_] => "Download File",
+                _ => "Download",
+            })
             .accept_label("Download")
-            .initial_name(&item.name)
             .build();
         if let Some(folder) = glib::user_special_dir(glib::UserDirectory::Downloads) {
             dialog.set_initial_folder(Some(&gio::File::for_path(folder)));
         }
-        dialog.save(
-            self.window().as_ref(),
-            gio::Cancellable::NONE,
-            glib::clone!(
-                #[weak(rename_to = this)]
-                self,
-                move |chosen| {
-                    if let Some(local) = chosen.ok().and_then(|file| file.path()) {
-                        this.start(Way::Down, remote, local);
-                    }
+        let into_folder = one_file.is_none();
+        let chosen = glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |chosen: Result<gio::File, glib::Error>| {
+                let Some(local) = chosen.ok().and_then(|file| file.path()) else {
+                    return;
+                };
+                for item in items {
+                    let local = if into_folder {
+                        local.join(&item.name)
+                    } else {
+                        local.clone()
+                    };
+                    // A name typed into the save dialog was asked about there.
+                    this.start(
+                        Way::Down,
+                        item.path.to_string_lossy().into_owned(),
+                        local,
+                        !into_folder,
+                    );
                 }
-            ),
+            }
         );
+        if let Some(name) = one_file {
+            dialog.set_initial_name(Some(&name));
+            dialog.save(self.window().as_ref(), gio::Cancellable::NONE, chosen);
+        } else {
+            dialog.select_folder(self.window().as_ref(), gio::Cancellable::NONE, chosen);
+        }
     }
 
-    /// Sends one local file into a remote directory, under the name it has
-    /// here.
-    fn upload(&self, directory: &Path) {
+    /// Sends one local file, or one folder and everything in it, into a
+    /// remote directory under the name it has here.
+    fn upload(&self, directory: &Path, folder: bool) {
         if self.imp().link.borrow().is_none() {
             return;
         }
         let directory = directory.to_path_buf();
         let dialog = gtk::FileDialog::builder()
-            .title("Upload File")
+            .title(if folder {
+                "Upload Folder"
+            } else {
+                "Upload File"
+            })
             .accept_label("Upload")
             .build();
-        dialog.open(
-            self.window().as_ref(),
-            gio::Cancellable::NONE,
-            glib::clone!(
-                #[weak(rename_to = this)]
-                self,
-                move |chosen| {
-                    let Some(local) = chosen.ok().and_then(|file| file.path()) else {
-                        return;
-                    };
-                    let Some(name) = local.file_name() else {
-                        return;
-                    };
-                    let remote = directory.join(name).to_string_lossy().into_owned();
-                    this.start(Way::Up, remote, local);
-                }
-            ),
+        let chosen = glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |chosen: Result<gio::File, glib::Error>| {
+                let Some(local) = chosen.ok().and_then(|file| file.path()) else {
+                    return;
+                };
+                let Some(name) = local.file_name() else {
+                    return;
+                };
+                let remote = directory.join(name).to_string_lossy().into_owned();
+                this.start(Way::Up, remote, local, false);
+            }
         );
+        if folder {
+            dialog.select_folder(self.window().as_ref(), gio::Cancellable::NONE, chosen);
+        } else {
+            dialog.open(self.window().as_ref(), gio::Cancellable::NONE, chosen);
+        }
     }
 
-    /// Takes what a drag left: every file goes into `directory` under the name
-    /// it has here, and a folder goes nowhere at all.
+    /// Fetches rows into a directory on this machine under the names they
+    /// have there, which is what dropping them on the files here asks for.
+    pub fn fetch(&self, items: Vec<Item>, directory: &Path) {
+        for item in items {
+            let local = directory.join(&item.name);
+            self.start(
+                Way::Down,
+                item.path.to_string_lossy().into_owned(),
+                local,
+                false,
+            );
+        }
+    }
+
+    /// Takes what a drag left: every file and folder goes into `directory`
+    /// under the name it has here.
     fn receive(&self, directory: &Path, dropped: &glib::Value) -> bool {
         if self.imp().link.borrow().is_none() {
             return false;
@@ -809,55 +1221,44 @@ impl TuniSftp {
         // A drag can carry something with no path at all, a file inside an
         // archive or a photo an application only holds in memory, and there is
         // nothing here to send for one of those.
-        let (files, folders): (Vec<PathBuf>, Vec<PathBuf>) = list
-            .files()
-            .iter()
-            .filter_map(gio::File::path)
-            .partition(|path| path.is_file());
-
-        for local in &files {
+        let mut any = false;
+        for local in list.files().iter().filter_map(gio::File::path) {
             let Some(name) = local.file_name() else {
                 continue;
             };
             let remote = directory.join(name).to_string_lossy().into_owned();
-            self.start(Way::Up, remote, local.clone());
+            self.start(Way::Up, remote, local.clone(), false);
+            any = true;
         }
-
-        if let Some(first) = folders.first() {
-            let name = first.file_name().unwrap_or(first.as_os_str());
-            self.report(&Failure {
-                message: if folders.len() == 1 {
-                    format!("Couldn't send “{}”.", name.to_string_lossy())
-                } else {
-                    format!("Couldn't send {} folders.", folders.len())
-                },
-                detail: String::from(
-                    "This carries one file at a time and has no recursive copy \
-                     in it. Drop the files inside instead, or use rsync, which \
-                     is better at a whole directory than this would be.",
-                ),
-            });
-        }
-        !files.is_empty()
+        any
     }
 
-    /// Puts one transfer at the back of the queue and starts it if the pipe is
-    /// free.
-    fn start(&self, way: Way, remote: String, local: PathBuf) {
+    /// Puts one transfer at the back of the queue, against the host the page
+    /// is on, and starts it if the pipe is free.
+    fn start(&self, way: Way, remote: String, local: PathBuf, asked: bool) {
+        let Some(alias) = self.imp().alias.borrow().clone() else {
+            return;
+        };
         self.imp()
             .queue
             .borrow_mut()
-            .push_back(Job { way, remote, local });
+            .push(&alias, way, remote, local, asked);
         self.pump();
+        self.refresh_transfers();
     }
 
     /// The button on the bar. Stops the transfer at its next chunk and
     /// forgets the ones queued behind it: the press means "stop
     /// transferring", and eleven files nobody wants any more would otherwise
-    /// start the moment this one dies.
+    /// start the moment this one dies. One of them alone is the list's.
     fn cancel_transfer(&self) {
         self.imp().queue.borrow_mut().clear();
-        if let Some(moved) = self.imp().moving.borrow().as_ref() {
+        self.stop_moving();
+        self.refresh_transfers();
+    }
+
+    fn stop_moving(&self) {
+        if let Some((_, moved)) = self.imp().moving.borrow().as_ref() {
             moved.stop.store(true, Ordering::Relaxed);
         }
     }
@@ -867,7 +1268,7 @@ impl TuniSftp {
         if self.imp().moving.borrow().is_some() {
             return;
         }
-        let next = self.imp().queue.borrow_mut().pop_front();
+        let next = self.imp().queue.borrow_mut().pop();
         if let Some(job) = next {
             self.transfer(job);
         }
@@ -875,127 +1276,215 @@ impl TuniSftp {
 
     /// Moves one file, and draws how far it has got while it goes.
     ///
-    /// One at a time, since the session is a single pipe behind a lock: a
-    /// second transfer would wait there with nothing on screen to say why. What
-    /// is waiting waits in [`imp::TuniSftp::queue`] instead, where the bar can
-    /// count it.
+    /// One at a time, on [`imp::TuniSftp::carrier`] rather than the session
+    /// the page lists with, so browsing goes on while a file moves. What is
+    /// waiting waits in [`imp::TuniSftp::queue`], where the bar can count it.
+    /// The job names its host, so the page going to another one changes
+    /// nothing here: the carrier is the job's host's, not the page's.
     fn transfer(&self, job: Job) {
-        let Job { way, remote, local } = job;
         let imp = self.imp();
-        let Some(link) = imp.link.borrow().clone() else {
-            return;
-        };
+        let carrier = imp
+            .carrier
+            .take()
+            .filter(|(carried, _)| *carried == job.alias)
+            .map(|(_, session)| session);
         let moved = Arc::new(Moved::default());
-        imp.moving.replace(Some(Arc::clone(&moved)));
+        imp.moving.replace(Some((job.clone(), Arc::clone(&moved))));
 
-        let directory = Path::new(&remote).parent().map(Path::to_path_buf);
-        let name = Path::new(&remote).file_name().map_or_else(
-            || remote.clone(),
-            |name| name.to_string_lossy().into_owned(),
-        );
-        let label = match way {
+        let name = job.name();
+        let label = match job.way {
             Way::Up => format!("Sending {name}"),
             Way::Down => format!("Fetching {name}"),
         };
-        let waiting = imp.queue.borrow().len();
-        self.watch(&if waiting == 0 {
-            label
-        } else {
-            format!("{label}, {waiting} to go")
-        });
+        self.watch(label, Arc::clone(&moved));
 
-        let generation = imp.generation.get();
         let flag = Arc::clone(&moved);
+        let asked = job.asked;
+        let (alias, way, remote, local) = (
+            job.alias.clone(),
+            job.way,
+            job.remote.clone(),
+            job.local.clone(),
+        );
         glib::spawn_future_local(glib::clone!(
             #[weak(rename_to = this)]
             self,
             async move {
-                let moved = gio::spawn_blocking(move || {
-                    let Ok(mut session) = link.lock() else {
-                        return Err(Failure {
-                            message: String::from("The connection ended."),
-                            detail: String::from("Nothing is holding it open any more."),
-                        });
-                    };
-                    let mut note = |done: u64, total: u64| {
-                        moved.done.store(done, Ordering::Relaxed);
-                        moved.total.store(total, Ordering::Relaxed);
-                        !moved.stop.load(Ordering::Relaxed)
-                    };
-                    match way {
-                        Way::Up => {
-                            let sent = session
-                                .put(&local, &remote, &mut note)
-                                .ok_or_else(|| failed(&session));
-                            // A cancelled upload has left a truncated file
-                            // under the real name at the far end; sweep it so
-                            // nothing over there opens half a file as the
-                            // whole thing.
-                            if sent.is_err() && moved.stop.load(Ordering::Relaxed) {
-                                let _ = session.remove(&remote);
+                let host = alias.clone();
+                let planned = gio::spawn_blocking(move || {
+                    // Opened the way the page's own session was. Over a shared
+                    // connection that is one more channel on the master;
+                    // without one it is a second login, as unattended as the
+                    // first.
+                    let mut session = match carrier {
+                        Some(session) => session,
+                        None => {
+                            let host = tuni_core::ssh::host(&host);
+                            let control = crate::hosts::control();
+                            match Session::open(&tuni_core::ssh::sftp_command(&host, &control)) {
+                                Ok(session) => session,
+                                Err(failure) => return (Err((failure, false)), None),
                             }
-                            sent
                         }
-                        Way::Down => {
-                            // Written beside where it is going and moved onto
-                            // it when it is whole, which is how the editor
-                            // saves: a transfer that dies leaves nothing under
-                            // a name something else would open.
-                            let part = local.with_file_name(partial(&local));
-                            let got = session
-                                .get(&remote, &part, &mut note)
-                                .ok_or_else(|| failed(&session));
-                            if got.is_err() {
-                                // Dead or cancelled either way, and nothing is
-                                // coming back for the half that landed.
-                                let _ = std::fs::remove_file(&part);
-                                got
-                            } else {
-                                std::fs::rename(&part, &local).map_err(|error| {
-                                    let _ = std::fs::remove_file(&part);
-                                    Failure {
-                                        message: format!("Couldn't finish {}.", local.display()),
-                                        detail: error.to_string(),
-                                    }
-                                })
-                            }
+                    };
+                    // A folder is walked whole before anything moves, so the
+                    // bar can say how far through the bytes it is and the
+                    // question about landing on a folder of the same name
+                    // comes before any of it is written.
+                    let plan = match way {
+                        Way::Up => session.plan_upload(&local, &remote),
+                        Way::Down => session.plan_download(&remote, &local),
+                    };
+                    match plan {
+                        Some(plan) => (Ok(plan), Some(session)),
+                        None => {
+                            let lost = session.is_lost();
+                            (Err((failed(&session), lost)), (!lost).then_some(session))
                         }
                     }
                 })
                 .await;
 
-                this.imp().moving.replace(None);
-                if let Some(row) = this.imp().progress_row.borrow().as_ref() {
-                    row.set_visible(false);
-                }
-                if generation != this.imp().generation.get() {
-                    return;
-                }
-                match moved {
-                    // The cancel button doing its job is not news: the press
-                    // already emptied the queue, and a dialog would only
-                    // repeat what the hand that pressed it knows.
-                    Ok(Err(_)) if flag.stop.load(Ordering::Relaxed) => {}
-                    Ok(Err(failure)) => {
-                        // What was behind it goes no further. A connection that
-                        // died on the first file is going to die on the other
-                        // eleven, and eleven more dialogs is not eleven more
-                        // pieces of news.
-                        let waiting = this.imp().queue.borrow_mut().drain(..).count();
-                        this.report(&stopped(&failure, waiting));
+                let halted = || flag.stop.load(Ordering::Relaxed);
+                let (moved, session) = 'run: {
+                    let (plan, session) = match planned {
+                        Ok((Ok(plan), Some(session))) => (plan, session),
+                        Ok((Err(failure), session)) => break 'run (Some(Err(failure)), session),
+                        Ok((Ok(_), None)) | Err(_) => break 'run (None, None),
+                    };
+                    let ask = plan.replaces && !asked;
+                    let folder = plan.steps.first().is_some_and(|step| step.is_directory);
+                    if halted() || (ask && !this.replace(&name, folder).await) || halted() {
+                        break 'run (None, Some(session));
                     }
-                    // The directory has something in it that it did not have,
-                    // and nothing remote will say so on its own.
-                    Ok(Ok(())) => {
-                        if let (Way::Up, Some(directory)) = (way, directory) {
-                            this.list(directory, false);
-                        }
+                    let verb = match way {
+                        Way::Up => "send",
+                        Way::Down => "fetch",
+                    };
+                    let copied = gio::spawn_blocking(move || {
+                        let mut session = session;
+                        let mut note = |done: u64, total: u64| {
+                            moved.done.store(done, Ordering::Relaxed);
+                            moved.total.store(total, Ordering::Relaxed);
+                            !moved.stop.load(Ordering::Relaxed)
+                        };
+                        // Every file lands under a temporary name and is moved
+                        // on when whole, so a cancel or a dead link leaves
+                        // what was there before, at either end.
+                        let report = session.copy(way, &plan, &mut note);
+                        let lost = session.is_lost();
+                        let said = summary(&plan, &report, verb);
+                        let done = if report.stopped {
+                            Err((failed(&session), lost))
+                        // Nothing went at all, which is what the files behind
+                        // it would run into as well.
+                        } else if report.done == 0 && report.failed > 0 {
+                            Err((said.unwrap_or_else(|| failed(&session)), lost))
+                        } else {
+                            Ok(said)
+                        };
+                        // A session that will not answer again ends here, and
+                        // the next file opens another.
+                        (done, (!lost).then_some(session))
+                    })
+                    .await;
+                    match copied {
+                        Ok((done, session)) => (Some(done), session),
+                        Err(_) => (None, None),
                     }
-                    Err(_) => {}
+                };
+
+                // Back for the next file, and let go of at once if no file
+                // for that host is coming.
+                let imp = this.imp();
+                imp.carrier.replace(session.map(|session| (alias, session)));
+                let job = imp.moving.take().map(|(job, _)| job);
+                this.release();
+                if let (Some(job), Some(moved)) = (job, moved) {
+                    this.finish(job, moved, flag.stop.load(Ordering::Relaxed));
                 }
                 this.pump();
+                this.refresh_transfers();
             }
         ));
+    }
+
+    /// Whether a transfer may land on something of the same name: a file it
+    /// replaces, or a folder it goes into, which replaces what is in both.
+    /// Asked once the walk has found it there and before anything is written.
+    /// Cancel skips this one and leaves the queue behind it going.
+    ///
+    /// ponytail: one question per clash, so a drop of fifty files that are
+    /// all there already is fifty questions. An "all of them" switch when
+    /// that turns out to be a thing people do.
+    async fn replace(&self, name: &str, folder: bool) -> bool {
+        let dialog = if folder {
+            adw::AlertDialog::new(
+                Some(&format!("Merge with “{name}”?")),
+                Some(&format!(
+                    "There is already a folder called “{name}” where this is going. A \
+                     file in both is replaced by the copy coming in; the rest stays."
+                )),
+            )
+        } else {
+            adw::AlertDialog::new(
+                Some(&format!("Replace “{name}”?")),
+                Some(&format!(
+                    "There is already a file called “{name}” where this is going. It \
+                     is replaced by the copy coming in."
+                )),
+            )
+        };
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("replace", if folder { "Merge" } else { "Replace" });
+        dialog.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.choose_future(Some(self)).await == "replace"
+    }
+
+    /// What one transfer's end means for the page. Nothing here is a dialog:
+    /// a failure goes on the transfers list, where it waits to be read
+    /// without standing in front of whatever is being done meanwhile.
+    fn finish(
+        &self,
+        job: Job,
+        moved: Result<Option<Failure>, (Failure, bool)>,
+        stopped_by_hand: bool,
+    ) {
+        let here = self.imp().alias.borrow().as_deref() == Some(job.alias.as_str());
+        // The directory has something in it that it did not have, even after a
+        // folder stopped partway, and nothing remote will say so on its own.
+        // Only if the page is still showing that host, and only if the
+        // connection is still there to ask.
+        if job.way == Way::Up
+            && here
+            && !matches!(moved, Err((_, true)))
+            && let Some(directory) = Path::new(&job.remote).parent()
+        {
+            self.list(directory.to_path_buf(), false);
+        }
+        match moved {
+            // The cancel button doing its job is not news, and a failure line
+            // would only repeat what the hand that pressed it knows.
+            Err(_) if stopped_by_hand => {}
+            Err((failure, lost)) => {
+                // A connection that died under the carrier died under the
+                // listing too, since both go over the same one.
+                if lost && here {
+                    self.lose(&failure);
+                }
+                // What was behind it for the same host goes no further: a
+                // connection that died on the first file is going to die on
+                // the other eleven, and eleven failures is not eleven pieces
+                // of news.
+                self.imp().queue.borrow_mut().fail(job, failure, true);
+            }
+            // Some of a folder went and some did not, which is said without
+            // holding up what is queued behind it.
+            Ok(Some(partly)) => self.imp().queue.borrow_mut().fail(job, partly, false),
+            Ok(None) => {}
+        }
     }
 
     // --- changing them --------------------------------------------------------
@@ -1021,6 +1510,127 @@ impl TuniSftp {
                 }
             ),
         );
+    }
+
+    /// Makes an empty file, refused rather than emptied when the name is
+    /// taken.
+    fn new_file(&self, directory: &Path) {
+        let directory = directory.to_path_buf();
+        self.ask(
+            "New File",
+            &format!("Inside “{}”", directory.to_string_lossy()),
+            "",
+            "Create",
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |name: String| {
+                    let Some(path) = this.named(&directory, &name) else {
+                        return;
+                    };
+                    this.change(directory.clone(), true, move |session| {
+                        session.create(&path)
+                    });
+                }
+            ),
+        );
+    }
+
+    /// What `ls -l` would say about one thing, with its permissions as nine
+    /// boxes to tick. The kind of file and the setuid, setgid and sticky bits
+    /// are kept as they were: nothing here offers them, so nothing here
+    /// changes them.
+    fn properties(&self, item: &Item) {
+        let Some(directory) = item.path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let details = item.details.unwrap_or_default();
+        let grid = gtk::Grid::builder()
+            .row_spacing(6)
+            .column_spacing(12)
+            .halign(gtk::Align::Center)
+            .build();
+        for (column, heading) in ["Read", "Write", "Run"].into_iter().enumerate() {
+            let label = gtk::Label::new(Some(heading));
+            label.add_css_class("dim-label");
+            grid.attach(&label, column as i32 + 1, 0, 1, 1);
+        }
+        let octal = gtk::Label::new(None);
+        octal.add_css_class("numeric");
+        let mut boxes = Vec::with_capacity(9);
+        for (row, who) in ["Owner", "Group", "Others"].into_iter().enumerate() {
+            let label = gtk::Label::builder().label(who).xalign(0.0).build();
+            grid.attach(&label, 0, row as i32 + 1, 1, 1);
+            for column in 0..3 {
+                let bit = 0o400 >> (row * 3 + column);
+                let check = gtk::CheckButton::builder()
+                    .active(details.mode & bit != 0)
+                    .halign(gtk::Align::Center)
+                    .build();
+                grid.attach(&check, column as i32 + 1, row as i32 + 1, 1, 1);
+                boxes.push((check, bit));
+            }
+        }
+        let boxes = Rc::new(boxes);
+        let kept = details.mode & 0o7000;
+        let mode = {
+            let boxes = Rc::clone(&boxes);
+            move || {
+                boxes
+                    .iter()
+                    .filter(|(check, _)| check.is_active())
+                    .fold(kept, |mode, (_, bit)| mode | bit)
+            }
+        };
+        let show = {
+            let mode = mode.clone();
+            let octal = octal.clone();
+            move || octal.set_text(&format!("{:04o}", mode()))
+        };
+        show();
+        for (check, _) in boxes.iter() {
+            let show = show.clone();
+            check.connect_toggled(move |_| show());
+        }
+        grid.attach(&octal, 0, 4, 4, 1);
+
+        let mut body = item.path.to_string_lossy().into_owned();
+        if item.details.is_some() {
+            body.push('\n');
+            if !item.is_directory {
+                body.push_str(&tuni_core::editor::size_text(details.size));
+                body.push_str(", ");
+            }
+            body.push_str("changed ");
+            body.push_str(&crate::files::when(details.mtime));
+        }
+        let dialog = adw::AlertDialog::new(Some(&item.name), Some(&body));
+        dialog.set_extra_child(Some(&grid));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("apply", "Apply");
+        dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("apply"));
+        dialog.set_close_response("cancel");
+        let path = item.path.to_string_lossy().into_owned();
+        let before = details.mode & 0o7777;
+        dialog.connect_response(
+            None,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_, response| {
+                    let after = mode();
+                    if response != "apply" || after == before {
+                        return;
+                    }
+                    let path = path.clone();
+                    this.change(directory.clone(), false, move |session| {
+                        session.chmod(&path, after)
+                    });
+                }
+            ),
+        );
+        dialog.present(Some(self));
     }
 
     /// Gives one file or directory another name in the same directory.
@@ -1054,46 +1664,127 @@ impl TuniSftp {
         );
     }
 
-    /// Deletes one file, or one directory that has nothing in it.
-    fn delete(&self, item: &Item) {
-        let Some(directory) = item.path.parent().map(Path::to_path_buf) else {
+    /// Deletes files, and folders with everything in them.
+    ///
+    /// A folder is walked first, so the question can say what it holds, and
+    /// then emptied from the bottom up.
+    ///
+    /// ponytail: walk and delete both hold the session the page browses with,
+    /// one round trip a folder for the walk, so a big tree stops browsing
+    /// until it is gone. On the carrier, behind the queue, if that matters.
+    fn delete(&self, items: Vec<Item>) {
+        if items.is_empty() {
+            return;
+        }
+        let Some(link) = self.imp().link.borrow().clone() else {
             return;
         };
-        let path = item.path.to_string_lossy().into_owned();
-        let is_directory = item.is_directory;
-        let body = if is_directory {
-            "There is no trash on the other machine, so this is gone for good. A \
-             directory with anything in it is refused."
-        } else {
-            "There is no trash on the other machine, so this is gone for good."
+        let paths: Vec<String> = items
+            .iter()
+            .map(|item| item.path.to_string_lossy().into_owned())
+            .collect();
+        // Each directory something went from, read again once it is gone.
+        let mut directories: Vec<PathBuf> = items
+            .iter()
+            .filter_map(|item| item.path.parent().map(Path::to_path_buf))
+            .collect();
+        directories.sort();
+        directories.dedup();
+        let title = match items.as_slice() {
+            [item] => format!("Delete “{}”?", item.name),
+            _ => format!("Delete {} items?", items.len()),
         };
-        let dialog = adw::AlertDialog::new(Some(&format!("Delete “{}”?", item.name)), Some(body));
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("delete", "Delete");
-        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        dialog.connect_response(
-            None,
-            glib::clone!(
-                #[weak(rename_to = this)]
-                self,
-                move |_, response| {
-                    if response != "delete" {
+        let generation = self.imp().generation.get();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let walk = Arc::clone(&link);
+                let Ok(planned) = gio::spawn_blocking(move || {
+                    let Ok(mut session) = walk.lock() else {
+                        return Err((ended(), true));
+                    };
+                    session
+                        .plan_delete(&paths)
+                        .ok_or_else(|| (failed(&session), session.is_lost()))
+                })
+                .await
+                else {
+                    return;
+                };
+                if generation != this.imp().generation.get() {
+                    return;
+                }
+                let plan = match planned {
+                    Ok(plan) => plan,
+                    Err((failure, true)) => {
+                        this.lose(&failure);
                         return;
                     }
-                    let path = path.clone();
-                    this.change(directory.clone(), false, move |session| {
-                        if is_directory {
-                            session.rmdir(&path)
-                        } else {
-                            session.remove(&path)
-                        }
-                    });
+                    Err((failure, false)) => {
+                        this.report(&failure);
+                        return;
+                    }
+                };
+
+                // `inside` counts under the one folder chosen, which says
+                // nothing true about several.
+                let inside = if items.len() == 1 {
+                    plan.inside().map(|inside| format!("It holds {inside}."))
+                } else {
+                    Some(format!("That is {}.", plan.count()))
+                };
+                let body = match inside {
+                    Some(inside) => format!(
+                        "{inside} There is no trash on the other machine, \
+                         so all of it is gone for good."
+                    ),
+                    None => String::from(
+                        "There is no trash on the other machine, so this is gone for good.",
+                    ),
+                };
+                let dialog = adw::AlertDialog::new(Some(&title), Some(&body));
+                dialog.add_response("cancel", "Cancel");
+                dialog.add_response("delete", "Delete");
+                dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+                dialog.set_default_response(Some("cancel"));
+                dialog.set_close_response("cancel");
+                if dialog.choose_future(Some(&this)).await != "delete"
+                    || generation != this.imp().generation.get()
+                {
+                    return;
                 }
-            ),
-        );
-        dialog.present(Some(self));
+
+                let Ok(done) = gio::spawn_blocking(move || {
+                    let Ok(mut session) = link.lock() else {
+                        return Err((ended(), true));
+                    };
+                    let report = session.delete(&plan);
+                    if report.stopped {
+                        return Err((failed(&session), session.is_lost()));
+                    }
+                    Ok(summary(&plan, &report, "delete"))
+                })
+                .await
+                else {
+                    return;
+                };
+                if generation != this.imp().generation.get() {
+                    return;
+                }
+                if let Err((failure, true)) = &done {
+                    this.lose(failure);
+                    return;
+                }
+                for directory in directories {
+                    this.list(directory, false);
+                }
+                match done {
+                    Err((failure, _)) | Ok(Some(failure)) => this.report(&failure),
+                    Ok(None) => {}
+                }
+            }
+        ));
     }
 
     /// Runs one change at the far end and reads the directory it happened in,
@@ -1112,12 +1803,9 @@ impl TuniSftp {
             async move {
                 let Ok(done) = gio::spawn_blocking(move || {
                     let Ok(mut session) = link.lock() else {
-                        return Err(Failure {
-                            message: String::from("The connection ended."),
-                            detail: String::from("Nothing is holding it open any more."),
-                        });
+                        return Err((ended(), true));
                     };
-                    apply(&mut session).ok_or_else(|| failed(&session))
+                    apply(&mut session).ok_or_else(|| (failed(&session), session.is_lost()))
                 })
                 .await
                 else {
@@ -1132,7 +1820,8 @@ impl TuniSftp {
                         // writes over it with what is there now.
                         this.list(directory, expand);
                     }
-                    Err(failure) => this.report(&failure),
+                    Err((failure, true)) => this.lose(&failure),
+                    Err((failure, false)) => this.report(&failure),
                 }
             }
         ));
@@ -1140,16 +1829,16 @@ impl TuniSftp {
 
     /// Draws a transfer while it runs: a local timer over two numbers, not a
     /// poll of anything on the other machine.
-    fn watch(&self, label: &str) {
+    ///
+    /// The timer ends when `moved` is no longer the transfer running, which
+    /// the next one starting in the same turn of the loop would otherwise hide
+    /// from it: two timers on one bar, each writing its own file's name.
+    fn watch(&self, label: String, moved: Arc<Moved>) {
         let Some(bar) = self.imp().progress.borrow().clone() else {
             return;
         };
-        bar.set_text(Some(label));
+        bar.set_text(Some(&label));
         bar.set_fraction(0.0);
-        if let Some(row) = self.imp().progress_row.borrow().as_ref() {
-            row.set_visible(true);
-        }
-        let label = label.to_owned();
         let started = std::time::Instant::now();
         glib::timeout_add_local(
             std::time::Duration::from_millis(100),
@@ -1159,41 +1848,211 @@ impl TuniSftp {
                 #[upgrade_or]
                 glib::ControlFlow::Break,
                 move || {
-                    let Some(moved) = this.imp().moving.borrow().clone() else {
+                    let imp = this.imp();
+                    let running = imp
+                        .moving
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|(_, now)| Arc::ptr_eq(now, &moved));
+                    if !running {
                         return glib::ControlFlow::Break;
-                    };
+                    }
                     let done = moved.done.load(Ordering::Relaxed);
                     let total = moved.total.load(Ordering::Relaxed);
-                    if let Some(bar) = this.imp().progress.borrow().as_ref() {
-                        // Bytes over the whole run rather than over the last
-                        // tick: an average settles where a 100ms sample
-                        // flickers between a stall and a burst. Held back for
-                        // the first moment because dividing by almost no time
-                        // opens every transfer on a nonsense number.
-                        let elapsed = started.elapsed().as_secs_f64();
-                        let speed = if elapsed < 0.5 {
-                            String::new()
-                        } else {
-                            let rate = done as f64 / elapsed;
-                            format!(" · {}/s", glib::format_size(rate as u64))
-                        };
-                        // A server that did not say how big a file is leaves
-                        // nothing to draw a fraction from, so the bar moves
-                        // without claiming to know how far along it is.
-                        if total == 0 {
-                            bar.pulse();
-                            bar.set_text(Some(&format!("{label}{speed}")));
-                        } else {
-                            let fraction = done as f64 / total as f64;
-                            bar.set_fraction(fraction);
-                            let percent = (fraction * 100.0) as u32;
-                            bar.set_text(Some(&format!("{label} — {percent}%{speed}")));
-                        }
+                    // Counted each tick rather than when the file started,
+                    // since the list can take one off while this one moves.
+                    let waiting = imp.queue.borrow().waiting().len();
+                    let rest = if waiting == 0 {
+                        String::new()
+                    } else {
+                        format!(" · {waiting} to go")
+                    };
+                    // Bytes over the whole run rather than over the last
+                    // tick: an average settles where a 100ms sample flickers
+                    // between a stall and a burst. Held back for the first
+                    // moment because dividing by almost no time opens every
+                    // transfer on a nonsense number.
+                    let elapsed = started.elapsed().as_secs_f64();
+                    let speed = if elapsed < 0.5 {
+                        String::new()
+                    } else {
+                        let rate = done as f64 / elapsed;
+                        format!(" · {}/s", glib::format_size(rate as u64))
+                    };
+                    // A server that did not say how big a file is leaves
+                    // nothing to draw a fraction from, so the bar moves
+                    // without claiming to know how far along it is.
+                    if total == 0 {
+                        bar.pulse();
+                        bar.set_text(Some(&format!("{label}{speed}{rest}")));
+                    } else {
+                        let fraction = done as f64 / total as f64;
+                        bar.set_fraction(fraction);
+                        let percent = (fraction * 100.0) as u32;
+                        bar.set_text(Some(&format!("{label} · {percent}%{speed}{rest}")));
                     }
                     glib::ControlFlow::Continue
                 }
             ),
         );
+    }
+
+    /// Shows the transfers row while it has anything to say, and says it: the
+    /// bar while something moves, a count once nothing does and something
+    /// failed. The list under its button is redrawn if it is open.
+    fn refresh_transfers(&self) {
+        let imp = self.imp();
+        let moving = imp.moving.borrow().is_some();
+        let (waiting, failed) = {
+            let queue = imp.queue.borrow();
+            (queue.waiting().len(), queue.failed().len())
+        };
+        let busy = moving || waiting > 0;
+        if let Some(row) = imp.progress_row.borrow().as_ref() {
+            row.set_visible(busy || failed > 0);
+        }
+        if let Some(bar) = imp.progress.borrow().as_ref() {
+            bar.set_visible(busy);
+        }
+        if let Some(cancel) = imp.cancel.borrow().as_ref() {
+            cancel.set_visible(busy);
+        }
+        if let Some(label) = imp.failed.borrow().as_ref() {
+            label.set_visible(!busy && failed > 0);
+            label.set_text(&if failed == 1 {
+                String::from("A transfer failed")
+            } else {
+                format!("{failed} transfers failed")
+            });
+        }
+        if imp
+            .transfers_popover
+            .borrow()
+            .as_ref()
+            .is_some_and(gtk::Popover::is_visible)
+        {
+            self.list_transfers();
+        }
+    }
+
+    /// Fills the transfers popover: the one running, the ones waiting, the ones
+    /// that failed, each with the button that takes it away.
+    ///
+    /// ponytail: rebuilt whole on every change while open, and cut at
+    /// [`SHOWN_TRANSFERS`] rows with a count of the rest, since a drop of a
+    /// thousand files would otherwise be a thousand rows rebuilt per file.
+    fn list_transfers(&self) {
+        let imp = self.imp();
+        let Some(list) = imp.transfers.borrow().clone() else {
+            return;
+        };
+        list.remove_all();
+        let mut shown = 0;
+        let mut more = 0;
+        let mut add = |row: gtk::Box| {
+            if shown < SHOWN_TRANSFERS {
+                list.append(&row);
+                shown += 1;
+            } else {
+                more += 1;
+            }
+        };
+        if let Some((job, _)) = imp.moving.borrow().as_ref() {
+            add(self.transfer_row(job, "Moving", "Stop", None));
+        }
+        let queue = imp.queue.borrow();
+        for job in queue.waiting() {
+            add(self.transfer_row(job, "Waiting", "Remove", Some(job.id)));
+        }
+        for (job, failure) in queue.failed() {
+            let row = self.transfer_row(job, &failure.message, "Dismiss", Some(job.id));
+            row.set_tooltip_text(Some(&failure.detail));
+            add(row);
+        }
+        let failed = !queue.failed().is_empty();
+        drop(queue);
+        if more > 0 {
+            let rest = gtk::Label::new(Some(&format!("and {more} more")));
+            rest.add_css_class("dim-label");
+            rest.set_margin_top(6);
+            rest.set_margin_bottom(6);
+            list.append(&rest);
+        }
+        if shown == 0 {
+            let none = gtk::Label::new(Some("No transfers"));
+            none.add_css_class("dim-label");
+            none.set_margin_top(6);
+            none.set_margin_bottom(6);
+            list.append(&none);
+        }
+        if failed {
+            let clear = gtk::Button::with_label("Clear Failed");
+            clear.add_css_class("flat");
+            clear.connect_clicked(glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                move |_| {
+                    this.imp().queue.borrow_mut().dismiss();
+                    this.refresh_transfers();
+                }
+            ));
+            list.append(&clear);
+        }
+    }
+
+    /// One line of the transfers list: the file, what is happening to it and
+    /// on which host, and a button. `id` is the job to take off the queue, and
+    /// nothing at all for the one running, which is stopped instead.
+    fn transfer_row(&self, job: &Job, state: &str, action: &str, id: Option<u64>) -> gtk::Box {
+        let name = gtk::Label::builder()
+            .label(job.name())
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+        let way = match job.way {
+            Way::Up => "to",
+            Way::Down => "from",
+        };
+        let said = gtk::Label::builder()
+            .label(format!("{state}, {way} {}", job.alias))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        said.add_css_class("caption");
+        said.add_css_class("dim-label");
+        let words = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        words.set_hexpand(true);
+        words.append(&name);
+        words.append(&said);
+
+        let button = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text(action)
+            .valign(gtk::Align::Center)
+            .build();
+        button.add_css_class("flat");
+        button.connect_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| {
+                match id {
+                    Some(id) => {
+                        this.imp().queue.borrow_mut().remove(id);
+                    }
+                    None => this.stop_moving(),
+                }
+                this.refresh_transfers();
+            }
+        ));
+
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.set_margin_start(6);
+        row.set_margin_end(2);
+        row.set_margin_top(4);
+        row.set_margin_bottom(4);
+        row.append(&words);
+        row.append(&button);
+        row
     }
 
     // --- drawing --------------------------------------------------------------
@@ -1227,7 +2086,24 @@ impl TuniSftp {
 
     /// Shows a sentence instead of a listing.
     fn say(&self, heading: &str, body: &str) {
+        self.tell(heading, body, None);
+    }
+
+    /// Shows why the connection failed, with the button that tries again.
+    fn fail(&self, heading: &str, body: &str) {
+        self.tell(heading, body, Some("Reconnect"));
+    }
+
+    /// The sentence, and the button under it when there is one, which always
+    /// dials the host from the start.
+    fn tell(&self, heading: &str, body: &str, button: Option<&str>) {
         let imp = self.imp();
+        if let Some(reconnect) = imp.reconnect.borrow().as_ref() {
+            reconnect.set_visible(button.is_some());
+            if let Some(label) = button {
+                reconnect.set_label(label);
+            }
+        }
         if let Some(status) = imp.status.borrow().as_ref() {
             status.set_title(heading);
             status.set_description(Some(body).filter(|body| !body.is_empty()));
@@ -1243,32 +2119,51 @@ impl TuniSftp {
         }
     }
 
+    /// The context menu for a row. A click on a row inside the selection acts
+    /// on all of it, and anywhere else selects that row alone first, which is
+    /// what a file manager does.
     fn popup_menu(&self, widget: &gtk::Box, item: &Item, position: u32, x: f64, y: f64) {
         let imp = self.imp();
         let (Some(menu), Some(list)) = (imp.menu.borrow().clone(), imp.list.borrow().clone())
         else {
             return;
         };
-        if let Some(selection) = list.model().and_downcast::<gtk::SingleSelection>() {
-            selection.set_selected(position);
+        if let Some(selection) = list.model()
+            && !selection.is_selected(position)
+        {
+            selection.select_item(position, true);
         }
-        imp.target.replace(Some(item.clone()));
+        let mut targets = self.selected();
+        if targets.is_empty() {
+            targets.push(item.clone());
+        }
+        let many = targets.len() > 1;
+        imp.targets.replace(targets);
+
         let model = gio::Menu::new();
         let move_files = gio::Menu::new();
-        if item.is_directory {
-            move_files.append(Some("Upload File Here…"), Some("sftp.upload"));
-        } else {
-            move_files.append(Some("Download…"), Some("sftp.download"));
-        }
-        if item.is_directory {
-            move_files.append(Some("New Folder…"), Some("sftp.new-folder"));
-        }
-        move_files.append(Some("Copy Path"), Some("sftp.copy-path"));
-        model.append_section(None, &move_files);
-
         let edit = gio::Menu::new();
-        edit.append(Some("Rename…"), Some("sftp.rename"));
-        edit.append(Some("Delete…"), Some("sftp.delete"));
+        if many {
+            move_files.append(Some("Download…"), Some("sftp.download"));
+            edit.append(Some("Delete…"), Some("sftp.delete"));
+        } else {
+            if !item.is_directory {
+                move_files.append(Some("Edit"), Some("sftp.edit"));
+            }
+            move_files.append(Some("Download…"), Some("sftp.download"));
+            if item.is_directory {
+                move_files.append(Some("Upload File Here…"), Some("sftp.upload"));
+                move_files.append(Some("Upload Folder Here…"), Some("sftp.upload-folder"));
+                move_files.append(Some("New File…"), Some("sftp.new-file"));
+                move_files.append(Some("New Folder…"), Some("sftp.new-folder"));
+            }
+            move_files.append(Some("Copy Path"), Some("sftp.copy-path"));
+            move_files.append(Some("Copy Remote Address"), Some("sftp.copy-address"));
+            edit.append(Some("Rename…"), Some("sftp.rename"));
+            edit.append(Some("Properties…"), Some("sftp.properties"));
+            edit.append(Some("Delete…"), Some("sftp.delete"));
+        }
+        model.append_section(None, &move_files);
         model.append_section(None, &edit);
         menu.set_menu_model(Some(&model));
 
@@ -1276,6 +2171,128 @@ impl TuniSftp {
             .compute_point(&list, &gtk::graphene::Point::new(x as f32, y as f32))
             .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
         crate::menu::popup_at(&menu, point);
+    }
+
+    /// The rows selected now, top to bottom.
+    fn selected(&self) -> Vec<Item> {
+        let Some(model) = self
+            .imp()
+            .list
+            .borrow()
+            .as_ref()
+            .and_then(|list| list.model())
+        else {
+            return Vec::new();
+        };
+        let set = model.selection();
+        let Some((rest, first)) = gtk::BitsetIter::init_first(&set) else {
+            return Vec::new();
+        };
+        std::iter::once(first)
+            .chain(rest)
+            .filter_map(|position| model.item(position).and_downcast::<Row>())
+            .filter_map(|row| row.item())
+            .collect()
+    }
+
+    /// The one row a menu was opened on, for the actions that act on one.
+    fn target(&self) -> Option<Item> {
+        match self.imp().targets.borrow().as_slice() {
+            [item] => Some(item.clone()),
+            _ => None,
+        }
+    }
+
+    fn folder_target(&self) -> Option<Item> {
+        self.target().filter(|item| item.is_directory)
+    }
+
+    /// Goes to a path typed into the bar. `~` is wherever the session started,
+    /// which is the far end's home, and a path that is not absolute starts
+    /// from the directory being shown, the way `cd` would take it.
+    fn go_to(&self, text: &str) {
+        let imp = self.imp();
+        let Some(link) = imp.link.borrow().clone() else {
+            return;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let asked = match text.strip_prefix('~') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                format!(".{rest}")
+            }
+            _ if text.starts_with('/') => text.to_owned(),
+            _ => imp
+                .tree
+                .borrow()
+                .root()
+                .join(text)
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let generation = imp.generation.get();
+        glib::spawn_future_local(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            async move {
+                let Ok((found, lost)) = gio::spawn_blocking(move || {
+                    let Ok(mut session) = link.lock() else {
+                        return (None, Some(ended()));
+                    };
+                    let found = session.realpath(&asked).and_then(|path| {
+                        let is_directory = session.stat(&path)?.is_directory;
+                        Some((path, is_directory))
+                    });
+                    (found, gone(&session))
+                })
+                .await
+                else {
+                    return;
+                };
+                if generation != this.imp().generation.get() {
+                    return;
+                }
+                if let Some(failure) = lost {
+                    this.lose(&failure);
+                    return;
+                }
+                match found {
+                    Some((path, true)) => {
+                        this.show_location(false);
+                        this.browse(Path::new(&path));
+                    }
+                    _ => {
+                        if let Some(location) = this.imp().location.borrow().as_ref() {
+                            location.add_css_class("error");
+                        }
+                    }
+                }
+            }
+        ));
+    }
+
+    fn show_location(&self, show: bool) {
+        let imp = self.imp();
+        let (Some(bar), Some(location)) = (
+            imp.location_bar.borrow().clone(),
+            imp.location.borrow().clone(),
+        ) else {
+            return;
+        };
+        if show && imp.link.borrow().is_none() {
+            return;
+        }
+        location.remove_css_class("error");
+        bar.set_reveal_child(show);
+        if show {
+            location.set_text(&imp.tree.borrow().root().to_string_lossy());
+            location.set_position(-1);
+            location.grab_focus();
+        } else if let Some(list) = imp.list.borrow().as_ref() {
+            list.grab_focus();
+        }
     }
 
     /// A name typed into a dialog, joined onto the directory it belongs in.
@@ -1340,39 +2357,21 @@ impl TuniSftp {
     }
 }
 
-/// Which way a transfer goes. Everything else about the two is the same.
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Way {
-    Up,
-    Down,
-}
+/// How many rows the transfers list draws before it counts the rest instead.
+const SHOWN_TRANSFERS: usize = 100;
 
-/// A name beside the file being written, and the reason it is a dotfile with a
-/// process id in it is the one [`tuni_core::editor::save`] gives: two windows
-/// fetching the same name at once must not share the temporary.
-fn partial(local: &Path) -> String {
-    let name = local
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    format!(".{name}.tuni-{}", std::process::id())
-}
-
-/// A failure that took a queue down with it, since what stopped the file being
-/// moved is what the ones behind it would have run into.
-fn stopped(failure: &Failure, waiting: usize) -> Failure {
-    if waiting == 0 {
-        return failure.clone();
-    }
-    let rest = if waiting == 1 {
-        String::from("The one behind it was left where it is.")
-    } else {
-        format!("The {waiting} behind it were left where they are.")
-    };
+/// The session behind a lock that a panicked thread left poisoned, which is
+/// as gone as a broken pipe.
+fn ended() -> Failure {
     Failure {
-        message: failure.message.clone(),
-        detail: format!("{} {rest}", failure.detail),
+        message: String::from("The connection ended."),
+        detail: String::from("Nothing is holding it open any more."),
     }
+}
+
+/// Why the session will not answer again, if it will not.
+fn gone(session: &Session) -> Option<Failure> {
+    session.is_lost().then(|| failed(session))
 }
 
 /// Why a transfer stopped, in the two parts a dialog wants.
@@ -1381,6 +2380,17 @@ fn failed(session: &Session) -> Failure {
         message: String::from("The transfer stopped."),
         detail: String::from("The connection ended."),
     })
+}
+
+/// A session on a host, and where it starts and what is there. Run on a
+/// worker: it is a login and two round trips.
+fn connect(argv: &[String]) -> Result<(Session, PathBuf, Vec<Item>), String> {
+    let mut session = Session::open(argv).map_err(|failure| failure.detail)?;
+    let Some(home) = session.realpath(".") else {
+        return Err(reason(&session));
+    };
+    let rows = rows(&mut session, &home).ok_or_else(|| reason(&session))?;
+    Ok((session, PathBuf::from(home), rows))
 }
 
 /// One directory's rows, in the order a file manager shows them.
@@ -1410,9 +2420,19 @@ fn rows(session: &mut Session, directory: &str) -> Option<Vec<Item>> {
                 path,
                 is_directory,
                 depth: 0,
+                details: Some(tuni_core::files::Details {
+                    size: entry.size,
+                    mtime: entry.mtime,
+                    mode: entry.mode,
+                }),
             }
         })
         .collect();
+    // A pipe that broke on one of the links' second round trip leaves every
+    // link after it drawn as a file.
+    if session.is_lost() {
+        return None;
+    }
     items.sort_by(|a, b| {
         b.is_directory
             .cmp(&a.is_directory)

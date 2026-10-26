@@ -14,13 +14,14 @@ than translated.
 ```sh
 make zig                  # fetch Zig 0.15.2 into ~/.local; needed once before any build
 cargo build --release     # or `make build`, which warns if the wrong zig is on PATH
-cargo run --release
+cargo run --release       # runs tuni-gtk, the application, without the launcher
 make check                # fmt --check, clippy -D warnings, test, desktop/AppStream validation
 ```
 
 `make check` is what CI runs, so run it before pushing rather than reading the
-failure in a mail. It needs four packages a build does not: `rustfmt`, `clippy`,
-`desktop-file-utils` and `appstream`. README lists both sets for Fedora.
+failure in a mail. It needs five packages a build does not: `rustfmt`, `clippy`,
+`desktop-file-utils`, `appstream`, and `openssh-server` for the `sftp-server`
+the SFTP tests copy real folders through. README lists both sets for Fedora.
 
 Tests:
 
@@ -74,11 +75,18 @@ Four crates, and the dependency arrow only points one way:
 | `tuni-vt` | Facade over `libghostty-vt`. Nothing above this line imports it. |
 | `tuni-pty` | Shell process, PTY, reader thread, window resize. |
 | `tuni-core` | Portable models: settings, themes, projects, panes, session, git, ssh, sftp, lsp, dap, syntax, `/proc`. No GTK. |
-| `tuni-gtk` | Widgets, window, actions, keybindings. The binary is `tuni`. |
+| `tuni-gtk` | Widgets, window, actions, keybindings. Two binaries: `tuni-gtk` is the application, `tuni` the launcher. |
 
 The upstream C API is pre-1.0 and expected to change, which is why the
 dependency is pinned to a rev in the workspace `Cargo.toml` and why every call
 to it goes through `tuni-vt`.
+
+`tuni` is what a launch runs. It links GLib and GIO alone, so it reaches
+`main` about 17 ms before a program carrying libadwaita would, starts the
+first window's shell there, and `exec`s `tuni-gtk` beside itself with the
+PTY's master inherited (`Pty::hand_over`, `Pty::inherited`). A launch that
+will restore a session or hand itself to a Tuni already running starts no
+shell. Both binaries have to be installed side by side.
 
 ### Rules that span files
 

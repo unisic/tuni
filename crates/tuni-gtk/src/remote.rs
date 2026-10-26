@@ -32,6 +32,7 @@ mod imp {
         pub banner: RefCell<Option<adw::Banner>>,
         pub terminal: RefCell<Option<TuniTerminal>>,
         pub handler: RefCell<Option<Handler>>,
+        pub offer: RefCell<Option<Handler>>,
     }
 
     #[glib::object_subclass]
@@ -65,7 +66,8 @@ impl TuniRemote {
             #[weak(rename_to = this)]
             remote,
             move |_| {
-                let handler = this.imp().handler.borrow().clone();
+                let offer = this.imp().offer.take();
+                let handler = offer.or_else(|| this.imp().handler.borrow().clone());
                 if let Some(handler) = handler {
                     handler();
                 }
@@ -89,9 +91,18 @@ impl TuniRemote {
 
     /// Puts the bar away: something is running down there.
     pub fn set_running(&self) {
+        self.imp().offer.take();
         if let Some(banner) = self.imp().banner.borrow().as_ref() {
             banner.set_revealed(false);
         }
+    }
+
+    /// Raises the bar over a button that does something other than connect,
+    /// once. The press runs `handler` in place of the usual one, and raising
+    /// the bar again for whatever comes next is the handler's job.
+    pub fn set_offer(&self, message: &str, action: &str, handler: impl Fn() + 'static) {
+        self.imp().offer.replace(Some(Rc::new(handler)));
+        self.set_idle(message, action);
     }
 
     /// Raises the bar, reading `message`, over a button reading `action`.

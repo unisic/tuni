@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           dnf install -y --setopt=install_weak_deps=False \
-            cargo rust rustfmt clippy gcc make git-core curl tar xz openssh-clients \
+            cargo rust rustfmt clippy gcc make git-core curl tar xz openssh-clients openssh-server \
             gtk4-devel libadwaita-devel gtksourceview5-devel sqlite-devel \
             desktop-file-utils libappstream-glib
 
@@ -69,7 +69,7 @@ jobs:
         run: make build
 
       - name: Check the binary against the baseline CPU
-        run: scripts/check-baseline.sh target/release/tuni
+        run: scripts/check-baseline.sh target/release/tuni-gtk
 
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -102,10 +102,11 @@ jobs:
       - name: Install dependencies
         # The same libraries the job above links against, less the tools only a
         # release build needs. `make test-next` runs the tests too, so sqlite is
-        # here for rusqlite to link and ssh for the test that reads `ssh -G`.
+        # here for rusqlite to link, ssh for the test that reads `ssh -G` and
+        # sftp-server for the ones that copy a real tree.
         run: |
           dnf install -y --setopt=install_weak_deps=False \
-            cargo rust gcc make git-core curl tar xz openssh-clients \
+            cargo rust gcc make git-core curl tar xz openssh-clients openssh-server \
             gtk4-devel libadwaita-devel gtksourceview5-devel sqlite-devel
 
       - uses: actions/checkout@v7

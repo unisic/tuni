@@ -140,7 +140,13 @@ impl Control {
     pub fn at(directory: PathBuf, persist: u32, enabled: bool) -> Self {
         Self {
             directory,
-            persist,
+            // Zero is the setting's word for "close with the last pane", and
+            // to ssh `ControlPersist=0` means the opposite: kept forever. `no`
+            // is not the answer either, since it keeps the master in the
+            // foreground of the first pane, which then cannot finish until
+            // every other pane on the host has. One second is the closest
+            // thing ssh has to what zero promises.
+            persist: persist.max(1),
             enabled,
         }
     }
@@ -441,11 +447,9 @@ pub fn command(host: &Host, control: &Control) -> Vec<String> {
         argv.push("-o".to_owned());
         argv.push(option);
     }
-    // A saved host's port is already in the configuration `ssh` is about to
-    // read for itself. One typed by hand has nowhere else to carry it.
-    if host.source == Source::Adhoc && host.port != 0 {
+    if let Some(port) = host.port_flag() {
         argv.push("-p".to_owned());
-        argv.push(host.port.to_string());
+        argv.push(port.to_string());
     }
     // `--`, because a destination may begin with a dash.
     argv.push("--".to_owned());
@@ -688,15 +692,82 @@ impl Host {
     /// The destination for an `ssh` command line. The alias, because
     /// everything the configuration says about the host is filed under that
     /// name; an address typed by hand has no name to be filed under and so
-    /// carries itself. The port is not in here: it is `-p`.
+    /// carries itself.
+    ///
+    /// A port typed by hand travels in here as `ssh://user@host:port`, because
+    /// the destination is all that `ssh -G` and `ssh -O check` are given: with
+    /// the port on `-p` instead they would work out the socket of port 22, and
+    /// a connection that is up would read as one that is not. OpenSSH 10.2
+    /// takes no IPv6 address inside such a URI, so that one alone keeps `-p`;
+    /// see [`Host::port_flag`].
     #[must_use]
     pub fn target(&self) -> String {
-        match self.source {
-            Source::Adhoc if !self.user.is_empty() => {
-                format!("{}@{}", self.user, self.hostname)
-            }
-            Source::Adhoc => self.hostname.clone(),
-            _ => self.alias.clone(),
+        if self.source != Source::Adhoc {
+            return self.alias.clone();
+        }
+        let login = if self.user.is_empty() {
+            self.hostname.clone()
+        } else {
+            format!("{}@{}", self.user, self.hostname)
+        };
+        if self.port != 0 && self.port_flag().is_none() {
+            format!("ssh://{login}:{}", self.port)
+        } else {
+            login
+        }
+    }
+
+    /// The port that has to go on `-p`, when [`Host::target`] could not carry
+    /// it: a typed IPv6 address. A saved host's port is in the configuration
+    /// `ssh` reads for itself.
+    // ponytail: the socket of a typed IPv6 address with a port is still looked
+    // up on port 22; passing `-p` to every `ssh -G` is the fix if it matters.
+    fn port_flag(&self) -> Option<u16> {
+        (self.source == Source::Adhoc && self.port != 0 && self.hostname.contains(':'))
+            .then_some(self.port)
+    }
+
+    /// The bare command a person would have typed for this host, not the one
+    /// tuni runs: the options it adds are its own business.
+    #[must_use]
+    pub fn typed(&self) -> String {
+        let mut argv = vec!["ssh".to_owned()];
+        if let Some(port) = self.port_flag() {
+            argv.extend(["-p".to_owned(), port.to_string()]);
+        }
+        argv.push(self.target());
+        shell_line(&argv)
+    }
+
+    /// What the extra lines give `keyword`, found the way ssh finds it: in any
+    /// case, after a space or an `=`. The first line, since the first value
+    /// obtained is the one ssh uses.
+    #[must_use]
+    pub fn option(&self, keyword: &str) -> Option<String> {
+        let keyword = keyword.to_lowercase();
+        self.extra
+            .iter()
+            .filter_map(|line| split(line))
+            .find_map(|(found, value)| (found == keyword).then_some(value))
+    }
+
+    /// Gives `keyword` one line among the extra lines, in the place of the
+    /// first one that gave it a value, and drops every other. An empty value
+    /// takes it out, which leaves it to ssh's default.
+    pub fn set_option(&mut self, keyword: &str, value: &str) {
+        let lower = keyword.to_lowercase();
+        let gives = |line: &String| split(line).is_some_and(|(found, _)| found == lower);
+        let at = self.extra.iter().position(gives);
+        self.extra.retain(|line| !gives(line));
+        let value = value.trim();
+        if value.is_empty() {
+            return;
+        }
+        // Nothing before the first match was removed, so its index still holds.
+        let line = format!("{keyword} {value}");
+        match at {
+            Some(at) => self.extra.insert(at, line),
+            None => self.extra.push(line),
         }
     }
 
@@ -834,6 +905,16 @@ pub struct Meta {
     pub label: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// The heading the host is listed under. One per host, where tags are
+    /// many: a group is where a host sits, a tag is what it is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    /// The theme the host's panes are painted in, by its name in the catalog.
+    /// Empty, or a name no bundled theme answers to, leaves the pane in the
+    /// window's colors. One theme rather than a light and dark pair: the point
+    /// is that this machine looks like itself whatever the desktop is doing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub theme: String,
     /// A themed icon name or an emoji, written the way a project's row writes
     /// one. Nothing means the server icon every unmarked host shares, which is
     /// exactly what a launcher of identical rows is not worth marking.
@@ -904,6 +985,40 @@ impl Notes {
         }
     }
 
+    /// Every tag the given hosts carry, once each and in order. Asked of the
+    /// hosts on the list rather than of the file, which still holds the tags
+    /// of a host somebody deleted from their own configuration by hand.
+    #[must_use]
+    pub fn tags<'a>(&self, aliases: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        let mut tags: Vec<String> = aliases
+            .into_iter()
+            .filter_map(|alias| self.0.get(alias))
+            .flat_map(|meta| meta.tags.iter().cloned())
+            .collect();
+        tags.sort_by(|left, right| (left.to_lowercase(), left).cmp(&(right.to_lowercase(), right)));
+        tags.dedup();
+        tags
+    }
+
+    /// The hosts connected to last, newest first and at most `limit` of them.
+    /// Asked of the hosts on the list, the way [`Notes::tags`] is, since the
+    /// file still dates a host somebody has since deleted by hand, and a
+    /// shortcut to it would dial a name nothing answers to.
+    #[must_use]
+    pub fn recent<'a>(
+        &self,
+        hosts: impl IntoIterator<Item = &'a Host>,
+        limit: usize,
+    ) -> Vec<&'a Host> {
+        let mut dated: Vec<(&Host, u64)> = hosts
+            .into_iter()
+            .filter_map(|host| Some((host, self.0.get(&host.alias)?.last_used?)))
+            .collect();
+        dated.sort_by_key(|(_, when)| std::cmp::Reverse(*when));
+        dated.truncate(limit);
+        dated.into_iter().map(|(host, _)| host).collect()
+    }
+
     /// Records that a connection was opened, which is what puts a host at the
     /// top of the list next time.
     pub fn used(&mut self, alias: &str) {
@@ -928,6 +1043,59 @@ impl Notes {
         fs::write(&temporary, text)?;
         fs::rename(&temporary, &path)
     }
+}
+
+/// Writes down a connection to `alias`, which is what puts it first in the
+/// Recent section and in the "+" button's menu next time.
+///
+/// Read fresh from the file rather than from a copy somebody holds, because
+/// the host list, the palette and the "+" button all connect, and a copy saved
+/// whole writes back whatever the others wrote since it was read. An address
+/// typed once is not a host, so it gets no history: the file would fill up
+/// with lines nobody can act on.
+///
+/// ponytail: two of these at the same instant can lose one of the dates, since
+/// nothing orders the read against the other write; a lock around `Notes`
+/// writers is the fix if two connections a millisecond apart ever matter.
+///
+/// File reads and a write, so the caller belongs off the main thread.
+pub fn note_use(alias: &str) -> std::io::Result<()> {
+    if Hosts::load().get(alias).is_none() {
+        return Ok(());
+    }
+    let mut notes = Notes::load();
+    notes.used(alias);
+    notes.save()
+}
+
+/// Hosts under the group each is filed in, groups by name and hosts by alias
+/// inside each, with the hosts in no group last under an empty name. Last,
+/// because a group is something somebody made on purpose and the rest is
+/// whatever was left over.
+#[must_use]
+pub fn grouped<'a>(
+    hosts: impl IntoIterator<Item = &'a Host>,
+    notes: &Notes,
+) -> Vec<(String, Vec<&'a Host>)> {
+    let mut groups: Vec<(String, Vec<&'a Host>)> = Vec::new();
+    for host in hosts {
+        let group = notes.get(&host.alias).group.trim().to_owned();
+        match groups.iter_mut().find(|(name, _)| *name == group) {
+            Some((_, members)) => members.push(host),
+            None => groups.push((group, vec![host])),
+        }
+    }
+    groups.sort_by(|(left, _), (right, _)| {
+        (left.is_empty(), left.to_lowercase(), left).cmp(&(
+            right.is_empty(),
+            right.to_lowercase(),
+            right,
+        ))
+    });
+    for (_, members) in &mut groups {
+        members.sort_by(|left, right| left.alias.cmp(&right.alias));
+    }
+    groups
 }
 
 /// What tuni writes at the top of the file it owns, so somebody who opens it
@@ -1106,9 +1274,20 @@ fn render(hosts: &[Host]) -> Result<String, String> {
             if extra.contains(['\n', '\r', '\0']) {
                 return Err(format!("{extra} cannot be an option"));
             }
-            let keyword = extra.split_whitespace().next().unwrap_or_default();
-            if keyword.eq_ignore_ascii_case("host") || keyword.eq_ignore_ascii_case("match") {
-                return Err(format!("{keyword} would start another host's block"));
+            // The keyword found the way ssh finds it, which ends at an `=` as
+            // well as at a space: `Host=*` and a quoted `"Host" *` both open a
+            // block to ssh. Every keyword ssh has is letters and digits, so a
+            // quote or anything else in its place is refused rather than
+            // guessed at. A line that is only a comment has no keyword and
+            // carries nothing.
+            if let Some((keyword, _)) = split(extra) {
+                if keyword.is_empty() || !keyword.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    return Err(format!("{extra} cannot be an option"));
+                }
+                if keyword == "host" || keyword == "match" {
+                    let typed = &extra[..keyword.len()];
+                    return Err(format!("{typed} would start another host's block"));
+                }
             }
             out.push_str(&format!("    {extra}\n"));
         }
@@ -1271,6 +1450,46 @@ fn describe_io(path: &Path, error: &std::io::Error) -> String {
 #[must_use]
 pub fn describe(alias: &str) -> Vec<(String, String)> {
     described(&[], alias)
+}
+
+/// The name `ssh` files a host's key under in `known_hosts`, from its
+/// [`describe`] report.
+///
+/// Neither the alias nor anything typed: the `HostKeyAlias` when there is one,
+/// as it is, and otherwise the `HostName`, in brackets with the port when the
+/// port is not 22. Read off what OpenSSH 10.2 writes rather than its source.
+#[must_use]
+pub fn known_name(report: &[(String, String)]) -> Option<String> {
+    let value = |keyword: &str| {
+        report
+            .iter()
+            .find(|(key, _)| key == keyword)
+            .map(|(_, value)| value.as_str())
+    };
+    if let Some(alias) = value("hostkeyalias") {
+        return Some(alias.to_owned());
+    }
+    let host = value("hostname")?;
+    Some(match value("port") {
+        Some(port) if port != "22" => format!("[{host}]:{port}"),
+        _ => host.to_owned(),
+    })
+}
+
+/// Every file `ssh` looks a host key up in, the user's before the system's.
+///
+/// `ssh -G` prints a list of them unquoted, so a path with a space in it comes
+/// apart into pieces that are not absolute or do not exist. That is a lookup
+/// that misses, which costs a prompt in the pane and nothing worse.
+#[must_use]
+pub fn known_files(report: &[(String, String)]) -> Vec<PathBuf> {
+    report
+        .iter()
+        .filter(|(key, _)| key == "userknownhostsfile" || key == "globalknownhostsfile")
+        .flat_map(|(_, files)| files.split_whitespace())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .collect()
 }
 
 /// The same report with settings of tuni's own applied first, which is the only
@@ -1715,6 +1934,194 @@ pub fn shell_line(argv: &[String]) -> String {
         .join(" ")
 }
 
+/// A host key ssh refused because the far end now sends another one: the name
+/// it is filed under and the file holding the old one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedKey {
+    pub name: String,
+    pub file: PathBuf,
+}
+
+impl ChangedKey {
+    /// The command that forgets the old key, for typing onto a prompt rather
+    /// than running. A changed key is what a man in the middle looks like, so
+    /// the decision that it is not one is the person's, made with the
+    /// fingerprint in front of them.
+    #[must_use]
+    pub fn forget(&self) -> Vec<String> {
+        vec![
+            "ssh-keygen".to_owned(),
+            "-R".to_owned(),
+            self.name.clone(),
+            "-f".to_owned(),
+            self.file.to_string_lossy().into_owned(),
+        ]
+    }
+
+    /// Whether this is the key of the host `report` describes, under the name
+    /// and in a file `ssh` would look it up in.
+    ///
+    /// The warning is read off a screen a far shell can print anything on, so
+    /// what it names is checked against what `ssh -G` says before a button is
+    /// offered for it. Against the raw lists rather than [`known_files`], whose
+    /// split comes apart at a space that a real path may hold.
+    #[must_use]
+    pub fn belongs_to(&self, report: &[(String, String)]) -> bool {
+        let file = self.file.to_string_lossy();
+        let listed = |files: &str| {
+            files == file
+                || files.starts_with(&format!("{file} "))
+                || files.ends_with(&format!(" {file}"))
+                || files.contains(&format!(" {file} "))
+        };
+        known_name(report).as_deref() == Some(self.name.as_str())
+            && report
+                .iter()
+                .filter(|(key, _)| key == "userknownhostsfile" || key == "globalknownhostsfile")
+                .any(|(_, files)| listed(files))
+    }
+}
+
+/// The changed key ssh is complaining about, read off what it left on screen.
+///
+/// Read from the screen rather than from `ssh -G`, because the warning names
+/// the exact file and name ssh matched, `HostKeyAlias` and a port included,
+/// and asking again could only arrive at the same answer by a longer road.
+/// Only a screen that ends on the refusal counts: a session can print anything
+/// before it exits, and text a remote shell echoed must not turn into an offer
+/// to edit some other file.
+#[must_use]
+pub fn changed_key(screen: &str) -> Option<ChangedKey> {
+    let mut lines = screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    if lines.next_back()? != "Host key verification failed." {
+        return None;
+    }
+    let mut name = None;
+    let mut file = None;
+    for line in screen.lines().map(str::trim) {
+        if let Some((found, _)) = line
+            .strip_prefix("Host key for ")
+            .and_then(|rest| rest.split_once(" has changed"))
+        {
+            name = Some(found);
+        }
+        if let Some((path, number)) = line
+            .strip_prefix("Offending ")
+            .and_then(|rest| rest.split_once(" key in "))
+            .and_then(|(_, rest)| rest.rsplit_once(':'))
+            && number.parse::<u32>().is_ok()
+        {
+            file = Some(path);
+        }
+    }
+    let name = name.filter(|name| !name.is_empty() && !name.contains(char::is_whitespace))?;
+    let file = PathBuf::from(file?);
+    file.is_absolute().then(|| ChangedKey {
+        name: name.to_owned(),
+        file,
+    })
+}
+
+/// How an ssh pane's session ended, as far as reconnecting is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    /// Logged out, refused, or anything else a second try would only repeat.
+    Closed,
+    /// A connection that was up went away under the session.
+    Dropped,
+    /// No connection could be made, which is worth another try only while the
+    /// network is coming back after a drop.
+    Unreachable,
+}
+
+/// Reads how a session ended off its exit code and what ssh said last.
+///
+/// Both, because neither is enough alone. ssh exits 255 for every failure of
+/// its own, a refused key and a mistyped name included, and a far shell that
+/// runs `exit 255` hands on the same code. Only the end of the screen is read,
+/// so text a remote shell printed earlier cannot pass for ssh, and only the
+/// end of a line, because ssh writes after whatever was on it: a connection
+/// that drops at a prompt leaves `$ Connection to box closed.`.
+///
+/// `Connection to box closed.` alone is what a pane with a terminal prints
+/// whenever ssh leaves, `exit 255` included. A drop puts its reason on the line
+/// above, `closed by remote host.` or `Read from remote host`, and that line
+/// is what decides. `Shared connection to box closed.` has no line above it in
+/// either case, so `master_up` is asked instead, and only then: a master still
+/// answering means the far shell left and the connection did not. Read off
+/// what OpenSSH 10.2 prints against a real `sshd`.
+#[must_use]
+pub fn ending(code: Option<u32>, screen: &str, master_up: impl FnOnce() -> bool) -> Ending {
+    if code != Some(255) {
+        return Ending::Closed;
+    }
+    let mut lines = screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(last) = lines.next_back() else {
+        return Ending::Closed;
+    };
+    let above = lines.next_back().unwrap_or_default();
+    fn from<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+        line.rfind(marker).map(|at| &line[at..])
+    }
+    let closed =
+        |line: &str| from(line, "onnection to ").is_some_and(|rest| rest.ends_with(" closed."));
+    let lost = |line: &str| {
+        from(line, "onnection to ").is_some_and(|rest| rest.ends_with(" closed by remote host."))
+            || from(line, "Read from remote host ").is_some()
+    };
+    let dropped = if from(last, "Shared connection to ").is_some() && closed(last) {
+        !master_up()
+    } else if closed(last) {
+        lost(above)
+    } else {
+        lost(last)
+            || from(last, "Timeout, server ").is_some_and(|rest| rest.ends_with(" not responding."))
+            || last.ends_with(": Broken pipe")
+            || last.contains("Connection reset by ")
+    };
+    if dropped {
+        return Ending::Dropped;
+    }
+    // Resolution failing for want of a network says so; a name that does not
+    // exist says `Name or service not known`, and trying it again is pointless.
+    let unreachable = from(last, "ssh: connect to host ").is_some()
+        && [
+            ": Network is unreachable",
+            ": No route to host",
+            ": Connection timed out",
+            ": Connection refused",
+        ]
+        .iter()
+        .any(|reason| last.ends_with(reason))
+        || from(last, "ssh: Could not resolve hostname ").is_some()
+            && last.ends_with(": Temporary failure in name resolution");
+    if unreachable {
+        Ending::Unreachable
+    } else {
+        Ending::Closed
+    }
+}
+
+/// How long to wait before the `attempt`th try at a dropped connection, the
+/// first being zero, or `None` once trying has gone on long enough.
+///
+/// Quick at first, because most drops are a wifi handover that is over in
+/// seconds, then a minute apart, and over after about five minutes, since a
+/// host still gone by then is down rather than out of reach.
+#[must_use]
+pub fn retry_delay(attempt: u32) -> Option<std::time::Duration> {
+    const SECONDS: [u64; 8] = [2, 5, 15, 30, 60, 60, 60, 60];
+    SECONDS
+        .get(attempt as usize)
+        .map(|seconds| std::time::Duration::from_secs(*seconds))
+}
+
 /// Whether `text` matches an ssh pattern: `*` for any run of characters, `?`
 /// for exactly one, and everything else literal. What `Host` lines and
 /// `Include` globs are both written in.
@@ -1771,6 +2178,13 @@ struct Line {
 
 /// Reads one file and everything it includes, in place, so a block opened
 /// before an `Include` and continued after it stays one block.
+///
+/// In place the way ssh reads it, which is not quite line for line: ssh puts
+/// the block that was open back after each included file, so what an included
+/// file says before its first `Host` and what follows the `Include` both
+/// belong to the block around it. The blocks an included file opens are held
+/// back until that block ends, which keeps every line in the block ssh reads
+/// it in without a marker the parser would have to learn.
 fn flatten(
     path: &Path,
     base: &Path,
@@ -1790,6 +2204,7 @@ fn flatten(
         return Vec::new();
     };
     let mut lines = Vec::new();
+    let mut held = Vec::new();
     for (index, text) in text.lines().enumerate() {
         if text.trim().is_empty() {
             continue;
@@ -1799,10 +2214,19 @@ fn flatten(
         {
             for glob in words(&value) {
                 for file in expand(&glob, base) {
-                    lines.extend(flatten(&file, base, depth + 1, seen, read));
+                    let mut included = flatten(&file, base, depth + 1, seen, read);
+                    let opens = included
+                        .iter()
+                        .position(|line| opens_block(&line.text))
+                        .unwrap_or(included.len());
+                    held.extend(included.split_off(opens));
+                    lines.extend(included);
                 }
             }
             continue;
+        }
+        if opens_block(text) {
+            lines.append(&mut held);
         }
         lines.push(Line {
             path: path.clone(),
@@ -1810,7 +2234,12 @@ fn flatten(
             text: text.to_owned(),
         });
     }
+    lines.append(&mut held);
     lines
+}
+
+fn opens_block(text: &str) -> bool {
+    split(text).is_some_and(|(keyword, _)| keyword == "host" || keyword == "match")
 }
 
 /// The block being read, held open until the next `Host`, `Match` or the end
@@ -2084,6 +2513,310 @@ fn modified(path: &Path) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CHANGED: &str = "\
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+The fingerprint for the ED25519 key sent by the remote host is
+SHA256:/w4hHeRrJJl/8JiT7Ue/YvdQyZuX91gSGoxAKsEAIsM.
+Please contact your system administrator.
+Add correct host key in /home/dean/.ssh/known hosts to get rid of this message.
+Offending ED25519 key in /home/dean/.ssh/known hosts:1
+Host key for [127.0.0.1]:22222 has changed and you have requested strict checking.
+Host key verification failed.
+
+";
+
+    #[test]
+    fn a_changed_key_names_the_file_and_the_name_it_is_filed_under() {
+        let key = changed_key(CHANGED).unwrap();
+        assert_eq!(key.name, "[127.0.0.1]:22222");
+        assert_eq!(key.file, PathBuf::from("/home/dean/.ssh/known hosts"));
+        assert_eq!(
+            shell_line(&key.forget()),
+            "ssh-keygen -R '[127.0.0.1]:22222' -f '/home/dean/.ssh/known hosts'"
+        );
+    }
+
+    #[test]
+    fn a_changed_key_counts_only_for_the_host_the_pane_is_on() {
+        let key = changed_key(CHANGED).unwrap();
+        let own = report(&[
+            "hostname 127.0.0.1",
+            "port 22222",
+            "userknownhostsfile /home/dean/.ssh/known hosts /home/dean/.ssh/known_hosts2",
+        ]);
+        assert!(key.belongs_to(&own));
+        // A warning a far shell printed about some other machine's key.
+        let other = report(&[
+            "hostname 10.0.0.9",
+            "userknownhostsfile /home/dean/.ssh/known hosts",
+        ]);
+        assert!(!key.belongs_to(&other));
+        let elsewhere = report(&[
+            "hostname 127.0.0.1",
+            "port 22222",
+            "userknownhostsfile /home/dean/.ssh/known",
+        ]);
+        assert!(!key.belongs_to(&elsewhere));
+    }
+
+    #[test]
+    fn a_warning_the_session_printed_before_carrying_on_is_not_a_changed_key() {
+        let echoed = format!("{CHANGED}dean@box:~$ exit\nConnection to box closed.\n");
+        assert_eq!(changed_key(&echoed), None);
+    }
+
+    #[test]
+    fn an_unknown_host_refused_is_not_a_changed_key() {
+        let screen = "No ED25519 host key is known for box and you have requested strict checking.\n\
+                      Host key verification failed.\n";
+        assert_eq!(changed_key(screen), None);
+    }
+
+    #[test]
+    fn a_shared_connection_dying_under_its_pane_is_a_drop() {
+        let screen = "dean@box:~$ \nShared connection to 127.0.0.1 closed.\n";
+        assert_eq!(ending(Some(255), screen, || false), Ending::Dropped);
+        let plain =
+            "Connection to 127.0.0.1 closed by remote host.\nConnection to 127.0.0.1 closed.\n";
+        assert_eq!(ending(Some(255), plain, || true), Ending::Dropped);
+        let hung = "Timeout, server 127.0.0.1 not responding.\n";
+        assert_eq!(ending(Some(255), hung, || true), Ending::Dropped);
+        let prompt = "~\n\u{276f} Shared connection to 127.0.0.1 closed.";
+        assert_eq!(ending(Some(255), prompt, || false), Ending::Dropped);
+        let read = "Read from remote host box: Connection reset by peer\n\
+                    Connection to box closed.\n";
+        assert_eq!(ending(Some(255), read, || true), Ending::Dropped);
+    }
+
+    #[test]
+    fn a_logout_prints_the_same_line_with_the_far_shell_s_code() {
+        let screen = "logout\nShared connection to 127.0.0.1 closed.\n";
+        assert_eq!(ending(Some(0), screen, || true), Ending::Closed);
+        assert_eq!(ending(Some(3), screen, || true), Ending::Closed);
+        assert_eq!(ending(None, screen, || true), Ending::Closed);
+    }
+
+    #[test]
+    fn a_refused_login_is_not_worth_another_try() {
+        assert_eq!(
+            ending(
+                Some(255),
+                "dean@box: Permission denied (publickey).\n",
+                || true
+            ),
+            Ending::Closed
+        );
+        assert_eq!(ending(Some(255), CHANGED, || true), Ending::Closed);
+        assert_eq!(
+            ending(
+                Some(255),
+                "ssh: Could not resolve hostname bxo: Name or service not known\n",
+                || true
+            ),
+            Ending::Closed
+        );
+    }
+
+    #[test]
+    fn a_network_that_is_not_back_yet_is_unreachable() {
+        for line in [
+            "ssh: connect to host 10.0.0.2 port 22: Network is unreachable",
+            "ssh: connect to host 127.0.0.1 port 22223: Connection refused",
+            "ssh: connect to host 10.255.255.1 port 22: Connection timed out",
+            "ssh: Could not resolve hostname box: Temporary failure in name resolution",
+        ] {
+            assert_eq!(
+                ending(Some(255), line, || true),
+                Ending::Unreachable,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_far_shell_exiting_255_is_not_a_drop() {
+        // What a pane with a terminal shows after `ssh -tt box 'exit 255'`.
+        let plain = "dean@box:~$ exit 255\nConnection to box closed.\n";
+        assert_eq!(ending(Some(255), plain, || false), Ending::Closed);
+        // The same through a shared connection, whose master is still up
+        // because only the session on it ended.
+        let shared = "dean@box:~$ exit 255\nShared connection to box closed.\n";
+        assert_eq!(ending(Some(255), shared, || true), Ending::Closed);
+    }
+
+    #[test]
+    fn the_master_is_asked_only_about_a_shared_line() {
+        let asked = std::cell::Cell::new(false);
+        let ask = || {
+            asked.set(true);
+            false
+        };
+        let plain = "Connection to box closed by remote host.\nConnection to box closed.\n";
+        assert_eq!(ending(Some(255), plain, ask), Ending::Dropped);
+        assert!(!asked.get());
+    }
+
+    #[test]
+    fn a_remote_shell_echoing_ssh_s_words_earlier_does_not_count() {
+        let screen = "Shared connection to box closed.\ndean@box:~$ exit 255\nkilled\n";
+        assert_eq!(ending(Some(255), screen, || true), Ending::Closed);
+    }
+
+    #[test]
+    fn retrying_backs_off_and_then_stops() {
+        assert_eq!(retry_delay(0), Some(std::time::Duration::from_secs(2)));
+        assert_eq!(retry_delay(7), Some(std::time::Duration::from_secs(60)));
+        assert_eq!(retry_delay(8), None);
+    }
+
+    fn report(lines: &[&str]) -> Vec<(String, String)> {
+        lines
+            .iter()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(keyword, value)| (keyword.to_owned(), value.to_owned()))
+            .collect()
+    }
+
+    fn noted(entries: &[(&str, &str, &[&str])]) -> Notes {
+        let mut notes = Notes::default();
+        for (alias, group, tags) in entries {
+            notes.set(
+                alias,
+                Meta {
+                    group: (*group).to_owned(),
+                    tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+                    ..Meta::default()
+                },
+            );
+        }
+        notes
+    }
+
+    #[test]
+    fn groups_come_by_name_and_the_hosts_in_none_come_last() {
+        let hosts: Vec<Host> = ["web", "db", "box", "api"]
+            .into_iter()
+            .map(|alias| Host {
+                alias: alias.to_owned(),
+                ..Host::default()
+            })
+            .collect();
+        let notes = noted(&[
+            ("web", "Prod", &[]),
+            ("api", "prod", &[]),
+            ("db", " Prod ", &[]),
+        ]);
+        let names: Vec<(String, Vec<&str>)> = grouped(&hosts, &notes)
+            .into_iter()
+            .map(|(name, members)| {
+                (
+                    name,
+                    members.iter().map(|host| host.alias.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Prod".to_owned(), vec!["db", "web"]),
+                ("prod".to_owned(), vec!["api"]),
+                (String::new(), vec!["box"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn tags_are_listed_once_and_only_for_the_hosts_asked_about() {
+        let notes = noted(&[
+            ("web", "", &["prod", "nginx"]),
+            ("db", "", &["Prod", "prod"]),
+            ("gone", "", &["old"]),
+        ]);
+        assert_eq!(notes.tags(["web", "db"]), ["nginx", "Prod", "prod"]);
+    }
+
+    #[test]
+    fn an_option_is_found_in_any_case_and_after_an_equals_sign_and_the_first_one_wins() {
+        let host = Host {
+            extra: vec![
+                "# ForwardAgent yes".to_owned(),
+                "forwardagent=no".to_owned(),
+                "ForwardAgent yes".to_owned(),
+            ],
+            ..Host::default()
+        };
+        assert_eq!(host.option("ForwardAgent").as_deref(), Some("no"));
+        assert_eq!(host.option("SetEnv"), None);
+    }
+
+    #[test]
+    fn setting_an_option_leaves_one_line_where_the_first_one_was() {
+        let mut host = Host {
+            extra: vec![
+                "Compression yes".to_owned(),
+                "SetEnv A=1".to_owned(),
+                "ServerAliveInterval 30".to_owned(),
+                "setenv=B=2".to_owned(),
+            ],
+            ..Host::default()
+        };
+        host.set_option("SetEnv", " LANG=C.UTF-8 EDITOR=vim ");
+        assert_eq!(
+            host.extra,
+            [
+                "Compression yes",
+                "SetEnv LANG=C.UTF-8 EDITOR=vim",
+                "ServerAliveInterval 30",
+            ]
+        );
+        host.set_option("ForwardAgent", "yes");
+        assert_eq!(
+            host.extra.last().map(String::as_str),
+            Some("ForwardAgent yes")
+        );
+    }
+
+    #[test]
+    fn an_empty_value_takes_the_option_out() {
+        let mut host = Host {
+            extra: vec!["ForwardAgent yes".to_owned(), "# a note".to_owned()],
+            ..Host::default()
+        };
+        host.set_option("ForwardAgent", "  ");
+        assert_eq!(host.extra, ["# a note"]);
+    }
+
+    #[test]
+    fn a_host_key_is_looked_up_under_the_name_ssh_files_it_under() {
+        let plain = report(&["hostname 10.0.0.4", "port 22"]);
+        assert_eq!(known_name(&plain).as_deref(), Some("10.0.0.4"));
+        let moved = report(&["hostname 10.0.0.4", "port 2222"]);
+        assert_eq!(known_name(&moved).as_deref(), Some("[10.0.0.4]:2222"));
+        let aliased = report(&["hostname 10.0.0.4", "port 2222", "hostkeyalias gate"]);
+        assert_eq!(known_name(&aliased).as_deref(), Some("gate"));
+        assert_eq!(known_name(&[]), None);
+    }
+
+    #[test]
+    fn host_keys_are_looked_for_in_every_file_ssh_reads() {
+        let files = report(&[
+            "globalknownhostsfile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2",
+            "userknownhostsfile /home/a/.ssh/known_hosts none",
+        ]);
+        assert_eq!(
+            known_files(&files),
+            [
+                "/etc/ssh/ssh_known_hosts",
+                "/etc/ssh/ssh_known_hosts2",
+                "/home/a/.ssh/known_hosts"
+            ]
+            .map(PathBuf::from)
+        );
+    }
     use std::time::UNIX_EPOCH;
 
     fn tempdir() -> PathBuf {
@@ -2191,6 +2924,43 @@ mod tests {
     }
 
     #[test]
+    fn what_follows_an_include_belongs_to_the_block_around_it() {
+        // Checked against `ssh -G`: `web` gets `User after` and the second
+        // file's leading `Compression yes`, and at the top level the line
+        // after the `Include` is global rather than the last included host's.
+        let directory = tempdir();
+        fs::write(directory.join("a.conf"), "Host db\n  Port 5433\n").expect("write");
+        fs::write(
+            directory.join("b.conf"),
+            "Compression yes\nHost beta\n  Port 2\n",
+        )
+        .expect("write");
+        let path = directory.join("config");
+        fs::write(
+            &path,
+            "Host web\n  Include *.conf\n  User after\nHost other\n  Port 7\n",
+        )
+        .expect("write");
+        let hosts = Hosts::read_from(&path);
+        let web = hosts.get("web").expect("web");
+        assert_eq!(web.user, "after");
+        assert!(web.extra.iter().any(|line| line.contains("Compression")));
+        assert_eq!(hosts.get("beta").expect("beta").user, "");
+        assert_eq!(hosts.get("beta").expect("beta").port, 2);
+
+        fs::write(&path, "Include *.conf\nUser global\nHost other\n").expect("write");
+        assert_eq!(Hosts::read_from(&path).get("beta").expect("beta").user, "");
+        assert!(
+            !Hosts::read_from(&path)
+                .get("beta")
+                .expect("beta")
+                .extra
+                .iter()
+                .any(|line| line.contains("global"))
+        );
+    }
+
+    #[test]
     fn a_file_that_includes_itself_is_read_once() {
         let directory = tempdir();
         let path = directory.join("config");
@@ -2286,9 +3056,21 @@ mod tests {
         assert_eq!(host.user, "deploy");
         assert_eq!(host.hostname, "10.0.0.1");
         assert_eq!(host.port, 2222);
-        assert_eq!(host.target(), "deploy@10.0.0.1");
+        assert_eq!(host.target(), "ssh://deploy@10.0.0.1:2222");
         assert_eq!(Host::adhoc("[::1]:22").expect("host").hostname, "::1");
         assert_eq!(Host::adhoc("box").expect("host").target(), "box");
+        assert_eq!(
+            Host::adhoc("deploy@box").expect("host").target(),
+            "deploy@box"
+        );
+        // The alias is what a pane is opened with, and what brings the port
+        // back when the pane looks its host up again.
+        assert_eq!(Host::adhoc(&host.alias).expect("host").port, 2222);
+        assert_eq!(host.typed(), "ssh ssh://deploy@10.0.0.1:2222");
+        assert_eq!(
+            Host::adhoc("[::1]:2222").expect("host").typed(),
+            "ssh -p 2222 ::1"
+        );
         assert!(Host::adhoc("two words here").is_none());
         assert!(Host::adhoc("").is_none());
     }
@@ -2312,6 +3094,13 @@ mod tests {
     }
 
     #[test]
+    fn a_linger_of_zero_is_not_written_as_zero_because_zero_means_forever_to_ssh() {
+        let directory = PathBuf::from("/nowhere");
+        assert_eq!(Control::at(directory.clone(), 0, true).persist, 1);
+        assert_eq!(Control::at(directory, CONTROL_PERSIST, true).persist, 600);
+    }
+
+    #[test]
     fn a_connection_ends_in_the_host_it_opens() {
         let control = Control::new(CONTROL_PERSIST, false);
         let host = Host {
@@ -2325,11 +3114,15 @@ mod tests {
         assert!(!argv.iter().any(|arg| arg.starts_with("ControlPath")));
 
         // A port the configuration has never heard of has to travel on the
-        // command line.
+        // command line, inside the destination where `ssh -G` sees it too.
         let typed = Host::adhoc("deploy@10.0.0.1:2222").expect("host");
         let argv = command(&typed, &control);
+        assert!(!argv.iter().any(|arg| arg == "-p"));
+        assert_eq!(argv[argv.len() - 1], "ssh://deploy@10.0.0.1:2222");
+        let typed = Host::adhoc("[::1]:2222").expect("host");
+        let argv = command(&typed, &control);
         assert!(argv.windows(2).any(|pair| pair == ["-p", "2222"]));
-        assert_eq!(argv[argv.len() - 1], "deploy@10.0.0.1");
+        assert_eq!(argv[argv.len() - 1], "::1");
     }
 
     #[test]
@@ -2395,6 +3188,26 @@ mod tests {
             ..Host::default()
         };
         assert!(render(&[smuggled]).is_err());
+    }
+
+    #[test]
+    fn a_host_line_spelled_with_an_equals_sign_is_still_refused() {
+        // Each of these opens a block to `ssh -G`, checked by hand against
+        // OpenSSH 10.
+        for line in ["Host=*", "\"Host\" *", "MATCH all", "host\t*", "=Host *"] {
+            let smuggled = Host {
+                alias: "web".to_owned(),
+                extra: vec![line.to_owned()],
+                ..Host::default()
+            };
+            assert!(render(&[smuggled]).is_err(), "{line} was written");
+        }
+        let fine = Host {
+            alias: "web".to_owned(),
+            extra: vec!["ServerAliveInterval=30".to_owned(), "# a note".to_owned()],
+            ..Host::default()
+        };
+        assert!(render(&[fine]).is_ok());
     }
 
     #[test]
@@ -2465,6 +3278,31 @@ mod tests {
             "renaming onto the link would detach the user from their dotfiles"
         );
         assert!(fs::read_to_string(&real).expect("read").contains("Include"));
+    }
+
+    #[test]
+    fn the_recent_hosts_are_the_newest_of_the_ones_still_listed() {
+        let dated = |when| Meta {
+            last_used: Some(when),
+            ..Meta::default()
+        };
+        let mut notes = Notes::default();
+        notes.set("old", dated(10));
+        notes.set("newest", dated(30));
+        notes.set("middle", dated(20));
+        notes.set("deleted", dated(40));
+        let hosts: Vec<Host> = ["old", "never", "middle", "newest"]
+            .map(|alias| Host {
+                alias: alias.to_owned(),
+                ..Host::default()
+            })
+            .to_vec();
+        let recent: Vec<&str> = notes
+            .recent(&hosts, 2)
+            .into_iter()
+            .map(|host| host.alias.as_str())
+            .collect();
+        assert_eq!(recent, ["newest", "middle"]);
     }
 
     #[test]
@@ -2540,17 +3378,27 @@ mod tests {
             "{refused}"
         );
 
-        // The far end's ports are the far end's business, and a forward that
-        // asks for whichever port is free cannot be checked at all.
-        drop(held);
-        assert!(check_port(&taken).is_ok());
+        // The far end's ports are the far end's business, so a remote forward
+        // on the very port held here passes, and a forward that asks for
+        // whichever port is free cannot be checked at all. Both asked while the
+        // port is still held: once it is let go, anything on the machine that
+        // binds port 0, another test included, can be handed it before this
+        // looks, which is how a check that it had come free used to fail.
         assert!(
             check_port(&Forward {
                 direction: Direction::Remote,
+                ..taken.clone()
+            })
+            .is_ok()
+        );
+        assert!(
+            check_port(&Forward {
+                listen_port: 0,
                 ..taken
             })
             .is_ok()
         );
+        drop(held);
     }
 
     #[test]

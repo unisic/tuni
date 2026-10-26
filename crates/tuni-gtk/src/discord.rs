@@ -91,11 +91,9 @@ fn run(receiver: &Receiver<Wanted>) {
             sent = None;
             continue;
         };
-        let activity = format_activity(status, &look_up(status, *show), *show, start);
-        if connection.is_some() && sent.as_ref() == Some(&activity) {
-            continue;
-        }
-
+        // Connected before looked up, since the look-up is three `git` runs
+        // and a Discord that is closed would otherwise cost them every retry,
+        // for as long as the window is open, for a presence that goes nowhere.
         let ipc = match &mut connection {
             Some(ipc) => ipc,
             None => match DiscordIpc::connect(CLIENT_ID) {
@@ -109,6 +107,10 @@ fn run(receiver: &Receiver<Wanted>) {
                 }
             },
         };
+        let activity = format_activity(status, &look_up(status, *show), *show, start);
+        if sent.as_ref() == Some(&activity) {
+            continue;
+        }
         match ipc.set_activity(Some(&activity)) {
             Ok(_) => {
                 if trace {

@@ -140,3 +140,43 @@ fn a_shell_that_leaves_on_its_own_is_reaped() {
     }
     assert_ne!(state, "Z", "the shell was left as a zombie");
 }
+
+#[test]
+fn a_shell_that_leaves_says_with_what_code() {
+    // What tells a dropped ssh connection, 255, from a logout that ended with
+    // the far shell's own code: the line ssh prints is the same for both.
+    let mut pty = Pty::spawn(&shell()).expect("spawn a shell on a pty");
+    let events = pty.events();
+    pty.write(b"exit 7\n").expect("write to the pty");
+    while let Ok(event) = events.recv_blocking() {
+        if matches!(event, PtyEvent::Exited) {
+            break;
+        }
+    }
+    assert_eq!(pty.finish(), Some(7));
+}
+
+#[test]
+fn a_program_that_goes_raw_is_seen_to() {
+    // What a host's on-connect snippet waits on: `ssh` asks for a password in
+    // line mode and goes raw once it is logged in. `stty raw` is the same
+    // switch without a server to log in to. A program run directly, the way a
+    // pane runs `ssh`, and not an interactive shell, whose line editor takes
+    // the terminal out of line mode at every prompt.
+    let mut pty = Pty::spawn(&PtyConfig {
+        argv: ["sh", "-c", "read line; stty raw -echo; sleep 300"]
+            .map(str::to_owned)
+            .to_vec(),
+        ..PtyConfig::default()
+    })
+    .expect("spawn a program on a pty");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!pty.is_raw(), "a program reading a line keeps line mode");
+
+    pty.write(b"answer\n").expect("write to the pty");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pty.is_raw() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(pty.is_raw(), "the terminal never left line mode");
+}

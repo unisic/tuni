@@ -1,0 +1,43 @@
+# Maintainer: Unisic <contact@unisic.app>
+#
+# AUR binary package: repacks the .pkg.tar.zst the release workflow builds and
+# installs in an archlinux:base-devel container, so this is the binary the
+# GitHub release ships, not a rebuild. Regenerate with ../sync.sh rather than
+# editing pkgver and sha256sums by hand.
+#
+# The source package takes ten minutes and a Zig toolchain; this takes seconds.
+# The cost is the usual one for a -bin: it links the gtk4 and libadwaita that
+# were current when the release was cut, and after a soname bump in [extra]
+# the source package is the one that still starts.
+
+pkgname=tuni-bin
+pkgver=1.6.0
+pkgrel=1
+# pkgrel of the upstream release asset: part of its file name, and it moves
+# independently of this package's own pkgrel.
+_pkgrel=1
+pkgdesc='Terminals, projects, files, and Git in one window (binary release)'
+arch=('x86_64')
+url='https://github.com/unisic/tuni'
+license=('GPL-3.0-or-later')
+# The same list the source recipe carries; sync.sh refuses to publish if the
+# released package names one that is missing here.
+depends=('gtk4' 'libadwaita' 'gtksourceview5' 'sqlite' 'git' 'curl'
+         'hicolor-icon-theme')
+optdepends=('ghostty-terminfo: terminfo for the TERM tuni panes advertise')
+provides=("tuni=${pkgver}")
+conflicts=('tuni')
+options=('!strip' '!debug')
+source=("tuni-${pkgver}-${_pkgrel}-x86_64.pkg.tar.zst::${url}/releases/download/v${pkgver}/tuni-${pkgver}-${_pkgrel}-x86_64.pkg.tar.zst")
+sha256sums=('ee4d96d6a0511187fd7864d6d736a7ce40e71a2dfdf33102528717aa584161fb')
+# makepkg would extract a pacman package into $srcdir along with its metadata;
+# unpacking it here instead means only usr/ can reach $pkgdir.
+noextract=("tuni-${pkgver}-${_pkgrel}-x86_64.pkg.tar.zst")
+
+package() {
+    bsdtar -xf "${srcdir}/tuni-${pkgver}-${_pkgrel}-x86_64.pkg.tar.zst" -C "${pkgdir}" usr
+    # Tells the running app that the AUR helper owns its updates. Without it
+    # the update dialog offers scripts/install.sh, whose pacman -U of the
+    # release package conflicts with this one and fails under --noconfirm.
+    install -Dm644 /dev/stdin "${pkgdir}/usr/share/tuni/install-channel" <<< 'aur'
+}

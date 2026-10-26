@@ -1,9 +1,10 @@
 //! Whether a newer Tuni has been released.
 //!
-//! No distribution packages Tuni yet, so nothing on the machine notices a
-//! release: an installed copy stays the version it was installed at until
-//! somebody goes looking. This asks the GitHub release page what the newest
-//! version is, and `scripts/install.sh` is what installs the answer.
+//! No distribution ships Tuni in its own repositories, so outside COPR and the
+//! AUR nothing on the machine notices a release: an installed copy stays the
+//! version it was installed at until somebody goes looking. This asks the
+//! GitHub release page what the newest version is, and `scripts/install.sh` is
+//! what installs the answer.
 //!
 //! `curl` rather than an HTTP client crate, for the same reason git is `git`:
 //! one question a day about a public JSON document does not justify a TLS
@@ -117,6 +118,24 @@ pub fn install_command() -> String {
 #[must_use]
 pub fn in_flatpak() -> bool {
     std::path::Path::new("/.flatpak-info").exists()
+}
+
+/// Whether this copy was built from an AUR recipe, which leaves a one-word
+/// marker in `share/tuni` beside the binary's `bin`. The helper that built it
+/// owns its updates: the installer would `pacman -U` the release package over
+/// it, which takes it out of the helper's hands, and over `tuni-bin` is a
+/// conflict pacman refuses under `--noconfirm`.
+///
+/// Read relative to the binary rather than from `/usr`, so a recipe with
+/// another prefix is still recognised. Blocking, but one small read.
+#[must_use]
+pub fn from_aur() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            std::fs::read_to_string(exe.parent()?.join("../share/tuni/install-channel")).ok()
+        })
+        .is_some_and(|channel| channel.trim() == "aur")
 }
 
 #[cfg(test)]

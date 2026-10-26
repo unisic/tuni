@@ -215,7 +215,10 @@ where
     group.add(&run);
     page.add(&group);
 
-    let body_group = adw::PreferencesGroup::builder().title("Text").build();
+    let body_group = adw::PreferencesGroup::builder()
+        .title("Text")
+        .description("Write {{name}} for a blank to fill in before it is typed")
+        .build();
     let body = gtk::TextView::builder()
         .monospace(true)
         .top_margin(6)
@@ -312,6 +315,113 @@ where
 
     dialog.present(Some(parent));
     name.grab_focus();
+}
+
+/// Asks for a snippet's blanks, then hands over its text with them filled in.
+/// One without blanks is handed over at once.
+///
+/// The values are not remembered. A field that offered last time's answer
+/// would be a store of whatever somebody typed into it, and a password is one
+/// of the things that gets typed into a blank.
+pub fn ask<F>(parent: &impl IsA<gtk::Widget>, snippet: &Snippet, done: F)
+where
+    F: Fn(String) + 'static,
+{
+    let blanks = tuni_core::snippets::blanks(&snippet.body);
+    if blanks.is_empty() {
+        done(snippet.body.clone());
+        return;
+    }
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .build();
+    list.add_css_class("boxed-list");
+    // Weak, because every row's `changed` handler holds `check`, which reads
+    // this list: a strong row here keeps its own handler alive, and the rows
+    // outlive the dialog they were in. The list box is what owns them.
+    let rows: Rc<Vec<(String, glib::WeakRef<adw::EntryRow>)>> = Rc::new(
+        blanks
+            .into_iter()
+            .map(|blank| {
+                let row = adw::EntryRow::builder()
+                    .title(blank)
+                    .activates_default(true)
+                    .build();
+                list.append(&row);
+                (blank.to_owned(), row.downgrade())
+            })
+            .collect(),
+    );
+
+    let dialog = adw::AlertDialog::new(Some(&snippet.name), Some(&summary(&snippet.body)));
+    dialog.set_extra_child(Some(&list));
+    dialog.add_response("cancel", "Cancel");
+    // Says which of the two the snippet does, since the blanks are the last
+    // thing between it and the shell.
+    let verb = if snippet.body.ends_with('\n') {
+        "Run"
+    } else {
+        "Type"
+    };
+    dialog.add_response("type", verb);
+    dialog.set_response_appearance("type", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("type"));
+    dialog.set_close_response("cancel");
+
+    let body = snippet.body.clone();
+    let filled = glib::clone!(
+        #[strong]
+        rows,
+        move || {
+            let values: Vec<(String, String)> = rows
+                .iter()
+                .filter_map(|(blank, row)| Some((blank.clone(), row.upgrade()?.text().to_string())))
+                .collect();
+            tuni_core::snippets::fill(&body, &values)
+        }
+    );
+    // A value that cannot be typed marks its own row, and the button waits
+    // until it is fixed, rather than typing half of what was asked.
+    let check = glib::clone!(
+        #[strong]
+        rows,
+        #[strong]
+        filled,
+        #[weak]
+        dialog,
+        move || {
+            let refused = filled().err();
+            for (blank, row) in rows.iter() {
+                let Some(row) = row.upgrade() else {
+                    continue;
+                };
+                if refused.as_ref() == Some(blank) {
+                    row.add_css_class("error");
+                } else {
+                    row.remove_css_class("error");
+                }
+            }
+            dialog.set_response_enabled("type", refused.is_none());
+        }
+    );
+    for row in rows.iter().filter_map(|(_, row)| row.upgrade()) {
+        row.connect_changed(glib::clone!(
+            #[strong]
+            check,
+            move |_| check()
+        ));
+    }
+    dialog.connect_response(None, move |_, response| {
+        if response == "type"
+            && let Ok(text) = filled()
+        {
+            done(text);
+        }
+    });
+    dialog.present(Some(parent));
+    if let Some(first) = rows.first().and_then(|(_, row)| row.upgrade()) {
+        first.grab_focus();
+    }
 }
 
 /// A snippet in one line, for the row above the tooltip that holds all of it.
