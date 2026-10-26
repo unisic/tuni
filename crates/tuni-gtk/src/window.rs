@@ -1266,6 +1266,19 @@ impl TuniWindow {
                     window.run_snippet(name);
                 }
             }),
+            // Runs a task the checkout declares. The target is the directory
+            // the file declaring it is in, and the line, already quoted.
+            entry(
+                "run-task",
+                glib::VariantTy::new("(ss)").ok(),
+                |window, target| {
+                    if let Some((directory, line)) =
+                        target.and_then(glib::Variant::get::<(String, String)>)
+                    {
+                        window.run_task(Path::new(&directory), &line);
+                    }
+                },
+            ),
             entry("snippets", None, |window, _| {
                 crate::snippets::present(window);
             }),
@@ -1676,6 +1689,39 @@ impl TuniWindow {
         };
         terminal.send_text(&snippet.body);
         terminal.grab_focus();
+    }
+
+    /// Runs a task in a shell of its own beside the pane on screen, started
+    /// where the file declaring it is.
+    ///
+    /// Beside rather than in the pane with the keyboard, which may be busy, or
+    /// a connection, or the agent; and a dev server is a thing to keep an eye
+    /// on next to the shell being worked in, the way Zentty splits for one.
+    fn run_task(&self, directory: &Path, line: &str) {
+        let Some((project, tab)) = self.selected_tab() else {
+            return;
+        };
+        let pane = Pane::new();
+        let pane_id = pane.id();
+        if !self.insert_pane(project, tab, pane, Edge::Right) {
+            return;
+        }
+        self.fill_pane(
+            project,
+            tab,
+            pane_id,
+            &Content::Terminal,
+            Some(directory.to_path_buf()),
+        );
+        let Some(terminal) = self.imp().terminals.borrow().get(&pane_id).cloned() else {
+            return;
+        };
+        let line = format!("{line}\n");
+        // Behind the shell starting, as in `run_line`.
+        glib::idle_add_local_once(move || {
+            terminal.send_text(&line);
+            terminal.grab_focus();
+        });
     }
 
     /// Puts a command on the prompt of a shell of its own, and leaves it there.
@@ -4901,6 +4947,41 @@ impl TuniWindow {
                 shortcut: None,
                 action: "win.run-snippet",
                 target: Some(snippet.name.to_variant()),
+                terminal: false,
+            });
+        }
+
+        // What the checkout under the shell on screen declares, read again on
+        // every opening, so a script added a moment ago is there. A handful of
+        // small files in the directories up to the repository, on this thread
+        // for the reason the hosts are.
+        let directory = self
+            .selected_tab()
+            .and_then(|(project, _)| self.directory_for_new_shell(project));
+        for task in directory
+            .as_deref()
+            .map(tuni_core::tasks::discover)
+            .unwrap_or_default()
+        {
+            let Some(path) = task.directory.to_str() else {
+                continue;
+            };
+            // A task from further up says from where, by the directory's name:
+            // a monorepo's package and its top can both have a `build`.
+            let subtitle = match task.directory.file_name() {
+                Some(name) if Some(&task.directory) != directory.as_ref() => {
+                    format!("{} in {}", task.command, name.to_string_lossy())
+                }
+                _ => task.command.clone(),
+            };
+            entries.push(palette::Entry {
+                search: format!("{} {} task run", task.name, task.command),
+                title: task.name,
+                subtitle: Some(subtitle),
+                icon: "media-playback-start-symbolic",
+                shortcut: None,
+                action: "win.run-task",
+                target: Some((path, task.command.as_str()).to_variant()),
                 terminal: false,
             });
         }

@@ -25,6 +25,7 @@ pub mod sftp;
 pub mod snippets;
 pub mod ssh;
 pub mod syntax;
+pub mod tasks;
 pub mod theme;
 pub mod updates;
 pub mod usage;

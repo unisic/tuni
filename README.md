@@ -19,6 +19,8 @@ A native terminal workspace for Linux.
 - Session inspector: what is running, what is listening, what a connection
   forwards
 - Command palette, tab switcher, find in whichever pane has the keyboard
+- The checkout's own tasks in the palette: `package.json` scripts, `just`,
+  `make`, Taskfile and `mise`, each run in a pane beside the one on screen
 - The hosts `~/.ssh/config` already declares, one shared connection per machine,
   and an SFTP page for the machine a pane is on
 - Kitty graphics, OSC 8 hyperlinks, desktop notifications, progress bars

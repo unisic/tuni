@@ -331,7 +331,7 @@ impl Project {
 /// looking for a `.git` entry — a directory in a normal checkout, a file in a
 /// worktree or a submodule, so existence is the test rather than being a
 /// directory.
-fn closest_git_repository(path: &Path) -> Option<PathBuf> {
+pub(crate) fn closest_git_repository(path: &Path) -> Option<PathBuf> {
     let mut dir = path;
     loop {
         if dir.join(".git").exists() {

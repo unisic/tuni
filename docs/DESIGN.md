@@ -227,7 +227,18 @@ already selected can be handed to the bar as the term, which is the quickest
 way to look for something a command just printed. `Ctrl+Shift+P` opens the command palette —
 everything the window can do, by name, with the keys that do the same thing
 beside it, and under that every terminal in the workspace, so a shell in another
-project is one query away rather than a hunt through tabs. Holding `Ctrl` and
+project is one query away rather than a hunt through tabs. It also lists the
+tasks the checkout under the shell declares, from the shell's directory up to
+the top of its repository: the scripts in `package.json`, run with the package
+manager whose lockfile is there, and the recipes of a `justfile`, the jobs of a
+`Makefile`, the tasks of a `Taskfile.yml` and of a `mise.toml`. One runs in a
+shell opened beside the pane on screen, in the directory of the file that
+declares it, because the pane with the keyboard may be busy or on another
+machine, and a dev server is a thing to watch next to the shell being worked
+in. Only what runs by its name alone is offered: a recipe that wants an
+argument, or a rule that builds a file rather than doing a job, is left out.
+The files are read again on every opening, at most 256 KiB each, so a script
+added a moment ago is there. Zentty lists them the same way. Holding `Ctrl` and
 pressing `Tab` brings up the tab switcher: a card per tab with a picture of what
 is in it, in the order they were last worked in, so one press and release goes
 back to where you just were.
