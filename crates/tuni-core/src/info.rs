@@ -228,6 +228,24 @@ pub fn age(pid: u32) -> Option<u64> {
     Some((uptime - started).max(0.0) as u64)
 }
 
+/// The ports anything under any of `shells` is listening on, one row a port:
+/// what the palette offers to open. One walk of `/proc` however many shells
+/// there are, since the palette asks for every pane in the window at once.
+#[must_use]
+pub fn served(shells: &[u32]) -> Vec<Port> {
+    let proc = Path::new("/proc");
+    let stats = read_stats(proc);
+    let mut pids: Vec<u32> = shells.to_vec();
+    for &shell in shells {
+        pids.extend(descendants(&stats, shell));
+    }
+    let mut ports = ports(proc, &pids, &[], &stats);
+    // Sorted by port, so every worker of one forked server is next to the
+    // others.
+    ports.dedup_by_key(|port| port.port);
+    ports
+}
+
 /// Every TCP port anything on this machine is listening on.
 ///
 /// Two file reads whatever the question was, which is what makes it the right
@@ -579,6 +597,21 @@ fn page_size() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_port_this_process_listens_on_is_served_once() {
+        let first = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+        let port = first.local_addr().expect("address").port();
+        // Held twice, as a server that duplicates its socket holds it.
+        let _second = first.try_clone().expect("clone");
+
+        let served: Vec<u16> = served(&[std::process::id()])
+            .into_iter()
+            .map(|served| served.port)
+            .filter(|&served| served == port)
+            .collect();
+        assert_eq!(served, [port]);
+    }
 
     /// A line in the shape a kernel writes: fields 3 to 24 in order, with 100
     /// ticks of user time, 50 of system, a start 900 ticks after boot, and 512

@@ -115,7 +115,11 @@ those processes are listening on. A port is a button that opens
 `http://localhost:<port>` in the browser, which is the reason to look — a dev
 server prints its port and then scrolls away. A process can be asked to quit, or
 made to. Nothing here shells out: it is `/proc`, read on a worker thread while
-the page is showing and no more often than that.
+the page is showing and no more often than that. The command palette offers
+the same ports for every shell in the window, "Open localhost:5173" by number
+or by the process holding it, so the browser is a query away without the page
+open. That is one walk of `/proc` each time the palette opens, however many
+shells there are, and one row a port however many workers hold it.
 
 When a coding agent is running under that shell, the page grows an Agent section
 for it. Claude Code, Codex, OpenCode and Pi each keep a record of their own turns

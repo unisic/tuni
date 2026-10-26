@@ -1279,6 +1279,11 @@ impl TuniWindow {
                     }
                 },
             ),
+            entry("open-url", string, |window, target| {
+                if let Some(url) = target.and_then(glib::Variant::str) {
+                    gtk::UriLauncher::new(url).launch(Some(window), gio::Cancellable::NONE, |_| ());
+                }
+            }),
             entry("snippets", None, |window, _| {
                 crate::snippets::present(window);
             }),
@@ -4982,6 +4987,28 @@ impl TuniWindow {
                 shortcut: None,
                 action: "win.run-task",
                 target: Some((path, task.command.as_str()).to_variant()),
+                terminal: false,
+            });
+        }
+
+        // Whatever a shell in the window is serving, so a dev server is a query
+        // away from a browser without opening the Info page on its pane.
+        let shells: Vec<u32> = self
+            .imp()
+            .terminals
+            .borrow()
+            .values()
+            .filter_map(TuniTerminal::shell_pid)
+            .collect();
+        for port in tuni_core::info::served(&shells) {
+            entries.push(palette::Entry {
+                search: format!("{} {} open browser localhost port", port.port, port.process),
+                title: format!("Open localhost:{}", port.port),
+                subtitle: Some(port.process.clone()),
+                icon: "web-browser-symbolic",
+                shortcut: None,
+                action: "win.open-url",
+                target: Some(port.url().to_variant()),
                 terminal: false,
             });
         }
