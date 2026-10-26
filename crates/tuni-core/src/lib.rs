@@ -16,6 +16,7 @@ pub mod info;
 pub mod links;
 pub mod lsp;
 pub mod panes;
+pub mod pasted;
 pub mod rpc;
 pub mod secrets;
 pub mod session;

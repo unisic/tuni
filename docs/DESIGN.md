@@ -396,6 +396,7 @@ installed, which is the whole of why a prompt's icons come out as boxes.
 | `Ctrl+Shift+M` | Take the mouse back from applications entirely, and hand it over again |
 | `Ctrl`+click | Open the hyperlink under the pointer |
 | Drop a file on a pane | Its path, quoted, onto the prompt as an argument, followed by a space |
+| Paste an image | A clipboard holding only an image, a screenshot, pastes the path of a file holding it, the way dropping one would |
 | `Shift+Page Up` / `Shift+Page Down` | Scroll the viewport by a page |
 | `Ctrl+Shift+Page Up` / `Ctrl+Shift+Page Down` | Scroll a command at a time, where the shell marks its prompts |
 | `Shift+Home` / `Shift+End` | Jump to the top of the scrollback, or the bottom |
@@ -1018,6 +1019,21 @@ the person meant. It goes in bracketed, like every other paste, so a name with a
 newline in it cannot run itself. A drag carrying text rather than files is that
 text, and one carrying a file the other side only holds in memory is its URI,
 which is the only name it has.
+
+A paste with no text in it but an image is the same drop with the file not
+written yet. A screenshot copied from the desktop is exactly that, and the
+coding agents that take an image take it as a path, so the image goes to a file
+of its own under `$XDG_CACHE_HOME/tuni/pasted` and the paste types that path the
+way a drop would. Kero does the same. The bytes are written as the clipboard
+holds them, PNG, JPEG, GIF or WebP, never decoded, off the main thread, into a
+directory only its owner can enter and a file only its owner can read: a
+screenshot is whatever was on screen. A name is never reused, so two pastes
+cannot write over each other, and each paste first removes the pastes older
+than a week, which is long enough for an agent to come back to a path and short
+enough that the directory stays a handful of files. A clipboard larger than
+64 MiB is refused rather than read into memory without end, and a paste that
+cannot be written says why in a toast, since one that does nothing reads as a
+broken key.
 
 The keyboard arriving and leaving is news as well, to the programs that asked
 for it with mode 1004: an editor rereads a file that changed while it was away,

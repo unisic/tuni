@@ -3114,9 +3114,70 @@ impl TuniTerminal {
                     && let Some(text) = text
                 {
                     this.paste_text(&text);
+                    return;
                 }
+                this.paste_image(&clipboard).await;
             }
         ));
+    }
+
+    /// A clipboard holding an image and no text, as a screenshot copied from
+    /// the desktop does, pastes the path of a file holding the image: the way
+    /// a coding agent is given an image, and the same words dropping the file
+    /// on the pane would type. A paste that cannot be written says why, since
+    /// a paste that silently does nothing reads as a broken key.
+    ///
+    /// The bytes are read as the clipboard has them, never decoded and encoded
+    /// again, and written off this thread. One copy of the image is held for
+    /// the length of the paste, and a clipboard larger than any screenshot is
+    /// refused rather than read without end.
+    async fn paste_image(&self, clipboard: &gdk::Clipboard) {
+        const LIMIT: usize = 64 * 1024 * 1024;
+        let types: Vec<&str> = tuni_core::pasted::TYPES
+            .iter()
+            .map(|&(mime, _)| mime)
+            .collect();
+        let Ok((stream, mime)) = clipboard.read_future(&types, glib::Priority::DEFAULT).await
+        else {
+            return;
+        };
+        let extension = tuni_core::pasted::TYPES
+            .iter()
+            .find(|&&(known, _)| known == mime.as_str())
+            .map_or("png", |&(_, extension)| extension);
+
+        let mut image = Vec::new();
+        loop {
+            match stream
+                .read_bytes_future(64 * 1024, glib::Priority::DEFAULT)
+                .await
+            {
+                Ok(chunk) if chunk.is_empty() => break,
+                Ok(chunk) if image.len() + chunk.len() > LIMIT => {
+                    return self.say("The image is too large to paste");
+                }
+                Ok(chunk) => image.extend_from_slice(&chunk),
+                Err(error) => return self.say(&format!("Couldn't read the image: {error}")),
+            }
+        }
+
+        let directory = tuni_core::pasted::directory();
+        let saved =
+            gio::spawn_blocking(move || tuni_core::pasted::save(&directory, &image, extension))
+                .await;
+        match saved {
+            Ok(Ok(path)) => self.paste_text(&format!("{} ", tuni_core::files::shell_quote(&path))),
+            Ok(Err(error)) => self.say(&format!("Couldn't save the image: {error}")),
+            Err(_) => {}
+        }
+    }
+
+    /// A line for the window's toast, from a pane that has nowhere of its own
+    /// to put one.
+    fn say(&self, message: &str) {
+        if let Some(window) = self.root().and_downcast::<crate::window::TuniWindow>() {
+            window.toast(message);
+        }
     }
 
     /// What a drag leaves on the prompt. Files come in as shell words, dragged

@@ -847,6 +847,13 @@ pub fn data_dir() -> PathBuf {
     xdg_dir("XDG_DATA_HOME", ".local/share")
 }
 
+/// `$XDG_CACHE_HOME/tuni`, or `~/.cache/tuni`: copies of things that came
+/// from elsewhere, which losing costs nothing but the copy.
+#[must_use]
+pub fn cache_dir() -> PathBuf {
+    xdg_dir("XDG_CACHE_HOME", ".cache")
+}
+
 fn xdg_dir(variable: &str, fallback: &str) -> PathBuf {
     let base = std::env::var_os(variable)
         .map(PathBuf::from)

@@ -466,9 +466,9 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
 
     // Actions typed the way the keyboard would reach them: "win.new-tab" or
     // "win.new-project", one per comma, each a step later, so a capture can
-    // show a window that has more than one of anything. An "editor." or a
-    // "diff." action goes to the pane showing one, since those groups live on
-    // the pane rather than on the window.
+    // show a window that has more than one of anything. An "editor.", a
+    // "diff." or a "term." action goes to the pane showing one, since those
+    // groups live on the pane rather than on the window.
     if let Ok(actions) = std::env::var("TUNI_CAPTURE_ACTIONS") {
         for (step, action) in actions.split(',').map(str::trim).enumerate() {
             let action = action.to_owned();
@@ -496,24 +496,31 @@ fn maybe_capture(window: &TuniWindow, terminal: Option<&TuniTerminal>) {
                             name.strip_prefix("editor."),
                             name.strip_prefix("diff."),
                             name.strip_prefix("hosts."),
+                            name.strip_prefix("term."),
                         ) {
-                            (Some(rest), _, _) => match window.active_editor() {
+                            (Some(rest), _, _, _) => match window.active_editor() {
                                 Some(editor) => {
                                     (editor.upcast::<gtk::Widget>(), format!("editor.{rest}"))
                                 }
                                 None => return eprintln!("no file is open: {name}"),
                             },
-                            (_, Some(rest), _) => match window.active_diff() {
+                            (_, Some(rest), _, _) => match window.active_diff() {
                                 Some(diff) => {
                                     (diff.upcast::<gtk::Widget>(), format!("diff.{rest}"))
                                 }
                                 None => return eprintln!("no diff is open: {name}"),
                             },
-                            (_, _, Some(rest)) => match window.active_hosts() {
+                            (_, _, Some(rest), _) => match window.active_hosts() {
                                 Some(hosts) => {
                                     (hosts.upcast::<gtk::Widget>(), format!("hosts.{rest}"))
                                 }
                                 None => return eprintln!("no host list is open: {name}"),
+                            },
+                            (_, _, _, Some(rest)) => match window.active_terminal() {
+                                Some(terminal) => {
+                                    (terminal.upcast::<gtk::Widget>(), format!("term.{rest}"))
+                                }
+                                None => return eprintln!("no terminal is open: {name}"),
                             },
                             _ => {
                                 let name = name.strip_prefix("win.").unwrap_or(&name);
