@@ -48,7 +48,7 @@ pub enum Agent {
 }
 
 impl Agent {
-    /// The agent running under a shell, if one of them is.
+    /// The agent running under a shell, if one of them is, and its process.
     ///
     /// The process list is the one the Info page already polls, so recognising
     /// an agent costs nothing beyond a walk of names that were read anyway.
@@ -56,7 +56,7 @@ impl Agent {
     /// Code's executable is a file named after its version and the comm is
     /// where `claude` survives.
     #[must_use]
-    pub fn running(processes: &[Process]) -> Option<Self> {
+    pub fn running(processes: &[Process]) -> Option<(Self, u32)> {
         processes.iter().find_map(|process| {
             [process.comm.as_str(), process.name.as_str()]
                 .into_iter()
@@ -67,6 +67,7 @@ impl Agent {
                     "pi" => Some(Self::Pi),
                     _ => None,
                 })
+                .map(|agent| (agent, process.pid))
         })
     }
 
@@ -201,6 +202,9 @@ pub struct Limit {
 pub struct Snapshot {
     pub agent: Option<Agent>,
     pub model: Option<String>,
+    /// Who serves the model, in the agent's own word for it: the same Gemini
+    /// is `google` under Pi on an API key and `antigravity` on a Google login.
+    pub source: Option<String>,
     /// The session running in this directory.
     pub session: Tokens,
     pub context: Option<Fill>,
@@ -246,6 +250,9 @@ pub struct Reader {
     /// The last word from UsageFleet and when it came, held as long as a plan
     /// reading and for the same reason.
     fleet: Option<(i64, Option<Fleet>)>,
+    /// Who serves Claude Code, for the process it was read from. Its
+    /// environment cannot change once it runs, so it is read once a process.
+    claude_source: Option<(u32, &'static str)>,
 }
 
 /// A fetched reading of the plan, held until it is stale.
@@ -264,6 +271,7 @@ struct Tail {
     read: u64,
     tokens: Tokens,
     model: Option<String>,
+    source: Option<String>,
     /// The directory the session was started in, for the logs that say.
     directory: Option<PathBuf>,
     /// Turns already counted, so a line the agent wrote twice is not paid for
@@ -280,10 +288,18 @@ impl Reader {
     /// Code's plan bars, which come off the account's usage page. Everything
     /// else is the agent's own logs and stays on the machine either way.
     /// `fleet` decides whether UsageFleet is asked for the group's budget.
+    /// `pid` is the agent's own process.
     #[must_use]
-    pub fn read(&mut self, agent: Agent, cwd: &Path, plan: bool, fleet: bool) -> Snapshot {
+    pub fn read(
+        &mut self,
+        agent: Agent,
+        pid: u32,
+        cwd: &Path,
+        plan: bool,
+        fleet: bool,
+    ) -> Snapshot {
         let mut snapshot = match agent {
-            Agent::Claude => self.claude(cwd, plan),
+            Agent::Claude => self.claude(pid, cwd, plan),
             Agent::Codex => self.codex(cwd),
             Agent::OpenCode => opencode(cwd),
             Agent::Pi => self.pi(cwd),
@@ -315,9 +331,10 @@ impl Reader {
 
     /// Claude Code: one log per session, under a directory named after the
     /// directory the session works in.
-    fn claude(&mut self, cwd: &Path, plan: bool) -> Snapshot {
+    fn claude(&mut self, pid: u32, cwd: &Path, plan: bool) -> Snapshot {
         let mut snapshot = Snapshot {
             agent: Some(Agent::Claude),
+            source: Some(self.claude_source(pid).to_owned()),
             ..Snapshot::default()
         };
         let root = home().join(".claude/projects");
@@ -359,6 +376,20 @@ impl Reader {
             limits: limits.clone(),
         });
         limits
+    }
+
+    /// Claude Code's log names the model and not who served it, so this asks
+    /// the switches it chooses that by, in the environment it was started in.
+    fn claude_source(&mut self, pid: u32) -> &'static str {
+        match self.claude_source {
+            Some((read, source)) if read == pid => source,
+            _ => {
+                let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+                let source = claude_platform(&environ);
+                self.claude_source = Some((pid, source));
+                source
+            }
+        }
     }
 
     fn claude_tail(&mut self, log: &Path) -> &Tail {
@@ -420,6 +451,7 @@ impl Reader {
             }
             snapshot.session = tail.tokens;
             snapshot.model.clone_from(&tail.model);
+            snapshot.source.clone_from(&tail.source);
             snapshot.context = tail.context;
             snapshot.limits.clone_from(&tail.limits);
             break;
@@ -445,6 +477,9 @@ impl Reader {
             }
             if let Some(model) = payload.model {
                 tail.model = Some(model);
+            }
+            if let Some(provider) = payload.model_provider {
+                tail.source = Some(provider);
             }
             // Codex reports the running total rather than the turn, so the
             // newest count replaces what the last one said.
@@ -493,6 +528,7 @@ impl Reader {
         let tail = self.pi_tail(&log);
         snapshot.session = tail.tokens;
         snapshot.model.clone_from(&tail.model);
+        snapshot.source.clone_from(&tail.source);
         snapshot
     }
 
@@ -545,6 +581,7 @@ impl Reader {
             });
             if message.model.is_some() {
                 tail.model = message.model;
+                tail.source = message.provider;
             }
         });
         tail
@@ -591,18 +628,55 @@ fn opencode(cwd: &Path) -> Snapshot {
         },
     );
     if let Ok((model, tokens)) = row {
-        snapshot.model = model.map(|model| opencode_model(&model));
+        if let Some(model) = model {
+            (snapshot.model, snapshot.source) = opencode_model(&model);
+        }
         snapshot.session = tokens;
     }
     snapshot
 }
 
-/// OpenCode names the model in a column of JSON, `{"id":..,"providerID":..}`,
-/// and the identifier is the part anyone reads.
-fn opencode_model(column: &str) -> String {
-    serde_json::from_str::<OpenCodeModel>(column)
-        .map(|model| model.id)
-        .unwrap_or_else(|_| column.to_owned())
+/// OpenCode names the model in a column of JSON, `{"id":..,"providerID":..}`:
+/// the model, and who serves it.
+fn opencode_model(column: &str) -> (Option<String>, Option<String>) {
+    serde_json::from_str::<OpenCodeModel>(column).map_or_else(
+        |_| (Some(column.to_owned()), None),
+        |model| (Some(model.id), model.provider),
+    )
+}
+
+/// Who serves Claude Code, in its own word for it, from the environment it
+/// runs in: Anthropic, unless one of the switches below sends it to a cloud.
+/// The order and the words are Claude Code's own, read out of 2.1.311.
+///
+/// ponytail: only what it was started with. A switch set under `env` in its
+/// settings file, or a gateway login, is applied inside it and reads as
+/// `anthropic` here.
+fn claude_platform(environ: &[u8]) -> &'static str {
+    let on = |name: &str| {
+        environ.split(|byte| *byte == 0).any(|pair| {
+            pair.strip_prefix(name.as_bytes())
+                .and_then(|rest| rest.strip_prefix(b"="))
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .is_some_and(|value| {
+                    ["1", "true", "yes", "on"].contains(&value.trim().to_lowercase().as_str())
+                })
+        })
+    };
+    [
+        ("CLAUDE_CODE_USE_BEDROCK", "bedrock"),
+        ("CLAUDE_CODE_USE_FOUNDRY", "foundry"),
+        ("CLAUDE_CODE_USE_ANTHROPIC_AWS", "anthropicAws"),
+        (
+            "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+            "anthropicGoogleCloud",
+        ),
+        ("CLAUDE_CODE_USE_MANTLE", "mantle"),
+        ("CLAUDE_CODE_USE_VERTEX", "vertex"),
+    ]
+    .into_iter()
+    .find(|(name, _)| on(name))
+    .map_or("anthropic", |(_, source)| source)
 }
 
 // --- the files ------------------------------------------------------------
@@ -1020,6 +1094,8 @@ struct CodexPayload {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    model_provider: Option<String>,
+    #[serde(default)]
     info: Option<CodexInfo>,
     #[serde(default)]
     rate_limits: Option<CodexLimits>,
@@ -1068,6 +1144,8 @@ struct CodexWindow {
 #[derive(Deserialize)]
 struct OpenCodeModel {
     id: String,
+    #[serde(rename = "providerID", default)]
+    provider: Option<String>,
 }
 
 /// A line of a Pi session log: the header that opens it, or one message.
@@ -1085,6 +1163,8 @@ struct PiLine {
 struct PiMessage {
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
     #[serde(default)]
     usage: Option<PiUsage>,
 }
@@ -1285,7 +1365,7 @@ mod tests {
         };
         let turn = |id: &str| {
             format!(
-                r#"{{"type":"message","id":"{id}","timestamp":"2026-08-03T15:04:24.287Z","message":{{"role":"assistant","model":"gpt-5.6-sol","usage":{{"input":10,"output":20,"cacheRead":30,"cacheWrite":40,"reasoning":15,"totalTokens":100}}}}}}"#
+                r#"{{"type":"message","id":"{id}","timestamp":"2026-08-03T15:04:24.287Z","message":{{"role":"assistant","model":"gpt-5.6-sol","provider":"antigravity","usage":{{"input":10,"output":20,"cacheRead":30,"cacheWrite":40,"reasoning":15,"totalTokens":100}}}}}}"#
             )
         };
         std::fs::write(
@@ -1321,6 +1401,7 @@ mod tests {
         );
         assert_eq!(tail.tokens.total(), 200);
         assert_eq!(tail.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(tail.source.as_deref(), Some("antigravity"));
 
         std::fs::remove_dir_all(&directory).expect("clean up");
     }
@@ -1382,13 +1463,45 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_is_served_by_anthropic_unless_a_switch_says_otherwise() {
+        assert_eq!(claude_platform(b""), "anthropic");
+        assert_eq!(
+            claude_platform(b"HOME=/h\0CLAUDE_CODE_USE_BEDROCK=0\0"),
+            "anthropic"
+        );
+        assert_eq!(claude_platform(b"CLAUDE_CODE_USE_VERTEX=1\0"), "vertex");
+        // Bedrock is asked before Vertex, so both on is Bedrock.
+        assert_eq!(
+            claude_platform(b"CLAUDE_CODE_USE_VERTEX=true\0CLAUDE_CODE_USE_BEDROCK=Yes\0"),
+            "bedrock"
+        );
+        // A longer name that starts with a switch's is not that switch.
+        assert_eq!(
+            claude_platform(b"CLAUDE_CODE_USE_BEDROCK_X=1\0"),
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn opencode_names_the_model_and_its_provider_in_one_column() {
+        assert_eq!(
+            opencode_model(r#"{"id":"claude-opus-5-5","providerID":"github-copilot"}"#),
+            (
+                Some("claude-opus-5-5".to_owned()),
+                Some("github-copilot".to_owned())
+            )
+        );
+        assert_eq!(opencode_model("plain"), (Some("plain".to_owned()), None));
+    }
+
+    #[test]
     fn codex_reports_a_running_total_and_the_account_it_is_against() {
         let directory = tempdir();
         let log = directory.join("rollout-2026-07-26T12-00-00-abc.jsonl");
         std::fs::write(
             &log,
             concat!(
-                r#"{"type":"session_meta","payload":{"cwd":"/work","model":"gpt-5-codex"}}"#,
+                r#"{"type":"session_meta","payload":{"cwd":"/work","model":"gpt-5-codex","model_provider":"openai"}}"#,
                 "\n",
                 r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":10,"total_tokens":110},"last_token_usage":{"total_tokens":80},"model_context_window":200},"rate_limits":{"primary":{"used_percent":78.0,"window_minutes":10080,"resets_at":1784539081}}}}"#,
                 "\n",
@@ -1400,6 +1513,7 @@ mod tests {
         let tail = reader.codex_tail(&log);
         assert_eq!(tail.directory.as_deref(), Some(Path::new("/work")));
         assert_eq!(tail.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(tail.source.as_deref(), Some("openai"));
         assert_eq!(
             tail.tokens,
             Tokens {

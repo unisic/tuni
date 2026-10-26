@@ -782,8 +782,10 @@ impl TuniInfo {
                     let mut reader = reader;
                     let usage = Agent::running(&snapshot.processes)
                         .filter(|_| agents.usage)
-                        .filter(|agent| agent.watched(&agents))
-                        .map(|agent| reader.read(agent, &cwd, agents.plan, agents.usagefleet))
+                        .filter(|(agent, _)| agent.watched(&agents))
+                        .map(|(agent, agent_pid)| {
+                            reader.read(agent, agent_pid, &cwd, agents.plan, agents.usagefleet)
+                        })
                         .unwrap_or_default();
                     (snapshot, usage, reader)
                 })
@@ -1123,10 +1125,17 @@ impl TuniInfo {
         };
 
         section.container.set_visible(true);
-        section.model.set_text(&match usage.model.as_deref() {
-            Some(model) => format!("{} · {model}", agent.label()),
-            None => agent.label().to_owned(),
-        });
+        let model = usage.model.as_deref().map(|model| format!(" · {model}"));
+        let source = usage
+            .source
+            .as_deref()
+            .map(|source| format!(" via {source}"));
+        section.model.set_text(&format!(
+            "{}{}{}",
+            agent.label(),
+            model.unwrap_or_default(),
+            source.unwrap_or_default()
+        ));
 
         while let Some(child) = section.list.first_child() {
             section.list.remove(&child);

@@ -159,6 +159,18 @@ on this machine, it goes to the same place the agent itself talks to, and it
 carries nothing that was not already in `~/.claude`. Tokens and percentages,
 never prices, and nothing here signs in anywhere.
 
+The section's heading names the model and who serves it, in the agent's own
+word for it: "Pi · gemini-3.8-flash via antigravity". Pi, Codex and OpenCode
+write the provider into the same record as the model, and it is worth a place
+on the page because the same model under the same agent can be two different
+bills, `google` on an API key and `antigravity` on a Google login. Claude
+Code's record names only the model; which cloud runs it is decided by the
+`CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY` family of switches in its
+environment, so those are read out of `/proc` for the agent's process, once
+per process, in the order and with the words Claude Code itself uses. A switch
+set under `env` in its settings file, or a gateway login, is applied inside
+the agent where `/proc` cannot see it, and reads as `anthropic`.
+
 A pane holds a file as readily as it holds a shell. Opening one from either page
 puts it where a terminal would have gone — syntax highlighting for whatever
 GtkSourceView recognizes, line numbers, undo, find and replace, and `Ctrl+S`.
