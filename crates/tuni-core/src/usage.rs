@@ -45,6 +45,8 @@ pub enum Agent {
     Codex,
     OpenCode,
     Pi,
+    /// rokartur's `agent`, which keeps its sessions under `~/.agents`.
+    Rokartur,
 }
 
 impl Agent {
@@ -65,6 +67,7 @@ impl Agent {
                     "codex" => Some(Self::Codex),
                     "opencode" => Some(Self::OpenCode),
                     "pi" => Some(Self::Pi),
+                    "agent" => Some(Self::Rokartur),
                     _ => None,
                 })
                 .map(|agent| (agent, process.pid))
@@ -80,6 +83,7 @@ impl Agent {
             Self::Codex => agents.codex,
             Self::OpenCode => agents.opencode,
             Self::Pi => agents.pi,
+            Self::Rokartur => agents.rokartur,
         }
     }
 
@@ -90,6 +94,7 @@ impl Agent {
             Self::Codex => "Codex",
             Self::OpenCode => "OpenCode",
             Self::Pi => "Pi",
+            Self::Rokartur => "agent",
         }
     }
 }
@@ -270,11 +275,14 @@ struct Plan {
 }
 
 /// Whose Claude login the plan is asked with: the one Claude Code keeps, or
-/// the one Pi signed in with itself when it is on Anthropic.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// the one Pi or rokartur's agent signed in with itself when it is on
+/// Anthropic. The agent keeps several and moves between them, so its login is
+/// named by the account the last turn went to.
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Login {
     Claude,
     Pi,
+    Rokartur(Option<String>),
 }
 
 /// What a log has said so far, and how much of it has been read. Which fields
@@ -287,6 +295,8 @@ struct Tail {
     tokens: Tokens,
     model: Option<String>,
     source: Option<String>,
+    /// The login the last turn was answered with, for the logs that say.
+    account: Option<String>,
     /// The directory the session was started in, for the logs that say.
     directory: Option<PathBuf>,
     /// Turns already counted, so a line the agent wrote twice is not paid for
@@ -318,6 +328,7 @@ impl Reader {
             Agent::Codex => self.codex(cwd),
             Agent::OpenCode => opencode(cwd),
             Agent::Pi => self.pi(pid, cwd, plan),
+            Agent::Rokartur => self.rokartur(pid, plan),
         };
         if !fleet {
             self.fleet = None;
@@ -385,7 +396,7 @@ impl Reader {
         // reason to blank the panel. Only the same login's, though: another
         // one can be another account.
         let previous = self.plan.take().filter(|plan| plan.login == login);
-        let limits = fetch_plan(login).or_else(|| previous.map(|plan| plan.limits));
+        let limits = fetch_plan(&login).or_else(|| previous.map(|plan| plan.limits));
         let limits = limits.unwrap_or_default();
         self.plan = Some(Plan {
             at,
@@ -626,6 +637,78 @@ impl Reader {
         });
         tail
     }
+
+    /// rokartur's agent: one log per session under `~/.agents/sessions`, which
+    /// it holds open and locked for as long as it is in that session. The one
+    /// it has open is the pane's, then, which follows `/new` and a resume and
+    /// tells two of them in one checkout apart. As with Pi, the context window
+    /// is not written down.
+    fn rokartur(&mut self, pid: u32, plan: bool) -> Snapshot {
+        let mut snapshot = Snapshot {
+            agent: Some(Agent::Rokartur),
+            ..Snapshot::default()
+        };
+        let Some(log) = agents_log(pid) else {
+            return snapshot;
+        };
+        let tail = self.rokartur_tail(&log);
+        snapshot.session = tail.tokens;
+        snapshot.model.clone_from(&tail.model);
+        snapshot.source.clone_from(&tail.source);
+        if plan && snapshot.source.as_deref() == Some("anthropic") {
+            let login = Login::Rokartur(tail.account.clone());
+            snapshot.limits = self.claude_plan(login);
+        }
+        snapshot
+    }
+
+    fn rokartur_tail(&mut self, log: &Path) -> &Tail {
+        let tail = self.logs.entry(log.to_path_buf()).or_default();
+        read_lines(log, tail, |tail, line| {
+            let Ok(entry) = serde_json::from_str::<AgentsLine>(line) else {
+                return;
+            };
+            match entry.kind.as_deref() {
+                // The header names the model the session starts on, and not
+                // who serves it: that waits for the first answer.
+                Some("session") => tail.model = entry.model,
+                // One line a reply, each counted once: none of 2,923 in the
+                // logs read on 0.1.25 repeated an id. `cache_write_1h` is a
+                // share of `cache_write` and is not added again.
+                Some("usage") => {
+                    tail.tokens.add(Tokens {
+                        input: entry.input,
+                        output: entry.output,
+                        cache_read: entry.cache_read,
+                        cache_write: entry.cache_write,
+                    });
+                    tail.model = entry.model;
+                    tail.source = entry.provider;
+                    tail.account = entry.account;
+                }
+                _ => {}
+            }
+        });
+        tail
+    }
+}
+
+/// The session log under some `.agents/sessions` that `pid` holds open, off
+/// its descriptors: about ten links read, every poll, since `/new` swaps it.
+/// The directory is matched by its tail because `/proc` gives the path with
+/// the links resolved, which on an rpm-ostree system is `/var/home`.
+fn agents_log(pid: u32) -> Option<PathBuf> {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .ok()?
+        .flatten()
+        .filter_map(|descriptor| std::fs::read_link(descriptor.path()).ok())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+                && path
+                    .parent()
+                    .is_some_and(|parent| parent.ends_with(".agents/sessions"))
+        })
 }
 
 /// OpenCode: a database rather than a log, with the totals already added up
@@ -813,7 +896,7 @@ fn newest_first(root: &Path) -> Vec<PathBuf> {
 /// login the agent keeps on disk. The request goes
 /// to the same place the agent itself talks to, and it carries nothing but the
 /// token that was already there.
-fn fetch_plan(login: Login) -> Option<Vec<Limit>> {
+fn fetch_plan(login: &Login) -> Option<Vec<Limit>> {
     let (token, expires) = match login {
         Login::Claude => {
             let credentials = home().join(".claude/.credentials.json");
@@ -829,6 +912,17 @@ fn fetch_plan(login: Login) -> Option<Vec<Limit>> {
         Login::Pi => {
             let auth = std::fs::read_to_string(home().join(".pi/agent/auth.json")).ok()?;
             let login = serde_json::from_str::<PiAuth>(&auth).ok()?.anthropic?;
+            (login.access, login.expires)
+        }
+        // Its logins are a list per provider, keys among them, and the turn
+        // names the one it was sent with by the account's id.
+        Login::Rokartur(account) => {
+            let accounts = std::fs::read_to_string(home().join(".agents/accounts.json")).ok()?;
+            let login = serde_json::from_str::<AgentsAccounts>(&accounts)
+                .ok()?
+                .anthropic
+                .into_iter()
+                .find(|login| login.kind == "oauth" && login.account_id == *account)?;
             (login.access, login.expires)
         }
     };
@@ -1344,6 +1438,49 @@ struct PiLogin {
     expires: i64,
 }
 
+/// A line of rokartur's agent's session log: the header that opens it, a
+/// reply's usage, or one of the many kinds neither of those is.
+#[derive(Deserialize)]
+struct AgentsLine {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    input: u64,
+    #[serde(default)]
+    output: u64,
+    #[serde(default)]
+    cache_read: u64,
+    #[serde(default)]
+    cache_write: u64,
+}
+
+/// `~/.agents/accounts.json`, of which only Anthropic's list is read.
+#[derive(Deserialize)]
+struct AgentsAccounts {
+    #[serde(default)]
+    anthropic: Vec<AgentsLogin>,
+}
+
+#[derive(Deserialize)]
+struct AgentsLogin {
+    /// `oauth` or `api_key`; a key has no plan behind it.
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    access: String,
+    /// In milliseconds, as Claude Code's.
+    #[serde(default)]
+    expires: i64,
+    #[serde(default, rename = "accountId")]
+    account_id: Option<String>,
+}
+
 impl CodexWindow {
     fn into_limit(self) -> Limit {
         Limit {
@@ -1525,6 +1662,62 @@ mod tests {
         assert_eq!(tail.model.as_deref(), Some("claude-haiku-5-5"));
         assert_eq!(tail.source.as_deref(), Some("anthropic"));
         assert_eq!(tail.tokens.total(), 200);
+
+        std::fs::remove_dir_all(&directory).expect("clean up");
+    }
+
+    #[test]
+    fn rokartur_s_agent_reads_the_session_it_holds_open_and_adds_up_its_replies() {
+        let directory = tempdir();
+        let sessions = directory.join(".agents/sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let log = sessions.join("6cf4f88f.jsonl");
+        // The lines as 0.1.25 wrote them, keys in the order it writes them.
+        let header = r#"{"cwd":"/home/dean/Projects/tuni","id":"6cf4f88f","model":"claude-opus-5-5","timestamp":1792842272298,"type":"session"}"#;
+        let reply = |model: &str| {
+            format!(
+                r#"{{"account":"a1","cache_read":30,"cache_write":40,"cache_write_1h":40,"id":"msg_{model}","input":10,"model":"{model}","output":20,"provider":"anthropic","timestamp":1792842272298,"type":"usage"}}"#
+            )
+        };
+        std::fs::write(&log, format!("{header}\n")).expect("write");
+
+        let held = File::open(&log).expect("open");
+        let found = agents_log(std::process::id()).expect("the log this process holds");
+        assert_eq!(found.file_name(), log.file_name());
+        drop(held);
+
+        // Before the first answer: the model the session started on, and no
+        // one yet to say serves it.
+        let mut reader = Reader::default();
+        let tail = reader.rokartur_tail(&log);
+        assert_eq!(tail.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(tail.source, None);
+        assert_eq!(tail.tokens.total(), 0);
+
+        let message = r#"{"message":{"content":"{\"type\":\"usage\",\"input\":999}","role":"user"},"type":"message"}"#;
+        let mut text = std::fs::read_to_string(&log).expect("read");
+        for line in [
+            reply("claude-opus-5-5"),
+            message.to_owned(),
+            reply("claude-haiku-5-5"),
+        ] {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        std::fs::write(&log, text).expect("append");
+        let tail = reader.rokartur_tail(&log);
+        assert_eq!(
+            tail.tokens,
+            Tokens {
+                input: 20,
+                output: 40,
+                cache_read: 60,
+                cache_write: 80,
+            }
+        );
+        assert_eq!(tail.model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(tail.source.as_deref(), Some("anthropic"));
+        assert_eq!(tail.account.as_deref(), Some("a1"));
 
         std::fs::remove_dir_all(&directory).expect("clean up");
     }

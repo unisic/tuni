@@ -963,6 +963,21 @@ fn agents_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw::
     ));
     known.add(&pi);
 
+    let rokartur = adw::SwitchRow::builder()
+        .title("rokartur's agent")
+        .subtitle("Tokens, and the plan bars on a Claude login")
+        .active(settings.agents.rokartur)
+        .build();
+    rokartur.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.agents.rokartur = on);
+        }
+    ));
+    known.add(&rokartur);
+
     let fleet = adw::SwitchRow::builder()
         .title("UsageFleet")
         .subtitle(

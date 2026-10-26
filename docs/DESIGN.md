@@ -144,35 +144,40 @@ before anything is spawned, because a window's actions can be activated from
 outside it, and a command taken as it came would run whatever sent it.
 
 When a coding agent is running under that shell, the page grows an Agent section
-for it. Claude Code, Codex, OpenCode and Pi each keep a record of their own turns
-on disk, and that is where the figures come from: what the session working in this
-directory has spent, split into fresh input, output and what came back from the
-cache, which is most of a long conversation and costs a fraction of the rest.
-Above the tokens sit the plan's own windows, a bar per window with how much of
-it is gone and when it starts over, which is the reason to look: the
-alternative is a browser tab. Codex writes those percentages into its log along with how
-full the model's context is; Claude Code's log does not carry them, so they are
-asked of the account's usage endpoint, the numbers its own usage page shows,
-with the login the agent already keeps on disk, at most once a minute, only
-while the agent runs. That request is the one exception to everything staying
-on this machine, it goes to the same place the agent itself talks to, and it
-carries nothing that was not already in `~/.claude`. Pi on Anthropic with a
-Claude login spends the same plan, so it gets the same bars, asked with the
-login Pi keeps in `~/.pi/agent/auth.json`; on an API key there is no plan and no
-bars. The request goes out as `tuni/<version>`, never under another client's
-name. Measured on 2026-10-26, the endpoint answered Pi's login that way and
-refused Claude Code's own with a 429 under every name but Claude Code's, so a
-Claude Code pane shows its session without bars while that holds. Tokens and
-percentages, never prices, and nothing here signs in anywhere.
+for it. Claude Code, Codex, OpenCode, Pi and rokartur's `agent` each keep a
+record of their own turns on disk, and that is where the figures come from: what
+the session working in this directory has spent, split into fresh input, output
+and what came back from the cache, which is most of a long conversation and
+costs a fraction of the rest. Above the tokens sit the plan's own windows, a bar
+per window with how much of it is gone and when it starts over, which is the
+reason to look: the alternative is a browser tab. Codex writes those percentages
+into its log along with how full the model's context is; Claude Code's log does
+not carry them, so they are asked of the account's usage endpoint, the numbers
+its own usage page shows, with the login the agent already keeps on disk, at
+most once a minute, only while the agent runs. That request is the one exception
+to everything staying on this machine, it goes to the same place the agent
+itself talks to, and it carries nothing that was not already in `~/.claude`. Pi
+on Anthropic with a Claude login spends the same plan, so it gets the same bars,
+asked with the login Pi keeps in `~/.pi/agent/auth.json`; on an API key there is
+no plan and no bars. rokartur's `agent` keeps a list of logins in
+`~/.agents/accounts.json` and moves between them, so its bars are asked with the
+one its last answer names. The request goes out as `tuni/<version>`, never under
+another client's name. Measured on 2026-10-26, the endpoint answered Pi's login
+that way and refused Claude Code's own with a 429 under every name but Claude
+Code's, so a Claude Code pane shows its session without bars while that holds.
+Tokens and percentages, never prices, and nothing here signs in anywhere.
 
 Which record is the pane's is the agent's to say where it says it. Claude Code
 names its conversation in `~/.claude/sessions/<pid>.json` and rewrites it on
 `/clear` or a resume, so two Claude Codes in one checkout each read their own;
-the newest record in the checkout is the guess only where that file is
-missing. Pi writes nothing until its first answer, so a Pi log older than the
-Pi process is the run before and is not shown; a switch of model is its own
-line in the log, written when it is made, so the heading follows it before
-the next answer.
+the newest record in the checkout is the guess only where that file is missing.
+Pi writes nothing until its first answer, so a Pi log older than the Pi process
+is the run before and is not shown; a switch of model is its own line in the
+log, written when it is made, so the heading follows it before the next answer.
+rokartur's `agent` holds its session's log open and locked for as long as it is
+in it, so the log is the one among its open descriptors in `/proc`, which
+follows `/new` and a resume; its switch of model shows with the next answer, the
+first line that names a provider.
 
 The section's heading names the model and who serves it, in the agent's own
 word for it: "Pi · gemini-3.8-flash via antigravity". Pi, Codex and OpenCode
@@ -1315,8 +1320,8 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `check-updates` | `true` | Whether the window asks the GitHub release page for a newer version, once per run. Off leaves the menu's "Check for Updates" to do it by hand |
 | `panel.files`, `panel.git`, `panel.info`, `panel.debug` | `true` | Which pages the panel's switcher offers. The Remote page manages itself: it exists while a pane is on a host |
 | `agent.usage` | `true` | Whether the Info panel reads a coding agent's own session log. Off takes the Agent section away and stops every file below it from being opened |
-| `agent.claude`, `agent.codex`, `agent.opencode`, `agent.pi` | `true` | Which agents count as one. An agent turned off is a pane like any other: no section, no log read, no request made |
-| `agent.plan` | `true` | Whether Claude Code's plan bars, and Pi's on a Claude login, are asked of the account's usage page, at most once a minute, with the login the agent already keeps on disk. The one thing a session log does not carry, so the one thing that leaves the machine. Codex's bars come out of its log and are not affected |
+| `agent.claude`, `agent.codex`, `agent.opencode`, `agent.pi`, `agent.rokartur` | `true` | Which agents count as one. An agent turned off is a pane like any other: no section, no log read, no request made |
+| `agent.plan` | `true` | Whether Claude Code's plan bars, and Pi's and rokartur's `agent`'s on a Claude login, are asked of the account's usage page, at most once a minute, with the login the agent already keeps on disk. The one thing a session log does not carry, so the one thing that leaves the machine. Codex's bars come out of its log and are not affected |
 | `agent.spinner` | `true` | Whether a tab whose agent is thinking spins. This also decides the title: the agent's own glyph is taken off the tab name exactly while tuni draws the spinner in its place |
 | `agent.mark` | `true` | Whether a turn that ends into a tab nobody is looking at marks that tab and its project's row, to be cleared by looking at it |
 | `agent.notify` | `true` | Whether the same moment raises a desktop notification, which also fires for a window sitting behind another one |

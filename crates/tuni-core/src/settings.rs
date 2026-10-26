@@ -109,8 +109,10 @@ pub struct Agents {
     pub codex: bool,
     pub opencode: bool,
     pub pi: bool,
+    pub rokartur: bool,
     /// Whether Claude Code's plan bars are asked of the account's usage page,
-    /// and Pi's when it is on Anthropic with a Claude login of its own.
+    /// and Pi's and rokartur's agent's when on Anthropic with a Claude login of
+    /// their own.
     ///
     /// The one thing its log does not carry, so it is the one thing that leaves
     /// the machine: at most one request a minute, with the login the agent
@@ -153,6 +155,7 @@ impl Default for Agents {
             codex: true,
             opencode: true,
             pi: true,
+            rokartur: true,
             plan: true,
             usagefleet: true,
             spinner: true,
@@ -542,6 +545,9 @@ impl Settings {
         if let Some(on) = table.boolean("agent.pi") {
             settings.agents.pi = on;
         }
+        if let Some(on) = table.boolean("agent.rokartur") {
+            settings.agents.rokartur = on;
+        }
         if let Some(on) = table.boolean("agent.plan") {
             settings.agents.plan = on;
         }
@@ -761,6 +767,11 @@ impl Settings {
                 default.agents.opencode,
             ),
             ("agent.pi", self.agents.pi, default.agents.pi),
+            (
+                "agent.rokartur",
+                self.agents.rokartur,
+                default.agents.rokartur,
+            ),
             ("agent.plan", self.agents.plan, default.agents.plan),
             (
                 "agent.usagefleet",
