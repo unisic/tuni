@@ -264,7 +264,16 @@ machine, and a dev server is a thing to watch next to the shell being worked
 in. Only what runs by its name alone is offered: a recipe that wants an
 argument, or a rule that builds a file rather than doing a job, is left out.
 The files are read again on every opening, at most 256 KiB each, so a script
-added a moment ago is there. Zentty lists them the same way. A command also
+added a moment ago is there. Zentty lists them the same way. Under the tasks
+are the five conversations Claude Code had most recently at the top of the
+checkout, each by the title Claude Code gave it or else by the first thing
+asked in it, and picking one opens a tab there running `claude --resume` on
+it: kero's Resume Conversation, for the agent tab that was closed. They come
+from Claude Code's own records under `~/.claude/projects`, so a conversation
+from before tuni was installed is there too. A record runs to tens of
+megabytes, so at most ten are opened per opening, and of each only the last
+64 KiB, where the newest title is, and the first 64 KiB when there is no title
+yet. The id reaches the shell only when it is hex digits and dashes. A command also
 answers to the word a person reaches for before its name, as kero's do: "ssh"
 finds New Connection, "maximize" Zoom Pane, and "font" or "dark" the settings
 page that holds them, which the palette opens on. Those words count only from

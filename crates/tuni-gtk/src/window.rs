@@ -1390,6 +1390,23 @@ impl TuniWindow {
                     }
                 },
             ),
+            // Picks a coding agent's conversation up again, in a tab of its
+            // own in the directory it was had in. The target is that
+            // directory and the conversation's id.
+            entry(
+                "resume-conversation",
+                glib::VariantTy::new("(ss)").ok(),
+                |window, target| {
+                    let Some((directory, id)) =
+                        target.and_then(glib::Variant::get::<(String, String)>)
+                    else {
+                        return;
+                    };
+                    if let Some(line) = tuni_core::conversations::resume_line(&id) {
+                        window.run_line(&line, true, Some(directory));
+                    }
+                },
+            ),
             entry("open-folder", string, |window, target| {
                 if let Some(path) = target.and_then(glib::Variant::str) {
                     gtk::FileLauncher::new(Some(&gio::File::for_path(path))).launch(
@@ -1717,7 +1734,7 @@ impl TuniWindow {
                     self,
                     move |_, response| {
                         if response == "update" {
-                            this.run_line(&tuni_core::updates::install_command(), true);
+                            this.run_line(&tuni_core::updates::install_command(), true, None);
                         }
                     }
                 ),
@@ -1950,18 +1967,20 @@ impl TuniWindow {
     /// commands about this machine. Typed and not run, for the reason a snippet
     /// without a newline is not run: the line is somebody's to read first.
     fn run_locally(&self, argv: &[String]) {
-        self.run_line(&tuni_core::ssh::shell_line(argv), false);
+        self.run_line(&tuni_core::ssh::shell_line(argv), false, None);
     }
 
     /// Opens a pane of its own and puts `line` on its prompt, either run or
     /// left there to be read first. Everything that asks a question a window
-    /// cannot answer — a passphrase, a `sudo` password, whether to overwrite
-    /// something — goes through here rather than behind the window.
-    fn run_line(&self, line: &str, run: bool) {
+    /// cannot answer (a passphrase, a `sudo` password, whether to overwrite
+    /// something) goes through here rather than behind the window. The
+    /// shell starts in `directory`, else where a new tab's would.
+    fn run_line(&self, line: &str, run: bool, directory: Option<String>) {
         let Some(project) = self.imp().workspace.borrow().selected_id() else {
             return;
         };
-        let pane = Pane::new();
+        let mut pane = Pane::new();
+        pane.directory = directory;
         let pane_id = pane.id();
         if !self.add_tab(project, Tab::with_pane(pane)) {
             return;
@@ -5324,6 +5343,28 @@ impl TuniWindow {
                     shortcut: None,
                     action: "win.open-in-editor",
                     target: Some((editor.command, root).to_variant()),
+                    terminal: false,
+                });
+            }
+
+            // Claude Code files a conversation under the directory it was
+            // started in, which is the checkout's top far more often than the
+            // shell's own directory. At most two 64 KiB reads for each of ten
+            // records, on this thread for the reason the hosts are.
+            let now = std::time::SystemTime::now();
+            for conversation in tuni_core::conversations::recent(Path::new(root), 5) {
+                entries.push(palette::Entry {
+                    search: conversation.title.clone(),
+                    words: "resume conversation claude agent history",
+                    subtitle: Some(format!(
+                        "Claude Code, {}",
+                        tuni_core::conversations::ago(conversation.modified, now)
+                    )),
+                    title: conversation.title,
+                    icon: "document-open-recent-symbolic",
+                    shortcut: None,
+                    action: "win.resume-conversation",
+                    target: Some((root, conversation.id.as_str()).to_variant()),
                     terminal: false,
                 });
             }
