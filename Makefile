@@ -47,9 +47,9 @@ ZIG_CPU ?= baseline
 
 # Which Ghostty is compiled is libghostty-rs's choice unless GHOSTTY_SOURCE_DIR
 # names another, and the commit it pins, 521cf2c5, does not have the fix for
-# GHSA-w9q4-5jvv-mcv4: clearing the screen into a small scrollback could free
-# the page the cursor stood on while the cursor kept its style and hyperlink
-# ids. So every build through here hands it the 1.4.0 release instead, and
+# GHSA-w9q4-5jvv-mcv4: clearing the screen into the scrollback could free the
+# page the cursor stood on while the cursor kept its style and hyperlink ids.
+# So every build through here hands it the 1.4.0 release instead, and
 # crates/tuni-vt/tests/feed.rs carries the input that aborted the Ghostty this
 # tree compiled before. The checksum is of the tarball whose minisign signature
 # checks out against the key in Ghostty's PACKAGING.md. Once the bindings pin
@@ -59,6 +59,14 @@ ZIG_CPU ?= baseline
 GHOSTTY_VERSION := 1.4.0
 GHOSTTY_SHA256 := cb188ac6c3a8278d5fd7bfef15d8c017104c87f638b5560eb38024a71ae0f005
 export GHOSTTY_SOURCE_DIR ?= $(CARGO_TARGET_DIR)/ghostty-$(GHOSTTY_VERSION)
+# Ghostty's build asks git for its version and, finding a tag, panics unless
+# the tag is Ghostty's own. The unpacked release has no .git, so git walks up
+# into the tree around it, and in a checkout of a Tuni tag, which is what the
+# release workflow builds, it answers with that tag. Stopping git at the
+# directory that holds the Ghostty tree makes it answer "not a repository",
+# which Ghostty takes for a build of the version its VERSION file names. A
+# source directory that is a Ghostty checkout still finds its own .git.
+export GIT_CEILING_DIRECTORIES := $(if $(GIT_CEILING_DIRECTORIES),$(GIT_CEILING_DIRECTORIES):)$(abspath $(dir $(GHOSTTY_SOURCE_DIR)))
 
 .PHONY: all build install install-data uninstall check dist clean zig \
 	ghostty ghostty-dir dev
