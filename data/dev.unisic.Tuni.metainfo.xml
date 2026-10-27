@@ -67,6 +67,26 @@
   </provides>
 
   <releases>
+    <release version="1.7.1" date="2026-10-27">
+      <description>
+        <p>The terminal core is Ghostty 1.4.0, which fixes a way for output to
+        make the terminal write through freed memory (GHSA-w9q4-5jvv-mcv4).
+        Searching 50,000 lines of scrollback takes 25 ms instead of 45, and a
+        frame lays out only the rows that changed, so a screen where a spinner
+        moves costs half the CPU it did.</p>
+        <p>Ctrl+Shift+J goes to the next tab that needs you, and a pasted
+        screenshot arrives as the path of a file holding it, ready for a coding
+        agent.</p>
+        <p>The palette runs the checkout's own tasks from package.json, a
+        justfile, a Makefile, a Taskfile or mise.toml, opens a dev server's
+        port in the browser, opens the checkout in Files or an editor, resumes
+        a Claude Code conversation, and opens a tab in a git worktree of its
+        own.</p>
+        <p>Split panes without the keyboard are dimmed, the keyboard can follow
+        the mouse, a folder dropped on the sidebar opens as a project, and
+        settings and commands are found by the words people use for them.</p>
+      </description>
+    </release>
     <release version="1.7.0" date="2026-10-25">
       <description>
         <p>A host's files open in a pane of their own, beside this machine's:

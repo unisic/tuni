@@ -83,7 +83,7 @@ build, rather than sitting at the top of the tree the whole time.
 ## Arch — `arch/PKGBUILD`
 
 ```sh
-make dist && mv tuni-1.7.0.tar.gz packaging/arch/
+make dist && mv tuni-1.7.1.tar.gz packaging/arch/
 cd packaging/arch && makepkg -si
 ```
 

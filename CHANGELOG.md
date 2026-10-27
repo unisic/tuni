@@ -5,6 +5,71 @@ publishes a version's section as the notes of its GitHub release, so the
 section has to exist before the tag does. Releases before 1.7.0 are described
 in `data/dev.unisic.Tuni.metainfo.xml`.
 
+## 1.7.1
+
+### Added
+
+- Ctrl+Shift+J goes to the next tab that needs you, one a bell, a long command
+  that ended or a finished agent marked, and lands on the pane the agent
+  finished in. The foot of the sidebar counts those tabs on a button that does
+  the same.
+- A clipboard holding a screenshot and no text pastes as the quoted path of a
+  file holding the image, so it can be handed to a coding agent without saving
+  it first. Pastes older than a week are removed.
+- The palette runs the checkout's own tasks: `package.json` scripts with the
+  package manager the project names, `justfile` recipes, and `Makefile`,
+  `Taskfile` and `mise.toml` tasks. Each opens a shell beside the pane on
+  screen, in the directory that declares it.
+- The palette opens a dev server's port in the browser, opens the checkout in
+  Files or an installed editor, and resumes one of the checkout's five latest
+  Claude Code conversations.
+- New Tab in Worktree opens a tab on a branch checked out in a git worktree of
+  its own under `.tuni/worktrees`, so agents side by side never edit the same
+  files. Closing its last tab offers to remove the worktree, and its branch
+  once every commit on it is merged, never by force.
+- Split panes without the keyboard are dimmed, as in Ghostty, and
+  focus-follows-mouse hands the keyboard to the pane under the pointer. Both
+  are under Window in Preferences, and the second is off by default.
+- A folder dropped on the sidebar opens as a project, the empty foot of the
+  sidebar moves the window, and Close All Tabs in a project's menu closes
+  every tab and keeps the project.
+- Settings and commands are found by the words people use for them: the
+  Preferences search looks through its rows, the palette opens a settings
+  page by what is on it, and a command answers to its synonyms.
+- The Info panel recognises rokartur's agent, with its sessions, usage and
+  plan bars, and names who serves an agent's model, as in "Pi ·
+  gemini-3.8-flash via antigravity".
+
+### Improved
+
+- The terminal core is Ghostty 1.4.0, built from its signed release rather
+  than a development snapshot from before it. Searching a full scrollback of
+  50,000 lines takes 25 ms instead of 45, and saving it with the session when
+  the window closes 28 ms a pane instead of 70.
+- A frame reads and lays out again only the rows that changed, so a screen
+  that stays put while a spinner moves costs about half the CPU: 181 to 199 ms
+  over ten seconds of a 30 Hz spinner instead of 313 to 476.
+- A closed pane and a flood of output hand their memory back to the system
+  once two seconds pass, instead of keeping it while the window is open.
+- An agent that reports itself busy with OSC 9;4, as Pi does, drives the tab's
+  spinner, the finished mark and the banner without being listed anywhere.
+- A Claude Code pane's Info section reads the conversation running in that
+  pane rather than the checkout's latest, and Pi's follows a model switch
+  before the next answer and shows the plan bars on a Claude login.
+
+### Fixed
+
+- Output that cleared the screen into the scrollback could leave the cursor
+  holding the style and hyperlink of a page already freed, so the next
+  character printed wrote through memory that was no longer its own
+  (GHSA-w9q4-5jvv-mcv4). Ghostty 1.4.0 fixes it.
+- The Fedora package builds in COPR again. 1.7.0 stopped there because the
+  build cloned Ghostty with git, which COPR's buildroot does not have.
+- Claude Code 2.1.311's new title spinner counts as a turn, so its tab shows
+  the spinner and the finished mark again.
+- The plan bars are asked for as `tuni/<version>`, which the endpoint answers,
+  instead of under curl's own name, which it refused with a 429.
+
 ## 1.7.0
 
 ### Added

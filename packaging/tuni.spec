@@ -6,7 +6,7 @@
 # for a local `rpmbuild`. Set GHOSTTY_SOURCE_DIR to that release unpacked and
 # CARGO_HOME to a populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.7.0/ -o tuni-1.7.0.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.7.1/ -o tuni-1.7.1.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.17.0
 
 Name:           tuni
-Version:        1.7.0
+Version:        1.7.1
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -94,6 +94,21 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/*/*/*.svg
 
 %changelog
+* Tue Oct 27 2026 Unisic <contact@unisic.app> - 1.7.1-1
+- The terminal core is Ghostty 1.4.0, which fixes a way for output to make the
+  terminal write through freed memory (GHSA-w9q4-5jvv-mcv4). Searching 50,000
+  lines of scrollback takes 25 ms instead of 45.
+- A frame lays out only the rows that changed, so a screen where a spinner
+  moves costs half the CPU, and a closed pane or a flood of output hands its
+  memory back.
+- Ctrl+Shift+J goes to the next tab that needs you, and a pasted screenshot
+  arrives as the path of a file holding it.
+- The palette runs the checkout's tasks, opens a dev server's port, opens the
+  checkout in Files or an editor, resumes a Claude Code conversation and opens
+  a tab in a git worktree of its own.
+- Split panes without the keyboard are dimmed, the keyboard can follow the
+  mouse, and a folder dropped on the sidebar opens as a project.
+
 * Sun Oct 25 2026 Unisic <contact@unisic.app> - 1.7.0-1
 - A host's files open in a pane beside this machine's, and a drag goes either
   way. Whole folders copy and delete, a remote file opens in the editor and
