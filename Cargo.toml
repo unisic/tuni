@@ -16,7 +16,7 @@ tuni-vt = { path = "crates/tuni-vt" }
 
 # Pre-1.0 and expected to move with the pinned Ghostty source, so pin the rev.
 # Everything that touches it lives behind the tuni-vt facade.
-libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "cd59174fd2ef5de8f1169987363c7815e62cff73" }
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "9ede35b8ea94a55ed3608408d67e102883129f1e" }
 
 [profile.release]
 lto = "thin"

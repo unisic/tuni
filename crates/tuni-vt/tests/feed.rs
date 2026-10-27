@@ -1028,6 +1028,29 @@ fn zero_scrollback_lines_means_none_not_unlimited() {
 }
 
 #[test]
+fn clearing_into_scrollback_keeps_the_cursor_hyperlink_valid() {
+    // GHSA-w9q4-5jvv-mcv4. Clearing the screen into scrollback could drop the
+    // page the cursor stood on, and the cursor kept that page's style and
+    // hyperlink ids, so the next print touched a table that was not its own.
+    // The bytes are upstream's minimised fuzz input: fill a page, open a
+    // hyperlink, step back onto the first page, clear, print. Once is enough
+    // with a scrollback of one line; three times reaches it at the default of
+    // 50,000 too, so this is a terminal as it ships. A debug build of the
+    // library checks a page whenever the cursor takes a hyperlink, and on
+    // a887df42, the Ghostty this tree compiled before 1.4.0, that check aborted
+    // the process here. The commit the bindings pin, 521cf2c5, is also older
+    // than the fix and yet survived the one-line form, so passing here is not
+    // proof that a source has the fix; the Makefile's checksum is.
+    let mut terminal = Terminal::new(200, 50, 50_000).expect("terminal");
+    for _ in 0..3 {
+        terminal.feed(b"A\x1b[48111b\x1b]8;;\x93\x1b[11A\x1b[22JB\x1b]8;;\x1b");
+    }
+    terminal.feed(b"\x1b[1;31mstill drawing\x1b[0m");
+    let hits = terminal.search("still drawing").expect("search");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
 fn a_walk_up_lands_on_the_prompt_above() {
     let mut terminal = Terminal::new(20, 6, 100).expect("terminal");
     // Five commands, each marked the way a shell with OSC 133 marks them, and

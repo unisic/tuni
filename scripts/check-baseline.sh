@@ -1,17 +1,18 @@
 #!/bin/sh
 # Refuses a binary that was compiled for the machine that built it.
 #
-# The Zig half of the build takes its CPU from a flag the Makefile passes
-# through a shim on PATH, and a cached artifact walks straight past both. So
-# the binary is asked directly instead of being trusted: 1.1.1 shipped a memset
-# full of AVX-512 because a GitHub runner had it, and every machine without it
-# died on SIGILL before the window appeared.
+# The Zig half of the build takes its CPU from LIBGHOSTTY_VT_SYS_CPU, which the
+# Makefile sets, and a cached artifact walks straight past it. So the binary is
+# asked directly instead of being trusted: 1.1.1 shipped a memset full of
+# AVX-512 because a GitHub runner had it, and every machine without it died on
+# SIGILL before the window appeared.
 #
 # Vector code that chooses itself at runtime is not the problem and is what the
 # list below allows. simdutf, memchr, simd-adler32, the Highway kernels
-# Ghostty carries, and aho-corasick's Teddy searcher (behind fancy-regex, which
-# matches URLs) all ask CPUID first and have a fallback behind them. A ymm
-# anywhere else got there because something compiled for the build machine.
+# Ghostty carries, wuffs (its image decoders, since 1.4), and aho-corasick's
+# Teddy searcher (behind fancy-regex, which matches URLs) all ask CPUID first
+# and have a fallback behind them. A ymm anywhere else got there because
+# something compiled for the build machine.
 #
 # That question can only be asked of a binary that still has its symbols. Every
 # package strips, and objdump then files the whole program under `.text`, so
@@ -21,7 +22,7 @@
 set -eu
 
 binary=${1:?usage: check-baseline.sh BINARY}
-dispatched='simdutf|memchr|simd_adler32|N_AVX2|N_AVX3|hwy|aho_corasick.*teddy'
+dispatched='simdutf|memchr|simd_adler32|N_AVX2|N_AVX3|hwy|wuffs_.*_x86_avx2|aho_corasick.*teddy'
 
 if [ "$(uname -m)" != x86_64 ]; then
     echo "$(uname -m) has no baseline to check against"
