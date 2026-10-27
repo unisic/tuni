@@ -7,12 +7,14 @@ and explains why each piece is built the way it is.
 ## Building
 
 The dependencies and the `make zig` step are in the
-[README](README.md#building). Zig **0.15.2** is not optional: `libghostty-vt`
-is Zig source compiled during the build, and the Ghostty commit pinned in
-`Cargo.toml` does not build against the 0.16 your distribution ships. To work
-against the newer pair instead, `make build-next` and `make test-next` fetch
-both. If you move either version, four files have to agree: `Makefile`,
-`.github/workflows/ci.yml`, `packaging/tuni.spec`,
+[README](README.md#building). Zig **0.17.0** is not optional: `libghostty-vt`
+is Zig source compiled during the build, and Ghostty 1.4 declares it the
+minimum. `make build` and `make check` compile the Ghostty 1.4.0 release rather
+than the commit the bindings pin, which lacks a security fix; plain `cargo`
+compiles the pinned one unless `GHOSTTY_SOURCE_DIR` says otherwise, so run
+`export GHOSTTY_SOURCE_DIR=$(make -s ghostty-dir)` after a `make ghostty` to
+test what ships. If you move either version, four files have to agree:
+`Makefile`, `.github/workflows/ci.yml`, `packaging/tuni.spec`,
 `packaging/dev.unisic.Tuni.yml`.
 
 ## Before opening a pull request

@@ -528,7 +528,7 @@ Add criterion benches for: `tuni-vt` feed throughput on a fixed payload, `Termin
 
 Use the headless patterns this repository already has: `crates/tuni-gtk/examples/resize_repro.rs` for VT-level work, and the `TUNI_CAPTURE_*` harness (`main.rs:234-673`) for widget-level work under a nested compositor or Xvfb.
 
-Note the build constraint: `libghostty-vt` compiles only with Zig 0.15.2, which `make zig` fetches. Any CI job you propose must account for that.
+Note the build constraint: `libghostty-vt` compiles only with Zig 0.17.0, which `make zig` fetches, and `make build` compiles the Ghostty 1.4.0 release rather than the commit the bindings pin. Any CI job you propose must account for that.
 
 OUTPUT FORMAT
 

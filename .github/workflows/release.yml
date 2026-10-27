@@ -127,7 +127,7 @@ jobs:
 
       - name: Build the deb
         run: |
-          # Ubuntu's zig is too new for the pinned Ghostty source, so the build
+          # Ubuntu's zig is not the one the Ghostty source names, so the build
           # gets the one it wants first — debian/rules expects it on PATH.
           make zig ZIG_PREFIX=/usr/local
           cp -r packaging/debian debian

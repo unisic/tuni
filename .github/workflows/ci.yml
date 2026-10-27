@@ -8,9 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The pinned Ghostty source builds with this and not with a newer one.
-  ZIG_VERSION: 0.15.2
-  ZIG_SHA256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+  # The Ghostty source the Makefile builds declares this its minimum.
+  ZIG_VERSION: 0.17.0
+  ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
 
 jobs:
   build:
@@ -68,6 +68,12 @@ jobs:
       - name: Build
         run: make build
 
+      # The Makefile hands cargo the Ghostty release rather than the commit the
+      # bindings pin; clippy and the tests below call cargo directly, so they
+      # are pointed at the source the build just unpacked.
+      - name: Point cargo at the Ghostty source
+        run: echo "GHOSTTY_SOURCE_DIR=$(make -s ghostty-dir)" >> "$GITHUB_ENV"
+
       - name: Check the binary against the baseline CPU
         run: scripts/check-baseline.sh target/release/tuni-gtk
 
@@ -91,25 +97,3 @@ jobs:
           name: tuni-x86_64
           path: staging
 
-  # The other known-good pair: the Zig current distributions ship, and the
-  # Ghostty commit that requires it. Releases are built from the pinned pair
-  # above; this job is what keeps `make build-next` from rotting.
-  zig-next:
-    runs-on: ubuntu-latest
-    container: fedora:44
-
-    steps:
-      - name: Install dependencies
-        # The same libraries the job above links against, less the tools only a
-        # release build needs. `make test-next` runs the tests too, so sqlite is
-        # here for rusqlite to link, ssh for the test that reads `ssh -G` and
-        # sftp-server for the ones that copy a real tree.
-        run: |
-          dnf install -y --setopt=install_weak_deps=False \
-            cargo rust gcc make git-core curl tar xz openssh-clients openssh-server \
-            gtk4-devel libadwaita-devel gtksourceview5-devel sqlite-devel
-
-      - uses: actions/checkout@v7
-
-      - name: Build and test against the newer Zig
-        run: make test-next ZIG_PREFIX="${GITHUB_WORKSPACE}/toolchains"

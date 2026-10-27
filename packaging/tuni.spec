@@ -1,19 +1,19 @@
 # RPM spec, for Fedora and everything that follows it.
 #
-# The build fetches: cargo dependencies, and the pinned Ghostty source that
-# libghostty-vt is compiled from. That rules out Koji, which builds offline —
-# this is for COPR with network enabled, or for a local `rpmbuild`. Set
-# GHOSTTY_SOURCE_DIR to a checkout of the pinned commit and CARGO_HOME to a
-# populated registry to build it without either.
+# The build fetches: cargo dependencies, and the Ghostty release that
+# libghostty-vt is compiled from (the Makefile's GHOSTTY_VERSION). That rules
+# out Koji, which builds offline — this is for COPR with network enabled, or
+# for a local `rpmbuild`. Set GHOSTTY_SOURCE_DIR to that release unpacked and
+# CARGO_HOME to a populated registry to build it without either.
 #
 #   make -C .. dist   # or: git archive --prefix=tuni-1.7.0/ -o tuni-1.7.0.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
-# Zig 0.15.2, which is what the pinned Ghostty source builds with. Fedora's own
-# zig package moves faster than that, so the build uses whatever is on PATH and
-# falls back to fetching this one.
-%global zig_version 0.15.2
+# Zig 0.17.0, which Ghostty 1.4 declares its minimum. Fedora 44's own zig is
+# 0.16, so the build uses whatever is on PATH and falls back to fetching this
+# one.
+%global zig_version 0.17.0
 
 Name:           tuni
 Version:        1.7.0
@@ -35,10 +35,10 @@ BuildRequires:  pkgconfig(gtksourceview-5)
 BuildRequires:  pkgconfig(sqlite3)
 BuildRequires:  desktop-file-utils
 BuildRequires:  libappstream-glib
-# libghostty-vt's build script clones the pinned Ghostty commit with the git
-# command rather than cargo's own fetcher, and COPR's buildroot has no git:
-# 1.7.0 failed there on "failed to execute git clone ghostty".
-BuildRequires:  git-core
+# The Makefile fetches the Ghostty release with curl and hands it to
+# libghostty-vt's build script, which therefore never runs its own git clone.
+# That clone is what failed 1.7.0 in COPR's buildroot, which has no git.
+BuildRequires:  curl
 
 # Everything the panels shell out to. curl fetches the plan bars the Info
 # page shows next to a running Claude Code, and the host list is read with the
@@ -62,8 +62,8 @@ and the diff viewer sit around it in the same window.
 %autosetup
 
 %build
-# Fedora's zig is newer than the pinned Ghostty source builds with, so prefer a
-# 0.15.2 on PATH and fetch one only when there is none.
+# Fedora's zig is older than the Ghostty source builds with, so prefer the
+# pinned one on PATH and fetch it only when there is none.
 if ! zig version 2>/dev/null | grep -q '^%{zig_version}$'; then
     curl -fsSLO https://ziglang.org/download/%{zig_version}/zig-%{_arch}-linux-%{zig_version}.tar.xz
     tar xf zig-%{_arch}-linux-%{zig_version}.tar.xz

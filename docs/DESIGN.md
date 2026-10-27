@@ -1478,19 +1478,20 @@ compositor looks — `make install-data PREFIX=$HOME/.local`.
 
 `packaging/` holds a Flatpak manifest and an RPM spec that both call into that
 same target, and [packaging/README.md](../packaging/README.md) says what each one
-needs — mainly Zig 0.15.2 and, unless it is given the offline paths, network
-during the build. `make zig` fetches that Zig into `~/.local`, because every
-distribution's package has moved past the version the pinned Ghostty commit
-builds with.
+needs — mainly Zig 0.17.0 and, unless it is given the offline paths, network
+during the build. `make zig` fetches that Zig into `~/.local`, because a
+distribution's package moves on its own schedule and the Ghostty source builds
+with the version it names.
 
-Zig 0.16 is the other half of that pin, not a separate problem: Ghostty's main
-branch requires it and the pinned commit rejects it, so building with the Zig a
-current distribution ships means building against a newer Ghostty as well.
-`make build-next` does exactly that — the 0.16 toolchain beside the 0.15.2 one,
-a shallow checkout of the Ghostty commit this tree is tested against, and
-`GHOSTTY_SOURCE_DIR` pointing the build at it. It is a second known-good pair,
-which is why both are commits rather than branches; releases are built from the
-0.15.2 one, since that is what the checked-in bindings were generated from.
+The Ghostty source is the other half of that pin. The bindings choose one by
+commit, and theirs lacks the fix for GHSA-w9q4-5jvv-mcv4, where clearing the
+screen into a small scrollback freed the page the cursor stood on. So the
+Makefile fetches the 1.4.0 release by checksum into the target directory and
+hands it to the bindings' build script as `GHOSTTY_SOURCE_DIR`, and every
+package recipe builds through that target. A release tarball rather than a
+commit, because Ghostty signs its releases and the checksum in the Makefile is
+of the one whose signature was checked. When the bindings pin 1.4.0 or later,
+the override goes and the bindings' choice is the build's again.
 
 ### Updating
 
@@ -1615,8 +1616,8 @@ not part of that, since a file is what is on disk.
 Requires a Rust toolchain, GTK4, libadwaita and SQLite development headers, and
 Zig, since `libghostty-vt` is Zig source that is compiled during the build.
 
-Fedora ships Zig 0.16, which is too new; fetch 0.15.2 from ziglang.org and put
-it on `PATH`.
+Fedora ships Zig 0.16, which is too old; fetch 0.17.0 from ziglang.org and put
+it on `PATH`, or let `make zig` do it.
 
 ```sh
 sudo dnf install cargo rust gcc make git-core curl tar xz \

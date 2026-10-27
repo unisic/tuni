@@ -24,67 +24,51 @@ CARGO_TARGET_DIR := $(shell $(CARGO) metadata --format-version 1 --no-deps 2>/de
 CARGO_TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 
 # libghostty-vt is Zig source compiled during the build, so which Zig works is
-# decided by the Ghostty source it is compiled from, not by taste:
-#
-#   0.15.2  the Ghostty commit libghostty-rs pins. The default, and what CI,
-#           the RPM spec and the Flatpak manifest all build with.
-#   0.16.0  what Fedora 44 and other current distributions ship. Ghostty's own
-#           main requires it and the pinned commit rejects it, so 0.16 also
-#           means a newer Ghostty, passed in through GHOSTTY_SOURCE_DIR.
-#
-# `make zig` fetches the default toolchain; `make build-next` builds the whole
-# thing the 0.16 way. Keep the pin in step with .github/workflows/ci.yml,
+# decided by the Ghostty source it is compiled from, not by taste. Ghostty 1.4
+# declares 0.17.0 its minimum, and Fedora 44 still ships 0.16, so `make zig`
+# fetches it. Keep the pin in step with .github/workflows/ci.yml,
 # packaging/tuni.spec and packaging/dev.unisic.Tuni.yml.
-ZIG_VERSION ?= 0.15.2
-ZIG_NEXT_VERSION := 0.16.0
+ZIG_VERSION ?= 0.17.0
 ZIG_PREFIX ?= $(HOME)/.local
 ZIG_ARCH := $(shell uname -m)
 ZIG_DIR = zig-$(ZIG_ARCH)-linux-$(ZIG_VERSION)
 ZIG_TAR = $(ZIG_DIR).tar.xz
-ZIG_SHA256_0.15.2_x86_64 := 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
-ZIG_SHA256_0.15.2_aarch64 := 958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f
-ZIG_SHA256_0.16.0_x86_64 := 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
-ZIG_SHA256_0.16.0_aarch64 := ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+ZIG_SHA256_0.17.0_x86_64 := 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+ZIG_SHA256_0.17.0_aarch64 := 9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
 ZIG_SHA256 = $(ZIG_SHA256_$(ZIG_VERSION)_$(ZIG_ARCH))
-# Whether the fetched toolchain also becomes the `zig` on PATH. The 0.16 one
-# does not: it is for this build and not for everything else on the machine.
-ZIG_LINK ?= yes
 
 # Which CPU the Zig half is compiled for. Left alone, zig detects the machine
 # doing the building, which is right for a build that stays there and wrong for
 # a package: the 1.1.1 binaries were compiled on a runner with AVX-512 and died
-# on SIGILL on the first machine without it. baseline is what a package wants;
+# on SIGILL on the first machine without it. The bindings pass it to zig from
+# LIBGHOSTTY_VT_SYS_CPU and default to baseline, which is what a package wants;
 # ZIG_CPU=native is for a build that never leaves this machine.
 ZIG_CPU ?= baseline
 
-# Ghostty's main branch moves and the C API the bindings are generated from
-# moves with it, so the 0.16 route is a commit that was built and tested
-# against this tree, not a branch name.
-GHOSTTY_NEXT_COMMIT := 2de5e7d38e1354759211722a8687c0815d2cf02c
-GHOSTTY_NEXT_DIR ?= $(ZIG_PREFIX)/opt/ghostty-$(GHOSTTY_NEXT_COMMIT)
+# Which Ghostty is compiled is libghostty-rs's choice unless GHOSTTY_SOURCE_DIR
+# names another, and the commit it pins, 521cf2c5, does not have the fix for
+# GHSA-w9q4-5jvv-mcv4: clearing the screen into a small scrollback could free
+# the page the cursor stood on while the cursor kept its style and hyperlink
+# ids. So every build through here hands it the 1.4.0 release instead, and
+# crates/tuni-vt/tests/feed.rs carries the input that aborted the Ghostty this
+# tree compiled before. The checksum is of the tarball whose minisign signature
+# checks out against the key in Ghostty's PACKAGING.md. Once the bindings pin
+# 1.4.0 or later, this and the `ghostty` target go. A build that sets
+# GHOSTTY_SOURCE_DIR itself, offline or not, keeps its own and nothing is
+# fetched.
+GHOSTTY_VERSION := 1.4.0
+GHOSTTY_SHA256 := cb188ac6c3a8278d5fd7bfef15d8c017104c87f638b5560eb38024a71ae0f005
+export GHOSTTY_SOURCE_DIR ?= $(CARGO_TARGET_DIR)/ghostty-$(GHOSTTY_VERSION)
 
-.PHONY: all build build-next test-next install install-data uninstall check \
-	dist clean zig zig-next ghostty-next dev
+.PHONY: all build install install-data uninstall check dist clean zig \
+	ghostty ghostty-dir dev
 
 all: build
 
-build:
+build: ghostty
 	@zig version 2>/dev/null | grep -qx '$(ZIG_VERSION)' || \
-		echo "warning: zig $(ZIG_VERSION) is not on PATH; \`make zig\` installs it, \`make build-next\` builds with $(ZIG_NEXT_VERSION) instead"
-	@TUNI_ZIG_CPU='$(ZIG_CPU)' PATH="$(CURDIR)/scripts/zig-baseline:$$PATH" \
-	$(CARGO) build --release --locked
-
-# The 0.16 route: that toolchain, the Ghostty commit that accepts it, and a
-# cargo that sees both. Nothing here changes what a plain `make build` uses.
-build-next: NEXT_ARGS := build --release --locked
-test-next: NEXT_ARGS := test --locked
-build-next test-next: zig-next ghostty-next
-	@dir="$(ZIG_PREFIX)/opt/zig-$(ZIG_ARCH)-linux-$(ZIG_NEXT_VERSION)"; \
-	if [ -x "$$dir/zig" ]; then PATH="$$dir:$$PATH"; export PATH; fi; \
-	zig version | grep -qx '$(ZIG_NEXT_VERSION)' || { \
-		echo "zig $(ZIG_NEXT_VERSION) is not on PATH" >&2; exit 1; \
-	}; \
-	GHOSTTY_SOURCE_DIR="$(GHOSTTY_NEXT_DIR)" $(CARGO) $(NEXT_ARGS)
+		echo "warning: zig $(ZIG_VERSION) is not on PATH; \`make zig\` installs it"
+	@LIBGHOSTTY_VT_SYS_CPU='$(ZIG_CPU)' $(CARGO) build --release --locked
 
 # Downloads into $(ZIG_PREFIX)/opt and links the binary into $(ZIG_PREFIX)/bin,
 # so nothing outside the home directory is touched and the distribution's own
@@ -92,9 +76,6 @@ build-next test-next: zig-next ghostty-next
 zig:
 	@if zig version 2>/dev/null | grep -qx '$(ZIG_VERSION)'; then \
 		echo "zig $(ZIG_VERSION) is already on PATH"; exit 0; \
-	fi; \
-	if [ -x "$(ZIG_PREFIX)/opt/$(ZIG_DIR)/zig" ] && [ '$(ZIG_LINK)' != yes ]; then \
-		echo "zig $(ZIG_VERSION) is already in $(ZIG_PREFIX)/opt/$(ZIG_DIR)"; exit 0; \
 	fi; \
 	if [ -z "$(ZIG_SHA256)" ]; then \
 		echo "no pinned Zig $(ZIG_VERSION) tarball for $(ZIG_ARCH)" >&2; exit 1; \
@@ -107,29 +88,34 @@ zig:
 	rm -rf "$(ZIG_PREFIX)/opt/$(ZIG_DIR)" && \
 	tar xf "$$tmp/$(ZIG_TAR)" -C "$(ZIG_PREFIX)/opt" && \
 	echo "zig $(ZIG_VERSION) installed in $(ZIG_PREFIX)/opt/$(ZIG_DIR)" && \
-	if [ '$(ZIG_LINK)' = yes ]; then \
-		ln -sfn "$(ZIG_PREFIX)/opt/$(ZIG_DIR)/zig" "$(ZIG_PREFIX)/bin/zig" && \
-		{ command -v zig >/dev/null || \
-			echo "warning: $(ZIG_PREFIX)/bin is not on PATH"; }; \
-	fi
+	ln -sfn "$(ZIG_PREFIX)/opt/$(ZIG_DIR)/zig" "$(ZIG_PREFIX)/bin/zig" && \
+	{ command -v zig >/dev/null || \
+		echo "warning: $(ZIG_PREFIX)/bin is not on PATH"; }
 
-zig-next:
-	@$(MAKE) --no-print-directory zig ZIG_VERSION=$(ZIG_NEXT_VERSION) ZIG_LINK=no
-
-# Only the parts of Ghostty that libghostty-vt needs get compiled, but the
-# checkout is the whole repository at that commit — fetched shallow, since the
-# history is not what is wanted here.
-ghostty-next:
-	@if [ "$$(git -C '$(GHOSTTY_NEXT_DIR)' rev-parse HEAD 2>/dev/null)" = '$(GHOSTTY_NEXT_COMMIT)' ]; then \
-		echo "ghostty $(GHOSTTY_NEXT_COMMIT) is already in $(GHOSTTY_NEXT_DIR)"; exit 0; \
+# Unpacked inside the target directory rather than the home directory, so a
+# package build needs nothing writable outside its own tree. It is unpacked
+# beside its destination and renamed onto it, so an interrupted fetch leaves no
+# half a tree for the next build to trust. A directory that is there without a
+# build.zig was not put there by this target and is not removed by it either.
+ghostty:
+	@if [ -f '$(GHOSTTY_SOURCE_DIR)/build.zig' ]; then exit 0; fi; \
+	if [ -e '$(GHOSTTY_SOURCE_DIR)' ]; then \
+		echo "$(GHOSTTY_SOURCE_DIR) is not a Ghostty source tree" >&2; exit 1; \
 	fi; \
-	rm -rf '$(GHOSTTY_NEXT_DIR)' && mkdir -p '$(GHOSTTY_NEXT_DIR)' && \
-	git -C '$(GHOSTTY_NEXT_DIR)' init -q && \
-	git -C '$(GHOSTTY_NEXT_DIR)' remote add origin \
-		https://github.com/ghostty-org/ghostty.git && \
-	git -C '$(GHOSTTY_NEXT_DIR)' fetch -q --depth 1 origin '$(GHOSTTY_NEXT_COMMIT)' && \
-	git -C '$(GHOSTTY_NEXT_DIR)' checkout -q FETCH_HEAD && \
-	echo "ghostty $(GHOSTTY_NEXT_COMMIT) checked out in $(GHOSTTY_NEXT_DIR)"
+	mkdir -p '$(dir $(GHOSTTY_SOURCE_DIR))' && \
+	tmp=$$(mktemp -d '$(GHOSTTY_SOURCE_DIR).XXXXXX') && trap 'rm -rf "$$tmp"' EXIT && \
+	curl -fsSL -o "$$tmp/ghostty.tar.gz" \
+		'https://release.files.ghostty.org/$(GHOSTTY_VERSION)/ghostty-$(GHOSTTY_VERSION).tar.gz' && \
+	echo "$(GHOSTTY_SHA256)  $$tmp/ghostty.tar.gz" | sha256sum -c - && \
+	mkdir "$$tmp/src" && \
+	tar xzf "$$tmp/ghostty.tar.gz" -C "$$tmp/src" --strip-components=1 && \
+	mv -T "$$tmp/src" '$(GHOSTTY_SOURCE_DIR)' && \
+	echo "ghostty $(GHOSTTY_VERSION) unpacked in $(GHOSTTY_SOURCE_DIR)"
+
+# For a cargo run that does not go through this Makefile, CI's clippy and test
+# steps among them, to be pointed at the same source.
+ghostty-dir:
+	@echo '$(GHOSTTY_SOURCE_DIR)'
 
 # Themes are baked into the binary at build time, so an installed Tuni needs
 # nothing beside the executable but its desktop integration.
@@ -176,7 +162,7 @@ uninstall:
 		rm -f $(icondir)/scalable/actions/$$(basename $$icon); \
 	done
 
-check:
+check: ghostty
 	$(CARGO) fmt --check
 	$(CARGO) clippy --all-targets -- -D warnings
 	$(CARGO) test
