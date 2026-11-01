@@ -171,6 +171,16 @@ thread_local! {
     static HOOKED: glib::WeakRef<gdk::Drag> = glib::WeakRef::new();
 }
 
+/// A project row in flight: the project and the window its sidebar is in,
+/// which may not be the one it is let go of over. In-process only, as a
+/// dragged tab is; there is nothing to say to another application.
+#[derive(Clone, glib::Boxed)]
+#[boxed_type(name = "TuniDraggedProject")]
+struct DraggedProject {
+    window: glib::WeakRef<TuniWindow>,
+    project: Id,
+}
+
 /// What a Find command found to act on. The bar over a terminal belongs to the
 /// window and is handed the terminal it is pointing at; a file pane carries its
 /// own search inside GtkSourceView.
@@ -781,7 +791,13 @@ impl TuniWindow {
         crate::diff::apply_colors(&self.theme());
 
         let sidebar = gtk::ListBox::new();
-        sidebar.set_selection_mode(gtk::SelectionMode::Single);
+        // Several at once, as a browser's tab strip allows: Shift extends,
+        // Ctrl adds, and the row menu then acts on all of them. The list's
+        // own click handling does that, but only once a click is not an
+        // activation: activate-on-single-click, the default, adds every
+        // clicked row to the selection and reads no modifier at all.
+        sidebar.set_selection_mode(gtk::SelectionMode::Multiple);
+        sidebar.set_activate_on_single_click(false);
         sidebar.add_css_class("navigation-sidebar");
         sidebar.connect_row_selected(glib::clone!(
             #[weak(rename_to = this)]
@@ -896,6 +912,24 @@ impl TuniWindow {
             }
         ));
         column.add_controller(folders);
+        // A project row let go of under the last row goes to the foot, loose,
+        // as a tab dragged past the end of a strip does: a row of this
+        // window's, or one carried over from another window's sidebar.
+        let projects = gtk::DropTarget::new(DraggedProject::static_type(), gdk::DragAction::MOVE);
+        projects.connect_drop(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            false,
+            move |_, value, _, _| {
+                let Ok(dragged) = value.get::<DraggedProject>() else {
+                    return false;
+                };
+                this.take_dropped_project(&dragged, None);
+                true
+            }
+        ));
+        column.add_controller(projects);
 
         let sidebar_header = adw::HeaderBar::builder()
             .show_end_title_buttons(false)
@@ -1175,6 +1209,9 @@ impl TuniWindow {
 
     fn install_actions(&self) {
         let uint64 = Some(glib::VariantTy::UINT64);
+        // A list of projects: one from a row's menu, several from the menu of
+        // a selection, as a browser's tab menu does for several tabs.
+        let ids = glib::VariantTy::new("at").ok();
         let string = Some(glib::VariantTy::STRING);
         self.add_action_entries([
             entry("new-tab", None, |window, _| {
@@ -1283,6 +1320,11 @@ impl TuniWindow {
                     window.close_project(id);
                 }
             }),
+            entry("close-projects", ids, |window, target| {
+                for id in projects_target(target) {
+                    window.close_project(id);
+                }
+            }),
             // Kero's Close All Sessions: every shell in the project ends and
             // the project stays, with its name, icon and directory, for the
             // next tab. Each tab is closed the way its own button closes it,
@@ -1309,10 +1351,8 @@ impl TuniWindow {
                     window.refresh();
                 }
             }),
-            entry("tear-out-project", uint64, |window, target| {
-                if let Some(id) = project_target(target) {
-                    window.tear_out_project(id);
-                }
+            entry("tear-out-project", ids, |window, target| {
+                window.tear_out_projects(&projects_target(target));
             }),
             // The menu's half of dragging a tab onto a sidebar row: the same
             // move, for a drag a tiling compositor swallowed or a hand that
@@ -1357,37 +1397,26 @@ impl TuniWindow {
             // A browser's tab groups, for projects. Each changes the model and
             // draws the sidebar again from it: order, membership and folds are
             // all read back out of the workspace, never off the rows.
-            entry("group-project", uint64, |window, target| {
-                if let Some(id) = project_target(target) {
-                    let group = window.imp().workspace.borrow_mut().add_to_new_group(id);
-                    window.redraw_sidebar();
-                    // Unnamed until asked, as a browser's new group is.
-                    if let Some(group) = group {
-                        window.rename_group(group);
-                    }
-                }
+            entry("group-project", ids, |window, target| {
+                window.group_projects(&projects_target(target), None);
             }),
             entry(
                 "group-project-into",
-                glib::VariantTy::new("(tt)").ok(),
+                glib::VariantTy::new("(att)").ok(),
                 |window, target| {
-                    if let Some((project, group)) =
-                        target.and_then(glib::Variant::get::<(u64, u64)>)
+                    if let Some((projects, group)) =
+                        target.and_then(glib::Variant::get::<(Vec<u64>, u64)>)
                     {
-                        window
-                            .imp()
-                            .workspace
-                            .borrow_mut()
-                            .add_to_group(Id::from(project), Id::from(group));
-                        window.redraw_sidebar();
+                        let projects: Vec<Id> = projects.into_iter().map(Id::from).collect();
+                        window.group_projects(&projects, Some(Id::from(group)));
                     }
                 },
             ),
-            entry("ungroup-project", uint64, |window, target| {
-                if let Some(id) = project_target(target) {
+            entry("ungroup-project", ids, |window, target| {
+                for id in projects_target(target) {
                     window.imp().workspace.borrow_mut().remove_from_group(id);
-                    window.redraw_sidebar();
                 }
+                window.redraw_sidebar();
             }),
             entry("rename-group", uint64, |window, target| {
                 if let Some(id) = project_target(target) {
@@ -2619,12 +2648,18 @@ impl TuniWindow {
         }
 
         // Writing the sidebar's selection here would otherwise come straight
-        // back as a selection change and re-enter this method.
+        // back as a selection change and re-enter this method. A row the hand
+        // just selected, with others beside it by Shift, is left as the hand
+        // left it; a selection that moved any other way collapses to its one
+        // row, as a browser's does.
         if let Some(list) = imp.sidebar.borrow().as_ref() {
             let row = selected.and_then(|id| self.row_for(id));
-            imp.selecting.set(true);
-            list.select_row(row.as_ref());
-            imp.selecting.set(false);
+            if !row.as_ref().is_some_and(|row| row.is_selected()) {
+                imp.selecting.set(true);
+                list.unselect_all();
+                list.select_row(row.as_ref());
+                imp.selecting.set(false);
+            }
         }
 
         self.refresh();
@@ -5175,25 +5210,37 @@ impl TuniWindow {
         view.transfer_page(page, &other, 0);
     }
 
-    /// Moves a whole project into a window of its own, shells and all.
+    /// Moves projects into a window of their own, shells and all.
     ///
     /// The tab strip has this for a single tab and gets it from `AdwTabView`,
     /// which knows when a page was dropped on nothing. A `GtkListBox` row knows
     /// no such thing, so the sidebar reads a drag that ended with no target as
-    /// the same request, and the move itself is the strip's: every page is
-    /// transferred to the new window's view, which carries the widgets, and so
-    /// the shells, across without closing anything. The row's menu asks for the
-    /// same thing by name, since a drag onto the desktop is a gesture a tiling
-    /// compositor can swallow before it ever reaches this window.
+    /// the same request, and the row's menu asks for it by name, since a drag
+    /// onto the desktop is a gesture a tiling compositor can swallow before it
+    /// ever reaches this window. The menu of a selection asks for several.
     ///
     /// The last project in a window may go too, and what stays behind is a
-    /// window with a New Project button in it — which is exactly what closing
+    /// window with a New Project button in it, which is exactly what closing
     /// that project by its own button already leaves.
-    fn tear_out_project(&self, id: Id) {
-        let imp = self.imp();
+    fn tear_out_projects(&self, ids: &[Id]) {
         let Some(app) = self.application().and_downcast::<adw::Application>() else {
             return;
         };
+        let window = Self::new(&app, self.imp().settings.borrow().clone());
+        window.present();
+        for id in ids {
+            self.move_project_to(*id, &window, None);
+        }
+    }
+
+    /// Moves a project into another window, set down where `onto` sits in that
+    /// window's sidebar, and in its group, or loose at the foot.
+    ///
+    /// The move itself is the strip's: every page is transferred to a strip in
+    /// the other window, which carries the widgets, and so the shells, across
+    /// without closing anything. The name, icon and directory go with them.
+    fn move_project_to(&self, id: Id, window: &Self, onto: Option<Id>) {
+        let imp = self.imp();
         let Some(view) = imp.views.borrow().get(&id).cloned() else {
             return;
         };
@@ -5211,19 +5258,21 @@ impl TuniWindow {
             return;
         };
 
-        let window = Self::new(&app, imp.settings.borrow().clone());
         let target = window.imp().workspace.borrow_mut().open_project();
         window.attach_project(target);
-        if let Some(project) = window.imp().workspace.borrow_mut().project_mut(target) {
-            project.custom_name = name;
-            project.icon = icon;
-            project.custom_directory = directory;
-            project.inherit_directory = follows;
+        {
+            let mut workspace = window.imp().workspace.borrow_mut();
+            if let Some(project) = workspace.project_mut(target) {
+                project.custom_name = name;
+                project.icon = icon;
+                project.custom_directory = directory;
+                project.inherit_directory = follows;
+            }
+            workspace.drop_project(target, onto);
         }
         let Some(other) = window.imp().views.borrow().get(&target).cloned() else {
             return;
         };
-        window.present();
 
         // Backwards, because each page goes to the head of the other strip:
         // walking from the end is what leaves them in the order they were in
@@ -6814,21 +6863,25 @@ impl TuniWindow {
         ));
         row.add_controller(middle);
 
-        // Dragging a row up or down reorders the sidebar, as it does in kero.
+        // Dragging a row up or down reorders the sidebar, as it does in kero;
+        // dragged onto another window's sidebar, the project moves there.
         let source = gtk::DragSource::builder()
             .actions(gdk::DragAction::MOVE)
             .build();
-        // The project's index, as a u32: a pane grid takes u64 pane ids, and
-        // a row carried over one must not read as a pane.
+        // The project and the window it is in, as a type of its own: a pane
+        // grid takes u64 pane ids, and a row carried over one must not read
+        // as a pane.
         source.connect_prepare(glib::clone!(
             #[weak(rename_to = this)]
             self,
             #[upgrade_or]
             None,
             move |_, _, _| {
-                let index = this.imp().workspace.borrow().index_of(id)?;
-                let index = u32::try_from(index).ok()?;
-                Some(gdk::ContentProvider::for_value(&index.to_value()))
+                let dragged = DraggedProject {
+                    window: this.downgrade(),
+                    project: id,
+                };
+                Some(gdk::ContentProvider::for_value(&dragged.to_value()))
             }
         ));
         // A drag with no icon of its own gets the toolkit's, which is a picture
@@ -6882,7 +6935,7 @@ impl TuniWindow {
                 if !refused {
                     return false;
                 }
-                glib::idle_add_local_once(move || this.tear_out_project(id));
+                glib::idle_add_local_once(move || this.tear_out_projects(&[id]));
                 true
             }
         ));
@@ -6951,32 +7004,41 @@ impl TuniWindow {
         &self,
         onto: impl Fn(&Workspace) -> Option<Id> + 'static,
     ) -> gtk::DropTarget {
-        let target = gtk::DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);
+        let target = gtk::DropTarget::new(DraggedProject::static_type(), gdk::DragAction::MOVE);
         target.connect_drop(glib::clone!(
             #[weak(rename_to = this)]
             self,
             #[upgrade_or]
             false,
             move |_, value, _, _| {
-                let Ok(from) = value.get::<u32>() else {
+                let Ok(dragged) = value.get::<DraggedProject>() else {
                     return false;
                 };
-                let moved = {
-                    let workspace = this.imp().workspace.borrow();
-                    workspace
-                        .projects()
-                        .get(from as usize)
-                        .map(Project::id)
-                        .zip(onto(&workspace))
-                };
-                if let Some((id, onto)) = moved {
-                    this.imp().workspace.borrow_mut().drop_project(id, onto);
-                    this.redraw_sidebar();
-                }
+                let onto = onto(&this.imp().workspace.borrow());
+                this.take_dropped_project(&dragged, onto);
                 true
             }
         ));
         target
+    }
+
+    /// A project row let go of on this sidebar: set down where `onto` is, or
+    /// at the foot. Moved within this window, or brought over from the window
+    /// it was dragged out of, shells and all.
+    fn take_dropped_project(&self, dragged: &DraggedProject, onto: Option<Id>) {
+        let Some(source) = dragged.window.upgrade() else {
+            return;
+        };
+        let id = dragged.project;
+        if source == *self {
+            self.imp().workspace.borrow_mut().drop_project(id, onto);
+            self.redraw_sidebar();
+            return;
+        }
+        // Out of the drop's own signal: the move closes the project in the
+        // other window, which destroys the row whose drag is still finishing.
+        let this = self.clone();
+        glib::idle_add_local_once(move || source.move_project_to(id, &this, onto));
     }
 
     /// A group's heading: its colour, its name, how many rows it is hiding
@@ -7059,7 +7121,11 @@ impl TuniWindow {
         row
     }
 
+    /// The menu of the selection when the row clicked is one of several
+    /// selected, as a browser's tab menu is; a click outside it is about that
+    /// row alone.
     fn popup_row_menu(&self, id: Id, row: &gtk::ListBoxRow, x: f64, y: f64) {
+        let selected = self.selected_projects();
         let model = {
             let workspace = self.imp().workspace.borrow();
             let Some(project) = workspace.project(id) else {
@@ -7070,9 +7136,54 @@ impl TuniWindow {
                 .iter()
                 .map(|group| (group.id(), group_label(group)))
                 .collect();
-            project_menu(project, &groups)
+            if selected.len() > 1 && selected.contains(&id) {
+                let members: Vec<Option<Id>> = selected
+                    .iter()
+                    .filter_map(|id| workspace.project(*id))
+                    .map(Project::group)
+                    .collect();
+                selection_menu(&selected, &groups, &members)
+            } else {
+                project_menu(project, &groups)
+            }
         };
         self.popup_on_row(&model, row, x, y);
+    }
+
+    /// The projects whose rows are selected, in sidebar order.
+    fn selected_projects(&self) -> Vec<Id> {
+        let Some(list) = self.imp().sidebar.borrow().clone() else {
+            return Vec::new();
+        };
+        list.selected_rows()
+            .iter()
+            .filter_map(|row| self.project_of_row(row))
+            .collect()
+    }
+
+    /// Puts projects in a group: the one named, else a new one, which is then
+    /// asked for its name, as a browser's new group is.
+    fn group_projects(&self, ids: &[Id], group: Option<Id>) {
+        let Some(first) = ids.first() else {
+            return;
+        };
+        let named = group.is_some();
+        let group = {
+            let mut workspace = self.imp().workspace.borrow_mut();
+            let group = group.or_else(|| workspace.add_to_new_group(*first));
+            if let Some(group) = group {
+                for id in ids {
+                    workspace.add_to_group(*id, group);
+                }
+            }
+            group
+        };
+        self.redraw_sidebar();
+        if let Some(group) = group
+            && !named
+        {
+            self.rename_group(group);
+        }
     }
 
     fn popup_group_menu(&self, id: Id, row: &gtk::ListBoxRow, x: f64, y: f64) {
@@ -7327,6 +7438,15 @@ fn project_target(target: Option<&glib::Variant>) -> Option<Id> {
     target.and_then(glib::Variant::get::<u64>).map(Id::from)
 }
 
+fn projects_target(target: Option<&glib::Variant>) -> Vec<Id> {
+    target
+        .and_then(glib::Variant::get::<Vec<u64>>)
+        .unwrap_or_default()
+        .into_iter()
+        .map(Id::from)
+        .collect()
+}
+
 /// The context menu on a sidebar row. Built per row because "Use Automatic
 /// Title" only belongs there when there is a custom one to drop, and because
 /// the directory rule reads as one label per state rather than a checkbox that
@@ -7381,29 +7501,13 @@ fn project_menu(project: &Project, groups: &[(Id, String)]) -> gio::Menu {
         &target,
     ));
 
-    // A browser's: a new group, else one of the others; and a way back out.
-    let grouping = gio::Menu::new();
-    let into = gio::Menu::new();
-    into.append_item(&item("New Group", "win.group-project", &target));
-    for (group, label) in groups {
-        if project.group() != Some(*group) {
-            into.append_item(&item(
-                label,
-                "win.group-project-into",
-                &(id.raw(), group.raw()).to_variant(),
-            ));
-        }
-    }
-    grouping.append_submenu(Some("Add to Group"), &into);
-    if project.group().is_some() {
-        grouping.append_item(&item("Remove from Group", "win.ungroup-project", &target));
-    }
+    let grouping = grouping_section(&[id], groups, &[project.group()], "Add to Group");
 
     let moving = gio::Menu::new();
     moving.append_item(&item(
         "Move to a New Window",
         "win.tear-out-project",
-        &target,
+        &[id.raw()][..].to_variant(),
     ));
 
     let closing = gio::Menu::new();
@@ -7419,6 +7523,79 @@ fn project_menu(project: &Project, groups: &[(Id, String)]) -> gio::Menu {
     menu.append_section(None, &moving);
     menu.append_section(None, &closing);
     menu
+}
+
+/// The context menu of several selected rows: what a browser offers for
+/// several tabs, each item for all of them at once.
+fn selection_menu(ids: &[Id], groups: &[(Id, String)], members: &[Option<Id>]) -> gio::Menu {
+    let count = ids.len();
+    let target = ids
+        .iter()
+        .map(|id| id.raw())
+        .collect::<Vec<_>>()
+        .to_variant();
+
+    let moving = gio::Menu::new();
+    moving.append_item(&item(
+        &format!("Move {count} Projects to a New Window"),
+        "win.tear-out-project",
+        &target,
+    ));
+
+    let closing = gio::Menu::new();
+    closing.append_item(&item(
+        &format!("Close {count} Projects"),
+        "win.close-projects",
+        &target,
+    ));
+
+    let menu = gio::Menu::new();
+    menu.append_section(
+        None,
+        &grouping_section(
+            ids,
+            groups,
+            members,
+            &format!("Add {count} Projects to Group"),
+        ),
+    );
+    menu.append_section(None, &moving);
+    menu.append_section(None, &closing);
+    menu
+}
+
+/// A browser's grouping, for one project or several: a new group, else one
+/// of the others, and a way back out. `members` is the group each is in now,
+/// so a group they are all in already is not offered, and leaving is, when
+/// any is in one.
+fn grouping_section(
+    ids: &[Id],
+    groups: &[(Id, String)],
+    members: &[Option<Id>],
+    label: &str,
+) -> gio::Menu {
+    let raw: Vec<u64> = ids.iter().map(|id| id.raw()).collect();
+    let into = gio::Menu::new();
+    into.append_item(&item("New Group", "win.group-project", &raw.to_variant()));
+    for (group, name) in groups {
+        if !members.iter().all(|member| *member == Some(*group)) {
+            into.append_item(&item(
+                name,
+                "win.group-project-into",
+                &(raw.clone(), group.raw()).to_variant(),
+            ));
+        }
+    }
+    let grouping = gio::Menu::new();
+    grouping.append_submenu(Some(label), &into);
+    if members.iter().any(Option::is_some) {
+        grouping.append_item(&item(
+            "Remove from Group",
+            "win.ungroup-project",
+            &raw.to_variant(),
+        ));
+    }
+    grouping
 }
 
 /// The context menu on a group's heading.

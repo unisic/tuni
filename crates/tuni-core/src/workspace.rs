@@ -595,12 +595,14 @@ impl Workspace {
 
     /// Drops a project where another one sits, as a drag down the sidebar
     /// does, and in that one's group: dragged into a band it joins, dragged
-    /// out it leaves, which is what keeps every band in one piece.
-    pub fn drop_project(&mut self, id: Id, onto: Id) {
-        let Some(to) = self.index_of(onto) else {
-            return;
+    /// out it leaves, which is what keeps every band in one piece. Dropped on
+    /// nobody, it goes to the foot, loose.
+    pub fn drop_project(&mut self, id: Id, onto: Option<Id>) {
+        let (to, group) = match onto.map(|onto| self.index_of(onto)) {
+            Some(Some(to)) => (to, self.projects[to].group),
+            Some(None) => return,
+            None => (self.projects.len(), None),
         };
-        let group = self.projects[to].group;
         self.move_project(id, to);
         if let Some(project) = self.project_mut(id) {
             project.group = group;
@@ -951,13 +953,17 @@ mod tests {
         let group = workspace.add_to_new_group(b).expect("b exists");
         workspace.add_to_group(c, group);
 
-        workspace.drop_project(d, b);
+        workspace.drop_project(d, Some(b));
         assert_eq!(order(&workspace), vec![a, d, b, c]);
         assert_eq!(workspace.project(d).unwrap().group(), Some(group));
 
-        workspace.drop_project(b, a);
+        workspace.drop_project(b, Some(a));
         assert_eq!(order(&workspace), vec![b, a, d, c]);
         assert_eq!(workspace.project(b).unwrap().group(), None);
+
+        workspace.drop_project(d, None);
+        assert_eq!(order(&workspace), vec![b, a, c, d]);
+        assert_eq!(workspace.project(d).unwrap().group(), None);
     }
 
     #[test]

@@ -13,6 +13,10 @@ in `data/dev.unisic.Tuni.metainfo.xml`.
   name and a colour, its heading folds the band away, and a project's menu
   moves it in and out.
 - A new project opens at the foot of the list, where a browser puts a new tab.
+- Several projects can be selected at once, Shift for a range and Ctrl for
+  one more, and the row menu then groups, moves or closes all of them.
+- A project row dragged onto another window's sidebar moves there, tabs,
+  panes and shells with it, the way a tab dragged between windows does.
 
 ### Changed
 

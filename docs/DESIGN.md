@@ -438,6 +438,18 @@ it, and GTK passes that on as an error, the same reason an Escape arrives with.
 So the window hooks every tab drag that crosses it and reads a performed drop
 followed by that cancel as the desktop, which KWin never sends for an Escape. A
 project row dragged off the sidebar reads its drag the same way.
+A row let go of on another window's sidebar does not leave the process, so it
+carries the project and the window it came from as a value of its own, and the
+sidebar it lands on asks that window for the same move it makes into a new one,
+set down where the drop was. The move closes the project in the window it left,
+and so the row whose drag is still finishing, so it waits for the drop to end.
+
+The list selects several rows, Shift for a range and Ctrl for one more, as a
+browser's tab strip does, and the menu of a row inside such a selection is about
+all of them: into a group, into a new window, closed. The list's own click
+handling does the selecting; the window writes the selection only when the
+selected project moved some other way, and then collapses it to that one row,
+so a selection made by hand survives the window's own bookkeeping.
 
 A mouse wheel over the tab strip moves to the next or previous tab, a tab per
 notch and stopping at either end, the way every Qt tab bar on a KDE desktop
