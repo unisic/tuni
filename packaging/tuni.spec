@@ -6,7 +6,7 @@
 # for a local `rpmbuild`. Set GHOSTTY_SOURCE_DIR to that release unpacked and
 # CARGO_HOME to a populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.7.1/ -o tuni-1.7.1.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.8.0/ -o tuni-1.8.0.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.17.0
 
 Name:           tuni
-Version:        1.7.1
+Version:        1.8.0
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -94,6 +94,21 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/*/*/*.svg
 
 %changelog
+* Sun Nov 01 2026 Unisic <contact@unisic.app> - 1.8.0-1
+- Projects gather into groups, as a browser groups tabs: a group has a name and
+  a color picked in the desktop's color dialog, its heading folds the band
+  away, and a project's menu moves it in and out.
+- Several projects select at once, Shift for a range and Ctrl for one more, and
+  the row menu groups, moves or closes all of them. A project row dragged onto
+  another window's sidebar moves there, tabs, panes and shells with it.
+- A new project opens at the foot of the list, and the field a project, group
+  or tab is renamed in has an emoji button beside it.
+- Typing right after switching projects reaches the terminal, the system emoji
+  chooser opens at once from the second time on, and tuni --version answers on
+  the command line instead of opening a project in the running Tuni.
+- A build run out of its own directory is an application of its own, apart
+  from the Tuni installed.
+
 * Tue Oct 27 2026 Unisic <contact@unisic.app> - 1.7.1-1
 - The terminal core is Ghostty 1.4.0, which fixes a way for output to make the
   terminal write through freed memory (GHSA-w9q4-5jvv-mcv4). Searching 50,000

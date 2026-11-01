@@ -1,3 +1,23 @@
+tuni (1.8.0) unstable; urgency=medium
+
+  * Projects gather into groups, as a browser groups tabs: a group has a name
+    and a color picked in the desktop's color dialog, its heading folds the
+    band away, and a project's menu moves it in and out.
+  * Several projects select at once, Shift for a range and Ctrl for one more,
+    and the row menu groups, moves or closes all of them. A project row
+    dragged onto another window's sidebar moves there, tabs, panes and shells
+    with it.
+  * A new project opens at the foot of the list, and the field a project,
+    group or tab is renamed in has an emoji button beside it.
+  * Typing right after switching projects reaches the terminal, the system
+    emoji chooser opens at once from the second time on, and tuni --version
+    answers on the command line instead of opening a project in the running
+    Tuni.
+  * A build run out of its own directory is an application of its own, apart
+    from the Tuni installed.
+
+ -- Unisic <contact@unisic.app>  Sun, 01 Nov 2026 17:30:00 +0100
+
 tuni (1.7.1) unstable; urgency=medium
 
   * The terminal core is Ghostty 1.4.0, which fixes a way for output to make
