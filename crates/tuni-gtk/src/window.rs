@@ -1804,7 +1804,11 @@ impl TuniWindow {
     /// goes on, so the only work here is telling it the truth.
     fn show_about(&self) {
         let about = adw::AboutDialog::builder()
-            .application_name("Tuni")
+            .application_name(if tuni_core::launch::development() {
+                "Tuni (dev)"
+            } else {
+                "Tuni"
+            })
             // An installed Tuni has its icon in the theme; one run out of the
             // build directory has not, and a missing-icon glyph the size of an
             // about dialog is worse than the terminal the empty window uses.
@@ -6426,7 +6430,11 @@ impl TuniWindow {
         };
 
         if let Some(title) = imp.title.borrow().as_ref() {
-            title.set_title(name.as_deref().unwrap_or("Tuni"));
+            let mut text = name.as_deref().unwrap_or("Tuni").to_owned();
+            if tuni_core::launch::development() {
+                text.push_str(" (dev)");
+            }
+            title.set_title(&text);
             title.set_subtitle(&subtitle.unwrap_or_default());
         }
         if let Some(content) = imp.content.borrow().as_ref() {

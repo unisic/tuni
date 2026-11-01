@@ -1668,14 +1668,14 @@ Debugging aids, all off unless set, and none of them written back to the
 configuration file: `TUNI_THEME` names one of the bundled themes for the run
 and `TUNI_FONT` a font the way Pango writes one (`"JetBrains Mono 13"`), with
 `TUNI_LIGATURES=1` to let them fire; `TUNI_SESSION=0` neither restores the
-saved session nor overwrites it; `TUNI_APP_ID=dev.unisic.Tuni.Devel` makes a
-build its own application, with its own taskbar entry and its own single
-instance, which is how `make dev` runs one, with `TUNI_SESSION=off` and
-`TUNI_SINGLE_INSTANCE=0` beside it, so a second `make dev` is the new build
-and not a window of the first;
-`TUNI_SINGLE_INSTANCE=0` runs a window of its
-own rather than opening a project in the tuni already running, which is what a
-build being worked on wants; `TUNI_DEBUG_FRAME_TIME` prints draw-time
+saved session nor overwrites it; a Tuni run out of its build directory
+is an application of its own, `dev.unisic.Tuni.Devel`, with a bus name, a
+"(dev)" in its title and a session directory (`tuni-devel`) of its own, so
+trying it never opens a project in the Tuni installed beside its desktop entry,
+and `TUNI_APP_ID` names another id outright; `TUNI_SINGLE_INSTANCE=0` runs a
+window of its own rather than opening a project in the tuni already running,
+which is how `make dev` runs one, with `TUNI_SESSION=off` beside it, so a
+second `make dev` is the new build and not a window of the first; `TUNI_DEBUG_FRAME_TIME` prints draw-time
 percentiles; `TUNI_DEBUG_STARTUP` prints how many milliseconds each phase
 before the first frame took;
 `TUNI_DEBUG_PTY_WRITE` logs what the terminal answers back to the shell;

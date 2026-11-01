@@ -8,18 +8,68 @@
 //! itself it has to arrive at the same answers.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 /// The application id: the bus name a running Tuni owns, the desktop entry and
 /// the icon.
 pub const APP_ID: &str = "dev.unisic.Tuni";
 
+/// The id this process runs as: `TUNI_APP_ID` when set, else `APP_ID` for an
+/// installed Tuni and `APP_ID.Devel` for one run out of its build directory.
+/// A build being worked on is an application of its own, with a bus name, a
+/// taskbar entry and a session of its own, so trying it never opens a project
+/// in the Tuni somebody is working in.
+///
+/// Installed means the desktop entry is beside the binary, where every `make
+/// install` puts it: `<prefix>/bin/tuni` and
+/// `<prefix>/share/applications/dev.unisic.Tuni.desktop`. A build directory
+/// has no such neighbour.
+#[must_use]
+pub fn app_id() -> String {
+    if let Some(id) = std::env::var("TUNI_APP_ID")
+        .ok()
+        .filter(|id| !id.is_empty())
+    {
+        return id;
+    }
+    let installed = std::env::current_exe()
+        .ok()
+        .and_then(|exe| desktop_entry_beside(&exe))
+        .is_some_and(|entry| entry.is_file());
+    if installed {
+        APP_ID.to_owned()
+    } else {
+        format!("{APP_ID}.Devel")
+    }
+}
+
+/// Whether this is a build being worked on: one running as an id of its own.
+#[must_use]
+pub fn development() -> bool {
+    static DEVELOPMENT: LazyLock<bool> = LazyLock::new(|| app_id() != APP_ID);
+    *DEVELOPMENT
+}
+
+/// Where an installed binary's desktop entry is: the `share/applications` of
+/// the prefix whose `bin` holds it.
+fn desktop_entry_beside(exe: &Path) -> Option<PathBuf> {
+    let prefix = exe.parent()?.parent()?;
+    Some(
+        prefix
+            .join("share")
+            .join("applications")
+            .join(format!("{APP_ID}.desktop")),
+    )
+}
+
 /// Whether this run must not join the one already going.
 ///
 /// A capture renders a window and quits, and forwarded to a running instance it
-/// would render nothing and quit anyway. A build being worked on is the same
-/// problem the other way around: `cargo run` while an installed Tuni is up
-/// would open a window in the installed one and test nothing.
+/// would render nothing and quit anyway. A build being worked on is an
+/// application of its own already (see `app_id`), but its second launch would
+/// still be a project in its first, and `make dev` wants each launch to be the
+/// new build, in a window of its own.
 #[must_use]
 pub fn separate_process() -> bool {
     std::env::var_os("TUNI_CAPTURE_PNG").is_some()
@@ -101,6 +151,23 @@ pub unsafe fn quieten(background_opacity: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_installed_binary_has_its_desktop_entry_beside_it() {
+        assert_eq!(
+            desktop_entry_beside(Path::new("/usr/bin/tuni")),
+            Some(PathBuf::from(
+                "/usr/share/applications/dev.unisic.Tuni.desktop"
+            ))
+        );
+        // A build directory has no `share` beside its `release`.
+        assert_eq!(
+            desktop_entry_beside(Path::new("/home/me/.cache/tuni-target/release/tuni")),
+            Some(PathBuf::from(
+                "/home/me/.cache/tuni-target/share/applications/dev.unisic.Tuni.desktop"
+            ))
+        );
+    }
 
     #[test]
     fn a_launch_from_home_is_not_about_home() {

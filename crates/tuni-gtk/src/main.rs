@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 use adw::prelude::*;
 use gtk::glib;
-use tuni_core::launch::{APP_ID, launch_directory};
+use tuni_core::launch::{APP_ID, app_id, launch_directory};
 use tuni_pty::Pty;
 
 use terminal::TuniTerminal;
@@ -317,17 +317,6 @@ fn main() -> glib::ExitCode {
         glib::ExitCode::SUCCESS
     });
     app.run()
-}
-
-/// The application ID, which `TUNI_APP_ID` replaces for a build being worked
-/// on: `dev.unisic.Tuni.Devel` gets a taskbar entry and a single instance of
-/// its own, where `TUNI_SINGLE_INSTANCE=0` alone would still file its windows
-/// under the installed Tuni's `.desktop`.
-fn app_id() -> String {
-    std::env::var("TUNI_APP_ID")
-        .ok()
-        .filter(|id| gtk::gio::Application::id_is_valid(id))
-        .unwrap_or_else(|| APP_ID.to_owned())
 }
 
 /// The icons Adwaita does not have, like the Git page's commit graph, out of

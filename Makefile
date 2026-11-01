@@ -141,7 +141,7 @@ ghostty-next:
 # `make dev` with the first still open would otherwise hand its window to the
 # first, which is the build from before.
 dev: build
-	TUNI_APP_ID=$(APP_ID).Devel TUNI_SESSION=off TUNI_SINGLE_INSTANCE=0 $(CARGO_TARGET_DIR)/release/tuni
+	TUNI_SESSION=off TUNI_SINGLE_INSTANCE=0 $(CARGO_TARGET_DIR)/release/tuni
 
 install: build install-data
 	install -Dm755 $(CARGO_TARGET_DIR)/release/tuni $(bindir)/tuni

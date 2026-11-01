@@ -20,7 +20,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 
 use gio::prelude::*;
-use tuni_core::launch::{self, APP_ID};
+use tuni_core::launch;
 use tuni_core::settings::Settings;
 use tuni_pty::{Pty, PtyConfig};
 
@@ -108,7 +108,7 @@ fn primary_running() -> bool {
         "/org/freedesktop/DBus",
         "org.freedesktop.DBus",
         "NameHasOwner",
-        Some(&(APP_ID,).to_variant()),
+        Some(&(launch::app_id(),).to_variant()),
         None,
         gio::DBusCallFlags::NONE,
         -1,

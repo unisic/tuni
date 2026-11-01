@@ -14,6 +14,13 @@ in `data/dev.unisic.Tuni.metainfo.xml`.
   moves it in and out.
 - A new project opens at the foot of the list, where a browser puts a new tab.
 
+### Changed
+
+- A Tuni run out of its build directory is an application of its own,
+  `dev.unisic.Tuni.Devel`: "(dev)" in its title, a single instance and a
+  session of its own, apart from the Tuni installed. Trying a build no longer
+  opens a project in the one being worked in.
+
 ### Fixed
 
 - Typing right after switching projects reaches the terminal instead of the

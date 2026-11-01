@@ -894,29 +894,36 @@ fn themes(value: &str, terminal: &mut TerminalConfig) {
 /// unset or relative `XDG_CONFIG_HOME` is to be ignored.
 #[must_use]
 pub fn config_dir() -> PathBuf {
-    xdg_dir("XDG_CONFIG_HOME", ".config")
+    xdg_dir("XDG_CONFIG_HOME", ".config").join("tuni")
 }
 
 /// `$XDG_DATA_HOME/tuni`, or `~/.local/share/tuni`: the session snapshot and
-/// the scrollback it may have saved.
+/// the scrollback it may have saved. A build being worked on keeps its own,
+/// `tuni-devel`, so trying it neither restores the installed Tuni's session
+/// nor writes over it; the configuration it shares, since it is the same
+/// person's terminal.
 #[must_use]
 pub fn data_dir() -> PathBuf {
-    xdg_dir("XDG_DATA_HOME", ".local/share")
+    let name = if crate::launch::development() {
+        "tuni-devel"
+    } else {
+        "tuni"
+    };
+    xdg_dir("XDG_DATA_HOME", ".local/share").join(name)
 }
 
 /// `$XDG_CACHE_HOME/tuni`, or `~/.cache/tuni`: copies of things that came
 /// from elsewhere, which losing costs nothing but the copy.
 #[must_use]
 pub fn cache_dir() -> PathBuf {
-    xdg_dir("XDG_CACHE_HOME", ".cache")
+    xdg_dir("XDG_CACHE_HOME", ".cache").join("tuni")
 }
 
 fn xdg_dir(variable: &str, fallback: &str) -> PathBuf {
-    let base = std::env::var_os(variable)
+    std::env::var_os(variable)
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| home().join(fallback));
-    base.join("tuni")
+        .unwrap_or_else(|| home().join(fallback))
 }
 
 pub(crate) fn home() -> PathBuf {
@@ -1382,6 +1389,7 @@ mod tests {
         let relative = PathBuf::from("relative/path");
         assert!(!relative.is_absolute(), "the filter is what this rests on");
         assert!(config_dir().ends_with("tuni"));
-        assert!(data_dir().ends_with("tuni"));
+        // A test binary is not an installed Tuni, so it has a build's data.
+        assert!(data_dir().ends_with("tuni-devel"));
     }
 }
