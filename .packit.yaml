@@ -13,8 +13,8 @@ jobs:
     trigger: release
     owner: debondor
     project: Tuni
-    # The build fetches cargo crates, the Ghostty source libghostty-vt-sys pins
-    # and Zig 0.15.2, as the spec's header says, so it needs the network. No
+    # The build fetches cargo crates, the Ghostty release the Makefile names
+    # and Zig 0.17.0, as the spec's header says, so it needs the network. No
     # targets: with a project of its own Packit takes the chroots ticked in
     # the COPR project's settings.
     enable_net: true

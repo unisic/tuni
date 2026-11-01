@@ -153,7 +153,8 @@ pub(crate) fn placements(
 /// The pixels of one stored image, as RGBA.
 ///
 /// Returns `None` when the id names nothing, which happens when a placement is
-/// read a frame after its image was deleted.
+/// read a frame after its image was deleted, and while the pixels of an image
+/// the library already knows about are still arriving.
 pub(crate) fn pixels(term: &VtTerminal<'static, 'static>, id: u32) -> Result<Option<Pixels>> {
     let graphics = term.kitty_graphics()?;
     let Some(image) = graphics.image(id) else {
@@ -161,7 +162,9 @@ pub(crate) fn pixels(term: &VtTerminal<'static, 'static>, id: u32) -> Result<Opt
     };
     let width = image.width()?;
     let height = image.height()?;
-    let data = image.data()?;
+    let Some(data) = image.data()? else {
+        return Ok(None);
+    };
 
     // Stored images are always decompressed and never still PNG — loading
     // inflates and decodes before an image is completed — so this is the whole
@@ -208,20 +211,22 @@ fn expand(data: &[u8], stride: usize, mut per_pixel: impl FnMut(&[u8], &mut Vec<
     out
 }
 
-/// Install the PNG decoder for this thread, once.
+/// Install the PNG decoder, once per process.
 ///
-/// The library holds one decoder per thread and calls it while loading an image
-/// transmitted as `f=100`. Without one, PNG transmissions are refused — which
+/// The library holds one decoder for the whole process and calls it while
+/// loading an image transmitted as `f=100`. Without one, PNG transmissions are refused — which
 /// is most of them, since `f=100` is what every image tool sends by default.
 pub(crate) fn install_png_decoder() {
-    thread_local! {
-        static INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INSTALLED.with(|installed| {
-        if installed.replace(true) {
-            return;
-        }
-        let _ = set_png_decoder(Some(Box::new(Decoder::default())));
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        // SAFETY: the hook is not synchronised upstream, so nothing may be
+        // loading an image while it is set. `Once` makes this the only write,
+        // and every terminal passes through here before it is fed a byte, so
+        // none can be loading an image while it runs: the others are either
+        // not yet fed or waiting on the `Once`. In the application every
+        // library call is on the main thread anyway; the case this argues for
+        // is the test harness, which builds terminals on several threads.
+        let _ = unsafe { set_png_decoder(Some(Box::new(Decoder::default()))) };
     });
 }
 

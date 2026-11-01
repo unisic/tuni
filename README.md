@@ -67,7 +67,7 @@ Updates turns that off.
 ```sh
 sudo dnf install cargo rust gcc make git-core curl tar xz \
     gtk4-devel libadwaita-devel gtksourceview5-devel sqlite-devel
-make zig                        # Zig 0.15.2 into ~/.local, which the build needs
+make zig                        # Zig 0.17.0 into ~/.local, which the build needs
 cargo run --release             # make dev while an installed Tuni runs
 sudo make install PREFIX=/usr
 ```

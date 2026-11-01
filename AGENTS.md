@@ -12,7 +12,7 @@ than translated.
 ## Commands
 
 ```sh
-make zig                  # fetch Zig 0.15.2 into ~/.local; needed once before any build
+make zig                  # fetch Zig 0.17.0 into ~/.local; needed once before any build
 cargo build --release     # or `make build`, which warns if the wrong zig is on PATH
 cargo run --release       # runs tuni-gtk, the application, without the launcher
 make check                # fmt --check, clippy -D warnings, test, desktop/AppStream validation
@@ -50,13 +50,17 @@ installed files.
 ### The Zig pin
 
 `libghostty-vt` is Zig source compiled during the build, so which Zig works is
-decided by the Ghostty commit `libghostty-rs` pins. **0.15.2** is that
-toolchain, and what CI, the RPM spec and the Flatpak manifest all use. Current
-distributions ship 0.16, which the pinned commit rejects, so building that way
-also means a newer Ghostty: `make build-next` and `make test-next` fetch both
-and pass the checkout in as `GHOSTTY_SOURCE_DIR`. Releases come from the pinned
-pair. If you move either version, four files have to agree: `Makefile`,
-`.github/workflows/ci.yml`, `packaging/tuni.spec`, `packaging/dev.unisic.Tuni.yml`.
+decided by the Ghostty source. The commit `libghostty-rs` pins lacks the fix
+for GHSA-w9q4-5jvv-mcv4, so the Makefile fetches the Ghostty **1.4.0** release
+by checksum into the target directory and exports it as `GHOSTTY_SOURCE_DIR`
+for `make build`, `make check` and every package recipe. Ghostty 1.4 declares
+Zig **0.17.0** its minimum, and that is what CI, the RPM spec and the Flatpak
+manifest use. Plain `cargo` still compiles the commit the bindings pin; for a
+test run that matches a release, `make ghostty` once, then
+`export GHOSTTY_SOURCE_DIR=$(make -s ghostty-dir)`. If you move the Zig
+version, four files have to agree: `Makefile`, `.github/workflows/ci.yml`,
+`packaging/tuni.spec`, `packaging/dev.unisic.Tuni.yml`. A Ghostty version is
+two: the Makefile and the Flatpak manifest.
 
 ### Where the binary lands
 

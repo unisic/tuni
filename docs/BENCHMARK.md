@@ -312,6 +312,45 @@ three rounds with the terminals interleaved, median and range of the three.
   would skip it, but that changes how every glyph looks, so it is left to
   the desktop.
 
+### 1.7.0 against 1.7.1
+
+1.7.1 is 1.7.0 with the row work above and Ghostty 1.4.0 in place of the
+development snapshot it was built from. The released 1.7.0, installed as
+`/usr/bin/tuni`, against the 1.7.1 build, in a fresh headless session on
+2026-10-27, nice 19, interleaved: two throughput passes of two best-of-five
+runs each, nine first frames each, then three rounds of the spinner and three
+of the prompt. The load average moved between 0.7 and 2.1.
+
+| | 1.7.0 | 1.7.1 | |
+| --- | --- | --- | --- |
+| Startup | 5.3 to 6.8 ms | 5.1 to 6.6 ms | unchanged |
+| First frame, median of 9 | 236.2 ms | 237.5 ms | unchanged |
+| Throughput, best pass | 153.9 MiB/s | 154.8 MiB/s | unchanged |
+| RSS, median of 4 | 111.6 MiB | 112.0 MiB | unchanged |
+| PSS, median of 4 | 48.9 MiB | 49.2 MiB | 0.3 MiB more |
+| Idle | 0 to 10 ms/5s | 0 to 10 ms/5s | unchanged |
+| Spinner, ms per 10 s, median of 3 | 452.6 | 193.6 | 57% less |
+| At a prompt, ms per 20 s, median of 3 | 6.3 | 5.1 | 19% less |
+
+- A flood, a launch and memory are where Ghostty 1.4.0 changes nothing a
+  person waits on: the throughput passes overlap, 148.6 to 153.9 MiB/s
+  against 149.5 to 154.8. What it changes shows in `search_cost`, outside
+  the app: searching 50 000 lines of scrollback went from 44.6 to 25.4 ms,
+  and `dump_history(500)`, which a session save runs per pane, from 70.1 to
+  28.1 ms, medians.
+- The spinner is the row work. 1.7.0 moves a lot between rounds, 312.5 to
+  476.4 ms, where 1.7.1 stays at 181.4 to 198.9. An earlier set of three
+  rounds in the same session gave 257 to 342 against 123 to 182, and the
+  2026-10-26 pair above 274.3 to 309.5 against 166.0 to 187.2, so the
+  saving is about half whichever set is read.
+- perf is not installed on the machine this ran on, so the prompt is read
+  from `schedstat` like the spinner, not with `perf stat`. Each thread is
+  read at both ends and only the difference counted: three threads exited
+  during the 20 seconds, and a plain sum over the threads lost their whole
+  history and came out negative. What those three spent before exiting is
+  not counted, so the prompt figures are a floor. The earlier set above was
+  that plain sum, which held for the spinner because no thread exited.
+
 ## tuni against kero
 
 kero runs its terminals in a daemon, `kerod`, and the app draws them, so the

@@ -6,10 +6,10 @@
 # sha256sums by hand.
 #
 # libghostty-vt is Zig source compiled during the build, so Zig comes down in
-# source(), pinned by URL and checksum: Arch's own zig is 0.16 and the Ghostty
-# commit libghostty-rs pins does not build with it. build() also needs the
-# network, because cargo fetches the registry and the libghostty-vt-sys build
-# script fetches the pinned Ghostty source.
+# source(), pinned by URL and checksum: Ghostty 1.4.0 declares 0.17.0 its
+# minimum, and the Makefile, CI and the other recipes build with that one.
+# build() also needs the network, because cargo fetches the registry and the
+# Makefile fetches the Ghostty release.
 
 pkgname=tuni
 pkgver=1.6.0
@@ -35,11 +35,11 @@ options=('!debug' '!lto')
 # GitHub's archive is the whole source, and it unpacks to tuni-<version>/.
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
 sha256sums=('3ad1f5fec4c35adaae3a536a4a85bb7da73987147e85643ac082fde1e5d1f9bb')
-_zigver=0.15.2
+_zigver=0.17.0
 source_x86_64=("https://ziglang.org/download/${_zigver}/zig-x86_64-linux-${_zigver}.tar.xz")
-sha256sums_x86_64=('02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239')
+sha256sums_x86_64=('1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026')
 source_aarch64=("https://ziglang.org/download/${_zigver}/zig-aarch64-linux-${_zigver}.tar.xz")
-sha256sums_aarch64=('958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f')
+sha256sums_aarch64=('9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8')
 
 build() {
     export PATH="${srcdir}/zig-${CARCH}-linux-${_zigver}:${PATH}"

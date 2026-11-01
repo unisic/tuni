@@ -35,7 +35,7 @@ use libghostty_vt::selection::gesture::{
 };
 use libghostty_vt::selection::{FormatOptions, SelectWordOptions};
 use libghostty_vt::terminal::{
-    ClipboardLocation, Mode, Options as TerminalOptions, Point, PointCoordinate, ScrollViewport,
+    ClipboardLocation, ClipboardWriteError, Mode, Point, PointCoordinate, ScrollViewport,
     Terminal as VtTerminal,
 };
 use libghostty_vt::{focus, key, mouse, paste};
@@ -367,11 +367,8 @@ impl Terminal {
         // passes through: upstream reads zero as "no scrollback at all",
         // which is also what zero means in the preferences.
         let max_scrollback = scrollback_lines.saturating_mul(usize::from(cols.max(80)) * 16);
-        let mut inner = VtTerminal::new(TerminalOptions {
-            cols: cols.max(1),
-            rows: rows.max(1),
-            max_scrollback,
-        })?;
+        let mut inner = VtTerminal::new(cols.max(1), rows.max(1))?;
+        inner.set_scrollback_max_bytes(Some(max_scrollback))?;
 
         // The Kitty graphics protocol is off until a storage limit says
         // otherwise, and a PNG transmission is refused until a decoder is
@@ -415,15 +412,20 @@ impl Terminal {
             let mut contents = write.contents();
             let text = contents
                 .clone()
-                .find(|c| c.mime.starts_with("text/plain"))
+                .find(|c| c.mime.starts_with(b"text/plain"))
                 .or_else(|| contents.next())
-                .map(|c| c.data.to_owned());
-            if let Some(text) = text {
-                sink.borrow_mut()
-                    .clipboard_writes
-                    .push(ClipboardRequest { target, text });
-            }
-            Ok(())
+                .map(|c| String::from_utf8_lossy(c.data).into_owned());
+            // The library counts a write it was not answered on as refused,
+            // and OSC 5522 tells the program so. The widget performs every
+            // write it is handed, so the answer is known here already.
+            let Some(text) = text else {
+                write.reply(Err(ClipboardWriteError::Unsupported), false);
+                return;
+            };
+            sink.borrow_mut()
+                .clipboard_writes
+                .push(ClipboardRequest { target, text });
+            write.reply(Ok(()), false);
         })?;
 
         // Say, once, that the shell redraws its own prompt.
@@ -634,7 +636,11 @@ impl Terminal {
     }
 
     pub fn title(&self) -> Option<&str> {
-        self.inner.title().ok().filter(|t| !t.is_empty())
+        self.inner
+            .title()
+            .ok()
+            .and_then(|t| std::str::from_utf8(t).ok())
+            .filter(|t| !t.is_empty())
     }
 
     /// The shell's working directory, as OSC 7 last reported it.
@@ -643,7 +649,12 @@ impl Terminal {
     /// names — and nothing at all when the URI names another machine, whose
     /// paths mean nothing here.
     pub fn pwd(&self) -> Option<String> {
-        let raw = self.inner.pwd().ok().filter(|p| !p.is_empty())?;
+        let raw = self
+            .inner
+            .pwd()
+            .ok()
+            .and_then(|p| std::str::from_utf8(p).ok())
+            .filter(|p| !p.is_empty())?;
         local_path(raw)
     }
 

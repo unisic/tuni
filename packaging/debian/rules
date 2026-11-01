@@ -1,7 +1,7 @@
 #!/usr/bin/make -f
 # The top-level Makefile is what installs; debhelper only has to be told the
 # prefix, since its makefile buildsystem would otherwise pass none and land in
-# /usr/local. Zig 0.15.2 has to be on PATH before dpkg-buildpackage runs —
+# /usr/local. Zig 0.17.0 has to be on PATH before dpkg-buildpackage runs —
 # `make zig ZIG_PREFIX=/usr/local` does that. See ../README.md.
 
 # Compat 13 points HOME at a throwaway directory under debian/ for every
