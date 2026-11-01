@@ -189,6 +189,29 @@ fn main() -> glib::ExitCode {
                 | separate_process(),
         )
         .build();
+    // An option is answered here, before the bus is asked whether a Tuni is
+    // running. With no option of its own registered, GLib hands anything with
+    // a dash to the running instance, which read `tuni --version` as a launch
+    // from the shell's directory and opened a project there, in the window
+    // somebody was working in. One registered option also turns on GLib's
+    // `--help` and its refusal of options it does not know, so nothing with a
+    // dash is a launch any more.
+    app.add_main_option(
+        "version",
+        glib::Char::from(0u8),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "Print the version and exit",
+        None,
+    );
+    app.set_option_context_parameter_string(Some("[DIRECTORY]"));
+    app.connect_handle_local_options(|_, options| {
+        if options.contains("version") {
+            println!("tuni {}", env!("CARGO_PKG_VERSION"));
+            return std::ops::ControlFlow::Break(glib::ExitCode::SUCCESS);
+        }
+        std::ops::ControlFlow::Continue(())
+    });
     // GTK loads the icon theme on a thread as soon as anything asks for it,
     // and any change to where icons are looked up after that throws the load
     // away and does it again, on the main thread, at the next lookup. With a

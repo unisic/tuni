@@ -18,6 +18,10 @@ in `data/dev.unisic.Tuni.metainfo.xml`.
 
 - Typing right after switching projects reaches the terminal instead of the
   sidebar.
+- `tuni --version` prints the version. It used to be forwarded to the running
+  Tuni, which read it as a launch from the shell's directory and opened a
+  project there. `--help` and unknown options are answered on the command line
+  too.
 
 ## 1.7.0
 

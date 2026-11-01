@@ -68,6 +68,15 @@ fn first_shell(settings: &Settings, arguments: &[OsString]) -> Option<PtyConfig>
     {
         return None;
     }
+    // A launch with an option opens no window: `tuni-gtk` answers `--version`
+    // and `--help` on the command line and refuses the rest.
+    if arguments
+        .iter()
+        .skip(1)
+        .any(|argument| argument.to_string_lossy().starts_with('-'))
+    {
+        return None;
+    }
     // Where `build_window` opens its project without a session, and so where
     // `directory_for_new_shell` starts the first shell: the directory the
     // launch named, else the process's own. Each is read the way that path
