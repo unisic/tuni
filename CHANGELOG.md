@@ -5,6 +5,20 @@ publishes a version's section as the notes of its GitHub release, so the
 section has to exist before the tag does. Releases before 1.7.0 are described
 in `data/dev.unisic.Tuni.metainfo.xml`.
 
+## 1.8.0
+
+### Added
+
+- Projects can be gathered into groups, as a browser groups tabs: a group has a
+  name and a colour, its heading folds the band away, and a project's menu
+  moves it in and out.
+- A new project opens at the foot of the list, where a browser puts a new tab.
+
+### Fixed
+
+- Typing right after switching projects reaches the terminal instead of the
+  sidebar.
+
 ## 1.7.0
 
 ### Added

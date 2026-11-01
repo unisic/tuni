@@ -4,7 +4,9 @@
 //! layout of panes. The rules here are kero's: a new tab opens next to the selected
 //! one rather than at the end, closing the selected tab falls to its neighbor,
 //! selection wraps at both ends, and a project whose tabs are all closed stays
-//! in the sidebar until it is closed on purpose.
+//! in the sidebar until it is closed on purpose. Projects themselves follow a
+//! browser's tab strip: a new one goes to the foot of the sidebar, and projects
+//! sit in groups that fold to a heading, the members of one always together.
 //!
 //! Nothing here knows about widgets. The tab strip is an `AdwTabView`, which
 //! implements the tab-level rules itself and reports what it did; this model
@@ -45,6 +47,43 @@ impl From<u64> for Id {
 
 /// Shown when a tab has neither a name of its own nor a title from the shell.
 const UNTITLED_TAB: &str = "Terminal";
+
+/// The colours a group can wear, a browser's nine in a browser's order. A
+/// group holds an index into this list; what each colour looks like is the
+/// window's business.
+pub const GROUP_COLORS: [&str; 9] = [
+    "grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange",
+];
+
+/// A band of adjacent projects under one heading, as a browser groups tabs.
+/// Folded, the band is its heading alone.
+#[derive(Clone, Debug)]
+pub struct Group {
+    id: Id,
+    /// Empty until the user names it; the heading then shows the colour.
+    pub name: String,
+    /// An index into [`GROUP_COLORS`].
+    pub color: usize,
+    collapsed: bool,
+}
+
+impl Group {
+    #[must_use]
+    pub fn id(&self) -> Id {
+        self.id
+    }
+
+    #[must_use]
+    pub fn collapsed(&self) -> bool {
+        self.collapsed
+    }
+
+    /// The colour's name, forgiving an index a hand-edited session wrote.
+    #[must_use]
+    pub fn color_name(&self) -> &'static str {
+        GROUP_COLORS[self.color % GROUP_COLORS.len()]
+    }
+}
 
 /// One entry in a project's strip: a layout of panes, which for a tab that was
 /// never split is one terminal.
@@ -163,6 +202,9 @@ pub struct Project {
     /// project cannot opt back in once the setting is off — an exception in the
     /// other direction is the setting itself.
     pub inherit_directory: bool,
+    /// The group this project sits in. Written only by the workspace, which
+    /// keeps a group's members together.
+    group: Option<Id>,
     tabs: Vec<Tab>,
     selected: Option<Id>,
 }
@@ -177,6 +219,7 @@ impl Project {
             icon: None,
             custom_directory: None,
             inherit_directory: true,
+            group: None,
             tabs: Vec::new(),
             selected: None,
         }
@@ -185,6 +228,11 @@ impl Project {
     #[must_use]
     pub fn id(&self) -> Id {
         self.id
+    }
+
+    #[must_use]
+    pub fn group(&self) -> Option<Id> {
+        self.group
     }
 
     /// What the sidebar shows: the name the user gave it, else the selected
@@ -345,6 +393,8 @@ pub(crate) fn closest_git_repository(path: &Path) -> Option<PathBuf> {
 #[derive(Clone, Debug, Default)]
 pub struct Workspace {
     projects: Vec<Project>,
+    /// Only groups somebody is in: a group whose last member leaves is gone.
+    groups: Vec<Group>,
     selected: Option<Id>,
     /// Numbers the automatic names. Never decremented: a project called
     /// "Project 2" keeps that name after "Project 1" is closed, and the next
@@ -396,17 +446,14 @@ impl Workspace {
         self.selected.and_then(move |id| self.project_mut(id))
     }
 
-    /// Opens a project next to the selected one — not at the end of the list,
-    /// which is where a project opened from the one you are in does not belong
-    /// — and selects it.
+    /// Opens a project at the foot of the sidebar, where a browser puts a new
+    /// tab, and selects it. Loose rather than in the selected project's group:
+    /// a group is joined on purpose.
     pub fn open_project(&mut self) -> Id {
         self.counter += 1;
         let project = Project::new(format!("Project {}", self.counter));
         let id = project.id;
-        match self.selected.and_then(|id| self.index_of(id)) {
-            Some(index) => self.projects.insert(index + 1, project),
-            None => self.projects.push(project),
-        }
+        self.projects.push(project);
         self.selected = Some(id);
         id
     }
@@ -423,6 +470,7 @@ impl Workspace {
                 .get(index.min(self.projects.len().saturating_sub(1)))
                 .map(Project::id);
         }
+        self.settle();
         Some(project)
     }
 
@@ -444,11 +492,165 @@ impl Workspace {
         if self.index_of(id).is_some() {
             self.selected = Some(id);
         }
+        self.settle();
     }
 
     pub fn select_index(&mut self, index: usize) {
         if let Some(project) = self.projects.get(index) {
             self.selected = Some(project.id);
+        }
+        self.settle();
+    }
+
+    #[must_use]
+    pub fn groups(&self) -> &[Group] {
+        &self.groups
+    }
+
+    #[must_use]
+    pub fn group(&self, id: Id) -> Option<&Group> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    pub fn group_mut(&mut self, id: Id) -> Option<&mut Group> {
+        self.groups.iter_mut().find(|group| group.id == id)
+    }
+
+    /// Puts a project in a new group of its own, wearing the first colour no
+    /// other group wears. Unnamed: the name is the caller's to ask for.
+    pub fn add_to_new_group(&mut self, project: Id) -> Option<Id> {
+        self.index_of(project)?;
+        let color = (0..GROUP_COLORS.len())
+            .find(|color| !self.groups.iter().any(|group| group.color == *color))
+            .unwrap_or(self.groups.len() % GROUP_COLORS.len());
+        let id = Id::next();
+        self.groups.push(Group {
+            id,
+            name: String::new(),
+            color,
+            collapsed: false,
+        });
+        self.add_to_group(project, id);
+        Some(id)
+    }
+
+    /// Makes a project a member of a group and sets it down at the group's
+    /// foot: members sit together, which is what lets a group fold to one
+    /// row.
+    pub fn add_to_group(&mut self, project: Id, group: Id) {
+        if self.group(group).is_none() {
+            return;
+        }
+        let Some(from) = self.index_of(project) else {
+            return;
+        };
+        self.projects[from].group = Some(group);
+        self.move_under_band(project, from, group);
+        self.settle();
+    }
+
+    /// Takes a project out of its group and sets it down just under the
+    /// group, where a browser puts a tab taken out of one.
+    pub fn remove_from_group(&mut self, project: Id) {
+        let Some(from) = self.index_of(project) else {
+            return;
+        };
+        let Some(group) = self.projects[from].group.take() else {
+            return;
+        };
+        self.move_under_band(project, from, group);
+        self.settle();
+    }
+
+    /// Dissolves a group. Its projects stay where they are, loose.
+    pub fn ungroup(&mut self, group: Id) {
+        for project in &mut self.projects {
+            if project.group == Some(group) {
+                project.group = None;
+            }
+        }
+        self.settle();
+    }
+
+    /// Folds a group to its heading, or opens it again. Folding the group
+    /// the selected project is in hands the selection to the nearest project
+    /// outside it, and a group that holds every project stays open: nothing
+    /// on screen is not a state to fold into.
+    pub fn set_collapsed(&mut self, group: Id, collapsed: bool) {
+        if collapsed
+            && self
+                .selected_project()
+                .is_some_and(|project| project.group == Some(group))
+        {
+            let Some(outside) = self.neighbor_outside(group) else {
+                return;
+            };
+            self.selected = Some(outside);
+        }
+        if let Some(group) = self.group_mut(group) {
+            group.collapsed = collapsed;
+        }
+        self.settle();
+    }
+
+    /// Drops a project where another one sits, as a drag down the sidebar
+    /// does, and in that one's group: dragged into a band it joins, dragged
+    /// out it leaves, which is what keeps every band in one piece.
+    pub fn drop_project(&mut self, id: Id, onto: Id) {
+        let Some(to) = self.index_of(onto) else {
+            return;
+        };
+        let group = self.projects[to].group;
+        self.move_project(id, to);
+        if let Some(project) = self.project_mut(id) {
+            project.group = group;
+        }
+        self.settle();
+    }
+
+    /// Moves the project at `from` to just under the last other member of
+    /// `group`, if the group has one.
+    fn move_under_band(&mut self, project: Id, from: usize, group: Id) {
+        let last = self
+            .projects
+            .iter()
+            .rposition(|other| other.group == Some(group) && other.id != project);
+        if let Some(last) = last {
+            // Taken out from above the band, the band moves up by one.
+            let to = if from < last { last } else { last + 1 };
+            self.move_project(project, to);
+        }
+    }
+
+    /// The project just under a group's band, else the one just above it.
+    fn neighbor_outside(&self, group: Id) -> Option<Id> {
+        let is_member = |project: &Project| project.group == Some(group);
+        let last = self.projects.iter().rposition(is_member)?;
+        let first = self.projects.iter().position(is_member)?;
+        self.projects
+            .get(last + 1)
+            .or_else(|| {
+                first
+                    .checked_sub(1)
+                    .and_then(|index| self.projects.get(index))
+            })
+            .map(Project::id)
+    }
+
+    /// Kept true after every change: a group nobody is in is gone, and the
+    /// group the selected project is in is open, since a project folded out
+    /// of sight cannot be the one on screen.
+    fn settle(&mut self) {
+        let projects = &self.projects;
+        self.groups.retain(|group| {
+            projects
+                .iter()
+                .any(|project| project.group == Some(group.id))
+        });
+        if let Some(group) = self.selected_project().and_then(Project::group)
+            && let Some(group) = self.group_mut(group)
+        {
+            group.collapsed = false;
         }
     }
 
@@ -494,6 +696,7 @@ impl Workspace {
         let count_i = count as isize;
         let next = (current as isize + offset).rem_euclid(count_i) as usize;
         self.selected = Some(self.projects[next].id);
+        self.settle();
     }
 }
 
@@ -686,23 +889,120 @@ mod tests {
         assert_eq!(project.directory_for_new_tab(true), Some("/home/me/src"));
     }
 
+    fn order(workspace: &Workspace) -> Vec<Id> {
+        workspace.projects().iter().map(Project::id).collect()
+    }
+
+    /// Four loose projects, the first one selected.
+    fn four() -> (Workspace, [Id; 4]) {
+        let mut workspace = Workspace::new();
+        let ids = [(); 4].map(|()| workspace.open_project());
+        workspace.select(ids[0]);
+        (workspace, ids)
+    }
+
     #[test]
-    fn a_new_project_opens_next_to_the_selected_one() {
+    fn a_new_project_opens_at_the_foot_of_the_sidebar_whatever_is_selected() {
         let mut workspace = Workspace::new();
         let first = workspace.open_project();
         let second = workspace.open_project();
         workspace.select(first);
         let third = workspace.open_project();
 
-        assert_eq!(
-            workspace
-                .projects()
-                .iter()
-                .map(Project::id)
-                .collect::<Vec<_>>(),
-            vec![first, third, second]
-        );
+        assert_eq!(order(&workspace), vec![first, second, third]);
         assert_eq!(workspace.selected_id(), Some(third));
+    }
+
+    #[test]
+    fn a_project_added_to_a_group_moves_to_the_groups_foot() {
+        let (mut workspace, [a, b, c, d]) = four();
+        let group = workspace.add_to_new_group(b).expect("b exists");
+        workspace.add_to_group(d, group);
+        workspace.add_to_group(a, group);
+
+        assert_eq!(order(&workspace), vec![b, d, a, c]);
+        assert!(
+            [a, b, d]
+                .iter()
+                .all(|&id| workspace.project(id).unwrap().group() == Some(group))
+        );
+        assert_eq!(workspace.project(c).unwrap().group(), None);
+    }
+
+    #[test]
+    fn a_project_taken_out_of_its_group_sits_just_under_it_and_an_empty_group_is_gone() {
+        let (mut workspace, [a, b, c, d]) = four();
+        let group = workspace.add_to_new_group(a).expect("a exists");
+        workspace.add_to_group(b, group);
+        workspace.add_to_group(c, group);
+
+        workspace.remove_from_group(a);
+        assert_eq!(order(&workspace), vec![b, c, a, d]);
+        assert_eq!(workspace.project(a).unwrap().group(), None);
+
+        workspace.remove_from_group(b);
+        workspace.remove_from_group(c);
+        assert!(workspace.groups().is_empty());
+    }
+
+    #[test]
+    fn a_project_dropped_into_a_band_joins_it_and_one_dropped_out_leaves_it() {
+        let (mut workspace, [a, b, c, d]) = four();
+        let group = workspace.add_to_new_group(b).expect("b exists");
+        workspace.add_to_group(c, group);
+
+        workspace.drop_project(d, b);
+        assert_eq!(order(&workspace), vec![a, d, b, c]);
+        assert_eq!(workspace.project(d).unwrap().group(), Some(group));
+
+        workspace.drop_project(b, a);
+        assert_eq!(order(&workspace), vec![b, a, d, c]);
+        assert_eq!(workspace.project(b).unwrap().group(), None);
+    }
+
+    #[test]
+    fn folding_the_selected_projects_group_hands_the_selection_to_the_project_under_it() {
+        let (mut workspace, [a, b, c, _]) = four();
+        let group = workspace.add_to_new_group(a).expect("a exists");
+        workspace.add_to_group(b, group);
+        workspace.select(b);
+
+        workspace.set_collapsed(group, true);
+        assert!(workspace.group(group).unwrap().collapsed());
+        assert_eq!(workspace.selected_id(), Some(c));
+
+        // Stepping back into the band opens it again.
+        workspace.select_previous();
+        assert_eq!(workspace.selected_id(), Some(b));
+        assert!(!workspace.group(group).unwrap().collapsed());
+    }
+
+    #[test]
+    fn a_group_holding_every_project_stays_open() {
+        let mut workspace = Workspace::new();
+        let only = workspace.open_project();
+        let group = workspace.add_to_new_group(only).expect("only exists");
+
+        workspace.set_collapsed(group, true);
+        assert!(!workspace.group(group).unwrap().collapsed());
+        assert_eq!(workspace.selected_id(), Some(only));
+    }
+
+    #[test]
+    fn each_new_group_wears_a_colour_no_other_group_wears() {
+        let (mut workspace, [a, b, c, _]) = four();
+        let first = workspace.add_to_new_group(a).expect("a exists");
+        let second = workspace.add_to_new_group(b).expect("b exists");
+        assert_ne!(
+            workspace.group(first).unwrap().color,
+            workspace.group(second).unwrap().color
+        );
+
+        // Ungrouping frees the colour for the next group.
+        workspace.ungroup(first);
+        let third = workspace.add_to_new_group(c).expect("c exists");
+        assert_eq!(workspace.group(third).unwrap().color, 0);
+        assert_eq!(workspace.project(a).unwrap().group(), None);
     }
 
     #[test]

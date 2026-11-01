@@ -30,7 +30,7 @@ use tuni_core::panes::{Content, Edge, Layout, Pane};
 use tuni_core::session::{History, PaneState, Snapshot};
 use tuni_core::settings::{Appearance, HISTORY_LINE_LIMIT, NewTab, Settings};
 use tuni_core::theme::{Rgb, Theme};
-use tuni_core::workspace::{Id, Tab, Workspace};
+use tuni_core::workspace::{GROUP_COLORS, Group, Id, Project, Tab, Workspace};
 
 use crate::browser::TuniBrowser;
 use crate::diff::TuniDiff;
@@ -524,8 +524,11 @@ mod imp {
         pub panel_view: RefCell<Option<TuniPanel>>,
         /// The panel's re-read poll, alive only while the panel is showing.
         pub panel_timer: RefCell<Option<glib::SourceId>>,
-        /// Project name labels, in sidebar order.
-        pub labels: RefCell<Vec<gtk::Label>>,
+        /// Project name labels, by project.
+        pub labels: RefCell<HashMap<Id, gtk::Label>>,
+        /// The sidebar row of each project whose group is not folded away.
+        /// Group headings are rows too, but stand for no project.
+        pub rows: RefCell<HashMap<Id, gtk::ListBoxRow>>,
         /// Shared context menu for the sidebar rows, parented once.
         pub row_menu: RefCell<Option<gtk::PopoverMenu>>,
         /// The sidebar's foot, counting the tabs that want a look, and the
@@ -787,8 +790,8 @@ impl TuniWindow {
                 if this.imp().selecting.get() {
                     return;
                 }
-                if let Some(row) = row {
-                    this.select_project_at(row.index() as usize);
+                if let Some(id) = row.and_then(|row| this.project_of_row(row)) {
+                    this.select_project(id);
                 }
             }
         ));
@@ -1349,6 +1352,95 @@ impl TuniWindow {
                     && let Some(project) = window.imp().workspace.borrow_mut().project_mut(id)
                 {
                     project.inherit_directory = !project.inherit_directory;
+                }
+            }),
+            // A browser's tab groups, for projects. Each changes the model and
+            // draws the sidebar again from it: order, membership and folds are
+            // all read back out of the workspace, never off the rows.
+            entry("group-project", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    let group = window.imp().workspace.borrow_mut().add_to_new_group(id);
+                    window.redraw_sidebar();
+                    // Unnamed until asked, as a browser's new group is.
+                    if let Some(group) = group {
+                        window.rename_group(group);
+                    }
+                }
+            }),
+            entry(
+                "group-project-into",
+                glib::VariantTy::new("(tt)").ok(),
+                |window, target| {
+                    if let Some((project, group)) =
+                        target.and_then(glib::Variant::get::<(u64, u64)>)
+                    {
+                        window
+                            .imp()
+                            .workspace
+                            .borrow_mut()
+                            .add_to_group(Id::from(project), Id::from(group));
+                        window.redraw_sidebar();
+                    }
+                },
+            ),
+            entry("ungroup-project", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.imp().workspace.borrow_mut().remove_from_group(id);
+                    window.redraw_sidebar();
+                }
+            }),
+            entry("rename-group", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.rename_group(id);
+                }
+            }),
+            entry(
+                "group-color",
+                glib::VariantTy::new("(tu)").ok(),
+                |window, target| {
+                    if let Some((group, color)) = target.and_then(glib::Variant::get::<(u64, u32)>)
+                    {
+                        if let Some(group) = window
+                            .imp()
+                            .workspace
+                            .borrow_mut()
+                            .group_mut(Id::from(group))
+                        {
+                            group.color = color as usize;
+                        }
+                        window.redraw_sidebar();
+                    }
+                },
+            ),
+            entry("new-project-in-group", uint64, |window, target| {
+                if let Some(group) = project_target(target) {
+                    let id = window.open_project();
+                    window.imp().workspace.borrow_mut().add_to_group(id, group);
+                    window.redraw_sidebar();
+                }
+            }),
+            entry("ungroup", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.imp().workspace.borrow_mut().ungroup(id);
+                    window.redraw_sidebar();
+                }
+            }),
+            // Each member the way its own button closes it, so the shells in
+            // each are torn down by the one place that knows how.
+            entry("close-group", uint64, |window, target| {
+                if let Some(group) = project_target(target) {
+                    let members: Vec<Id> = window
+                        .imp()
+                        .workspace
+                        .borrow()
+                        .projects()
+                        .iter()
+                        .filter(|project| project.group() == Some(group))
+                        .map(Project::id)
+                        .collect();
+                    for id in members {
+                        window.close_project(id);
+                    }
                 }
             }),
             // The editor has `Ctrl+S` of its own, which a terminal may not:
@@ -2472,6 +2564,29 @@ impl TuniWindow {
         self.show_selected_project();
     }
 
+    fn select_project(&self, id: Id) {
+        self.imp().workspace.borrow_mut().select(id);
+        self.show_selected_project();
+    }
+
+    /// The project a sidebar row stands for; a group heading stands for none.
+    fn project_of_row(&self, row: &gtk::ListBoxRow) -> Option<Id> {
+        self.imp()
+            .rows
+            .borrow()
+            .iter()
+            .find(|(_, candidate)| *candidate == row)
+            .map(|(id, _)| *id)
+    }
+
+    /// After a change to the projects' order, groups or folds: the rows are
+    /// built again from the model, and the selection, which a fold can move,
+    /// is shown.
+    fn redraw_sidebar(&self) {
+        self.rebuild_sidebar();
+        self.show_selected_project();
+    }
+
     /// Brings the selected project's tab strip on screen and points the tab bar
     /// and the sidebar at it.
     fn show_selected_project(&self) {
@@ -2502,12 +2617,9 @@ impl TuniWindow {
         // Writing the sidebar's selection here would otherwise come straight
         // back as a selection change and re-enter this method.
         if let Some(list) = imp.sidebar.borrow().as_ref() {
-            let index = selected.and_then(|id| imp.workspace.borrow().index_of(id));
+            let row = selected.and_then(|id| self.row_for(id));
             imp.selecting.set(true);
-            match index {
-                Some(index) => list.select_row(list.row_at_index(index as i32).as_ref()),
-                None => list.select_row(gtk::ListBoxRow::NONE),
-            }
+            list.select_row(row.as_ref());
             imp.selecting.set(false);
         }
 
@@ -4884,21 +4996,9 @@ impl TuniWindow {
         );
     }
 
-    /// The sidebar row drawn for a project. The rows are appended in the order
-    /// the projects are in, and nothing else is in that list.
+    /// The sidebar row drawn for a project, if its group is not folded away.
     fn row_for(&self, project: Id) -> Option<gtk::ListBoxRow> {
-        let index = self
-            .imp()
-            .workspace
-            .borrow()
-            .projects()
-            .iter()
-            .position(|entry| entry.id() == project)?;
-        self.imp()
-            .sidebar
-            .borrow()
-            .as_ref()?
-            .row_at_index(i32::try_from(index).ok()?)
+        self.imp().rows.borrow().get(&project).cloned()
     }
 
     /// Where a tab let go of outside every strip should land: the project whose
@@ -6452,8 +6552,10 @@ impl TuniWindow {
     fn refresh_names(&self) {
         let imp = self.imp();
         let workspace = imp.workspace.borrow();
-        for (label, project) in imp.labels.borrow().iter().zip(workspace.projects()) {
-            label.set_text(project.name());
+        for project in workspace.projects() {
+            if let Some(label) = imp.labels.borrow().get(&project.id()) {
+                label.set_text(project.name());
+            }
         }
 
         // A tab is named by the pane being worked in, so a title arriving in
@@ -6556,23 +6658,48 @@ impl TuniWindow {
             list.remove(&row);
         }
         imp.labels.borrow_mut().clear();
+        imp.rows.borrow_mut().clear();
         imp.spinners.borrow_mut().clear();
         imp.icons.borrow_mut().clear();
         imp.emoji.borrow_mut().clear();
 
-        let projects: Vec<(Id, String)> = imp
-            .workspace
-            .borrow()
-            .projects()
-            .iter()
-            .map(|project| (project.id(), project.name().to_owned()))
-            .collect();
+        let (projects, groups) = {
+            let workspace = imp.workspace.borrow();
+            let projects: Vec<(Id, String, Option<Id>)> = workspace
+                .projects()
+                .iter()
+                .map(|project| (project.id(), project.name().to_owned(), project.group()))
+                .collect();
+            (projects, workspace.groups().to_vec())
+        };
 
         let empty = projects.is_empty();
-        for (id, name) in projects {
-            let (row, label) = self.build_row(id, &name);
+        let mut heading: Option<Id> = None;
+        for (id, name, group) in &projects {
+            let group = group.and_then(|id| groups.iter().find(|group| group.id() == id));
+            // A heading where a band starts. A band a hand-edited session
+            // split gets a heading per piece rather than a panic.
+            if let Some(group) = group
+                && heading != Some(group.id())
+            {
+                let count = projects
+                    .iter()
+                    .filter(|(_, _, member)| *member == Some(group.id()))
+                    .count();
+                list.append(&self.build_header(group, count));
+            }
+            heading = group.map(Group::id);
+            if group.is_some_and(Group::collapsed) {
+                continue;
+            }
+            let (row, label) = self.build_row(*id, name);
+            if let Some(group) = group {
+                row.add_css_class("tuni-member");
+                row.add_css_class(&format!("tuni-group-{}", group.color_name()));
+            }
             list.append(&row);
-            imp.labels.borrow_mut().push(label);
+            imp.labels.borrow_mut().insert(*id, label);
+            imp.rows.borrow_mut().insert(*id, row);
         }
         imp.selecting.set(false);
         // The rows are new, so whatever was spinning on the old ones has to be
@@ -6642,6 +6769,12 @@ impl TuniWindow {
         content.append(&close);
 
         let row = gtk::ListBoxRow::builder().child(&content).build();
+        // The list would otherwise take the keyboard straight back from the
+        // terminal: GtkListBox selects on press, which is when `row-selected`
+        // hands the keyboard to the pane, and grabs focus to the row after.
+        // Typing into a project just clicked went nowhere until the terminal
+        // was clicked too.
+        row.set_focus_on_click(false);
 
         let press = gtk::GestureClick::new();
         press.set_button(gdk::BUTTON_SECONDARY);
@@ -6650,7 +6783,7 @@ impl TuniWindow {
             self,
             #[weak]
             row,
-            move |_, _, x, y| this.popup_row_menu(&row, x, y)
+            move |_, _, x, y| this.popup_row_menu(id, &row, x, y)
         ));
         row.add_controller(press);
 
@@ -6677,13 +6810,16 @@ impl TuniWindow {
         let source = gtk::DragSource::builder()
             .actions(gdk::DragAction::MOVE)
             .build();
+        // The project's index, as a u32: a pane grid takes u64 pane ids, and
+        // a row carried over one must not read as a pane.
         source.connect_prepare(glib::clone!(
-            #[weak]
-            row,
+            #[weak(rename_to = this)]
+            self,
             #[upgrade_or]
             None,
             move |_, _, _| {
-                let index = u32::try_from(row.index()).ok()?;
+                let index = this.imp().workspace.borrow().index_of(id)?;
+                let index = u32::try_from(index).ok()?;
                 Some(gdk::ContentProvider::for_value(&index.to_value()))
             }
         ));
@@ -6744,23 +6880,7 @@ impl TuniWindow {
         ));
         row.add_controller(source);
 
-        let target = gtk::DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);
-        target.connect_drop(glib::clone!(
-            #[weak(rename_to = this)]
-            self,
-            #[weak]
-            row,
-            #[upgrade_or]
-            false,
-            move |_, value, _, _| {
-                let Ok(from) = value.get::<u32>() else {
-                    return false;
-                };
-                this.move_project(from as usize, row.index().max(0) as usize);
-                true
-            }
-        ));
-        row.add_controller(target);
+        row.add_controller(self.row_drop_target(move |_| Some(id)));
 
         // A tab dragged out of the strip and let go of on a row moves into that
         // project. The move is not made here: `AdwTabBox` detached the page when
@@ -6816,46 +6936,157 @@ impl TuniWindow {
         (row, label)
     }
 
-    fn move_project(&self, from: usize, to: usize) {
-        let imp = self.imp();
-        let id = imp
-            .workspace
-            .borrow()
-            .projects()
-            .get(from)
-            .map(tuni_core::workspace::Project::id);
-        let Some(id) = id else {
-            return;
-        };
-        imp.workspace.borrow_mut().move_project(id, to);
-        self.rebuild_sidebar();
-        self.show_selected_project();
+    /// Takes a dragged project row. `onto` names the project the drop lands
+    /// on, asked when it lands: the project this row stands for, or a folded
+    /// group's first member for its heading.
+    fn row_drop_target(
+        &self,
+        onto: impl Fn(&Workspace) -> Option<Id> + 'static,
+    ) -> gtk::DropTarget {
+        let target = gtk::DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);
+        target.connect_drop(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[upgrade_or]
+            false,
+            move |_, value, _, _| {
+                let Ok(from) = value.get::<u32>() else {
+                    return false;
+                };
+                let moved = {
+                    let workspace = this.imp().workspace.borrow();
+                    workspace
+                        .projects()
+                        .get(from as usize)
+                        .map(Project::id)
+                        .zip(onto(&workspace))
+                };
+                if let Some((id, onto)) = moved {
+                    this.imp().workspace.borrow_mut().drop_project(id, onto);
+                    this.redraw_sidebar();
+                }
+                true
+            }
+        ));
+        target
     }
 
-    fn popup_row_menu(&self, row: &gtk::ListBoxRow, x: f64, y: f64) {
-        let imp = self.imp();
-        let index = row.index().max(0) as usize;
-        let Some((id, named, pinned, follows, iconed, tabs)) =
-            imp.workspace.borrow().projects().get(index).map(|p| {
-                (
-                    p.id(),
-                    p.custom_name.is_some(),
-                    p.custom_directory.is_some(),
-                    p.inherit_directory,
-                    p.icon.is_some(),
-                    !p.is_empty(),
-                )
-            })
+    /// A group's heading: its colour, its name, how many rows it is hiding
+    /// when folded, and the arrow that folds it. A button inside a row the
+    /// list cannot select, as the host list has it: selecting is what shows a
+    /// project, and a heading is not one.
+    fn build_header(&self, group: &Group, count: usize) -> gtk::ListBoxRow {
+        let id = group.id();
+        let collapsed = group.collapsed();
+        let dot = gtk::Box::builder().valign(gtk::Align::Center).build();
+        dot.add_css_class("tuni-group-dot");
+        dot.add_css_class(&format!("tuni-group-{}", group.color_name()));
+        let label = gtk::Label::builder()
+            .label(group_label(group))
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        label.add_css_class("heading");
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        content.append(&dot);
+        content.append(&label);
+        if collapsed {
+            let number = gtk::Label::new(Some(&count.to_string()));
+            number.add_css_class("dim-label");
+            content.append(&number);
+        }
+        content.append(&gtk::Image::from_icon_name(if collapsed {
+            "pan-end-symbolic"
+        } else {
+            "pan-down-symbolic"
+        }));
+
+        let button = gtk::Button::builder()
+            .child(&content)
+            .focus_on_click(false)
+            .build();
+        button.add_css_class("flat");
+        button.update_state(&[gtk::accessible::State::Expanded(Some(!collapsed))]);
+        button.connect_clicked(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |_| {
+                this.imp()
+                    .workspace
+                    .borrow_mut()
+                    .set_collapsed(id, !collapsed);
+                this.redraw_sidebar();
+            }
+        ));
+
+        let row = gtk::ListBoxRow::builder()
+            .child(&button)
+            .selectable(false)
+            .activatable(false)
+            .build();
+        row.set_can_focus(false);
+        row.add_css_class("tuni-group-heading");
+
+        let press = gtk::GestureClick::new();
+        press.set_button(gdk::BUTTON_SECONDARY);
+        press.connect_pressed(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            #[weak]
+            row,
+            move |_, _, x, y| this.popup_group_menu(id, &row, x, y)
+        ));
+        row.add_controller(press);
+
+        // A row dropped on the heading joins the group at its head, which is
+        // the only way in by hand while the group is folded.
+        row.add_controller(self.row_drop_target(move |workspace| {
+            workspace
+                .projects()
+                .iter()
+                .find(|project| project.group() == Some(id))
+                .map(Project::id)
+        }));
+        row
+    }
+
+    fn popup_row_menu(&self, id: Id, row: &gtk::ListBoxRow, x: f64, y: f64) {
+        let model = {
+            let workspace = self.imp().workspace.borrow();
+            let Some(project) = workspace.project(id) else {
+                return;
+            };
+            let groups: Vec<(Id, String)> = workspace
+                .groups()
+                .iter()
+                .map(|group| (group.id(), group_label(group)))
+                .collect();
+            project_menu(project, &groups)
+        };
+        self.popup_on_row(&model, row, x, y);
+    }
+
+    fn popup_group_menu(&self, id: Id, row: &gtk::ListBoxRow, x: f64, y: f64) {
+        let Some(color) = self
+            .imp()
+            .workspace
+            .borrow()
+            .group(id)
+            .map(|group| group.color)
         else {
             return;
         };
+        self.popup_on_row(&group_menu(id, color), row, x, y);
+    }
+
+    /// Opens the sidebar's shared popover on a row, at the point clicked.
+    fn popup_on_row(&self, model: &gio::Menu, row: &gtk::ListBoxRow, x: f64, y: f64) {
+        let imp = self.imp();
         let Some(menu) = imp.row_menu.borrow().clone() else {
             return;
         };
-
-        menu.set_menu_model(Some(&project_menu(
-            id, named, pinned, follows, iconed, tabs,
-        )));
+        menu.set_menu_model(Some(model));
         // The gesture reports the click in the row's coordinates; the popover
         // is parented to the list, which is where it has to point.
         let point = row
@@ -6883,6 +7114,24 @@ impl TuniWindow {
                 project.custom_name = name;
             }
             window.refresh();
+        });
+    }
+
+    /// An empty answer leaves the group unnamed, which shows as its colour.
+    fn rename_group(&self, id: Id) {
+        let current = self
+            .imp()
+            .workspace
+            .borrow()
+            .group(id)
+            .map(|group| group.name.clone())
+            .unwrap_or_default();
+
+        self.ask_for_name("Rename Group", &current, move |window, name| {
+            if let Some(group) = window.imp().workspace.borrow_mut().group_mut(id) {
+                group.name = name.unwrap_or_default();
+            }
+            window.redraw_sidebar();
         });
     }
 
@@ -7074,15 +7323,14 @@ fn project_target(target: Option<&glib::Variant>) -> Option<Id> {
 /// Title" only belongs there when there is a custom one to drop, and because
 /// the directory rule reads as one label per state rather than a checkbox that
 /// says what is off.
-fn project_menu(
-    id: Id,
-    named: bool,
-    pinned: bool,
-    follows: bool,
-    iconed: bool,
-    tabs: bool,
-) -> gio::Menu {
+fn project_menu(project: &Project, groups: &[(Id, String)]) -> gio::Menu {
+    let id = project.id();
     let target = id.raw().to_variant();
+    let named = project.custom_name.is_some();
+    let iconed = project.icon.is_some();
+    let pinned = project.custom_directory.is_some();
+    let follows = project.inherit_directory;
+    let tabs = !project.is_empty();
 
     let naming = gio::Menu::new();
     naming.append_item(&item("Rename…", "win.rename-project", &target));
@@ -7125,6 +7373,24 @@ fn project_menu(
         &target,
     ));
 
+    // A browser's: a new group, else one of the others; and a way back out.
+    let grouping = gio::Menu::new();
+    let into = gio::Menu::new();
+    into.append_item(&item("New Group", "win.group-project", &target));
+    for (group, label) in groups {
+        if project.group() != Some(*group) {
+            into.append_item(&item(
+                label,
+                "win.group-project-into",
+                &(id.raw(), group.raw()).to_variant(),
+            ));
+        }
+    }
+    grouping.append_submenu(Some("Add to Group"), &into);
+    if project.group().is_some() {
+        grouping.append_item(&item("Remove from Group", "win.ungroup-project", &target));
+    }
+
     let moving = gio::Menu::new();
     moving.append_item(&item(
         "Move to a New Window",
@@ -7141,10 +7407,74 @@ fn project_menu(
     let menu = gio::Menu::new();
     menu.append_section(None, &naming);
     menu.append_section(None, &directory);
+    menu.append_section(None, &grouping);
     menu.append_section(None, &moving);
     menu.append_section(None, &closing);
     menu
 }
+
+/// The context menu on a group's heading.
+fn group_menu(id: Id, color: usize) -> gio::Menu {
+    let target = id.raw().to_variant();
+
+    let naming = gio::Menu::new();
+    naming.append_item(&item("Rename Group…", "win.rename-group", &target));
+    let colours = gio::Menu::new();
+    for (index, (name, _)) in GROUP_SWATCHES.iter().enumerate() {
+        if index != color % GROUP_SWATCHES.len() {
+            colours.append_item(&item(
+                name,
+                "win.group-color",
+                &(id.raw(), index as u32).to_variant(),
+            ));
+        }
+    }
+    naming.append_submenu(Some("Colour"), &colours);
+
+    let opening = gio::Menu::new();
+    opening.append_item(&item(
+        "New Project in Group",
+        "win.new-project-in-group",
+        &target,
+    ));
+
+    let closing = gio::Menu::new();
+    closing.append_item(&item("Ungroup", "win.ungroup", &target));
+    closing.append_item(&item("Close Group", "win.close-group", &target));
+
+    let menu = gio::Menu::new();
+    menu.append_section(None, &naming);
+    menu.append_section(None, &opening);
+    menu.append_section(None, &closing);
+    menu
+}
+
+/// What a group is called in its heading and in menus: its name, else its
+/// colour, so an unnamed group is still told from the next one.
+fn group_label(group: &Group) -> String {
+    if group.name.is_empty() {
+        GROUP_SWATCHES[group.color % GROUP_SWATCHES.len()]
+            .0
+            .to_owned()
+    } else {
+        group.name.clone()
+    }
+}
+
+/// Each group colour as the menu names it and as the sidebar paints it, in
+/// `GROUP_COLORS`' order. A browser's palette, one set for both themes: a dot
+/// and a stripe this narrow read by hue, not by contrast.
+const GROUP_SWATCHES: [(&str, &str); 9] = [
+    ("Grey", "#80868b"),
+    ("Blue", "#1a73e8"),
+    ("Red", "#d93025"),
+    ("Yellow", "#f9ab00"),
+    ("Green", "#188038"),
+    ("Pink", "#d01884"),
+    ("Purple", "#a142f4"),
+    ("Cyan", "#007b83"),
+    ("Orange", "#fa903e"),
+];
 
 fn item(label: &str, action: &str, target: &glib::Variant) -> gio::MenuItem {
     let item = gio::MenuItem::new(Some(label), None);
@@ -7497,8 +7827,15 @@ fn load_css() {
         return;
     };
     PROVIDER.with(|provider| {
-        provider.load_from_string(
+        let mut css = String::from(
             "row .tuni-row-close { opacity: 0; min-width: 20px; min-height: 20px; padding: 0; }\n\
+             /* A group's heading is a flat button filling a row of its own, and\n\
+                its members wear the group's colour down their left edge, as a\n\
+                browser's grouped tabs sit under one coloured line. */\n\
+             row.tuni-group-heading { padding: 0; }\n\
+             row.tuni-group-heading > button { padding: 0 8px; }\n\
+             .tuni-group-dot { min-width: 10px; min-height: 10px; border-radius: 5px; }\n\
+             row.tuni-member { border-top-left-radius: 0; border-bottom-left-radius: 0; }\n\
              row:hover .tuni-row-close, row:selected .tuni-row-close { opacity: 1; }\n\
              /* The ring is only drawn once a tab is split: a lone pane is the\n\
                 whole tab, and outlining it says nothing. */\n\
@@ -7574,6 +7911,14 @@ fn load_css() {
                 which is what makes a thumbnail readable as itself. */\n\
              .tuni-switch-preview label { font-size: 5pt; }\n",
         );
+        for (name, (_, hex)) in GROUP_COLORS.iter().zip(GROUP_SWATCHES) {
+            let _ = write!(
+                css,
+                ".tuni-group-dot.tuni-group-{name} {{ background-color: {hex}; }}\n\
+                 row.tuni-member.tuni-group-{name} {{ border-left: 3px solid {hex}; }}\n"
+            );
+        }
+        provider.load_from_string(&css);
         gtk::style_context_add_provider_for_display(
             &display,
             provider,

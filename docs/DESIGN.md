@@ -67,6 +67,26 @@ does; files in the same drop are passed over. The sidebar's empty space under
 its rows moves the window, as the header above it does: on a tall window it is
 most of the sidebar, and the nearest thing to grab.
 
+A new project goes to the foot of the list and is selected, the way a browser
+puts a new tab at the end of its strip: the list reads as the order things were
+opened in, and a row that appeared in the middle would move every row under it.
+Projects can be gathered into groups, as a browser groups tabs. A group has a
+name and a colour, its heading is a row of its own in the list, and its members
+sit under the heading with a stripe of its colour down their left edge. The
+heading folds the band away and shows how many rows it hides; folding the band
+the selected project is in selects the nearest project outside it, and selecting
+a project inside a folded band unfolds it, since a selected row that cannot be
+seen is a puzzle. A project's menu offers every group there is and a new one,
+and a new group asks for its name at once; one left unnamed is called by its
+colour, and a new group takes the first colour no group has. The heading's menu
+renames the group, picks its colour, opens a new project in it, ungroups it or
+closes every project in it; a row dropped on a heading or on one of its members
+joins that band, and a group whose last member leaves is gone, so there is no
+empty group to tidy. Groups do not nest. A row does not take the keyboard when
+it is clicked: `GtkListBox` would otherwise focus the row after the selection
+had handed the keyboard to the pane, and the first keys typed after a switch
+would go to the sidebar.
+
 One tuni runs at a time, and a launch made while it is running is a project
 rather than a second window. "Open Terminal Here" in a file manager says where
 by starting the process in that directory and nothing else, since only konsole

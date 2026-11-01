@@ -148,11 +148,29 @@ pub struct ProjectSnapshot {
     pub tabs: Vec<TabSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_tab: Option<usize>,
+    /// Which of the snapshot's groups this project sits in, by index. Absent
+    /// for a loose project, and for every snapshot written before groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<usize>,
+}
+
+/// A group as the sidebar had it. Only groups with a member are written, and
+/// only groups with a restored member come back.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct GroupSnapshot {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub color: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapsed: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Snapshot {
     pub projects: Vec<ProjectSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_project: Option<usize>,
     /// Whether the sidebar was showing. Optional: a snapshot written before
@@ -224,6 +242,9 @@ impl Snapshot {
                 custom_directory: project.custom_directory.clone(),
                 inherit_directory: (!project.inherit_directory).then_some(false),
                 selected_tab: project.selected_id().and_then(|id| project.index_of(id)),
+                group: project
+                    .group()
+                    .and_then(|id| workspace.groups().iter().position(|group| group.id() == id)),
                 tabs: project
                     .tabs()
                     .iter()
@@ -234,6 +255,15 @@ impl Snapshot {
 
         Self {
             projects,
+            groups: workspace
+                .groups()
+                .iter()
+                .map(|group| GroupSnapshot {
+                    name: group.name.clone(),
+                    color: group.color,
+                    collapsed: group.collapsed(),
+                })
+                .collect(),
             selected_project: workspace
                 .selected_id()
                 .and_then(|id| workspace.index_of(id)),
@@ -252,6 +282,10 @@ impl Snapshot {
         let mut workspace = Workspace::new();
         let mut histories = HashMap::new();
         let mut cursors = HashMap::new();
+        // Snapshot group index to the group made for it, made when its first
+        // restored member arrives so a group whose members all failed to read
+        // is never made at all.
+        let mut groups: HashMap<usize, Id> = HashMap::new();
 
         for saved in &self.projects {
             let tabs: Vec<Tab> = saved
@@ -282,6 +316,31 @@ impl Snapshot {
                 .or_else(|| project.tabs().first())
                 .map(Tab::id);
             project.select(selected);
+
+            if let Some(index) = saved.group
+                && let Some(group) = self.groups.get(index)
+            {
+                match groups.get(&index) {
+                    Some(existing) => workspace.add_to_group(id, *existing),
+                    None => {
+                        let Some(made) = workspace.add_to_new_group(id) else {
+                            continue;
+                        };
+                        let entry = workspace.group_mut(made).expect("just made");
+                        entry.name.clone_from(&group.name);
+                        entry.color = group.color;
+                        groups.insert(index, made);
+                    }
+                }
+            }
+        }
+        // Folded last, so a fold does not open again as the next member joins,
+        // and before the selection is read back, which opens the group it is
+        // in should a session have folded it away.
+        for (index, id) in &groups {
+            if self.groups[*index].collapsed {
+                workspace.set_collapsed(*id, true);
+            }
         }
 
         if let Some(id) = self
@@ -861,6 +920,47 @@ mod tests {
         let pane = &restored.projects()[0].tabs()[0].layout().columns()[0].panes()[0];
         assert!(pane.directory.is_none());
         assert!((pane.weight - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn groups_come_back_with_their_names_colours_and_folds() {
+        let mut saved = workspace(&[1]);
+        for _ in 0..2 {
+            let id = saved.open_project();
+            let project = saved.project_mut(id).expect("just opened");
+            project.insert_tab(0, Tab::new());
+        }
+        let [a, b, c]: [Id; 3] = saved
+            .projects()
+            .iter()
+            .map(Project::id)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("three projects");
+        let group = saved.add_to_new_group(a).expect("a exists");
+        saved.add_to_group(b, group);
+        saved.group_mut(group).expect("exists").name = "Work".to_owned();
+        saved.group_mut(group).expect("exists").color = 3;
+        saved.select(c);
+        saved.set_collapsed(group, true);
+
+        let snapshot = Snapshot::of(&saved, |_| PaneState::default());
+        let text = serde_json::to_string(&snapshot).expect("plain data");
+        let read: Snapshot = serde_json::from_str(&text).expect("what we just wrote");
+        let restored = read.restore().workspace;
+
+        let groups = restored.groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Work");
+        assert_eq!(groups[0].color, 3);
+        assert!(groups[0].collapsed());
+        let members: Vec<bool> = restored
+            .projects()
+            .iter()
+            .map(|project| project.group() == Some(groups[0].id()))
+            .collect();
+        assert_eq!(members, vec![true, true, false]);
+        assert_eq!(restored.selected_id(), Some(restored.projects()[2].id()));
     }
 
     #[test]
