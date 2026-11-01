@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::panes::{Column, Content, Layout, Pane};
 use crate::settings::data_dir;
-use crate::workspace::{Id, Project, Tab, Workspace};
+use crate::workspace::{GROUP_COLORS, Id, Project, Tab, Workspace};
 
 /// One pane: what it held, where that was, and how much room it had.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -160,10 +160,38 @@ pub struct ProjectSnapshot {
 pub struct GroupSnapshot {
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
-    pub color: usize,
+    /// `#rrggbb`. Read forgivingly: an index into [`GROUP_COLORS`], as the
+    /// first sessions wrote it, or anything else, is the first of the nine
+    /// rather than a session lost over a color.
+    #[serde(default = "first_color", deserialize_with = "color")]
+    pub color: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub collapsed: bool,
+}
+
+fn first_color() -> String {
+    GROUP_COLORS[0].1.to_owned()
+}
+
+fn color<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Written {
+        Index(usize),
+        Text(String),
+    }
+    let hex = match Written::deserialize(deserializer)? {
+        Written::Index(index) => GROUP_COLORS[index % GROUP_COLORS.len()].1,
+        Written::Text(text)
+            if text.len() == 7
+                && text.starts_with('#')
+                && text[1..].bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            return Ok(text.to_ascii_lowercase());
+        }
+        Written::Text(_) => GROUP_COLORS[0].1,
+    };
+    Ok(hex.to_owned())
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -260,7 +288,7 @@ impl Snapshot {
                 .iter()
                 .map(|group| GroupSnapshot {
                     name: group.name.clone(),
-                    color: group.color,
+                    color: group.color.clone(),
                     collapsed: group.collapsed(),
                 })
                 .collect(),
@@ -328,7 +356,7 @@ impl Snapshot {
                         };
                         let entry = workspace.group_mut(made).expect("just made");
                         entry.name.clone_from(&group.name);
-                        entry.color = group.color;
+                        entry.color.clone_from(&group.color);
                         groups.insert(index, made);
                     }
                 }
@@ -923,7 +951,20 @@ mod tests {
     }
 
     #[test]
-    fn groups_come_back_with_their_names_colours_and_folds() {
+    fn a_group_color_written_as_an_index_or_as_nonsense_still_reads() {
+        let read = |json: &str| {
+            serde_json::from_str::<GroupSnapshot>(json)
+                .expect("reads")
+                .color
+        };
+        assert_eq!(read(r##"{"color": 3}"##), GROUP_COLORS[3].1);
+        assert_eq!(read(r##"{"color": "#3A7BD5"}"##), "#3a7bd5");
+        assert_eq!(read(r##"{"color": "blue"}"##), GROUP_COLORS[0].1);
+        assert_eq!(read(r##"{}"##), GROUP_COLORS[0].1);
+    }
+
+    #[test]
+    fn groups_come_back_with_their_names_colors_and_folds() {
         let mut saved = workspace(&[1]);
         for _ in 0..2 {
             let id = saved.open_project();
@@ -940,7 +981,7 @@ mod tests {
         let group = saved.add_to_new_group(a).expect("a exists");
         saved.add_to_group(b, group);
         saved.group_mut(group).expect("exists").name = "Work".to_owned();
-        saved.group_mut(group).expect("exists").color = 3;
+        saved.group_mut(group).expect("exists").color = "#3a7bd5".to_owned();
         saved.select(c);
         saved.set_collapsed(group, true);
 
@@ -952,7 +993,7 @@ mod tests {
         let groups = restored.groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].name, "Work");
-        assert_eq!(groups[0].color, 3);
+        assert_eq!(groups[0].color, "#3a7bd5");
         assert!(groups[0].collapsed());
         let members: Vec<bool> = restored
             .projects()

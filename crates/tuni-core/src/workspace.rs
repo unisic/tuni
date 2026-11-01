@@ -48,11 +48,19 @@ impl From<u64> for Id {
 /// Shown when a tab has neither a name of its own nor a title from the shell.
 const UNTITLED_TAB: &str = "Terminal";
 
-/// The colours a group can wear, a browser's nine in a browser's order. A
-/// group holds an index into this list; what each colour looks like is the
-/// window's business.
-pub const GROUP_COLORS: [&str; 9] = [
-    "grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange",
+/// The colors a new group is dealt from, a browser's nine in a browser's
+/// order, each with the name an unnamed group goes by. Once the user has
+/// picked one, a group's color is any `#rrggbb`.
+pub const GROUP_COLORS: [(&str, &str); 9] = [
+    ("Grey", "#80868b"),
+    ("Blue", "#1a73e8"),
+    ("Red", "#d93025"),
+    ("Yellow", "#f9ab00"),
+    ("Green", "#188038"),
+    ("Pink", "#d01884"),
+    ("Purple", "#a142f4"),
+    ("Cyan", "#007b83"),
+    ("Orange", "#fa903e"),
 ];
 
 /// A band of adjacent projects under one heading, as a browser groups tabs.
@@ -60,10 +68,10 @@ pub const GROUP_COLORS: [&str; 9] = [
 #[derive(Clone, Debug)]
 pub struct Group {
     id: Id,
-    /// Empty until the user names it; the heading then shows the colour.
+    /// Empty until the user names it; the heading then shows the color.
     pub name: String,
-    /// An index into [`GROUP_COLORS`].
-    pub color: usize,
+    /// `#rrggbb`, lower case.
+    pub color: String,
     collapsed: bool,
 }
 
@@ -78,10 +86,13 @@ impl Group {
         self.collapsed
     }
 
-    /// The colour's name, forgiving an index a hand-edited session wrote.
+    /// The color's name, while it is one of the nine a group is dealt.
     #[must_use]
-    pub fn color_name(&self) -> &'static str {
-        GROUP_COLORS[self.color % GROUP_COLORS.len()]
+    pub fn color_name(&self) -> Option<&'static str> {
+        GROUP_COLORS
+            .iter()
+            .find(|(_, hex)| *hex == self.color)
+            .map(|(name, _)| *name)
     }
 }
 
@@ -516,18 +527,19 @@ impl Workspace {
         self.groups.iter_mut().find(|group| group.id == id)
     }
 
-    /// Puts a project in a new group of its own, wearing the first colour no
+    /// Puts a project in a new group of its own, wearing the first color no
     /// other group wears. Unnamed: the name is the caller's to ask for.
     pub fn add_to_new_group(&mut self, project: Id) -> Option<Id> {
         self.index_of(project)?;
-        let color = (0..GROUP_COLORS.len())
-            .find(|color| !self.groups.iter().any(|group| group.color == *color))
-            .unwrap_or(self.groups.len() % GROUP_COLORS.len());
+        let (_, color) = GROUP_COLORS
+            .iter()
+            .find(|(_, hex)| !self.groups.iter().any(|group| group.color == *hex))
+            .unwrap_or(&GROUP_COLORS[self.groups.len() % GROUP_COLORS.len()]);
         let id = Id::next();
         self.groups.push(Group {
             id,
             name: String::new(),
-            color,
+            color: (*color).to_owned(),
             collapsed: false,
         });
         self.add_to_group(project, id);
@@ -995,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn each_new_group_wears_a_colour_no_other_group_wears() {
+    fn each_new_group_wears_a_color_no_other_group_wears() {
         let (mut workspace, [a, b, c, _]) = four();
         let first = workspace.add_to_new_group(a).expect("a exists");
         let second = workspace.add_to_new_group(b).expect("b exists");
@@ -1004,10 +1016,10 @@ mod tests {
             workspace.group(second).unwrap().color
         );
 
-        // Ungrouping frees the colour for the next group.
+        // Ungrouping frees the color for the next group.
         workspace.ungroup(first);
         let third = workspace.add_to_new_group(c).expect("c exists");
-        assert_eq!(workspace.group(third).unwrap().color, 0);
+        assert_eq!(workspace.group(third).unwrap().color, GROUP_COLORS[0].1);
         assert_eq!(workspace.project(a).unwrap().group(), None);
     }
 

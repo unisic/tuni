@@ -10,8 +10,10 @@ in `data/dev.unisic.Tuni.metainfo.xml`.
 ### Added
 
 - Projects can be gathered into groups, as a browser groups tabs: a group has a
-  name and a colour, its heading folds the band away, and a project's menu
-  moves it in and out.
+  name and a color picked in the desktop's color dialog, its heading folds the
+  band away, and a project's menu moves it in and out.
+- The field a project, group or tab is renamed in has an emoji button beside
+  it.
 - A new project opens at the foot of the list, where a browser puts a new tab.
 - Several projects can be selected at once, Shift for a range and Ctrl for
   one more, and the row menu then groups, moves or closes all of them.
@@ -29,6 +31,9 @@ in `data/dev.unisic.Tuni.metainfo.xml`.
 
 - Typing right after switching projects reaches the terminal instead of the
   sidebar.
+- The system emoji chooser behind the icon picker's last tile opens at once
+  from the second time on. It used to be built afresh for every picker, and
+  took half a second to fill.
 - `tuni --version` prints the version. It used to be forwarded to the running
   Tuni, which read it as a launch from the shell's directory and opened a
   project there. `--help` and unknown options are answered on the command line

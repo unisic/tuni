@@ -569,7 +569,7 @@ fn area(title: &str, description: &str, buffer: &gtk::TextBuffer) -> adw::Prefer
         .height_request(120)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
-    // The border rather than the card background: a card of the same colour as
+    // The border rather than the card background: a card of the same color as
     // the page is a text area nobody can see the edges of.
     scroller.add_css_class("frame");
     let group = adw::PreferencesGroup::builder()

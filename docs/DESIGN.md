@@ -46,7 +46,12 @@ first and the icons from the desktop's theme under them, since half of what
 makes one row findable is a color the other rows do not have and the colored
 half should not be the half behind a button. Every other emoji this desktop has
 is the last tile of that grid, which opens the system chooser with its search
-field. One field holds both and which of the two it is is read off the string
+field. There is one system chooser for the process, lent to whichever button
+asks for it: GTK fills its two thousand tiles from an idle handler when the
+chooser is built, so one built for each picker opened half a second after the
+tile was pressed, and one kept opens in a frame. The same chooser stands behind
+the emoji button beside the field a project, group or tab is renamed in; an
+emoji in a name is part of the name, not a second field. One field holds both and which of the two it is is read off the string
 rather than stored beside it: an icon name is ASCII, an emoji is not, so there
 is no pair of settings that can disagree about what a row shows. A themed icon
 is drawn in the row's own foreground color like every other symbolic icon in the
@@ -71,15 +76,16 @@ A new project goes to the foot of the list and is selected, the way a browser
 puts a new tab at the end of its strip: the list reads as the order things were
 opened in, and a row that appeared in the middle would move every row under it.
 Projects can be gathered into groups, as a browser groups tabs. A group has a
-name and a colour, its heading is a row of its own in the list, and its members
-sit under the heading with a stripe of its colour down their left edge. The
+name and a color, its heading is a row of its own in the list, and its members
+sit under the heading with a stripe of its color down their left edge. The
 heading folds the band away and shows how many rows it hides; folding the band
 the selected project is in selects the nearest project outside it, and selecting
 a project inside a folded band unfolds it, since a selected row that cannot be
 seen is a puzzle. A project's menu offers every group there is and a new one,
 and a new group asks for its name at once; one left unnamed is called by its
-colour, and a new group takes the first colour no group has. The heading's menu
-renames the group, picks its colour, opens a new project in it, ungroups it or
+color, and a new group takes the first color no group has. The heading's menu
+renames the group, opens the desktop's color dialog for its color, opens a new
+project in it, ungroups it or
 closes every project in it; a row dropped on a heading or on one of its members
 joins that band, and a group whose last member leaves is gone, so there is no
 empty group to tidy. Groups do not nest. A row does not take the keyboard when
@@ -411,8 +417,8 @@ drop anywhere in the window that is not a tab strip makes it ask for a window to
 put the page in, and the row that took the drop is what that question is
 answered with. That move is the one the window has to narrate, because the tab
 leaves the strip in front of a person and lands in a project they may not be
-looking at: the row lights up in the accent colour while the tab is held over
-it, so what will take it is lit before it is let go of, and keeps that colour
+looking at: the row lights up in the accent color while the tab is held over
+it, so what will take it is lit before it is let go of, and keeps that color
 for a moment afterwards as it fades, so what did take it is the same light going
 out rather than a second signal somewhere else. It also swells while the tab is
 over it and the icons either side of it lift, which is the dock's magnification

@@ -30,7 +30,7 @@ use tuni_core::panes::{Content, Edge, Layout, Pane};
 use tuni_core::session::{History, PaneState, Snapshot};
 use tuni_core::settings::{Appearance, HISTORY_LINE_LIMIT, NewTab, Settings};
 use tuni_core::theme::{Rgb, Theme};
-use tuni_core::workspace::{GROUP_COLORS, Group, Id, Project, Tab, Workspace};
+use tuni_core::workspace::{Group, Id, Project, Tab, Workspace};
 
 use crate::browser::TuniBrowser;
 use crate::diff::TuniDiff;
@@ -541,6 +541,11 @@ mod imp {
         pub rows: RefCell<HashMap<Id, gtk::ListBoxRow>>,
         /// Shared context menu for the sidebar rows, parented once.
         pub row_menu: RefCell<Option<gtk::PopoverMenu>>,
+        /// The rules that paint the groups' colors, rewritten with the sidebar
+        /// so there is one per group rather than one per color ever picked,
+        /// and the text last written, so an unchanged set restyles nothing.
+        pub tints: gtk::CssProvider,
+        pub tint_css: RefCell<String>,
         /// The sidebar's foot, counting the tabs that want a look, and the
         /// words on it.
         pub attention: RefCell<Option<(gtk::Revealer, adw::ButtonContent)>>,
@@ -787,6 +792,11 @@ impl TuniWindow {
         let imp = self.imp();
         crate::debug::mark("   build_ui begin");
         load_css();
+        gtk::style_context_add_provider_for_display(
+            &WidgetExt::display(self),
+            &imp.tints,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
         crate::editor::apply_font(&imp.settings.borrow().terminal);
         crate::diff::apply_colors(&self.theme());
 
@@ -1423,24 +1433,11 @@ impl TuniWindow {
                     window.rename_group(id);
                 }
             }),
-            entry(
-                "group-color",
-                glib::VariantTy::new("(tu)").ok(),
-                |window, target| {
-                    if let Some((group, color)) = target.and_then(glib::Variant::get::<(u64, u32)>)
-                    {
-                        if let Some(group) = window
-                            .imp()
-                            .workspace
-                            .borrow_mut()
-                            .group_mut(Id::from(group))
-                        {
-                            group.color = color as usize;
-                        }
-                        window.redraw_sidebar();
-                    }
-                },
-            ),
+            entry("group-color", uint64, |window, target| {
+                if let Some(id) = project_target(target) {
+                    window.choose_group_color(id);
+                }
+            }),
             entry("new-project-in-group", uint64, |window, target| {
                 if let Some(group) = project_target(target) {
                     let id = window.open_project();
@@ -6730,6 +6727,21 @@ impl TuniWindow {
             (projects, workspace.groups().to_vec())
         };
 
+        let mut css = String::new();
+        for group in &groups {
+            let _ = write!(
+                css,
+                ".tuni-group-dot.{class} {{ background-color: {hex}; }}\n\
+                 row.tuni-member.{class} {{ border-left: 3px solid {hex}; }}\n",
+                class = tint_class(&group.color),
+                hex = group.color
+            );
+        }
+        if *imp.tint_css.borrow() != css {
+            imp.tints.load_from_string(&css);
+            *imp.tint_css.borrow_mut() = css;
+        }
+
         let empty = projects.is_empty();
         let mut heading: Option<Id> = None;
         for (id, name, group) in &projects {
@@ -6752,7 +6764,7 @@ impl TuniWindow {
             let (row, label) = self.build_row(*id, name);
             if let Some(group) = group {
                 row.add_css_class("tuni-member");
-                row.add_css_class(&format!("tuni-group-{}", group.color_name()));
+                row.add_css_class(&tint_class(&group.color));
             }
             list.append(&row);
             imp.labels.borrow_mut().insert(*id, label);
@@ -7041,7 +7053,7 @@ impl TuniWindow {
         glib::idle_add_local_once(move || source.move_project_to(id, &this, onto));
     }
 
-    /// A group's heading: its colour, its name, how many rows it is hiding
+    /// A group's heading: its color, its name, how many rows it is hiding
     /// when folded, and the arrow that folds it. A button inside a row the
     /// list cannot select, as the host list has it: selecting is what shows a
     /// project, and a heading is not one.
@@ -7050,7 +7062,7 @@ impl TuniWindow {
         let collapsed = group.collapsed();
         let dot = gtk::Box::builder().valign(gtk::Align::Center).build();
         dot.add_css_class("tuni-group-dot");
-        dot.add_css_class(&format!("tuni-group-{}", group.color_name()));
+        dot.add_css_class(&tint_class(&group.color));
         let label = gtk::Label::builder()
             .label(group_label(group))
             .xalign(0.0)
@@ -7187,16 +7199,10 @@ impl TuniWindow {
     }
 
     fn popup_group_menu(&self, id: Id, row: &gtk::ListBoxRow, x: f64, y: f64) {
-        let Some(color) = self
-            .imp()
-            .workspace
-            .borrow()
-            .group(id)
-            .map(|group| group.color)
-        else {
+        if self.imp().workspace.borrow().group(id).is_none() {
             return;
-        };
-        self.popup_on_row(&group_menu(id, color), row, x, y);
+        }
+        self.popup_on_row(&group_menu(id), row, x, y);
     }
 
     /// Opens the sidebar's shared popover on a row, at the point clicked.
@@ -7236,7 +7242,7 @@ impl TuniWindow {
         });
     }
 
-    /// An empty answer leaves the group unnamed, which shows as its colour.
+    /// An empty answer leaves the group unnamed, which shows as its color.
     fn rename_group(&self, id: Id) {
         let current = self
             .imp()
@@ -7252,6 +7258,42 @@ impl TuniWindow {
             }
             window.redraw_sidebar();
         });
+    }
+
+    /// The desktop's color dialog, started on the group's color.
+    fn choose_group_color(&self, id: Id) {
+        let current = self
+            .imp()
+            .workspace
+            .borrow()
+            .group(id)
+            .and_then(|group| gdk::RGBA::parse(&group.color).ok());
+        gtk::ColorDialog::builder()
+            .title("Group Color")
+            .with_alpha(false)
+            .build()
+            .choose_rgba(
+                Some(self),
+                current.as_ref(),
+                gio::Cancellable::NONE,
+                glib::clone!(
+                    #[weak(rename_to = this)]
+                    self,
+                    move |picked| {
+                        let Ok(rgba) = picked else { return };
+                        let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                        if let Some(group) = this.imp().workspace.borrow_mut().group_mut(id) {
+                            group.color = format!(
+                                "#{:02x}{:02x}{:02x}",
+                                channel(rgba.red()),
+                                channel(rgba.green()),
+                                channel(rgba.blue())
+                            );
+                        }
+                        this.redraw_sidebar();
+                    }
+                ),
+            );
     }
 
     fn choose_project_icon(&self, id: Id) {
@@ -7308,8 +7350,12 @@ impl TuniWindow {
             .text(current)
             .activates_default(true)
             .build();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        entry.set_hexpand(true);
+        row.append(&entry);
+        row.append(&crate::icon_picker::emoji_button(&entry));
         let dialog = adw::AlertDialog::new(Some(heading), None);
-        dialog.set_extra_child(Some(&entry));
+        dialog.set_extra_child(Some(&row));
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("rename", "Rename");
         dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
@@ -7599,22 +7645,12 @@ fn grouping_section(
 }
 
 /// The context menu on a group's heading.
-fn group_menu(id: Id, color: usize) -> gio::Menu {
+fn group_menu(id: Id) -> gio::Menu {
     let target = id.raw().to_variant();
 
     let naming = gio::Menu::new();
     naming.append_item(&item("Rename Group…", "win.rename-group", &target));
-    let colours = gio::Menu::new();
-    for (index, (name, _)) in GROUP_SWATCHES.iter().enumerate() {
-        if index != color % GROUP_SWATCHES.len() {
-            colours.append_item(&item(
-                name,
-                "win.group-color",
-                &(id.raw(), index as u32).to_variant(),
-            ));
-        }
-    }
-    naming.append_submenu(Some("Colour"), &colours);
+    naming.append_item(&item("Color…", "win.group-color", &target));
 
     let opening = gio::Menu::new();
     opening.append_item(&item(
@@ -7635,31 +7671,22 @@ fn group_menu(id: Id, color: usize) -> gio::Menu {
 }
 
 /// What a group is called in its heading and in menus: its name, else its
-/// colour, so an unnamed group is still told from the next one.
+/// color, so an unnamed group is still told from the next one.
 fn group_label(group: &Group) -> String {
     if group.name.is_empty() {
-        GROUP_SWATCHES[group.color % GROUP_SWATCHES.len()]
-            .0
-            .to_owned()
+        group
+            .color_name()
+            .map_or_else(|| group.color.clone(), str::to_owned)
     } else {
         group.name.clone()
     }
 }
 
-/// Each group colour as the menu names it and as the sidebar paints it, in
-/// `GROUP_COLORS`' order. A browser's palette, one set for both themes: a dot
-/// and a stripe this narrow read by hue, not by contrast.
-const GROUP_SWATCHES: [(&str, &str); 9] = [
-    ("Grey", "#80868b"),
-    ("Blue", "#1a73e8"),
-    ("Red", "#d93025"),
-    ("Yellow", "#f9ab00"),
-    ("Green", "#188038"),
-    ("Pink", "#d01884"),
-    ("Purple", "#a142f4"),
-    ("Cyan", "#007b83"),
-    ("Orange", "#fa903e"),
-];
+/// The class a group's dot and its members' stripe carry for one `#rrggbb`.
+/// The rule behind it is written by `rebuild_sidebar`.
+fn tint_class(hex: &str) -> String {
+    format!("tuni-tint-{}", hex.trim_start_matches('#'))
+}
 
 fn item(label: &str, action: &str, target: &glib::Variant) -> gio::MenuItem {
     let item = gio::MenuItem::new(Some(label), None);
@@ -8012,11 +8039,11 @@ fn load_css() {
         return;
     };
     PROVIDER.with(|provider| {
-        let mut css = String::from(
+        let css = String::from(
             "row .tuni-row-close { opacity: 0; min-width: 20px; min-height: 20px; padding: 0; }\n\
              /* A group's heading is a flat button filling a row of its own, and\n\
-                its members wear the group's colour down their left edge, as a\n\
-                browser's grouped tabs sit under one coloured line. */\n\
+                its members wear the group's color down their left edge, as a\n\
+                browser's grouped tabs sit under one colored line. */\n\
              row.tuni-group-heading { padding: 0; }\n\
              row.tuni-group-heading > button { padding: 0 8px; }\n\
              .tuni-group-dot { min-width: 10px; min-height: 10px; border-radius: 5px; }\n\
@@ -8043,7 +8070,7 @@ fn load_css() {
              .tuni-sidebar-drop:drop(active) { \
               box-shadow: inset 0 0 0 2px alpha(@accent_color, 0.7); }\n\
              /* A tab held over a project row, and the same row for a moment\n\
-                after it has been let go of. The two are one colour on purpose:\n\
+                after it has been let go of. The two are one color on purpose:\n\
                 what lights up under the pointer is what keeps the tab, and the\n\
                 pulse is that light going out rather than a second signal. */\n\
              row.tuni-row-target { \
@@ -8096,13 +8123,6 @@ fn load_css() {
                 which is what makes a thumbnail readable as itself. */\n\
              .tuni-switch-preview label { font-size: 5pt; }\n",
         );
-        for (name, (_, hex)) in GROUP_COLORS.iter().zip(GROUP_SWATCHES) {
-            let _ = write!(
-                css,
-                ".tuni-group-dot.tuni-group-{name} {{ background-color: {hex}; }}\n\
-                 row.tuni-member.tuni-group-{name} {{ border-left: 3px solid {hex}; }}\n"
-            );
-        }
         provider.load_from_string(&css);
         gtk::style_context_add_provider_for_display(
             &display,

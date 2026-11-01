@@ -1,14 +1,14 @@
 //! The picker a sidebar icon is chosen in: a project's row, and a host's.
 //!
 //! Two alphabets, one field. A themed icon follows the desktop's icon theme and
-//! is drawn in the row's foreground colour like every other symbolic icon in the
-//! window; an emoji is coloured text the font decides. Which of the two a
+//! is drawn in the row's foreground color like every other symbolic icon in the
+//! window; an emoji is colored text the font decides. Which of the two a
 //! project uses is read back off the string rather than stored beside it, so
 //! there is one record and no pair of fields that can both be set.
 //!
 //! Both are on one scrolling page, emoji first, rather than an emoji button that
-//! opens a chooser over the grid: colour is what makes one row findable in a
-//! sidebar of six, so the coloured half has to be the half you see first. The
+//! opens a chooser over the grid: color is what makes one row findable in a
+//! sidebar of six, so the colored half has to be the half you see first. The
 //! forty here are the ones a directory of work tends to be about; the system
 //! chooser, with every emoji this desktop has and a search field over them, is
 //! the last tile of that grid rather than a second control in the header.
@@ -22,14 +22,17 @@
 //! application's own logo, and a project is none of those. Any the running theme
 //! is missing are dropped rather than drawn as a broken image.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use adw::prelude::*;
 use gtk::glib;
 
 /// The emoji offered without opening the system chooser: languages, tools, the
-/// states a piece of work is in, and enough plain colour to tell two rows apart.
+/// states a piece of work is in, and enough plain color to tell two rows apart.
 /// The ones written with a trailing U+FE0F carry it on purpose: their code point
 /// predates emoji and a font draws it as a black-and-white glyph without the
-/// selector, which in a grid of colour reads as a broken tile.
+/// selector, which in a grid of color reads as a broken tile.
 const EMOJI: &[&str] = &[
     "🐙",
     "🚀",
@@ -179,13 +182,13 @@ const DISTROS: &[(&str, &str)] = &[
 ];
 
 /// Draws an icon the way this picker writes them down: an emoji is text the
-/// font colours, a name is a symbolic icon in the foreground colour, and
+/// font colors, a name is a symbolic icon in the foreground color, and
 /// nothing at all is `fallback`, which is whatever the row draws when it has
 /// not been given one.
 ///
 /// `dim` is for a list, where the icon is beside the name rather than the thing
 /// being pointed at. An emoji is never dimmed whatever the caller asks: its
-/// colour is the reason somebody picked it.
+/// color is the reason somebody picked it.
 pub fn image(icon: Option<&str>, fallback: &str, dim: bool) -> gtk::Widget {
     match icon {
         Some(glyph) if tuni_core::workspace::is_emoji(glyph) => {
@@ -241,22 +244,23 @@ pub fn present<F>(
 
     // Last rather than first: the forty above answer the question most of the
     // time, and this is the door to the other two thousand.
-    let chooser = gtk::EmojiChooser::new();
-    chooser.connect_emoji_picked(glib::clone!(
-        #[strong]
-        apply,
-        #[weak]
-        dialog,
-        move |_, glyph| {
-            apply(Some(glyph.to_owned()));
-            dialog.close();
-        }
-    ));
     let more = gtk::MenuButton::builder()
         .icon_name("list-add-symbolic")
         .tooltip_text("Every other emoji")
-        .popover(&chooser)
         .build();
+    lend_chooser(
+        &more,
+        glib::clone!(
+            #[strong]
+            apply,
+            #[weak]
+            dialog,
+            move |glyph| {
+                apply(Some(glyph.to_owned()));
+                dialog.close();
+            }
+        ),
+    );
     more.add_css_class("flat");
     more.add_css_class("circular");
     emoji.append(&more);
@@ -363,6 +367,76 @@ where
             dialog.close();
         }
     )
+}
+
+/// Lends the system chooser, one for the process, to a button, from the
+/// first time the button is pressed.
+///
+/// `GtkEmojiChooser` fills its grid of two thousand tiles from an idle
+/// handler scheduled when it is built, so a chooser built for each picker
+/// opened half a second after its button was pressed, and the first in a
+/// process the best part of a second after that, for the font. Built once and
+/// kept, it opens in a frame or two from then on; what it keeps is about
+/// fifteen megabytes, over the few hundred the emoji font costs a process the
+/// first time any chooser is drawn, which is why it is not built before a
+/// button asks. The button that asked last has it and the one before is left
+/// without, which only two windows with a picker open each could tell.
+fn lend_chooser(button: &gtk::MenuButton, picked: impl Fn(&str) + 'static) {
+    thread_local! {
+        static CHOOSER: (gtk::EmojiChooser, Cell<Option<glib::SignalHandlerId>>) =
+            (gtk::EmojiChooser::new(), Cell::new(None));
+    }
+    let picked = Rc::new(picked);
+    button.set_create_popup_func(move |button| {
+        CHOOSER.with(|(chooser, handler)| {
+            if let Some(old) = handler.take() {
+                chooser.disconnect(old);
+            }
+            let picked = picked.clone();
+            handler.set(Some(
+                chooser.connect_emoji_picked(move |_, glyph| picked(glyph)),
+            ));
+            let holder = chooser.parent().and_downcast::<gtk::MenuButton>();
+            if holder.as_ref() == Some(button) {
+                return;
+            }
+            if let Some(holder) = holder {
+                holder.set_popover(gtk::Popover::NONE);
+            }
+            button.set_popover(Some(chooser));
+        });
+    });
+}
+
+/// A button that puts an emoji where the cursor is in an entry, so a name can
+/// carry one the way a browser's tab group does.
+pub fn emoji_button(entry: &gtk::Entry) -> gtk::MenuButton {
+    let button = gtk::MenuButton::builder()
+        .icon_name("face-smile-symbolic")
+        .tooltip_text("Insert Emoji")
+        .valign(gtk::Align::Center)
+        .build();
+    lend_chooser(
+        &button,
+        glib::clone!(
+            #[weak]
+            entry,
+            move |glyph| {
+                let mut at = entry.position();
+                entry.insert_text(glyph, &mut at);
+                entry.set_position(at);
+                // The chooser is still handing focus back to its button when
+                // this runs. The entry takes it a moment later, and without
+                // selecting, so Enter confirms the name rather than reopening
+                // the chooser or replacing what was typed.
+                let entry = entry.clone();
+                glib::idle_add_local_once(move || {
+                    entry.grab_focus_without_selecting();
+                });
+            }
+        ),
+    );
+    button
 }
 
 #[cfg(test)]
