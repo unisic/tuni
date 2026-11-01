@@ -151,6 +151,11 @@ thread_local! {
     /// tell a move from a drag that was called off and put back.
     static IN_FLIGHT: RefCell<Option<(TuniWindow, Id, Tab)>> = const { RefCell::new(None) };
 
+    /// Set while a whole project changes windows, so the attach of each of its
+    /// pages keeps quiet: the toast speaks of a tab, and what moved is the
+    /// project, whose row in the other sidebar is announcement enough.
+    static MOVING_PROJECT: Cell<bool> = const { Cell::new(false) };
+
     /// The project a dragged tab was let go of over, and the window whose
     /// sidebar drew that row. Read by the `create-window` that follows every
     /// drop outside a strip, which answers with that project's strip instead
@@ -4946,7 +4951,7 @@ impl TuniWindow {
         // nothing is said about it.
         let moved = source != *self || from != project;
         source.hand_over(self, project, tab, position.max(0) as usize);
-        if moved {
+        if moved && !MOVING_PROJECT.get() {
             self.announce_move(project);
         }
 
@@ -5274,11 +5279,14 @@ impl TuniWindow {
         // Backwards, because each page goes to the head of the other strip:
         // walking from the end is what leaves them in the order they were in
         // here. Every transfer detaches and attaches, so the same pair of
-        // handlers that carries one dragged tab carries these.
+        // handlers that carries one dragged tab carries these, minus the word
+        // about it.
+        MOVING_PROJECT.set(true);
         for position in (0..view.n_pages()).rev() {
             let page = view.nth_page(position);
             view.transfer_page(&page, &other, 0);
         }
+        MOVING_PROJECT.set(false);
         self.close_project(id);
 
         // The tab that was in front stays in front. Every page landed selected
