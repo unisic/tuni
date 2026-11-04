@@ -6,7 +6,7 @@
 # for a local `rpmbuild`. Set GHOSTTY_SOURCE_DIR to that release unpacked and
 # CARGO_HOME to a populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.8.0/ -o tuni-1.8.0.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.8.1/ -o tuni-1.8.1.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.17.0
 
 Name:           tuni
-Version:        1.8.0
+Version:        1.8.1
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -94,6 +94,12 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/*/*/*.svg
 
 %changelog
+* Wed Nov 04 2026 Unisic <contact@unisic.app> - 1.8.1-1
+- Tuni opens under GTK 4.24 on KWin 6.8 instead of closing at once with a
+  Wayland protocol error. GTK now asks the compositor for a window's
+  background effect itself, and the background blur is asked for through GTK
+  there.
+
 * Sun Nov 01 2026 Unisic <contact@unisic.app> - 1.8.0-1
 - Projects gather into groups, as a browser groups tabs: a group has a name and
   a color picked in the desktop's color dialog, its heading folds the band

@@ -67,6 +67,14 @@
   </provides>
 
   <releases>
+    <release version="1.8.1" date="2026-11-04">
+      <description>
+        <p>Tuni opens under GTK 4.24 on KWin 6.8, as on Fedora 45, instead of
+        closing at once with a Wayland protocol error. GTK now asks the
+        compositor for a window's background effect itself, and the
+        background blur is asked for through GTK there.</p>
+      </description>
+    </release>
     <release version="1.8.0" date="2026-11-01">
       <description>
         <p>Projects gather into groups, as a browser groups tabs: a group has

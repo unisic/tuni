@@ -1,3 +1,12 @@
+tuni (1.8.1) unstable; urgency=medium
+
+  * Tuni opens under GTK 4.24 on KWin 6.8 instead of closing at once with a
+    Wayland protocol error. GTK now asks the compositor for a window's
+    background effect itself, and the background blur is asked for through
+    GTK there.
+
+ -- Unisic <contact@unisic.app>  Wed, 04 Nov 2026 17:10:00 +0100
+
 tuni (1.8.0) unstable; urgency=medium
 
   * Projects gather into groups, as a browser groups tabs: a group has a name

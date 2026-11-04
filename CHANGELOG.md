@@ -5,6 +5,16 @@ publishes a version's section as the notes of its GitHub release, so the
 section has to exist before the tag does. Releases before 1.7.0 are described
 in `data/dev.unisic.Tuni.metainfo.xml`.
 
+## 1.8.1
+
+### Fixed
+
+- Tuni opens on Fedora 45 and anywhere else GTK 4.24 meets KWin 6.8. It used
+  to close at once with `Error 71 (Protocol error) dispatching to Wayland
+  display`, because GTK now asks the compositor for a window's background
+  effect itself and Tuni asked a second time. The background blur is asked
+  for through GTK there, and costs a blur pass per frame while it is on.
+
 ## 1.8.0
 
 ### Added
