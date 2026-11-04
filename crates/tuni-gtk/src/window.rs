@@ -8129,7 +8129,12 @@ fn load_css() {
               background-color: alpha(@window_bg_color, 0.7); }\n\
              /* Small enough that a screen's worth of terminal fits the card,\n\
                 which is what makes a thumbnail readable as itself. */\n\
-             .tuni-switch-preview label { font-size: 5pt; }\n",
+             .tuni-switch-preview label { font-size: 5pt; }\n\
+             /* The background blur on a GTK that asks the compositor itself,\n\
+                see `blur.rs`. From 20px on GTK sends the window's shape as\n\
+                the blur region; it also draws its own pass over the clear\n\
+                backdrop every frame, which is what the setting costs. */\n\
+             window.tuni-blur-behind { backdrop-filter: blur(20px); }\n",
         );
         provider.load_from_string(&css);
         gtk::style_context_add_provider_for_display(

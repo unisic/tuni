@@ -4,7 +4,9 @@
 //! wallpaper exactly as it is unless the compositor is told otherwise. On
 //! Wayland the ask is `ext-background-effect-v1`, spoken over the connection
 //! GDK already has open, and only once the manager's `capabilities` event has
-//! named blur among the effects it renders. On X11 it is a window property,
+//! named blur among the effects it renders. GTK 4.23.3 speaks it itself, so
+//! there the ask is a `backdrop-filter` in the stylesheet and GTK sends the
+//! region. On X11 it is a window property,
 //! KWin's `_KDE_NET_WM_BLUR_BEHIND_REGION`. These are the two asks Ghostty
 //! makes, and there is no third: a desktop that answers neither, GNOME first
 //! among them, offers no way to ask at all, so the setting quietly does
@@ -40,11 +42,25 @@ pub fn apply(window: &impl IsA<gtk::Window>, on: bool) {
         xorg::apply(window, on);
         return;
     };
-    let shape = if on { shape(window) } else { None };
 
     EFFECTS.with_borrow_mut(|slot| {
-        if let Effects::Blurs(effects) = slot.get_or_insert_with(Effects::look_up) {
-            effects.blur(&surface, shape);
+        let Effects::Blurs(effects) = slot.get_or_insert_with(Effects::look_up) else {
+            return;
+        };
+        if gtk_asks() {
+            // GTK turns a large enough `backdrop-filter` blur over the
+            // transparent part of the window into the region it sends,
+            // rounded corners included, so the ask is a class. A compositor
+            // that cannot blur never gets here, so it never costs GTK's pass.
+            if on != window.has_css_class(BLURRED) {
+                if on {
+                    window.add_css_class(BLURRED);
+                } else {
+                    window.remove_css_class(BLURRED);
+                }
+            }
+        } else {
+            effects.blur(&surface, if on { shape(window) } else { None });
         }
     });
 
@@ -71,6 +87,19 @@ pub fn forget(window: &impl IsA<gtk::Window>) {
             let _ = effects.connection.flush();
         }
     });
+}
+
+/// The class the stylesheet gives a `backdrop-filter` blur, for a GTK that
+/// asks the compositor itself.
+const BLURRED: &str = "tuni-blur-behind";
+
+/// Whether GTK holds each surface's background effect itself, which it does
+/// from 4.23.3 on whenever the compositor offers the manager. The protocol
+/// allows one effect object per surface and a second is a protocol error, so
+/// on such a GTK this module must not ask for its own: KWin 6.8 under GTK 4.24
+/// disconnected the window at its first frame, before anything was drawn.
+fn gtk_asks() -> bool {
+    gtk::check_version(4, 23, 3).is_none()
 }
 
 fn wl_surface(window: &gtk::Window) -> Option<WlSurface> {
