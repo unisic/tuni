@@ -130,6 +130,17 @@ pub fn launch_directory(
 /// tracking on, because it does not have the problem. `TUNI_PARTIAL_REDRAW=1`
 /// puts it back either way.
 ///
+/// It also keeps GTK off `ext-background-effect-v1`, which GTK 4.23.3 and later
+/// bind whenever the compositor offers it, so the window's blur stays with the
+/// application's own request. GTK sends the region measured from the corner of
+/// the surface, as the protocol says, and KWin 6.8 reads it from the corner of
+/// the window instead, which on a window with a client-side shadow shifts the
+/// blur right and down by the shadow's width and leaves the strip along the top
+/// and left edges unblurred. A surface may hold only one effect object, so the
+/// application cannot ask beside GTK; with GTK kept off the protocol it asks
+/// alone, measured the way KWin reads it. GTK reads the list once, when it
+/// connects, and has honored it since 4.20, before it spoke the protocol.
+///
 /// # Safety
 ///
 /// Writes the environment, so no other thread may be running: call it before
@@ -146,6 +157,32 @@ pub unsafe fn quieten(background_opacity: f64) {
         // SAFETY: as above.
         unsafe { std::env::set_var("GSK_DEBUG", "full-redraw") };
     }
+    let disabled = std::env::var_os(GDK_WAYLAND_DISABLE).unwrap_or_default();
+    if let Some(disabled) = without_background_effect(disabled) {
+        // SAFETY: as above.
+        unsafe { std::env::set_var(GDK_WAYLAND_DISABLE, disabled) };
+    }
+}
+
+/// The list of Wayland interfaces GTK leaves unbound.
+const GDK_WAYLAND_DISABLE: &str = "GDK_WAYLAND_DISABLE";
+
+/// `disabled` with the background effect manager added, or `None` when it is
+/// already on the list. GTK splits the list on any of `:;, \t`.
+fn without_background_effect(mut disabled: OsString) -> Option<OsString> {
+    const MANAGER: &str = "ext_background_effect_manager_v1";
+    let listed = disabled
+        .to_string_lossy()
+        .split([':', ';', ',', ' ', '\t'])
+        .any(|name| name == MANAGER);
+    if listed {
+        return None;
+    }
+    if !disabled.is_empty() {
+        disabled.push(",");
+    }
+    disabled.push(MANAGER);
+    Some(disabled)
 }
 
 #[cfg(test)]
@@ -166,6 +203,25 @@ mod tests {
             Some(PathBuf::from(
                 "/home/me/.cache/tuni-target/share/applications/dev.unisic.Tuni.desktop"
             ))
+        );
+    }
+
+    #[test]
+    fn gtk_is_kept_off_the_background_effect_once() {
+        let manager = "ext_background_effect_manager_v1";
+        assert_eq!(
+            without_background_effect(OsString::new()),
+            Some(OsString::from(manager))
+        );
+        assert_eq!(
+            without_background_effect(OsString::from("wp_color_manager_v1")),
+            Some(OsString::from(format!("wp_color_manager_v1,{manager}")))
+        );
+        // The second call, by the program the launcher becomes, adds nothing.
+        assert_eq!(without_background_effect(OsString::from(manager)), None);
+        assert_eq!(
+            without_background_effect(OsString::from(format!("a:{manager} b"))),
+            None
         );
     }
 
