@@ -5,6 +5,17 @@ publishes a version's section as the notes of its GitHub release, so the
 section has to exist before the tag does. Releases before 1.7.0 are described
 in `data/dev.unisic.Tuni.metainfo.xml`.
 
+## 1.8.2
+
+### Fixed
+
+- The background blur covers the whole window again under GTK 4.24 on KWin
+  6.8. GTK sent the blur region measured from the corner of the window's
+  shadow and KWin read it from the corner of the window, so the blur sat
+  25 px right of and below the window and the strip along the top and the
+  left edge showed the wallpaper sharp. Tuni asks for the blur itself again,
+  and the blur pass 1.8.1 added to every frame is gone.
+
 ## 1.8.1
 
 ### Fixed

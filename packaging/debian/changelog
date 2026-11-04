@@ -1,3 +1,11 @@
+tuni (1.8.2) unstable; urgency=medium
+
+  * The background blur covers the whole window again under GTK 4.24 on
+    KWin 6.8, instead of leaving an unblurred strip along the top and left
+    edges.
+
+ -- Unisic <contact@unisic.app>  Wed, 04 Nov 2026 18:25:00 +0100
+
 tuni (1.8.1) unstable; urgency=medium
 
   * Tuni opens under GTK 4.24 on KWin 6.8 instead of closing at once with a

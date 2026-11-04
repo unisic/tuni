@@ -67,6 +67,13 @@
   </provides>
 
   <releases>
+    <release version="1.8.2" date="2026-11-04">
+      <description>
+        <p>The background blur covers the whole window again under GTK 4.24
+        on KWin 6.8, instead of leaving an unblurred strip along the top and
+        left edges.</p>
+      </description>
+    </release>
     <release version="1.8.1" date="2026-11-04">
       <description>
         <p>Tuni opens under GTK 4.24 on KWin 6.8, as on Fedora 45, instead of
