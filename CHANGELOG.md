@@ -5,6 +5,13 @@ publishes a version's section as the notes of its GitHub release, so the
 section has to exist before the tag does. Releases before 1.7.0 are described
 in `data/dev.unisic.Tuni.metainfo.xml`.
 
+## 1.9.0
+
+### Added
+
+- The About window links to Buy Me a Coffee, for anyone who wants to support
+  Tuni's development.
+
 ## 1.8.2
 
 ### Fixed

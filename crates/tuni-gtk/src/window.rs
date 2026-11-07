@@ -1858,6 +1858,10 @@ impl TuniWindow {
             .license_type(gtk::License::Gpl30)
             .debug_info(debug_info())
             .build();
+        // An extra link on the Details page, beside the website, rather than
+        // `support_url`: libadwaita titles that row "Support Questions", which
+        // promises help, not a place to chip in.
+        about.add_link("Buy Me a Coffee", "https://buymeacoffee.com/unisic");
         about.present(Some(self));
     }
 
