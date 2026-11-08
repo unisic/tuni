@@ -9,7 +9,7 @@ in `data/dev.unisic.Tuni.metainfo.xml`.
 
 ### Added
 
-- The About window links to Buy Me a Coffee, for anyone who wants to support
+- The About window links to Ko-fi, for anyone who wants to support
   Tuni's development.
 
 ## 1.8.2
