@@ -4097,6 +4097,14 @@ struct StyleKey {
     mark: u8,
 }
 
+impl StyleKey {
+    /// Whether a space in this style puts anything on screen: a line drawn
+    /// through or under it.
+    fn inks_space(&self) -> bool {
+        self.underline || self.strikethrough || self.link
+    }
+}
+
 fn mouse_button(button: u32) -> Option<MouseButton> {
     // Ghostty's own table. Four and five are missing on purpose: as X11
     // button numbers they are the wheel, and the wheel arrives as scroll
@@ -4327,7 +4335,10 @@ impl Painter<'_> {
         let y = 0.0;
         let mut col = 0usize;
         while col < cells.len() {
-            if cells[col].text.is_empty() {
+            let cell = &cells[col];
+            if cell.text.is_empty()
+                || (cell.text == " " && !style_key(cell, hot(col), mark(col)).inks_space())
+            {
                 col += 1;
                 continue;
             }
@@ -4339,6 +4350,21 @@ impl Painter<'_> {
             while col < cells.len() {
                 let cell = &cells[col];
                 if cell.text.is_empty() || style_key(cell, hot(col), mark(col)) != style {
+                    break;
+                }
+                // A space ends the run rather than riding inside it. GTK's GPU
+                // renderer (4.20.4, 4.22.4 and 4.24.1 at least) leaks a
+                // reference on the font every time it draws a glyph with no
+                // ink, and a space inside a run is one; a run of nothing but
+                // spaces makes no node, so it costs nothing. A window redrawn
+                // for eight hours took one font past `G_MAXINT` references,
+                // `g_object_ref` began answering NULL, and the next text node
+                // crashed the renderer. Fixed upstream in GTK 8c4460ce. A word
+                // per node draws the same, each one placed on its own column,
+                // and only rows that changed are laid out again. A line under
+                // or through the text has to cross the gap, so those runs keep
+                // their spaces and the little they leak.
+                if cell.text == " " && !style.inks_space() {
                     break;
                 }
                 // Anything that is not one plain ASCII character is laid
