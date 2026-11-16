@@ -756,7 +756,10 @@ scrollback holds whatever was on screen when the window closed. So it is
 written only when it has been asked for, capped at 500 lines a pane the way
 kero caps it, and deleted outright the moment the setting is turned back off.
 Both are written beside themselves and renamed into place, so a crash mid-write
-costs the previous session rather than both. Every field the snapshot reads is
+costs the previous session rather than both. The shape is also written every
+thirty seconds while the window is open, and only when it changed, so a crash
+costs half a minute of projects rather than everything since the last clean
+close; the scrollback waits for the close. Every field the snapshot reads is
 optional and every unreadable tab is skipped, which is what lets a file written
 by an older build still open — and `TUNI_SESSION=0` turns the whole mechanism
 off, restore and save alike.

@@ -81,6 +81,11 @@ const GRIP: i32 = 5;
 /// read of what is already in the page cache costs nothing anyone can measure.
 const PANEL_POLL_SECONDS: u32 = 2;
 
+/// How often the session owner writes its shape down between closes: what a
+/// crash can cost. A tick that finds nothing moved reads the file and writes
+/// nothing.
+const SESSION_AUTOSAVE_SECONDS: u32 = 30;
+
 /// How long a host's on-connect snippet waits for the connection, and how often
 /// it looks. Long enough for somebody to find a phone and type a code into it,
 /// and each look is one `tcgetattr` on the pane's own terminal rather than
@@ -655,7 +660,10 @@ mod imp {
             // Written before the shells are hung up: the scrollback is read out
             // of the live terminals, and a terminal that has been shut down has
             // nothing left to read.
-            self.obj().save_session();
+            // Marked first, so an autosave tick between here and the window
+            // going away cannot write the shape alone over this save.
+            self.closing.set(true);
+            self.obj().save_session(true);
             self.obj().hang_up();
             // Hang up every shell before the widgets go, so the closing window
             // does not race the reader threads.
@@ -765,6 +773,28 @@ impl TuniWindow {
     /// startup, and the only one that writes the session file back.
     pub fn own_session(&self) {
         self.imp().session_owner.set(true);
+        if !tuni_core::session::enabled() {
+            return;
+        }
+        // Written at close, and every half minute in between: a window that
+        // crashed, or was killed with the session, would otherwise come back
+        // as it was at the last clean close, hours of projects behind.
+        glib::timeout_add_seconds_local(
+            SESSION_AUTOSAVE_SECONDS,
+            glib::clone!(
+                #[weak(rename_to = this)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    if this.imp().closing.get() {
+                        return glib::ControlFlow::Break;
+                    }
+                    this.save_session(false);
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
     }
 
     /// Opens another window on the same application, with the settings this one
@@ -2298,12 +2328,15 @@ impl TuniWindow {
     ///
     /// Runs while the window is closing, so it does the least it can: a
     /// snapshot of the model, one pass over the live terminals, two files.
-    fn save_session(&self) {
+    /// The autosave in between (`closing` false) writes the shape alone: the
+    /// scrollback is the expensive half, and a crash restores the projects
+    /// without it rather than the projects of the last clean close with it.
+    fn save_session(&self, closing: bool) {
         if !tuni_core::session::enabled() || !self.imp().session_owner.get() {
             return;
         }
         let imp = self.imp();
-        let keep_history = imp.settings.borrow().restore_history;
+        let keep_history = closing && imp.settings.borrow().restore_history;
         let terminals = imp.terminals.borrow();
         let editors = imp.editors.borrow();
         let history = RefCell::new(History::default());
@@ -2347,7 +2380,7 @@ impl TuniWindow {
         if let Err(error) = snapshot.save() {
             eprintln!("cannot save session: {error}");
         }
-        if let Err(error) = history.borrow().save() {
+        if closing && let Err(error) = history.borrow().save() {
             eprintln!("cannot save terminal history: {error}");
         }
     }

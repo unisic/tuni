@@ -433,6 +433,11 @@ impl Snapshot {
             fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string(self).map_err(io::Error::other)?;
+        // The window saves itself every half minute, and most of those find
+        // nothing moved: a read from the page cache instead of a write.
+        if fs::read_to_string(&path).is_ok_and(|old| old == text) {
+            return Ok(());
+        }
         let temporary = path.with_extension("json.new");
         fs::write(&temporary, text)?;
         fs::rename(&temporary, &path)
