@@ -11,6 +11,13 @@ in `data/dev.unisic.Tuni.metainfo.xml`.
 
 - The About window links to Ko-fi, for anyone who wants to support
   Tuni's development.
+- Remote Control, in Preferences and off until turned on, puts
+  `dev.unisic.Tuni.Remote` on the session bus: a program running as you can
+  list the projects, tabs and panes with whether an agent in one is working,
+  read a pane's text, type into it, open, focus and close tabs, and read what
+  the agent in a pane has used. Text typed this way arrives as a paste, so it
+  runs nothing until the caller sends Enter. For a phone remote or a script of
+  your own.
 
 ## 1.8.2
 

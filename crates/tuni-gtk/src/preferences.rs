@@ -886,6 +886,30 @@ fn session_page(window: &crate::window::TuniWindow, settings: &Settings) -> adw:
     updates.add(&check);
     page.add(&updates);
 
+    let control = adw::PreferencesGroup::builder()
+        .title("Remote Control")
+        .description(
+            "Lets programs running as you list the tabs, read them and type into them, \
+             for a phone remote or a script of your own. A program that can type into a \
+             shell can do anything the shell can.",
+        )
+        .build();
+    let allow = adw::SwitchRow::builder()
+        .title("Allow Remote Control")
+        .subtitle("dev.unisic.Tuni.Remote on the session bus")
+        .active(settings.remote_control)
+        .build();
+    allow.connect_active_notify(glib::clone!(
+        #[weak]
+        window,
+        move |row| {
+            let on = row.is_active();
+            edit(&window, |settings| settings.remote_control = on);
+        }
+    ));
+    control.add(&allow);
+    page.add(&control);
+
     // Off until asked for: this is the one setting whose effect is read by
     // other people, so each part of what it says can be held back on its own.
     let discord = adw::PreferencesGroup::builder()

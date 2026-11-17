@@ -3362,7 +3362,7 @@ impl TuniTerminal {
 
     /// Write pasted text to the shell, bracketed when the application asked for
     /// it so a multi-line paste cannot run itself.
-    fn paste_text(&self, text: &str) {
+    pub(crate) fn paste_text(&self, text: &str) {
         let mut guard = self.imp().session.borrow_mut();
         let Some(session) = guard.as_mut() else {
             return;

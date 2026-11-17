@@ -4,6 +4,7 @@
 //! them, the pane layout inside a tab, what all of it is restored from, and the
 //! directory tree and repository state beside it.
 
+pub mod control;
 pub mod conversations;
 pub mod dap;
 pub mod diff;

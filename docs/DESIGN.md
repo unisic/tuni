@@ -642,6 +642,23 @@ at all while nothing wants a look. Kero has the same foot and the same key:
 it is the one place that answers "is anything waiting on me" without reading
 every row.
 
+The same answer can be asked from outside the window. Remote Control, off
+until it is turned on in Preferences, puts `dev.unisic.Tuni.Remote` at
+`/dev/unisic/Tuni/Remote` on the session bus: `State` returns every window's
+projects, tabs and panes as JSON with the `working` and `finished` flags these
+spinners draw, `Text` reads the last lines of a pane, `Type` pastes into one
+and `Key` sends Enter, Escape, Tab, `Ctrl+C` or `Ctrl+D`, `Focus`, `NewTab` and
+`CloseTab` do what the sidebar does, and `Usage` returns what the Info panel's
+Agent section would show for a pane. It is a phone remote's way in, which is
+why it exists. The session bus is the door because it already admits callers
+running as this user and nobody else, and the window's own `org.gtk.Actions`
+are on it beside it; a socket of tuni's own would have been a second door to
+lock. Typed text goes in bracketed, as a paste does, so a newline in it runs
+nothing in a shell that asked for bracketed paste, and submitting is a
+separate `Key` call. The arrows are left out of `Key` because their bytes
+depend on a mode the application sets, and a remote that guessed wrong would
+move a cursor nobody can see.
+
 What it reads is what the agent says about itself, and nothing else. Claude Code
 writes its own state in the title — `✳ Claude Code` between turns, a braille
 spinner frame in place of the star while it works, or by 2.1.311 one of two
@@ -1630,6 +1647,7 @@ missing one mean the same thing. The names are Ghostty's where Ghostty has one.
 | `ssh-reconnect-on-restore` | `false` | Whether a restored ssh pane dials with nothing to attach to. Off, so a window putting eight panes back cannot start eight logins |
 | `ssh-reconnect` | `false` | Whether a pane whose connection dropped dials again by itself, backing off from two seconds to a minute and giving up after about five. Off, because a retry is a login and one that asks for a code should not start while nobody is looking |
 | `check-updates` | `true` | Whether the window asks the GitHub release page for a newer version, once per run. Off leaves the menu's "Check for Updates" to do it by hand |
+| `remote-control` | `false` | Whether `dev.unisic.Tuni.Remote` is on the session bus, for other programs running as you to list the tabs, read a pane and type into it. Off, because a program that can type into a shell can do what the shell can |
 | `panel.files`, `panel.git`, `panel.info`, `panel.debug` | `true` | Which pages the panel's switcher offers. The Remote page manages itself: it exists while a pane is on a host |
 | `agent.usage` | `true` | Whether the Info panel reads a coding agent's own session log. Off takes the Agent section away and stops every file below it from being opened |
 | `agent.claude`, `agent.codex`, `agent.opencode`, `agent.pi`, `agent.rokartur` | `true` | Which agents count as one. An agent turned off is a pane like any other: no section, no log read, no request made |

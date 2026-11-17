@@ -749,6 +749,10 @@ impl TuniWindow {
         if window.imp().settings.borrow().check_updates {
             window.check_updates(false);
         }
+        if let Some(application) = window.application() {
+            let on = window.imp().settings.borrow().remote_control;
+            crate::control::sync(&application, on);
+        }
         window
     }
 
@@ -1839,6 +1843,7 @@ impl TuniWindow {
         }
         if let Some(application) = self.application() {
             crate::shortcuts::apply(&application, &settings);
+            crate::control::sync(&application, settings.remote_control);
         }
         // The tabs and the sidebar draw what the two maps say only when a turn
         // starts or ends, so a switch flipped between turns needs the redraw
@@ -5409,6 +5414,55 @@ impl TuniWindow {
             .find_map(|window| window.project_of(tab).map(|project| (window, project)))
     }
 
+    // --- remote control ----------------------------------------------------
+
+    /// This window as `dev.unisic.Tuni.Remote`'s `State` describes it.
+    pub(crate) fn remote_state(&self) -> tuni_core::control::WindowState {
+        let imp = self.imp();
+        let working = imp.working.borrow();
+        let finished = imp.finished.borrow();
+        tuni_core::control::describe(self.id(), &imp.workspace.borrow(), |pane| {
+            tuni_core::control::Live {
+                working: working.contains_key(&pane),
+                finished: finished.contains_key(&pane),
+            }
+        })
+    }
+
+    /// The terminal showing `pane`, when it is this window's and a terminal.
+    pub(crate) fn terminal(&self, pane: Id) -> Option<TuniTerminal> {
+        self.imp().terminals.borrow().get(&pane).cloned()
+    }
+
+    pub(crate) fn holds_project(&self, project: Id) -> bool {
+        self.imp().workspace.borrow().index_of(project).is_some()
+    }
+
+    pub(crate) fn holds_pane(&self, pane: Id) -> bool {
+        self.imp()
+            .workspace
+            .borrow()
+            .projects()
+            .iter()
+            .flat_map(Project::tabs)
+            .any(|tab| tab.layout().pane(pane).is_some())
+    }
+
+    /// Closes `tab` as its close button does, so a file with unsaved edits
+    /// still asks first. Whether the tab was this window's.
+    pub(crate) fn close_tab(&self, tab: Id) -> bool {
+        let Some(project) = self.project_of(tab) else {
+            return false;
+        };
+        let imp = self.imp();
+        let view = imp.views.borrow().get(&project).cloned();
+        let page = imp.pages.borrow().get(&tab).cloned();
+        if let (Some(view), Some(page)) = (view, page) {
+            view.close_page(&page);
+        }
+        true
+    }
+
     /// Which of this window's projects holds `tab`.
     fn project_of(&self, tab: Id) -> Option<Id> {
         self.imp()
@@ -6072,7 +6126,7 @@ impl TuniWindow {
 
     /// Brings a pane on screen wherever it is: its project, then its tab within
     /// that project, then the pane within that tab.
-    fn reveal_pane(&self, pane: Id) {
+    pub(crate) fn reveal_pane(&self, pane: Id) {
         let imp = self.imp();
         let found = {
             let workspace = imp.workspace.borrow();

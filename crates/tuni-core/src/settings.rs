@@ -283,6 +283,13 @@ pub struct Settings {
     /// reaching the network on its own, so the switch is there and the manual
     /// "Check for Updates" keeps working when it is off.
     pub check_updates: bool,
+    /// Whether other programs running as this user may read the tabs and type
+    /// into them through `dev.unisic.Tuni.Remote` on the session bus.
+    ///
+    /// Off: a program that can type into a shell can do anything the shell
+    /// can, and this is a door somebody opens on purpose, for a phone or a
+    /// script of their own. See [`crate::control`].
+    pub remote_control: bool,
     /// Which pages the panel's switcher offers. All on by default; someone who
     /// never debugs from here takes that page off and the switcher stops
     /// asking. The Remote page is not among these because it manages its own
@@ -327,6 +334,7 @@ impl Default for Settings {
             ssh_reconnect_on_restore: false,
             ssh_reconnect: false,
             check_updates: true,
+            remote_control: false,
             panel_files: true,
             panel_git: true,
             panel_info: true,
@@ -525,6 +533,9 @@ impl Settings {
         }
         if let Some(on) = table.boolean("check-updates") {
             settings.check_updates = on;
+        }
+        if let Some(on) = table.boolean("remote-control") {
+            settings.remote_control = on;
         }
         if let Some(on) = table.boolean("panel.files") {
             settings.panel_files = on;
@@ -757,6 +768,9 @@ impl Settings {
         }
         if self.check_updates != default.check_updates {
             let _ = writeln!(out, "check-updates = {}", self.check_updates);
+        }
+        if self.remote_control != default.remote_control {
+            let _ = writeln!(out, "remote-control = {}", self.remote_control);
         }
         for (page, on) in [
             ("panel.files", self.panel_files),
@@ -1211,6 +1225,7 @@ mod tests {
             ssh_reconnect_on_restore: true,
             ssh_reconnect: true,
             check_updates: false,
+            remote_control: true,
             panel_files: true,
             panel_git: true,
             panel_info: true,
@@ -1263,6 +1278,7 @@ mod tests {
         assert!(read.ssh_reconnect_on_restore);
         assert!(read.ssh_reconnect);
         assert!(!read.check_updates);
+        assert!(read.remote_control);
         assert_eq!(read.info_editor, "zed");
         assert_eq!(read.discord, settings.discord);
         assert_eq!(read.agents, settings.agents);
