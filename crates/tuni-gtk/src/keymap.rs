@@ -417,7 +417,7 @@ fn key_from_keyval(keyval: gdk::Key) -> Key {
     }
 }
 
-fn key_from_char(ch: char) -> Key {
+pub(crate) fn key_from_char(ch: char) -> Key {
     match ch.to_ascii_lowercase() {
         'a' => Key::A,
         'b' => Key::B,

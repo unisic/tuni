@@ -647,17 +647,24 @@ until it is turned on in Preferences, puts `dev.unisic.Tuni.Remote` at
 `/dev/unisic/Tuni/Remote` on the session bus: `State` returns every window's
 projects, tabs and panes as JSON with the `working` and `finished` flags these
 spinners draw, `Text` reads the last lines of a pane, `Type` pastes into one
-and `Key` sends Enter, Escape, Tab, `Ctrl+C` or `Ctrl+D`, `Focus`, `NewTab` and
-`CloseTab` do what the sidebar does, and `Usage` returns what the Info panel's
-Agent section would show for a pane. It is a phone remote's way in, which is
-why it exists. The session bus is the door because it already admits callers
-running as this user and nobody else, and the window's own `org.gtk.Actions`
-are on it beside it; a socket of tuni's own would have been a second door to
-lock. Typed text goes in bracketed, as a paste does, so a newline in it runs
-nothing in a shell that asked for bracketed paste, and submitting is a
-separate `Key` call. The arrows are left out of `Key` because their bytes
-depend on a mode the application sets, and a remote that guessed wrong would
-move a cursor nobody can see.
+and `Key` presses a named key, `Focus`, `NewTab` and `CloseTab` do what the
+sidebar does, `Usage` returns what the Info panel's Agent section would show
+for a pane, and `Commands` lists the slash commands of the agent running in
+one. It is a phone remote's way in, which is why it exists. The session bus is
+the door because it already admits callers running as this user and nobody
+else, and the window's own `org.gtk.Actions` are on it beside it; a socket of
+tuni's own would have been a second door to lock. Typed text goes in
+bracketed, as a paste does, so a newline in it runs nothing in a shell that
+asked for bracketed paste, and submitting is a separate `Key` call. `Key`
+takes a name like `enter`, `up`, `shift-tab`, `ctrl-c` or `1` and hands it to
+the pane's own key encoder, so an arrow comes out as the program's cursor key
+mode wants and a program on the Kitty protocol gets its own codes; a remote
+that wrote the bytes itself would guess, and a wrong guess moves a cursor
+nobody can see. `Commands` is there so a remote can offer `/compact` rather
+than have somebody remember it: for `agent` and Claude Code it is their
+built-in commands, copied from the versions this was written against, then
+the skills, prompts and commands on disk that the agent itself would load,
+read on a worker thread.
 
 What it reads is what the agent says about itself, and nothing else. Claude Code
 writes its own state in the title — `✳ Claude Code` between turns, a braille

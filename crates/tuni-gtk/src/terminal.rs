@@ -3539,6 +3539,59 @@ impl TuniTerminal {
         self.refresh_links(mods);
     }
 
+    /// Presses a key a remote named, through the encoder a key typed here
+    /// goes through, so the program's cursor key mode and Kitty protocol
+    /// flags shape the bytes as they would for a real key. Whether anything
+    /// went to the shell.
+    pub(crate) fn press(&self, chord: tuni_core::control::Chord) -> bool {
+        use tuni_core::control::Base;
+        let (key, text) = match chord.base {
+            Base::Enter => (Key::Enter, None),
+            Base::Escape => (Key::Escape, None),
+            Base::Tab => (Key::Tab, None),
+            Base::Backspace => (Key::Backspace, None),
+            Base::Space => (Key::Space, Some(' ')),
+            Base::Up => (Key::ArrowUp, None),
+            Base::Down => (Key::ArrowDown, None),
+            Base::Left => (Key::ArrowLeft, None),
+            Base::Right => (Key::ArrowRight, None),
+            Base::Home => (Key::Home, None),
+            Base::End => (Key::End, None),
+            Base::PageUp => (Key::PageUp, None),
+            Base::PageDown => (Key::PageDown, None),
+            Base::Char(c) => (keymap::key_from_char(c), Some(c)),
+        };
+        let mut mods = Mods::empty();
+        mods.set(Mods::CTRL, chord.ctrl);
+        mods.set(Mods::ALT, chord.alt);
+        mods.set(Mods::SHIFT, chord.shift);
+        // A shifted letter types its capital, which uses the Shift up, as GDK
+        // reports it for a real key.
+        let shifted = chord.shift && text.is_some_and(|c| c.is_ascii_lowercase());
+        let consumed = if shifted { Mods::SHIFT } else { Mods::empty() };
+        let typed = text.map(|c| if shifted { c.to_ascii_uppercase() } else { c }.to_string());
+
+        let mut guard = self.imp().session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return false;
+        };
+        let input = KeyInput {
+            action: KeyAction::Press,
+            key,
+            mods,
+            consumed_mods: consumed,
+            text: typed.as_deref(),
+            unshifted_codepoint: text,
+        };
+        match session.term.encode_key(&input) {
+            Ok(bytes) if !bytes.is_empty() => {
+                send(&mut session.pty, bytes);
+                session.term.scroll_to_bottom();
+                true
+            }
+            _ => false,
+        }
+    }
     /// Hand a key event to the encoder and write back whatever it answers
     /// with. Says whether anything went to the shell at all.
     fn send_key(

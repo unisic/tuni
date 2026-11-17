@@ -69,12 +69,15 @@ fn register(
                 .into_iter()
                 .filter_map(|window| window.downcast().ok())
                 .collect();
-            if method == "Usage" {
+            if method == "Usage" || method == "Commands" {
                 let started = args::<(u64,)>(&parameters)
                     .and_then(|(pane,)| usage_source(&windows, Id::from(pane)));
                 match started {
-                    Ok(source) => {
+                    Ok(source) if method == "Usage" => {
                         invocation.return_future_local(usage(source, reader.clone()));
+                    }
+                    Ok(source) => {
+                        invocation.return_future_local(commands(source));
                     }
                     Err(error) => invocation.return_result(Err(error)),
                 }
@@ -110,8 +113,10 @@ fn call(
         }
         "Key" => {
             let (pane, key) = args::<(u64, String)>(parameters)?;
-            let sent = control::key(&key).ok_or_else(|| invalid("unknown key"))?;
-            terminal(windows, pane)?.send_text(sent);
+            let chord = control::chord(&key).ok_or_else(|| invalid("unknown key"))?;
+            if !terminal(windows, pane)?.press(chord) {
+                return Err(invalid("the pane took no input for that key"));
+            }
             Ok(None)
         }
         "Focus" => {
@@ -214,6 +219,25 @@ async fn usage(
     let (usage, taken) = read;
     reader.replace(taken);
     Ok(Some(control::usage_json(&usage).to_variant()))
+}
+
+/// The slash commands of the agent running in the pane, found the way
+/// `Usage` finds it, with the skills directories read on the same worker.
+async fn commands(source: UsageSource) -> Result<Option<glib::Variant>, glib::Error> {
+    let home = glib::home_dir();
+    let json = gio::spawn_blocking(move || {
+        let agent = (source.shell != 0)
+            .then(|| tuni_core::info::snapshot(source.shell))
+            .and_then(|snapshot| Agent::running(&snapshot.processes))
+            .map(|(agent, _)| agent);
+        let commands = agent.map_or_else(Vec::new, |agent| {
+            control::commands(agent, &home, &source.cwd)
+        });
+        control::commands_json(agent, &commands)
+    })
+    .await
+    .map_err(|_| invalid("the command read failed"))?;
+    Ok(Some(json.to_variant()))
 }
 
 fn invalid(message: &str) -> glib::Error {
