@@ -68,6 +68,16 @@
   </provides>
 
   <releases>
+    <release version="1.9.0" date="2026-11-17">
+      <description>
+        <p>Remote Control, off until turned on in Preferences, lets a program
+        running as you read Tuni's tabs and type into them over D-Bus, for a
+        phone remote or a script of your own.</p>
+        <p>A window left open all day no longer crashes after about eight
+        hours, and a crash no longer loses the projects and tabs opened since
+        the last close. The About window links to Ko-fi.</p>
+      </description>
+    </release>
     <release version="1.8.2" date="2026-11-04">
       <description>
         <p>The background blur covers the whole window again under GTK 4.24

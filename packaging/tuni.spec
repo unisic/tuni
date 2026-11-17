@@ -6,7 +6,7 @@
 # for a local `rpmbuild`. Set GHOSTTY_SOURCE_DIR to that release unpacked and
 # CARGO_HOME to a populated registry to build it without either.
 #
-#   make -C .. dist   # or: git archive --prefix=tuni-1.8.2/ -o tuni-1.8.2.tar.gz HEAD
+#   make -C .. dist   # or: git archive --prefix=tuni-1.9.0/ -o tuni-1.9.0.tar.gz HEAD
 #   rpmbuild -ba packaging/tuni.spec
 
 %global app_id dev.unisic.Tuni
@@ -16,7 +16,7 @@
 %global zig_version 0.17.0
 
 Name:           tuni
-Version:        1.8.2
+Version:        1.9.0
 Release:        1%{?dist}
 Summary:        Terminals, projects, files, and Git in one window
 
@@ -94,6 +94,12 @@ appstream-util validate-relax --nonet \
 %{_datadir}/icons/hicolor/*/*/*.svg
 
 %changelog
+* Tue Nov 17 2026 Unisic <contact@unisic.app> - 1.9.0-1
+- Remote Control, off until turned on in Preferences, lets a program running
+  as you read Tuni's tabs and type into them over D-Bus.
+- A window left open all day no longer crashes after about eight hours, and
+  a crash no longer loses the projects and tabs opened since the last close.
+
 * Wed Nov 04 2026 Unisic <contact@unisic.app> - 1.8.2-1
 - The background blur covers the whole window again under GTK 4.24 on KWin
   6.8, instead of leaving an unblurred strip along the top and left edges.

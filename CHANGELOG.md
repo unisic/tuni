@@ -20,6 +20,17 @@ in `data/dev.unisic.Tuni.metainfo.xml`.
   arrives as a paste, so it runs nothing until the caller sends Enter. For a
   phone remote or a script of your own.
 
+### Fixed
+
+- A window left open all day no longer crashes after about eight hours.
+  GTK's GPU renderer kept a reference on the terminal font for every space
+  it drew, until the count ran out; Tuni no longer hands it spaces to draw.
+  GTK has fixed this upstream, not yet in a release.
+- A crash or a killed session no longer brings back the window as it was at
+  the last clean close, sometimes hours behind. The window now writes its
+  projects and tabs every thirty seconds; the scrollback is still saved only
+  when it closes.
+
 ## 1.8.2
 
 ### Fixed

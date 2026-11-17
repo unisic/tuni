@@ -1,3 +1,13 @@
+tuni (1.9.0) unstable; urgency=medium
+
+  * Remote Control, off until turned on in Preferences, lets a program
+    running as you read Tuni's tabs and type into them over D-Bus.
+  * A window left open all day no longer crashes after about eight hours.
+  * A crash no longer loses the projects and tabs opened since the last
+    close.
+
+ -- Unisic <contact@unisic.app>  Tue, 17 Nov 2026 21:10:00 +0100
+
 tuni (1.8.2) unstable; urgency=medium
 
   * The background blur covers the whole window again under GTK 4.24 on
