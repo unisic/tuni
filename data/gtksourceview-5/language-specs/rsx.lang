@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<language id="rsx" name="RSX" version="2.0" _section="Source" >
+  <metadata>
+    <property name="globs">*.rsx</property>
+    <property name="line-comment-start">//</property>
+    <property name="block-comment-start">/*</property>
+    <property name="block-comment-end">*/</property>
+  </metadata>
+
+  <styles>
+    <style id="comment" name="Comment" map-to="def:comment"/>
+    <style id="keyword" name="Keyword" map-to="def:keyword"/>
+    <style id="tag" name="Tag" map-to="def:type"/>
+    <style id="component-tag" name="Component tag" map-to="def:type"/>
+    <style id="attribute" name="Attribute" map-to="def:identifier"/>
+    <style id="directive" name="Directive" map-to="def:preprocessor"/>
+    <style id="string" name="String" map-to="def:string"/>
+    <style id="bracket" name="Bracket" map-to="def:special-char"/>
+  </styles>
+
+  <definitions>
+    <context id="rust-expr">
+      <start>\{</start>
+      <end>\}</end>
+      <include>
+        <context sub-pattern="0" where="start" style-ref="bracket"/>
+        <context sub-pattern="0" where="end" style-ref="bracket"/>
+        <context ref="rust-expr"/>
+        <context ref="rust:rust"/>
+      </include>
+    </context>
+
+    <context id="text" style-ref="string" end-at-line-end="true">
+      <start>"</start>
+      <end>"</end>
+      <include>
+        <context id="interpolation">
+          <start>(?&lt;!\{)\{(?!\{)</start>
+          <end>\}</end>
+          <include>
+            <context sub-pattern="0" where="start" style-ref="bracket"/>
+            <context sub-pattern="0" where="end" style-ref="bracket"/>
+            <context ref="rust:rust"/>
+          </include>
+        </context>
+      </include>
+    </context>
+
+    <context id="attribute-value" style-ref="string" end-at-line-end="true">
+      <start>"</start>
+      <end>"</end>
+      <include>
+        <context ref="interpolation"/>
+      </include>
+    </context>
+
+    <context id="open-tag">
+      <start>&lt;/?(?:[a-z][a-z0-9-]*|[A-Z][A-Za-z0-9_]*(?:::[A-Za-z0-9_]+)*)</start>
+      <end>/?&gt;</end>
+      <include>
+        <context sub-pattern="0" where="start" style-ref="tag"/>
+        <context sub-pattern="0" where="end" style-ref="bracket"/>
+        <context style-ref="directive">
+          <match>\b(?:on|prop|class|bind|style|attr):[A-Za-z_][A-Za-z0-9_-]*</match>
+        </context>
+        <context style-ref="attribute">
+          <match>\b[A-Za-z_][A-Za-z0-9_-]*(?==)</match>
+        </context>
+        <context ref="attribute-value"/>
+        <context ref="rust-expr"/>
+      </include>
+    </context>
+
+    <context id="control">
+      <start>\b(?:if|else|for)\b</start>
+      <end>\}</end>
+      <include>
+        <context sub-pattern="0" where="start" style-ref="keyword"/>
+        <context sub-pattern="0" where="end" style-ref="bracket"/>
+        <context id="control-body">
+          <start>\{</start>
+          <end>(?=\})</end>
+          <include>
+            <context sub-pattern="0" where="start" style-ref="bracket"/>
+            <context ref="view-content"/>
+          </include>
+        </context>
+        <context style-ref="keyword">
+          <match>\bkey\b</match>
+        </context>
+        <context ref="rust:rust"/>
+      </include>
+    </context>
+
+    <context id="view-content">
+      <include>
+        <context ref="def:c-like-comment" style-ref="comment"/>
+        <context ref="control"/>
+        <context ref="open-tag"/>
+        <context ref="text"/>
+        <context ref="rust-expr"/>
+      </include>
+    </context>
+
+    <context id="view-block">
+      <start>\bview\s*\{</start>
+      <end>\}</end>
+      <include>
+        <context sub-pattern="0" where="start" style-ref="keyword"/>
+        <context sub-pattern="0" where="end" style-ref="bracket"/>
+        <context ref="view-content"/>
+      </include>
+    </context>
+
+    <context id="style-block">
+      <start>\bstyle\s*\{</start>
+      <end>\}</end>
+      <include>
+        <context sub-pattern="0" where="start" style-ref="keyword"/>
+        <context sub-pattern="0" where="end" style-ref="bracket"/>
+        <context ref="css:css"/>
+      </include>
+    </context>
+
+
+    <context id="rsx">
+      <include>
+        <context ref="view-block"/>
+        <context ref="style-block"/>
+        <context id="component">
+          <match>\b(component)\s+([A-Z][A-Za-z0-9_]*)</match>
+          <include>
+            <context sub-pattern="1" style-ref="keyword"/>
+            <context sub-pattern="2" style-ref="component-tag"/>
+          </include>
+        </context>
+        <context ref="rust:rust"/>
+      </include>
+    </context>
+  </definitions>
+</language>
