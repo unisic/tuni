@@ -159,6 +159,8 @@ install-data:
 	for icon in data/icons/hicolor/scalable/actions/*.svg; do \
 		install -Dm644 $$icon $(icondir)/scalable/actions/$$(basename $$icon); \
 	done
+	install -Dm644 data/gtksourceview-5/language-specs/rsx.lang \
+		$(datadir)/gtksourceview-5/language-specs/rsx.lang
 
 uninstall:
 	rm -f $(bindir)/tuni $(bindir)/tuni-gtk

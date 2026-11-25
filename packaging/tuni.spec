@@ -92,6 +92,7 @@ appstream-util validate-relax --nonet \
 # how the Git page's icon broke the 1.3.0 RPM. Nothing else writes into this
 # directory in the buildroot, so the glob is exactly tuni's icons.
 %{_datadir}/icons/hicolor/*/*/*.svg
+%{_datadir}/gtksourceview-5/language-specs/rsx.lang
 
 %changelog
 * Tue Nov 17 2026 Unisic <contact@unisic.app> - 1.9.0-1

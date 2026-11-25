@@ -133,6 +133,12 @@ pub const LANGUAGES: &[Language] = &[
         commands: &[&["bash-language-server", "start"]],
         roots: &[],
     },
+    Language {
+        id: "rsx",
+        extensions: &["rsx"],
+        commands: &[&["yawn-lsp"]],
+        roots: &["Yawn.toml"],
+    },
 ];
 
 /// The language a file is in, by its extension. `None` is a file the table
