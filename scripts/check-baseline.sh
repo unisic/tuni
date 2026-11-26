@@ -14,6 +14,12 @@
 # and have a fallback behind them. A ymm anywhere else got there because
 # something compiled for the build machine.
 #
+# `core::arch::x86` is allowed for the same reason. Since Rust 1.100 an
+# intrinsic such as `_mm256_sad_epu8` can stay a function of its own instead of
+# vanishing into its caller, and it only exists where a crate called it by
+# name from behind a `target_feature`. Code compiled for the build machine
+# vectorises under the caller's own symbol, which is still checked.
+#
 # That question can only be asked of a binary that still has its symbols. Every
 # package strips, and objdump then files the whole program under `.text`, so
 # what is left there is the AVX-512 count: zero in a baseline build, hundreds in
@@ -22,7 +28,7 @@
 set -eu
 
 binary=${1:?usage: check-baseline.sh BINARY}
-dispatched='simdutf|memchr|simd_adler32|N_AVX2|N_AVX3|hwy|wuffs_.*_x86_avx2|aho_corasick.*teddy'
+dispatched='simdutf|memchr|simd_adler32|N_AVX2|N_AVX3|hwy|wuffs_.*_x86_avx2|aho_corasick.*teddy|4core9core_arch3x86'
 
 if [ "$(uname -m)" != x86_64 ]; then
     echo "$(uname -m) has no baseline to check against"
